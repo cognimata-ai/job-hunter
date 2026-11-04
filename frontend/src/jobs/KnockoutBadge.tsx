@@ -6,7 +6,9 @@
 // the UI language ("German", "Deutsch"), and a code `Intl` does not know, or an ad's own name of a language,
 // stays as it is. A `degree` requirement's level ("master (Computer Science)") and the profile's side of a
 // `degree` or a `work_permit` knockout are codes, shown through `degree_level` and `work_authorization` (Ruling
-// T22-e); a value outside its namespace stays as it is.
+// T22-e); a `contract_type` requirement is the job's employment types ("internship, working_student"), each
+// shown through `employment` and joined in the UI language's list form ("internship and working student", Task
+// 23). A value outside its namespace stays as it is.
 import { useTranslation } from "react-i18next";
 import { cx } from "../components/cx";
 import { type CodeNamespace, intlLocale, useServerText } from "../i18n/index";
@@ -54,6 +56,12 @@ function namedDegree(requirement: string, serverText: ServerText): string {
   return serverText("degree_level", level) + (at === -1 ? "" : requirement.slice(at));
 }
 
+/** A `contract_type` requirement's employment types named, in the language's list form. */
+function namedEmployment(requirement: string, language: string, serverText: ServerText): string {
+  const names = requirement.split(",").map((code) => code.trim()).filter((code) => code !== "").map((code) => serverText("employment", code));
+  return new Intl.ListFormat(intlLocale(language), { type: "conjunction" }).format(names);
+}
+
 /** The requirement as the badge shows it. */
 function requirementText(code: string, requirement: string, language: string, serverText: ServerText): string {
   switch (code) {
@@ -61,6 +69,8 @@ function requirementText(code: string, requirement: string, language: string, se
       return namedLanguage(requirement, language);
     case "degree":
       return namedDegree(requirement, serverText);
+    case "contract_type":
+      return namedEmployment(requirement, language, serverText);
     default:
       return requirement;
   }

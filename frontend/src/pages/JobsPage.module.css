@@ -1,9 +1,118 @@
+/* The Jobs page: its title, then the filter panel beside the list (one column at 768 px and below, the panel
+ * first). */
 .page {
   display: grid;
   gap: var(--space-5);
 }
 
+.layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-6);
+}
+
+.results {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+.counts {
+  font-weight: var(--font-weight-medium);
+}
+
+.sort {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  font-size: var(--font-size-2);
+}
+
+.select {
+  max-width: 100%;
+  min-height: 36px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+/* The Ranking changed region holds nothing until it has something to say. */
+.status:empty {
+  display: none;
+}
+
+.ranking {
+  width: 100%;
+  min-height: 40px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-info);
+  border-radius: var(--radius-2);
+  background: var(--color-info-bg);
+  color: var(--color-info);
+  font-weight: var(--font-weight-medium);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ranking:hover {
+  text-decoration: underline;
+}
+
+.notice {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-warn);
+  border-radius: var(--radius-2);
+  background: var(--color-warn-bg);
+  font-weight: var(--font-weight-medium);
+}
+
+.notice a {
+  color: var(--color-warn);
+}
+
 .list {
   display: grid;
   gap: var(--space-3);
+}
+
+.more {
+  display: flex;
+  justify-content: center;
+}
+
+.button {
+  min-height: 40px;
+  padding: 0 var(--space-5);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+}
+
+.button[aria-disabled="true"] {
+  cursor: progress;
+}
+
+@media (max-width: 768px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

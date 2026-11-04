@@ -5,7 +5,9 @@ import { App, createApp } from "./app/App";
 import de from "./i18n/de.json";
 import en from "./i18n/en.json";
 import i18n from "./i18n/index";
+import userEvent from "@testing-library/user-event";
 import { fakeApi } from "./test/api";
+import { parseSearch, stringifySearch } from "./router";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -124,6 +126,48 @@ describe("the routes", () => {
     expect(screen.queryByRole("navigation", { name: en["nav.label"] })).toBeNull();
     expect(api.calls).not.toContain("GET /api/settings");
     expect(app.router.state.location.pathname).toBe("/Login");
+  });
+
+  it("the router serialises sets as repeated keys and keeps strings", async () => {
+    expect(stringifySearch({ work_mode: ["remote", "hybrid"], loc_id: "geonames:2950159", q: "123", score_min: 40, include_remote: false, job: undefined, x: null })).toBe(
+      "?work_mode=remote&work_mode=hybrid&loc_id=geonames%3A2950159&q=123&score_min=40&include_remote=false",
+    );
+    expect(stringifySearch({})).toBe("");
+    expect(parseSearch("?work_mode=remote&work_mode=hybrid&loc_id=geonames:2950159&q=123&e=&t=true")).toEqual({
+      work_mode: ["remote", "hybrid"], // repeated: an array
+      loc_id: "geonames:2950159", // once: a string, not JSON
+      q: "123", // a numeric-looking value stays a string
+      e: "",
+      t: "true",
+    });
+    expect(parseSearch("q=%22quoted%22+text")).toEqual({ q: '"quoted" text' });
+    fakeApi({ signedIn: true });
+    const app = at("/settings");
+    await screen.findByRole("heading", { level: 1, name: en["settings.title"] });
+    await app.router.navigate({ to: "/", search: { work_mode: ["remote", "hybrid"], q: "007", loc_id: "geonames:2950159", loc_lat: 52.5, loc_lon: 13.4, radius_km: 30 } });
+    const { searchStr, search } = app.router.state.location;
+    expect(new URLSearchParams(searchStr).getAll("work_mode")).toEqual(["remote", "hybrid"]);
+    expect(searchStr).not.toContain("%22");
+    expect(search).toMatchObject({ work_mode: ["remote", "hybrid"], q: "007", loc_id: "geonames:2950159", radius_km: "30" });
+  });
+
+  it("a login redirect with search and hash survives", async () => {
+    fakeApi({ loginAnswers: [() => new Response(null, { status: 204 })] });
+    const app = at("/settings?a=1&b=2#x");
+    await waitFor(() => {
+      expect(app.router.state.location.pathname).toBe("/login");
+    });
+    expect(app.router.state.location.search).toEqual({ redirect: "/settings?a=1&b=2#x" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText(en["login.username"]), "smoke");
+    await user.type(screen.getByLabelText(en["login.password"]), "correct horse");
+    await user.click(screen.getByRole("button", { name: en["login.submit"] }));
+    await waitFor(() => {
+      expect(app.router.state.location.href).toBe("/settings?a=1&b=2#x");
+    });
+    expect(app.router.state.location.search).toEqual({ a: "1", b: "2" });
+    expect(app.router.state.location.hash).toBe("x");
+    expect(await screen.findByRole("heading", { level: 1, name: en["settings.title"] })).toBeTruthy();
   });
 
   it("show a translated page for an unknown path", async () => {

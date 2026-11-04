@@ -294,5 +294,27 @@
     "phd",
     "unspecified",
     "vocational"
+  ],
+  "employment": [
+    "apprenticeship",
+    "contract",
+    "freelance",
+    "full_time",
+    "internship",
+    "part_time",
+    "temporary",
+    "unknown",
+    "working_student"
+  ],
+  "seniority": [
+    "apprentice",
+    "head",
+    "intern",
+    "junior",
+    "lead",
+    "mid",
+    "principal",
+    "senior",
+    "working_student"
   ]
 }

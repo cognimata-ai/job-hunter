@@ -1,15 +1,16 @@
-// The Jobs list's data (spec §14.2, §15.3; plan M4 Task 22, Ruling b): the first page of `GET /api/jobs`, the
+// The Jobs list's data (spec §14.2, §15.3; plan M4 Task 22, Ruling b): the types of `GET /api/jobs`, the
 // spend's estimated cost of one scored ad, and the card's writes: the user's actions, Score now (also Score
-// anyway, with `force`) and Retry.
+// anyway, with `force`) and Retry. The list itself is `useJobsList` (Task 23).
 //
-// Every list query lives under `JOBS_KEY` (`["jobs", "list", <params>]`; the first page's params are `{}`), so
-// a write that changes a card invalidates `JOBS_KEY` and the list is read again: there is no optimistic update.
-// Score now and Retry also read the header's status again, since its pending count changes.
+// Every list query lives under `JOBS_KEY` (`["jobs", "list", <params>]`, and the facets `["jobs", "facets",
+// …]`), so a write that changes a card invalidates `JOBS_KEY` and the list is read again: there is no
+// optimistic update. Score now and Retry also read the header's status again, since its pending count changes.
 //
 // A failed write raises its own toast (`useCardFailure`), so the query client's generic transient one is not
 // raised too (`meta.ownToast`). Its callbacks are the mutation's own, not `mutate`'s: they still run when the
 // card has left the list meanwhile (a hidden job's Undo comes from a toast, after its card has gone).
 import {
+  keepPreviousData,
   useMutation,
   useQuery,
   useQueryClient,
@@ -34,18 +35,38 @@ export type ScoringBucket = JobCardOut["bucket"];
 export type SpendOut = components["schemas"]["SpendOut"];
 export type ActionsOut = components["schemas"]["ActionsOut"];
 export type TargetMovedOut = components["schemas"]["TargetMovedOut"];
+export type FacetsOut = components["schemas"]["FacetsOut"];
 
 export const JOBS_KEY = ["jobs"] as const;
-/** The first page of the list under the server's default query (Task 23 puts its URL params in the last slot). */
-export const FIRST_PAGE_KEY = ["jobs", "list", {}] as const;
 export const SPEND_KEY = ["system", "spend"] as const;
 export const SPEND_STALE_MS = 60_000;
+/** The facets are counts for the filter panel: read again after a minute, or after a write. */
+export const FACETS_STALE_MS = 60_000;
 
-/** The first page of the Jobs list: `GET /api/jobs` with no params, so the server's defaults apply. */
-export function useJobsFirstPage(): UseQueryResult<JobsPageOut> {
+/**
+ * The facets of the listed cards (`GET /api/jobs/facets`) under the list's API params (`toApiParams`): their
+ * companies and sources with counts (Task 23's Company and Source filters), the companies by a `companyQ`
+ * prefix when one is given. `enabled: false` reads nothing (a picker's search still being typed).
+ */
+export function useFacets(
+  params: string,
+  { companyQ = "", limit, enabled = true }: { companyQ?: string; limit?: number; enabled?: boolean } = {},
+): UseQueryResult<FacetsOut> {
   return useQuery({
-    queryKey: FIRST_PAGE_KEY,
-    queryFn: ({ signal }) => apiFetch<JobsPageOut>("/api/jobs", { signal }),
+    queryKey: [...JOBS_KEY, "facets", params, companyQ, limit ?? null],
+    queryFn: ({ signal }) => {
+      const search = new URLSearchParams(params);
+      if (companyQ !== "") {
+        search.set("company_q", companyQ);
+      }
+      if (limit !== undefined) {
+        search.set("limit", String(limit));
+      }
+      return apiFetch<FacetsOut>(`/api/jobs/facets?${search.toString()}`, { signal });
+    },
+    enabled,
+    placeholderData: keepPreviousData,
+    staleTime: FACETS_STALE_MS,
   });
 }
 

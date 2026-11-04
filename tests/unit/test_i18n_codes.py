@@ -31,6 +31,7 @@ from jobhunter.db.seed import SOURCES
 from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
 from jobhunter.jobs.cards import Badge, ScoreOut
+from jobhunter.jobs.query import EMPLOYMENT_VALUES, SENIORITY_VALUES
 from jobhunter.llm import gateway
 from jobhunter.llm.schemas import generator
 from jobhunter.llm.schemas import profile as profile_schema
@@ -309,6 +310,10 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
         profile_schema.UserEntered.model_fields["work_authorization_de"].annotation
     ),
     "degree_level": degree_levels,
+    # the Jobs list's Employment and Seniority filters (plan M4 Task 23), also a `contract_type` knockout's
+    # employment types: the employment types plus `unknown`, and the seniority ladder
+    "employment": lambda: set(EMPLOYMENT_VALUES),
+    "seniority": lambda: set(SENIORITY_VALUES),
 }
 
 

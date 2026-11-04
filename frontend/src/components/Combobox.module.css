@@ -1,0 +1,82 @@
+/* A combobox: the label, the field (and what follows it in its row), and the list popup below the field. */
+.combobox {
+  position: relative;
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.label {
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.popup {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  left: 0;
+  z-index: 40;
+  margin-top: var(--space-1);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-overlay);
+}
+
+.popup[hidden] {
+  display: none;
+}
+
+.list {
+  max-height: 280px;
+  margin: 0;
+  padding: var(--space-1) 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.option {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-2);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.option:hover {
+  background: var(--color-surface-sunken);
+}
+
+/* The active option: filled and outlined, so it does not rest on colour alone. */
+.active,
+.active:hover {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+  background: var(--color-accent-soft);
+}
+
+.empty {
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+.list:empty {
+  display: none;
+}

@@ -1,0 +1,19 @@
+/* The place picker's clear button, beside its field. */
+.clear {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 36px;
+  min-height: 36px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-4);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.clear:hover {
+  background: var(--color-surface-sunken);
+}

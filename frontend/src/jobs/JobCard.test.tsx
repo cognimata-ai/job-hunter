@@ -1,4 +1,4 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
@@ -265,6 +265,29 @@ describe("JobCard", () => {
       `⚑ ${de["knockout.work_permit"]} – Profil: benötigt Visa-Sponsoring`,
       "⚑ Erfordert diploma (Physik) – Profil: magister",
       `⚑ Erfordert (Informatik) – Profil: ${de["degree_level.none"]}`,
+    ]);
+  });
+
+  it("a contract_type requirement names its employment types in the locale's list form", async () => {
+    const api = fakeApi({ signedIn: true });
+    const knockouts = [
+      knockout({ code: "contract_type", requirement: "internship, working_student" }),
+      knockout({ code: "contract_type", binding: false, requirement: "freelance, gig, part_time" }), // `gig`: no code
+    ];
+    const [card] = await cardsOf(api, [scored({ knockouts })]);
+    expect(texts(within(card).getByRole("list", { name: en["card.knockouts"] }))).toEqual([
+      `⚑ Requires ${en["employment.internship"]} and ${en["employment.working_student"]}`,
+      `⚑ Requires ${en["employment.freelance"]}, gig and ${en["employment.part_time"]} (unconfirmed)`,
+    ]);
+    cleanup();
+    api.uiLanguage = "de";
+    api.jobs = jobsPage([scored({ knockouts })]);
+    renderApp("/");
+    const list = await screen.findByRole("list", { name: de["jobs.title"] });
+    const [german] = within(list).getAllByRole("article");
+    expect(texts(within(german).getByRole("list", { name: de["card.knockouts"] }))).toEqual([
+      `⚑ Erfordert ${de["employment.internship"]} und ${de["employment.working_student"]}`,
+      `⚑ Erfordert ${de["employment.freelance"]}, gig und ${de["employment.part_time"]} (unbestätigt)`,
     ]);
   });
 
@@ -779,49 +802,5 @@ describe("the card's focus", () => {
     within(first).getByRole("button", { name: en["card.hide"] }).focus();
     await user.keyboard("{Enter}");
     expect(onOpen).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("JobsPage", () => {
-  it("shows 8 skeleton cards while loading, then the cards with the first one focusable", async () => {
-    const api = fakeApi({ signedIn: true });
-    let release: (() => void) | null = null;
-    api.routes.set("GET /api/jobs", () =>
-      new Promise<Response>((resolve) => {
-        release = () => { resolve(json(jobsPage([jobCard(), jobCard({ job_id: 6, title: "Second" })]))); };
-      }),
-    );
-    renderApp("/");
-    await screen.findByRole("heading", { level: 1, name: en["jobs.title"] }); // the shell has read the settings
-    const loading = within(screen.getByRole("main")).getByRole("status", { busy: true });
-    expect(loading.querySelectorAll("[aria-hidden=true]")).toHaveLength(8);
-    await act(async () => {
-      release?.();
-      await Promise.resolve();
-    });
-    const list = await screen.findByRole("list", { name: en["jobs.title"] });
-    const [first, second] = within(list).getAllByRole("article");
-    expect(first.tabIndex).toBe(0);
-    expect(second.tabIndex).toBe(-1);
-    expect(requestsTo(api, "GET /api/jobs")[0].path).toBe("/api/jobs"); // the server's default query
-  });
-
-  it("a failed first read shows the problem with Retry", async () => {
-    const api = fakeApi({ signedIn: true });
-    api.routes.set("GET /api/jobs", () => problem(400, "invalid_cursor"));
-    renderApp("/");
-    const box = await screen.findByRole("alert");
-    expect(box.textContent).toContain(en["problem.invalid_cursor"]);
-    api.routes.delete("GET /api/jobs");
-    api.jobs = jobsPage([jobCard()]);
-    await userEvent.setup().click(within(box).getByRole("button", { name: en["action.retry"] }));
-    expect(await screen.findByRole("article", { name: "Senior Backend Engineer" })).toBeTruthy();
-  });
-
-  it("shows the empty state without cards", async () => {
-    fakeApi({ signedIn: true });
-    renderApp("/");
-    expect(await screen.findByText(en["jobs.empty_title"])).toBeTruthy();
-    expect(screen.queryByRole("article")).toBeNull();
   });
 });

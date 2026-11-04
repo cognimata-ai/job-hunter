@@ -1,6 +1,7 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
-// can end, the session, settings, header-status, Jobs-list and spend reads, the logout, the login's answers in
-// the order a test gives them, and any other route a test answers itself (`routes`).
+// can end, the session, settings, header-status, Jobs-list, facets, places, profile and spend reads, the
+// logout, the login's answers in the order a test gives them, and any other route a test answers itself
+// (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -9,6 +10,10 @@ type StatusOut = components["schemas"]["StatusOut"];
 type JobCardOut = components["schemas"]["JobCardOut"];
 type JobsPageOut = components["schemas"]["JobsPageOut"];
 type SpendOut = components["schemas"]["SpendOut"];
+type FacetsOut = components["schemas"]["FacetsOut"];
+type PlaceOut = components["schemas"]["PlaceOut"];
+type ProfileListOut = components["schemas"]["ProfileListOut"];
+type CountsOut = components["schemas"]["CountsOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -116,6 +121,78 @@ export function jobsPage(items: JobCardOut[] = []): JobsPageOut {
   };
 }
 
+/** A paged Jobs list (`pagedJobs`): its pages, the ranking generation now, and the route that answers it. */
+export interface PagedList {
+  /** The cards of each page, in order; a test may change them between reads. */
+  pages: JobCardOut[][];
+  /** The ranking generation now. A cursor carries the generation of its first page, and a later page whose
+   * cursor carries an older one says `ranking_changed` (spec §14.3). */
+  generation: number;
+  /** The first page's counts. */
+  counts: CountsOut;
+  route: FakeRoute;
+}
+
+/**
+ * `GET /api/jobs` over `pages`, as the api pages it: a first page (no cursor) at the current generation with
+ * the counts, its `next_cursor` `c1.g<generation>`; a cursor `c<i>.g<g>` answers page `i` without counts, with
+ * `ranking_changed` when the generation has moved past `g`, and the next cursor keeps `g`. Any other cursor, or
+ * one past the last page, is 400 `invalid_cursor`.
+ */
+export function pagedJobs(pages: JobCardOut[][], counts?: CountsOut): PagedList {
+  const list: PagedList = {
+    pages,
+    generation: 1,
+    counts: counts ?? {
+      total_estimate: pages.flat().length,
+      unscored: pages.flat().filter((card) => card.score === null).length,
+      capped: false,
+    },
+    route: (request) => {
+      const cursor = request.search.get("cursor");
+      const at = cursor === null ? [0, list.generation] : /^c(\d+)\.g(\d+)$/.exec(cursor)?.slice(1).map(Number);
+      const [index, gen] = at ?? [-1, 0];
+      if (index < 0 || index >= list.pages.length) {
+        return problem(400, "invalid_cursor");
+      }
+      const page: JobsPageOut = {
+        items: list.pages[index],
+        next_cursor: index + 1 < list.pages.length ? `c${String(index + 1)}.g${String(gen)}` : null,
+        ranking_generation: list.generation,
+        ranking_changed: list.generation > gen,
+        counts: index === 0 ? list.counts : null,
+      };
+      return json(page);
+    },
+  };
+  return list;
+}
+
+/** The answer of `GET /api/profile`: an active profile version (v3), or none before a CV is confirmed. */
+export function profileList(active = true): ProfileListOut {
+  const version = { id: 3, version_no: 3, confirmed_at: "2026-10-30T09:00:00Z", purged: false, profile: null };
+  return {
+    active: active ? version : null,
+    versions: active ? [version] : [],
+    open_draft: null,
+    latest_proposal: null,
+    estimates: { extract_profile_usd: "0.040000", propose_queries_usd: "0.020000" },
+  };
+}
+
+/** A gazetteer place as `GET /api/geo/places` answers it. */
+export function place(overrides: Partial<PlaceOut> = {}): PlaceOut {
+  return {
+    gazetteer_id: "geonames:2950159",
+    label: "Berlin",
+    postal_codes: ["10115", "10117", "10119", "10178", "10179"],
+    lat: 52.52437,
+    lon: 13.41053,
+    population: 3426354,
+    ...overrides,
+  };
+}
+
 /** The month's spend: $38.20 of $100.00 counted, and an estimated $0.052646 per scored ad (`c_hat`). */
 export function spendOut(overrides: Partial<SpendOut> = {}): SpendOut {
   return {
@@ -151,10 +228,11 @@ export function problem(status: number, code: string, extra: Record<string, unkn
   );
 }
 
-/** A request the stub received: its method, path, headers and string body. */
+/** A request the stub received: its method, path (without the query string), query, headers and string body. */
 export interface FakeRequest {
   method: string;
   path: string;
+  search: URLSearchParams;
   headers: Headers;
   body: string | null;
 }
@@ -182,6 +260,12 @@ export interface FakeApi {
   jobs: JobsPageOut;
   /** What `GET /api/system/spend` answers. */
   spend: SpendOut;
+  /** What `GET /api/jobs/facets` answers (none by default). */
+  facets: FacetsOut;
+  /** What `GET /api/geo/places` answers (none by default). */
+  places: PlaceOut[];
+  /** Whether `GET /api/profile` has an active profile version (it has by default). */
+  profileActive: boolean;
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -204,14 +288,19 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     status: statusOut(),
     jobs: jobsPage(),
     spend: spendOut(),
+    facets: { companies: [], sources: [] },
+    places: [],
+    profileActive: true,
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
-    const path = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, "http://api.test");
+    const path = url.pathname;
     const method = (init?.method ?? "GET").toUpperCase();
     const request: FakeRequest = {
       method,
       path,
+      search: url.searchParams,
       headers: new Headers(init?.headers),
       body: typeof init?.body === "string" ? init.body : null,
     };
@@ -246,6 +335,15 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/system/spend") {
       return Promise.resolve(json(api.spend));
+    }
+    if (method === "GET" && path === "/api/jobs/facets") {
+      return Promise.resolve(json(api.facets));
+    }
+    if (method === "GET" && path === "/api/geo/places") {
+      return Promise.resolve(json(api.places));
+    }
+    if (method === "GET" && path === "/api/profile") {
+      return Promise.resolve(json(profileList(api.profileActive)));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;
