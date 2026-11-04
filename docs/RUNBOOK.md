@@ -3,18 +3,18 @@
 The operations guide of spec §19.8. This file starts with the score lane's entries (M3, plan Task 27): a
 paused score lane and its acknowledgement, a quarantined batch and its release, a submitted batch that cannot
 be retrieved, the live schema dry-run before a prompt-schema version is activated, and the golden eval run on
-the installation before an activation. M5 adds the host setup, start and stop, the health check, secret
-rotation, restore and the rest of the alert table (§19.8).
+the installation before an activation. M4 adds the web UI's operator paths (below), which each entry names
+before its API route. M5 adds the host setup, start and stop, the health check, secret rotation, restore and
+the rest of the alert table (§19.8).
 
 Every command below runs on the host in the compose directory. `docker compose run --rm --no-deps worker
 jobhunter …` starts a one-off container of the worker image with the worker's configuration and secrets; it
 never starts a second worker loop (§3.3: the worker stays a singleton). The logs carry ids, counts, codes and
 amounts, never ad, CV or profile text.
 
-Until M4 the API has no alert list (`GET /api/alerts`, spec §14.2) and no needs-attention list, and the web
-UI has no System view (§15.7: Health, Needs attention, the alerts' [Ack], "Release & re-score"): those come
-with M4. Today an operator finds ids with read-only queries in the postgres container and acts through the
-API routes below.
+The web UI is the first way to act: the System section of Profile & Settings lists what needs you and offers
+each action (below, **The web UI's operator paths**). The read-only queries and the API calls that follow are
+for what the UI does not show (an alert's `context`, a log line's ids) and for a host without a browser.
 
 **A read-only query.** As the application role, over the container's local socket (it selects ids, codes,
 states, times and counts only, never ad or profile text):
@@ -38,6 +38,54 @@ rm login.json
 Then pass `-b jh.cookies -H "Origin: $ORIGIN" -H 'X-JH-Request: 1'` to each call below, and remove
 `jh.cookies` when done (`POST /api/auth/logout` ends the session).
 
+## The web UI's operator paths
+
+Every path starts at **Profile & Settings** (`/settings`, the second item of the main navigation) →
+**System** (`/settings#system`). System holds, in this order, Display & notifications, **Needs attention**
+(`#needs-attention`), **Runs** (`#runs`), **Score cycles** (`#score-cycles`), **Alerts** (`#alerts`), **Golden
+set** (`#golden-set`) and **Health** (`#health`). Each action button is disabled while its request runs; once it
+is answered, Needs attention and the header strip are read again, and a refusal shows at the item. The
+labels below are the English UI's.
+
+**Alerts and [Acknowledge].** System → Alerts has three tabs: **Open** (unresolved and unacknowledged),
+**Acknowledged** and **Resolved**. Each alert shows its severity, its text, its first and last time and how
+often it was raised; an open one has **[Acknowledge]** (`POST /api/alerts/{id}/ack`), which records that you saw
+it and, for the two pausing alerts, lifts the pause (**A paused score lane**, below); it never resolves the
+alert. The header strip's "alerts ⚠ n (m critical)" counts the unacknowledged alerts and links to System,
+and the banner "Unresolved critical alerts: n" shows while a critical alert is unacknowledged.
+
+**Needs attention.** One block per section, each with its full count ("and n more" past the 50 shown, "Nothing
+here" when empty); a job an item names opens in the Jobs page's drawer. A header banner about such a state
+links here with **Needs attention**.
+
+| Block | Action | What it does (API route) |
+|---|---|---|
+| Rejected raw items | **[Replay]**, on a replayable response; another says why it cannot be replayed | Parses the response's rejected items again with the current parser and resolves those it now reads; the toast says how many are queued (`POST /api/system/raw-items/replay {raw_response_id}`). |
+| Identity conflicts | **[Keep apart]** or **[Merge]**, each behind a dialog naming the jobs ("Keep these jobs apart?", "Merge these jobs?") | Resolves the conflict (`POST /api/identity-conflicts/{id}/resolve {decision}`). |
+| Refused and failed scores; the refused or failed members of Unscorable duplicate groups | **[Retry]** | Puts the target back to `pending` with its attempts reset ("Scoring again"; `POST /api/targets/{id}/retry`). |
+| Quarantined batches; Batches that cannot be retrieved | **[Release & re-score]**, then **[Release & re-score]** in the dialog "Release this batch?", which states the amount that stays counted as ambiguous spend | Releases the submission and re-scores its ads (`POST /api/batches/{id}/release {"confirm": true}`). A lost batch offers it only once it is releasable; before, it reads "Can be released from <time>" (its expiry plus one hour). |
+| Mass disappearances | **[Confirm closure]**, behind "Close the missing postings?" | Closes the postings missing from that board now (`POST /api/ats-snapshots/{id}/acknowledge`). |
+| Paused scoring | **[Acknowledge]** | Acknowledges the pausing alert (as in Alerts). |
+| Failed scope apply | **[Retry apply]** | Applies the saved search scope again (`POST /api/settings/scope/retry-apply`); the header banner "Search scope not applied" offers the same **[Retry apply]**. |
+| Broken sources | none | Information: the source, its health and its last error; `degraded` is a warning. |
+
+**The run report.** System → Runs lists the runs, newest first; **[Report]** on a run's row opens its report
+below the row (status and reason, the partial causes, then Sources, Identity, Revisions, Quota and Execution;
+`GET /api/runs/{id}`), and **[Report]** again closes it. While a run is active, the header's **Run in progress
+(view)** opens the same report in a drawer, read again every 10 s. Score cycles lists the score cycles alike.
+
+**The golden set.** System → Golden set lists the golden cases with their label and source ("Your label",
+"Wrong-score report", "Synthetic (eval seed)"); **Active** and **Canary** are checkboxes (`PATCH
+/api/golden-cases/{id}`; at most two canaries, re-scored daily), and **[Delete]**, behind "Delete this golden
+case?", removes a case with its evaluation results (`DELETE /api/golden-cases/{id}`). Cases come from labels:
+the Jobs page's label mode and the drawer's feedback.
+
+**The eval status.** Profile & Settings → Scoring & models → **Evaluation** shows "Last eval: …" (the newest
+golden run's gate, or its status while it runs or when it did not finish, with ρ) and the **Eval gate** of the
+active configuration, and, while a draft changes a gated class, the gate its save would check. The page only
+reads them: golden runs start from the command line (**The golden eval run on the installation before an
+activation**, below).
+
 ## A paused score lane
 
 **What you see.** No score cycle starts. The worker logs `score_cycle_not_started` with a `reason`, and a batch
@@ -53,13 +101,15 @@ The reasons, in the order the lane checks them (`scoring.cycles.pause_reason`), 
 |---|---|---|
 | `reservation_bound_violated` | An open, unacknowledged `llm.reservation_bound_violated` (critical): a settled cost exceeded its reservation (§10.7). | Compare the call's usage in the alert's context with `llm/pricing.py` and the prompt overhead constant. Fix and deploy if they are wrong. Then acknowledge the alert. |
 | `auth_failed` | An open, unacknowledged `llm.auth_failed` (critical): Anthropic answered 401 or 403. | Rotate or renew `anthropic_key` (§19.2), then `docker compose restart worker`: the worker reads its file secrets at start, and `up -d` would keep the running container, with the old key, when its compose configuration did not change. Then acknowledge the alert; a successful call also resolves it. |
-| `cap_reached` | The month's scoring headroom is below the first reservation of an attempt (§6.9). `llm.cap_reached` (critical) is raised once per month and names any amount a quarantined batch holds. | Nothing to acknowledge: the pause lifts by itself when headroom returns (the next UTC month, or a higher `llm.cap_usd` in a settings save, `POST /api/settings`; the Settings page comes with M4). Release a quarantined batch only for the reasons below, never to win headroom. |
+| `cap_reached` | The month's scoring headroom is below the first reservation of an attempt (§6.9). `llm.cap_reached` (critical) is raised once per month and names any amount a quarantined batch holds. | Nothing to acknowledge: the pause lifts by itself when headroom returns (the next UTC month, or a higher cap: Profile & Settings → Budget & quota → Monthly LLM cap, then Save, which is `POST /api/settings`). Release a quarantined batch only for the reasons below, never to win headroom. |
 | `global_fence` | A global purge fence is active (§20.2). | It lifts when the purge completes. The `privacy.purge_failed` entry comes with M5's runbook (spec §19.8 L6300), with the purge procedures. |
 | `schema_unverified` | The active prompt-schema version and model policy have no passed live schema dry-run (§10.11). | Run the live dry-run (below). |
 
 **Acknowledging.** The acknowledgement lifts the two alert pauses while the alert itself stays open, so the
 cause stays visible (spec §17.6 L5608–5609; M3 plan Deviation 19). Acknowledge only after the cause is fixed:
 the next cycle admits targets at once, and a still wrong bound or a still refused key fails its calls again.
+In the UI: Profile & Settings → System → Needs attention → Paused scoring → **[Acknowledge]**, or System →
+Alerts → Open → the alert's **[Acknowledge]**. Without the UI:
 1. Find the alert's id with a read-only query:
 
    ```
@@ -103,8 +153,10 @@ timeout. `GET /api/system/spend` shows the held amount as `quarantined_batch_usd
    ```
 
    It answers 202 with `{"submission_id", "state": "released", "reserved_usd"}`: the amount that stays counted.
-   A submission that cannot be released is 409 `conflict_state` with `detail` `not_releasable`. ("Release &
-   re-score" in System → Needs attention comes with M4's UI.)
+   A submission that cannot be released is 409 `conflict_state` with `detail` `not_releasable`. In the UI:
+   Profile & Settings → System → Needs attention → Quarantined batches → the batch's **[Release & re-score]**,
+   then **[Release & re-score]** in the dialog "Release this batch?", which states the amount that stays
+   counted.
 4. After the release the submission is `released`: its targets are `pending` again and are re-scored, its
    reserved amount stays counted as `ambiguous`, and the alert is resolved. The reconciler keeps listing for
    29 days: if the batch turns up after all, its items settle from the provider's per-item results and publish
@@ -148,7 +200,8 @@ online cycles.
 3. Once a retrieval succeeds and the batch has ended, the next poll moves the submission to `ended`, resolves
    the alert and processes the results as usual. Nothing else is needed.
 4. A batch that stays lost (a 404, and not in the console): past `expires_at + 1 h` with the alert open,
-   System → Needs attention → Release & re-score (or `POST /api/batches/{id}/release {"confirm": true}`)
+   Profile & Settings → System → Needs attention → Batches that cannot be retrieved → **[Release &
+   re-score]** and its dialog (or `POST /api/batches/{id}/release {"confirm": true}`)
    releases it; its reservation stays counted as ambiguous and the poll keeps looking for the batch for 29
    days. The request is the one of step 3 of the quarantine above, with that submission's id; it answers 202
    with the `reserved_usd` that stays counted, and 409 `conflict_state` with `detail` `not_releasable` before
@@ -218,9 +271,10 @@ added, activated or deactivated while it runs never brings a run of fewer cases 
 3. A run the worker could not finish (a restart, a lost operation) ends `failed` with `metrics.failed =
    "interrupted"`; it is never resumed. Start a new one. A run requested `--live` on a worker in fake mode, or
    the reverse, fails at once with `"transport_mismatch"` and sends nothing.
-4. Read the result in the run's row: `passed`, and in its `metrics` the gate's state and, when it failed,
-   `failed_gates`. Then activate. A failed gate raises `eval.gate_failed` (warn); do not override it without
-   reading which gate failed.
+4. Read the result: Profile & Settings → Scoring & models → Evaluation shows "Last eval: …" with the gate
+   (passed, failed or not calibrated) and ρ, and the Eval gate; the run's row holds `passed`, and in its
+   `metrics` the gate's state and, when it failed, `failed_gates`. Then activate. A failed gate raises
+   `eval.gate_failed` (warn); do not override it without reading which gate failed.
 
 The daily canary run (`canary_daily`, 06:41 UTC) re-scores the canary cases with the active configuration and
 raises `scoring.canary_drift` (warn) for a canary more than 8 points from its first score; it needs no action
