@@ -369,11 +369,11 @@ _JOB: Final = q(
     "LEFT JOIN duplicate_groups g ON g.id = j.duplicate_group_id AND g.status = 'active' "
     "LEFT JOIN user_job_actions u ON u.job_id = j.id WHERE j.id = :job"
 )
-# The end of a merged job's chain: the first job of it that is not merged (`_MERGE_DEPTH` bounds a cycle)
 # The job's card bucket (module docstring, The bucket): the card's own CASE over the card's own joins
 _BUCKET: Final = q(
     "/* jobs_detail.bucket */ SELECT " + BUCKET_CASE + " AS bucket" + _sql.CARD_FROM + " WHERE j.id = :job"
 )
+# The end of a merged job's chain: the first job of it that is not merged (`_MERGE_DEPTH` bounds a cycle)
 _SURVIVOR: Final = q(
     "/* jobs_detail.survivor */ WITH RECURSIVE chain(id, next_id, depth) AS ("
     "SELECT id, merged_into_job_id, 0 FROM jobs WHERE id = :job "
