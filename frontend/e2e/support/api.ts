@@ -1,9 +1,13 @@
 // The API from a spec (plan M4 Task 32): a request context that sends what the SPA sends, and the saved session
 // of the smoke user. The session cookie is `__Host-` and `Secure`; Playwright's request contexts send a Secure
-// cookie to localhost over plain HTTP, as the browser does.
-import { type APIRequestContext, type Page, request } from "@playwright/test";
+// cookie to localhost over plain HTTP, as the browser does. Task 33 adds the page's answer to one of its own
+// requests, and a CV draft's path and state.
+import { type APIRequestContext, type Page, request, type Response } from "@playwright/test";
+import type { components } from "../../src/api/schema";
 import { AUTH_STATE } from "./paths";
-import type { SmokeUser } from "./stack";
+import { type SmokeUser, waitFor } from "./stack";
+
+type DraftOut = components["schemas"]["DraftOut"];
 
 /** The dev stack's one origin (devproxy). */
 export const ORIGIN = "http://localhost:8080";
@@ -33,6 +37,47 @@ export async function getJson<T>(api: APIRequestContext, path: string): Promise<
     throw new Error(`GET ${path} answered ${String(response.status())}, not 200`);
   }
   return (await response.json()) as T;
+}
+
+/** How long a draft's server step may take: the text phase (docparse), or the extraction on the fake LLM. */
+export const DRAFT_WITHIN_MS = 120_000;
+
+/** The answer to the page's next `method` request of `path` (its pathname: any search); start waiting before
+ * the action that sends it. */
+export function answerTo(page: Page, method: string, path: string): Promise<Response> {
+  return page.waitForResponse(
+    (response) => response.request().method() === method && new URL(response.url()).pathname === path,
+  );
+}
+
+/** A CV draft's API path (`/api/profile/drafts/{id}`), with `rest` after it (`/text`, `/confirm`, …). */
+export function draftPath(id: number, rest = ""): string {
+  return `/api/profile/drafts/${String(id)}${rest}`;
+}
+
+/** Draft `id` through the API once `done` holds for it, polled within `timeoutMs`. A draft that is `failed`
+ * while `done` does not hold fails at once, naming its failure code and `what` was awaited. */
+export async function draftWhen(
+  api: APIRequestContext,
+  id: number,
+  what: string,
+  done: (draft: DraftOut) => boolean,
+  timeoutMs = DRAFT_WITHIN_MS,
+): Promise<DraftOut> {
+  return waitFor(
+    async () => {
+      const draft = await getJson<DraftOut>(api, draftPath(id));
+      if (done(draft)) {
+        return draft;
+      }
+      if (draft.status === "failed") {
+        throw new Error(`draft ${String(id)} failed (${String(draft.failure_code)}) before ${what}`);
+      }
+      return null;
+    },
+    timeoutMs,
+    `draft ${String(id)}: ${what}`,
+  );
 }
 
 /** The smoke user signed in through the API, its session saved to `AUTH_STATE` (what `scenarios` start on). */

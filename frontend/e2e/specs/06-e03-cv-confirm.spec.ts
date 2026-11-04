@@ -9,10 +9,10 @@
 // one sentence names v2 (the setup confirmed v1) with the bulk budget and the split, all online
 // (`batch_bulk_rescore` is off). Confirm & re-score activates v2 and a new tuple, whose targets the API lists
 // as the cards' targets, pending, while no card shows a result of the old tuple.
-import type { Locator, Page, Response } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { type ApiContext, apiContext, getJson } from "../support/api";
+import { answerTo, type ApiContext, apiContext, DRAFT_WITHIN_MS, draftPath, draftWhen, getJson } from "../support/api";
 import { CV_DOCX, en, expect, PLANTED_PHONE, templateMatch, test } from "../support/fixtures";
 import { psql, waitFor } from "../support/stack";
 
@@ -28,7 +28,6 @@ type Category = NonNullable<components["schemas"]["SegmentOut"]["category"]>;
 
 const NEXT_VERSION = 2; // the setup confirmed v1
 const TEXT_WITHIN_MS = 90_000; // the text phase (docparse) and the stripping
-const EXTRACT_WITHIN_MS = 120_000; // the extraction on the fake LLM
 const TARGETS_WITHIN_MS = 120_000; // the new tuple's `create_targets_for_tuple`
 // The strip report's order (TextReview's `REPORT_ORDER`).
 const REPORT_ORDER: readonly Category[] = ["name", "email", "phone", "address", "url", "personal"];
@@ -44,30 +43,9 @@ const TARGETS_OF = (tuple: number): string =>
 const LAST_TARGET_OF = (tuple: number): string =>
   `SELECT coalesce(max(id), 0) FROM score_targets WHERE llm_tuple_id = ${String(tuple)}`;
 
-function draftPath(id: number, rest = ""): string {
-  return `/api/profile/drafts/${String(id)}${rest}`;
-}
-
-function answerTo(page: Page, method: string, path: string): Promise<Response> {
-  return page.waitForResponse(
-    (response) => response.request().method() === method && new URL(response.url()).pathname === path,
-  );
-}
-
-/** The draft through the API once `done` holds for it; a `failed` draft fails at once with its code. */
-async function draftWhen(api: ApiContext, id: number, what: string, done: (draft: DraftOut) => boolean): Promise<DraftOut> {
-  return waitFor(
-    async () => {
-      const draft = await getJson<DraftOut>(api, draftPath(id));
-      if (draft.status === "failed") {
-        throw new Error(`draft ${String(id)} failed (${String(draft.failure_code)}) before ${what}`);
-      }
-      return done(draft) ? draft : null;
-    },
-    EXTRACT_WITHIN_MS,
-    `draft ${String(id)}: ${what}`,
-  );
-}
+// One run per stack (v1 → v2): a retry could only fail again on the moved state, hiding the first failure's cause
+// (Ruling T33-b).
+test.describe.configure({ retries: 0 });
 
 /** "Removed: 1 name · 1 e-mail", as the strip report says the draft's counts. */
 function stripReportText(report: DraftOut["strip_report"]): string {
@@ -124,7 +102,7 @@ async function approve(page: Page, api: ApiContext, review: Locator, draftId: nu
   const response = await approved;
   expect(response.status()).toBe(202);
   expect(await response.request().headerValue("idempotency-key")).toBeTruthy();
-  await expect(page.getByRole("region", { name: en["cv.profile.title"] })).toBeVisible({ timeout: EXTRACT_WITHIN_MS });
+  await expect(page.getByRole("region", { name: en["cv.profile.title"] })).toBeVisible({ timeout: DRAFT_WITHIN_MS });
   return draftWhen(api, draftId, "ready", (draft) => draft.status === "ready" && draft.draft !== null);
 }
 
@@ -138,7 +116,7 @@ function other<T>(values: readonly T[], current: T): T {
 }
 
 test("E3: a CV through the text review twice and the profile review, confirmed as v2 with its re-score", async ({ page }) => {
-  test.setTimeout(TEXT_WITHIN_MS + 3 * EXTRACT_WITHIN_MS + TARGETS_WITHIN_MS + 120_000);
+  test.setTimeout(TEXT_WITHIN_MS + 3 * DRAFT_WITHIN_MS + TARGETS_WITHIN_MS + 120_000);
   const api = await apiContext(page);
   try {
     const before = await getJson<ProfileListOut>(api, "/api/profile");

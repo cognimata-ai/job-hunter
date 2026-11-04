@@ -28,9 +28,16 @@ const ACTIVE_RUNS = "SELECT count(*) FROM runs WHERE status IN ('queued', 'runni
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PRINTABLE_ASCII = /^[\x20-\x7e]+$/; // a compact JSON body: its text is its bytes
 
+// Resolution (d): never retried or re-timed into passing, CI's retry included (Ruling T33-b).
+test.describe.configure({ retries: 0 });
+
 /** A run status as the UI names it (`run_status.<s>`). */
 function statusText(status: RunStatus): string {
   return en[`run_status.${status}` as const];
+}
+
+function runPath(id: number): string {
+  return `/api/runs/${String(id)}`;
 }
 
 function isRunNow(request: Request): boolean {
@@ -70,12 +77,18 @@ test("E5: Run now queues one run, a second Start joins it, and the first key rep
     expect(response.status()).toBe(202);
     const firstText = await response.text();
     const first = JSON.parse(firstText) as RunNowOut;
-    expect(first.created).toBe(true);
-    expect(first.run).toMatchObject({ trigger: "manual", include_paid: false });
+    const firstSaid = `run ${String(first.run.id)} (${first.run.trigger}, ${first.run.status})`;
+    expect(first.created, `Start answered ${firstSaid}`).toBe(true);
+    expect(first.run, `Start answered ${firstSaid}`).toMatchObject({ trigger: "manual", include_paid: false });
 
     // A second Start at once, while the run is active: a new key, the same body.
     const second = await runNowAnswer(await api.post("/api/runs", { data: BODY, headers: { "Idempotency-Key": api.key() } }));
-    const state = `the second Start found run ${String(second.run.id)} ${second.run.status} (created ${String(second.created)})`;
+    const joined = second.run.id === first.run.id && !second.created && ACTIVE.includes(second.run.status);
+    // on a mismatch, where the first run is now (read only then, so the second Start follows the first at once)
+    const firstNow = joined ? "" : `, ${(await getJson<RunDetailOut>(api, runPath(first.run.id))).run.status} now`;
+    const state =
+      `the second Start found run ${String(second.run.id)} ${second.run.status} (created ${String(second.created)}); ` +
+      `the first Start's was ${firstSaid}${firstNow}`;
     expect(second.run.id, state).toBe(first.run.id);
     expect(second.created, state).toBe(false);
     expect(ACTIVE, state).toContain(second.run.status);
@@ -95,7 +108,7 @@ test("E5: Run now queues one run, a second Start joins it, and the first key rep
     // The run ends, succeeded or partial with its causes; the drawer follows.
     const ended = await waitFor(
       async () => {
-        const detail = await getJson<RunDetailOut>(api, `/api/runs/${String(first.run.id)}`);
+        const detail = await getJson<RunDetailOut>(api, runPath(first.run.id));
         return ACTIVE.includes(detail.run.status) ? null : detail;
       },
       RUN_WITHIN_MS,

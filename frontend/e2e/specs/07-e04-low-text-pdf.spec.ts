@@ -3,19 +3,17 @@
 // pasted text of at least `PASTE_MIN` code points (an invented CV, no name and no contact) opens a new draft,
 // whose text is approved and whose profile is extracted (`ready`); Discard (asked first) drops it, and the
 // active profile stays v2 (E3's).
-import type { Page, Response } from "@playwright/test";
+import type { Response } from "@playwright/test";
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { type ApiContext, apiContext, getJson } from "../support/api";
+import { answerTo, type ApiContext, apiContext, DRAFT_WITHIN_MS, draftPath, draftWhen, getJson } from "../support/api";
 import { en, expect, LOW_TEXT_PDF, templateMatch, test } from "../support/fixtures";
-import { waitFor } from "../support/stack";
 
 type DraftOut = components["schemas"]["DraftOut"];
 type ProfileListOut = components["schemas"]["ProfileListOut"];
 
 const ACTIVE_VERSION = 2; // E3 confirmed v2
 const PASTE_MIN = 300; // `cv/api.ts` PASTE_MIN, the server's minimum (code points)
-const DRAFT_WITHIN_MS = 120_000; // the text phase, or the extraction on the fake LLM
 // An invented CV: no name, no address, no contact detail.
 const PASTED = [
   "Backend-Entwicklerin mit Schwerpunkt auf Zahlungsdiensten und Datenplattformen.",
@@ -30,16 +28,6 @@ const PASTED = [
   "Sprachen: Deutsch (Muttersprache), Englisch (C1)",
 ].join("\n");
 
-function draftPath(id: number, rest = ""): string {
-  return `/api/profile/drafts/${String(id)}${rest}`;
-}
-
-function answerTo(page: Page, method: string, path: string): Promise<Response> {
-  return page.waitForResponse(
-    (response) => response.request().method() === method && new URL(response.url()).pathname === path,
-  );
-}
-
 /** A 202's `{draft_id}`. */
 async function draftCreated(response: Response): Promise<number> {
   expect(response.status()).toBe(202);
@@ -47,19 +35,13 @@ async function draftCreated(response: Response): Promise<number> {
 }
 
 /** The draft through the API once it is `status`. */
-async function draftIn(api: ApiContext, id: number, status: DraftOut["status"]): Promise<DraftOut> {
-  return waitFor(
-    async () => {
-      const draft = await getJson<DraftOut>(api, draftPath(id));
-      if (draft.status === "failed" && status !== "failed") {
-        throw new Error(`draft ${String(id)} failed (${String(draft.failure_code)}) before ${status}`);
-      }
-      return draft.status === status ? draft : null;
-    },
-    DRAFT_WITHIN_MS,
-    `draft ${String(id)} ${status}`,
-  );
+function draftIn(api: ApiContext, id: number, status: DraftOut["status"]): Promise<DraftOut> {
+  return draftWhen(api, id, status, (draft) => draft.status === status);
 }
+
+// One run per stack (it starts on E3's v2 without an open draft): a retry could only fail again on the moved
+// state, hiding the first failure's cause (Ruling T33-b).
+test.describe.configure({ retries: 0 });
 
 test("E4: a low-text PDF fails low_text, its paste repair reaches ready, and Discard keeps v2", async ({ page }) => {
   test.setTimeout(3 * DRAFT_WITHIN_MS + 60_000);
