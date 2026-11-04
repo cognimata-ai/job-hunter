@@ -9,7 +9,8 @@
 //   for a toggle (`setEntry`) and `watchlist[id=9]` for an entry the draft added (`addEntry`), because an internal
 //   save of another route reorders and resizes those lists. A rebase or a reapply takes the new base's list,
 //   writes each marked toggle onto the entry of the same id, appends an added entry the new base lacks, and drops
-//   a mark whose entry the new base no longer has.
+//   a mark whose entry the new base no longer has. An added entry can be taken back (`removeEntry`, Task 29); an
+//   entry of the base is toggled, never removed (the routes of Queries & sources and the watchlist remove one).
 // - **The dry-run** (Ruling T28-c) runs 500 ms after the last change, on the whole draft, and never while the
 //   draft is the base. The latest answer wins: a change aborts the request in flight, and an answer for an older
 //   draft is never taken. Until the current draft's answer is in, the form is `checking` and Save is disabled.
@@ -354,6 +355,7 @@ type Action =
   | { type: "set"; path: string; value: unknown }
   | { type: "setEntry"; list: EntryList; id: number; enabled: boolean }
   | { type: "addEntry"; list: EntryList; id: number }
+  | { type: "removeEntry"; list: EntryList; id: number }
   | { type: "baseDryRun"; epoch: number; result: DryRunOut }
   | { type: "dryRun"; draft: Settings; nonce: number; result: DryRunOut }
   | { type: "dryRunFailed"; draft: Settings; nonce: number; error: ProblemError }
@@ -510,6 +512,18 @@ function reducer(state: State, action: Action): State {
       const mark = entryPath(action.list, action.id);
       return changed(state, draft, mark, [...state.dirty, mark]);
     }
+    case "removeEntry": {
+      // only an entry the draft added: the base's entries are toggled, never removed (module docstring)
+      const added = findEntry(state.draft, action.list, action.id) !== undefined;
+      if (!added || findEntry(state.base.payload, action.list, action.id) !== undefined) {
+        return state;
+      }
+      const key = ID_KEY[action.list];
+      const kept = entriesOf(state.draft, action.list).filter((entry) => entry[key] !== action.id);
+      const draft = withEntries(state.draft, action.list, kept);
+      const mark = entryPath(action.list, action.id);
+      return changed(state, draft, mark, [...state.dirty, mark]);
+    }
     case "baseDryRun":
       if (action.epoch !== state.baseEpoch) {
         return state;
@@ -619,6 +633,8 @@ export interface SettingsForm {
   setEntry: (list: EntryList, id: number, enabled: boolean) => void;
   /** Adds the entry `id` to `list`, enabled (marked by its id). */
   addEntry: (list: EntryList, id: number) => void;
+  /** Takes back an entry the draft added (one the base lacks), with its mark; an entry of the base stays. */
+  removeEntry: (list: EntryList, id: number) => void;
   tick: (code: string, ticked: boolean) => void;
   setEvalOverride: (on: boolean) => void;
   /** Saves the draft; `from` is the section whose Save was pressed. */
@@ -893,6 +909,7 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
       set: (path, next) => { dispatch({ type: "set", path, value: next }); },
       setEntry: (list, id, enabled) => { dispatch({ type: "setEntry", list, id, enabled }); },
       addEntry: (list, id) => { dispatch({ type: "addEntry", list, id }); },
+      removeEntry: (list, id) => { dispatch({ type: "removeEntry", list, id }); },
       tick: (code, ticked) => { dispatch({ type: "tick", code, ticked }); },
       setEvalOverride: (on) => { dispatch({ type: "evalOverride", on }); },
       save: (from) => {

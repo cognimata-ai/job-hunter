@@ -1,0 +1,191 @@
+/* The tables of Queries & sources and the watchlist: rows with a rule between them; numbers right-aligned in
+ * tabular figures; a warn badge; a row's disclosure (its cells, its edit) on a sunken band below it. Narrow
+ * screens and 200 % zoom read each row as a card: its cells in a grid, each under its column's name
+ * (`data-label`), the column heads kept for screen readers only. */
+/* A safety net, as the quota table's: a table wider than its section scrolls in its box, never the page. */
+.scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-2);
+}
+
+.table th,
+.table td {
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.table thead th {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.number {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.table th.number,
+.table td.number {
+  text-align: right;
+}
+
+.text {
+  min-width: 10rem;
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-regular);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+}
+
+.warn {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-warn);
+  border-radius: var(--radius-3);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+/* A row's actions: a column of buttons of one width in the table, a row that wraps in a card. */
+.actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+}
+
+.action {
+  min-height: 32px;
+  padding: 2px var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--color-surface-sunken);
+}
+
+.detail > td {
+  padding: var(--space-3);
+  background: var(--color-surface-sunken);
+}
+
+.empty {
+  color: var(--color-text-muted);
+}
+
+/* Narrow screens and 200 % zoom: each row a card. */
+@media (max-width: 760px) {
+  .table,
+  .table tbody,
+  .table tr,
+  .table td {
+    display: block;
+  }
+
+  .table tr[hidden] {
+    display: none;
+  }
+
+  .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .table tbody > tr:not(.detail) {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 8.5rem), 1fr));
+    gap: var(--space-2) var(--space-3);
+    margin-top: var(--space-3);
+    padding: var(--space-3);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-2);
+    background: var(--color-surface);
+  }
+
+  .table tbody > tr:not(.detail) > td {
+    padding: 0;
+    border: 0;
+  }
+
+  .table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-1);
+  }
+
+  .table td:empty {
+    display: none;
+  }
+
+  .table td.number {
+    text-align: left;
+  }
+
+  .wide {
+    grid-column: 1 / -1;
+  }
+
+  .actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .detail > td {
+    margin-top: -1px;
+    border: 1px solid var(--color-border);
+    border-radius: 0 0 var(--radius-2) var(--radius-2);
+  }
+}

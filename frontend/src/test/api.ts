@@ -1,7 +1,8 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
-// can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend and quota reads, the
-// settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
-// answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
+// can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
+// stats and watchlist reads, the settings dry-run, the logout, the login's answers in the order a test gives
+// them, and any other route a test answers itself (`routes`). A route is matched by its path alone; the query
+// string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -19,6 +20,9 @@ type SettingsOut = components["schemas"]["SettingsOut"];
 type DryRunOut = components["schemas"]["DryRunOut"];
 type ProjectionsOut = components["schemas"]["ProjectionsOut"];
 type QuotaDetailOut = components["schemas"]["QuotaDetailOut"];
+type QueryListOut = components["schemas"]["QueryListOut"];
+type CellStatsOut = components["schemas"]["CellStatsOut"];
+type WatchlistCompanyOut = components["schemas"]["WatchlistCompanyOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -597,6 +601,73 @@ export function profileList(active = true): ProfileListOut {
   };
 }
 
+/** A live query as `GET /api/queries` lists it: query 1, "Backend Engineer" (English), the user's, enabled in the
+ * active settings, with 6 planned cells covered as of 05:00 UTC on 3 Nov 2026, 2 open gaps, a yield of 1.25 and a
+ * JSearch cadence of 3.5 days. */
+export function queryRow(overrides: Partial<QueryListOut> = {}): QueryListOut {
+  return {
+    id: 1,
+    text: "Backend Engineer",
+    lang: "en",
+    origin: "user",
+    exploration: false,
+    proposal_id: null,
+    created_at: "2026-10-20T08:00:00Z",
+    enabled: true,
+    cells: 6,
+    last_covered_at: "2026-11-03T05:00:00Z",
+    open_gaps: 2,
+    yield_ema: 1.25,
+    too_broad: false,
+    refresh_cadence_days: 3.5,
+    ...overrides,
+  };
+}
+
+/** A planned cell as `GET /api/queries/stats` lists it: query 1's JSearch cell at `berlin`, covered and searched,
+ * with 1 open gap and a cadence of 3.5 days. */
+export function cellStats(overrides: Partial<CellStatsOut> = {}): CellStatsOut {
+  return {
+    cell_id: 100,
+    query_id: 1,
+    source_id: "jsearch",
+    instance_label: "default",
+    location_key: "berlin",
+    last_covered_at: "2026-11-03T05:00:00Z",
+    last_success_at: "2026-11-03T05:01:00Z",
+    yield_ema: 1.5,
+    zero_yield_streak: 0,
+    consecutive_incomplete: 0,
+    too_broad: false,
+    open_gaps: 1,
+    cadence_days: 3.5,
+    ...overrides,
+  };
+}
+
+/** A watchlist company as `GET /api/watchlist` lists it: company 4, "Acme" on Greenhouse (`acme`), validated,
+ * enabled, its board healthy with a complete snapshot at 05:00 UTC on 3 Nov 2026 and 12 active postings. */
+export function watchlistCompany(overrides: Partial<WatchlistCompanyOut> = {}): WatchlistCompanyOut {
+  return {
+    id: 4,
+    display_name: "Acme",
+    ats_type: "greenhouse",
+    board_slug: "acme",
+    lever_region: null,
+    validation_status: "ok",
+    validated_at: "2026-11-01T09:00:00Z",
+    enabled: true,
+    instance: {
+      health: "ok",
+      last_error_code: null,
+      last_success_at: "2026-11-03T05:00:00Z",
+      last_complete_snapshot_at: "2026-11-03T05:00:00Z",
+    },
+    postings: { active: 12, stale: 3, unknown: 0, closed: 5 },
+    ...overrides,
+  };
+}
+
 /** A gazetteer place as `GET /api/geo/places` answers it. */
 export function place(overrides: Partial<PlaceOut> = {}): PlaceOut {
   return {
@@ -689,6 +760,12 @@ export interface FakeApi {
   places: PlaceOut[];
   /** Whether `GET /api/profile` has an active profile version (it has by default). */
   profileActive: boolean;
+  /** What `GET /api/queries` answers (none by default). */
+  queries: QueryListOut[];
+  /** What `GET /api/queries/stats` answers (none by default). */
+  queryStats: CellStatsOut[];
+  /** What `GET /api/watchlist` answers (none by default). */
+  watchlist: WatchlistCompanyOut[];
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -716,6 +793,9 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     facets: { companies: [], sources: [] },
     places: [],
     profileActive: true,
+    queries: [],
+    queryStats: [],
+    watchlist: [],
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -776,6 +856,15 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/profile") {
       return Promise.resolve(json(profileList(api.profileActive)));
+    }
+    if (method === "GET" && path === "/api/queries") {
+      return Promise.resolve(json(api.queries));
+    }
+    if (method === "GET" && path === "/api/queries/stats") {
+      return Promise.resolve(json(api.queryStats));
+    }
+    if (method === "GET" && path === "/api/watchlist") {
+      return Promise.resolve(json(api.watchlist));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

@@ -537,6 +537,39 @@
     "passed",
     "uncalibrated"
   ],
+  "query_origin": [
+    "llm_proposal",
+    "user"
+  ],
+  "proposal_failure": [
+    "attempts_exhausted",
+    "budget_exhausted",
+    "input_unbounded",
+    "invalid_output",
+    "llm_not_configured",
+    "max_tokens",
+    "model_mismatch",
+    "no_handler",
+    "profile_unavailable",
+    "refused",
+    "unexpected_stop_reason"
+  ],
+  "watchlist_validation": [
+    "error",
+    "not_found",
+    "ok",
+    "unvalidated"
+  ],
+  "watchlist_unsupported": [
+    "bad_slug",
+    "not_a_url",
+    "unsupported_pattern",
+    "workable"
+  ],
+  "lever_region": [
+    "eu",
+    "global"
+  ],
   "order": {
     "seniority": [
       "intern",

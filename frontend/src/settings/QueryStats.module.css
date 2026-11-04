@@ -1,0 +1,61 @@
+/* A query's cells: a grid of cards that wraps (one column at 390 px), each its source and place, then its
+ * figures as label and value. */
+.cells {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 16rem), 1fr));
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.cell {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+}
+
+.source {
+  font-weight: var(--font-weight-bold);
+}
+
+.place {
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.figures {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--font-size-1);
+}
+
+.figure {
+  min-width: 0;
+}
+
+.figure dt {
+  color: var(--color-text-muted);
+}
+
+.figure dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.none {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}

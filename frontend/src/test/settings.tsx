@@ -12,9 +12,11 @@ import { LiveRegion } from "../components/LiveRegion";
 import { Toaster } from "../components/Toaster";
 import en from "../i18n/en.json";
 import type { SettingsSection } from "../pages/ProfileSettingsPage";
+import { QueriesSection } from "../settings/QueriesSection";
 import { ScheduleSection } from "../settings/ScheduleSection";
 import { ScopeSection } from "../settings/ScopeSection";
 import { SectionFrame } from "../settings/SectionFrame";
+import { WatchlistSection } from "../settings/WatchlistSection";
 import { type SettingsForm, SettingsFormProvider, useSettingsForm } from "../settings/useSettingsForm";
 import { type FakeApi, type FakeRequest, requestsTo } from "./api";
 
@@ -22,6 +24,8 @@ type Settings = components["schemas"]["Settings"];
 
 const BODIES: Partial<Record<SettingsSection, ReactNode>> = {
   scope: <ScopeSection />,
+  queries: <QueriesSection />,
+  watchlist: <WatchlistSection />,
   schedule: <ScheduleSection />,
 };
 

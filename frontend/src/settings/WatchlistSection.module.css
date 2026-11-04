@@ -1,0 +1,141 @@
+/* The watchlist: the two ways to add a board side by side where they fit (stacked at 390 px and 200 % zoom),
+ * each a framed group; the board a URL names as label and value; then the list of companies. */
+.watchlist {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
+
+.group {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.paths {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  align-items: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.path {
+  display: grid;
+  align-content: start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.addRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+
+.url,
+.name {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.detectedForm {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+}
+
+.detectedForm > .name {
+  width: 100%;
+  max-width: 28rem;
+}
+
+.hand {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 12rem), 1fr));
+  align-items: start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.submit {
+  display: flex;
+  align-items: flex-end;
+  grid-column: 1 / -1;
+}
+
+.result:empty {
+  display: none;
+}
+
+.detected {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border-left: 4px solid var(--color-success);
+  border-radius: var(--radius-1);
+  background: var(--color-success-bg);
+}
+
+.board {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-5);
+  margin: 0;
+}
+
+.board dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+}
+
+.board dd {
+  margin: 0;
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.unsupported {
+  padding: var(--space-2) var(--space-3);
+  border-left: 4px solid var(--color-warn);
+  border-radius: var(--radius-1);
+  background: var(--color-warn-bg);
+}
+
+.notice:empty {
+  display: none;
+}
+
+.notice {
+  color: var(--color-success);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.refusal {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.errors {
+  margin: 0;
+  padding-left: var(--space-5);
+  color: var(--color-critical);
+  font-size: var(--font-size-2);
+}
+
+.listHeading:focus {
+  outline: none;
+}
+
+.listHeading:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}

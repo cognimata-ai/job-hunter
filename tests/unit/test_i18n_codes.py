@@ -32,6 +32,7 @@ from jobhunter.db.seed import SOURCES
 from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
 from jobhunter.graphs.profile.nodes import llm_outcome
+from jobhunter.graphs.profile.nodes import propose_queries as propose_node
 from jobhunter.jobs.cards import Badge, ScoreOut
 from jobhunter.jobs.detail import DET_CRITERIA, DetailScoreOut
 from jobhunter.jobs.query import EMPLOYMENT_VALUES, SENIORITY_VALUES
@@ -48,6 +49,7 @@ from jobhunter.profile import review
 from jobhunter.profile.contacts import Category
 from jobhunter.profile.errors import RejectReason
 from jobhunter.profile.review import Repair
+from jobhunter.queries import authoring
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
 from jobhunter.scoring import aggregate, validator
@@ -64,7 +66,7 @@ from jobhunter.settings import model as settings_model
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.llm_projection import CHatSource
 from jobhunter.settings.validate import GateState
-from jobhunter.sources import breaker
+from jobhunter.sources import breaker, watchlist_listing, watchlist_patterns
 from jobhunter.sources.parsing.dates import Precision
 from jobhunter.sources.parsing.salary import Period
 from jobhunter.worker import operations, runs
@@ -332,6 +334,52 @@ def draft_failure_codes() -> set[str]:
     return document | model | {operations.ATTEMPTS_EXHAUSTED} | operation_runner_codes()
 
 
+def call_args(module: str, constructor: str) -> set[str]:
+    """The first argument of every `constructor(...)` call in `module`, resolved; a computed one fails."""
+    path = Path(str(importlib.import_module(module).__file__))
+    tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    codes: set[str] = set()
+    for call, function in calls_by_function(tree):
+        if called_name(call) == constructor and call.args:
+            code = resolve(module, call.args[0], function)
+            assert code is not None, f"{module}: {constructor}({ast.unparse(call.args[0])}) is computed"
+            codes.add(code)
+    return codes
+
+
+def operation_runner_failure_codes() -> set[str]:
+    """The literal `error_code=` of every call in `worker/operations.py` with `status="failed"`: the codes the
+    operation runner itself ends an operation `failed` with (`no_handler`). Its requeue codes (`bug`,
+    `already_executing`) end one only through the attempts rule, whose code is `attempts_exhausted`."""
+    path = Path(str(operations.__file__))
+    codes: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), str(path))):
+        if not isinstance(node, ast.Call):
+            continue
+        status, expr = keyword(node, "status"), keyword(node, "error_code")
+        if isinstance(status, ast.Constant) and status.value == "failed" and isinstance(expr, ast.Constant):
+            assert isinstance(expr.value, str), f"{path}:{node.lineno}: error_code={expr.value!r}"
+            codes.add(expr.value)
+    return codes
+
+
+def proposal_failure_codes() -> set[str]:
+    """Every literal code a failed proposal's `failure_code` can hold (plan M4 Task 29, resolution c): the
+    `last_error_code` of its newest `propose_queries` operation (`queries.proposals.FAILURE_CODE_SQL`),
+    written where the operation ends `failed`:
+    - the node's own end (`graphs.profile.nodes.propose_queries`, `finish_in(status="failed", ...)`):
+      `llm_outcome`'s mapping of the gateway's errors, the walk's terminal codes and the repair's
+      `invalid_output`, and the node's own `Fail(…)` codes (`profile_unavailable`);
+    - the attempts rule (`worker.operations._release`) of a requeue, a reclaim or the takeover sweep:
+      `attempts_exhausted` (the requeue's own code, `llm_transient` among them, is not kept);
+    - the runner's own failure (`no_handler`).
+    `llm_request_<status>` is computed, so the UI shows it with its generic text."""
+    terminal = {*llm_outcome.TERMINAL_CODES, gateway.INVALID_OUTPUT}
+    model = {code for _, code in llm_outcome._FAILURES} | terminal
+    node = call_args(propose_node.__name__, "Fail")
+    return model | node | {operations.ATTEMPTS_EXHAUSTED} | operation_runner_failure_codes()
+
+
 def basis_values() -> set[str]:
     """The basis of a criterion: an LLM criterion's (the generator's) and a deterministic one's."""
     llm = literal_values(generator.Criterion.model_fields["basis"].annotation)
@@ -430,6 +478,13 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     ),
     "severity": lambda: literal_values(settings_model.Severity),
     "eval_gate": lambda: literal_values(GateState),
+    # Queries & sources and the watchlist (plan M4 Task 29, resolutions c to e): a query's origin, why a query
+    # proposal failed, a watchlist company's validation, why a careers URL names no board, and Lever's region
+    "query_origin": lambda: literal_values(authoring.Origin),
+    "proposal_failure": proposal_failure_codes,
+    "watchlist_validation": lambda: literal_values(watchlist_listing.ValidationStatus),
+    "watchlist_unsupported": lambda: literal_values(get_type_hints(watchlist_patterns.Unsupported)["reason"]),
+    "lever_region": lambda: literal_values(watchlist_patterns.LeverRegion),
 }
 
 # The profile form's closed sets that an existing namespace covers (plan M4 Task 27, resolution g): each
@@ -443,6 +498,10 @@ PROFILE_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
 }
 
 
+# The source switch of every watchlist board (`sources.enabled.ats`): no source of its own, so it has a
+# label of its own (`settings_queries.source_ats`), not a `source` code.
+ATS_SWITCH: Final = "ats"
+
 # The settings form's closed sets that an existing namespace covers (plan M4 Task 28): each literal of the
 # settings model is a subset of the namespace it is shown through. The knockout severities are keyed by the
 # knockout codes; the work modes are the Jobs list filter's own labels (`filters.work_mode.*`), held to the
@@ -450,10 +509,19 @@ PROFILE_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
 SETTINGS_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
     "employment": lambda: literal_values(settings_model.EmploymentType),
     "seniority": lambda: literal_values(settings_model.SeniorityLevel),
+    # also a query's language (Queries & sources, plan M4 Task 29)
     "language_code": lambda: (
-        literal_values(settings_model.LanguageCode) | literal_values(settings_model.AdLanguage)
+        literal_values(settings_model.LanguageCode)
+        | literal_values(settings_model.AdLanguage)
+        | literal_values(authoring.Lang)
     ),
     "knockout": lambda: set(settings_model.KnockoutSeverity.model_fields),
+    # the source switches but `ats` (all the watchlist boards, a label of its own: `ATS_SWITCH`), and the ATS
+    # of a watchlist board (plan M4 Task 29, resolutions b and d)
+    "source": lambda: (
+        (set(settings_model.SourceSwitches.model_fields) - {ATS_SWITCH})
+        | literal_values(watchlist_patterns.AtsType)
+    ),
 }
 
 
@@ -522,6 +590,18 @@ def test_a_role_s_seniority_is_the_profile_s_and_unspecified(catalogue: dict[str
 def test_the_runner_s_codes_are_found() -> None:
     """The walk finds the runner's three literal codes: a change in how they are passed cannot drop them."""
     assert operation_runner_codes() == {"no_handler", "bug", "already_executing"}
+
+
+def test_the_runner_s_failure_codes_are_found() -> None:
+    """The one code the runner itself fails an operation with: a change in how it is passed cannot drop it."""
+    assert operation_runner_failure_codes() == {"no_handler"}
+
+
+def test_the_propose_node_s_own_failure_codes_are_found() -> None:
+    """The node's one `Fail` code of its own, besides `llm_outcome`'s: a change in how it is passed cannot
+    drop it, and the brief's three codes are among the proposal's failures."""
+    assert call_args(propose_node.__name__, "Fail") == {propose_node.PROFILE_UNAVAILABLE}
+    assert {"budget_exhausted", "invalid_output", "refused"} <= proposal_failure_codes()
 
 
 def test_the_alert_walk_sees_the_gateway_s_classified_alerts() -> None:
