@@ -7,6 +7,7 @@
 import { Fragment, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import { useToast } from "../components/Toaster";
@@ -31,7 +32,7 @@ function CaseRow({ golden }: { golden: GoldenCaseOut }) {
   return (
     <Fragment>
       <tr>
-        <td data-label={t("golden.col_title")} className={tables.text}>{golden.title}</td>
+        <td data-label={t("golden.col_title")} className={cx(tables.text, tables.wide)}>{golden.title}</td>
         <td data-label={t("golden.col_company")}>{golden.company}</td>
         <td data-label={t("golden.col_label")}>{serverText("feedback_label", golden.label)}</td>
         <td data-label={t("golden.col_source")}>{serverText("golden_source", golden.source)}</td>

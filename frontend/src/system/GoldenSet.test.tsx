@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import en from "../i18n/en.json";
 import { fakeApi, goldenCase, json, problem, requestsTo } from "../test/api";
+import tables from "../settings/tables.module.css";
 import { renderInProviders } from "../test/app";
 import { GoldenSet } from "./GoldenSet";
 
@@ -18,6 +19,17 @@ function rowOf(title: string): HTMLElement {
 }
 
 describe("GoldenSet", () => {
+  it("the title spans its card's row in the narrow layout, so a long title never runs into the company", async () => {
+    // Task 36's visual pass: `tables.text` keeps a cell at least 10rem wide, more than a card column (8.5rem), so a
+    // title alone in its column ran into the company beside it; the queries' and watchlist's text cells span the row
+    fakeApi({ signedIn: true }).goldenCases = [goldenCase({ title: "Partnerships Manager" })];
+    renderInProviders(<GoldenSet />);
+    const cell = await screen.findByText("Partnerships Manager", { selector: "td" });
+    expect(tables.wide).toBeTruthy();
+    expect(cell.classList.contains(tables.text)).toBe(true);
+    expect(cell.classList.contains(tables.wide)).toBe(true);
+  });
+
   it("titles, toggles and delete with confirm", async () => {
     const api = fakeApi({ signedIn: true });
     api.goldenCases = [
