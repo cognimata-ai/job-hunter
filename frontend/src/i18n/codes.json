@@ -279,5 +279,20 @@
     "recruitee",
     "serpapi",
     "smartrecruiters"
+  ],
+  "work_authorization": [
+    "authorized",
+    "requires_sponsorship",
+    "unspecified"
+  ],
+  "degree_level": [
+    "bachelor",
+    "master",
+    "none",
+    "none_required",
+    "other",
+    "phd",
+    "unspecified",
+    "vocational"
   ]
 }

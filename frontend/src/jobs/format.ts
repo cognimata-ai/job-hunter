@@ -5,7 +5,10 @@
 // can hold "82.49999999999999999" only as 82.5). Dates are compared as calendar dates in the display time zone.
 import type { TFunction } from "i18next";
 import { relativeText } from "../components/RelativeTime";
-import i18n, { intlLocale } from "../i18n/index";
+import i18n, { type CodeNamespace, intlLocale } from "../i18n/index";
+
+/** `useServerText`'s function: a server code's text, else the fallback, else the code. */
+export type ServerText = (ns: CodeNamespace, code: string, fallback?: string) => string;
 
 // A `DecimalOut` in plain notation: digits, then an optional point and digits (no sign, no exponent).
 const DECIMAL = /^(\d+)(?:\.(\d*))?$/;
@@ -68,4 +71,24 @@ export function postedLabel(at: string | null, precision: string, now: Date, tz:
   const days = localDay(date, tz) - localDay(now, tz);
   const when = new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(days, "day");
   return t(precision === "ingest" ? "posted.ingest" : "posted.approx", { when });
+}
+
+/**
+ * Why a card fails its hard filter (spec §15.3, §11.1; B24): "Filtered: excluded keyword '<keyword>'" when an
+ * excluded keyword is named, else "Filtered: <reasons>" in the `filter_reason` texts, else the `filtered_out`
+ * state's name. The unscored card's chip and the scored card's badge both read it.
+ */
+export function filteredText(
+  keyword: string | null,
+  reasons: readonly string[],
+  t: TFunction,
+  serverText: ServerText,
+): string {
+  if (keyword !== null) {
+    return t("chip.filtered_keyword", { keyword });
+  }
+  if (reasons.length > 0) {
+    return t("chip.filtered_reasons", { reasons: reasons.map((r) => serverText("filter_reason", r)).join(", ") });
+  }
+  return serverText("target_state", "filtered_out");
 }

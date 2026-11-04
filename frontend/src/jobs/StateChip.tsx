@@ -4,7 +4,7 @@
 //   pending            "Pending — queued"
 //   budget_deferred    "Budget deferred — resumes when budget frees up"
 //   filtered_out       "Filtered: excluded keyword '<keyword>'" (else "Filtered: <reasons>"), with Score anyway
-//   failed_*           "Failed: <state>", its reason code beneath, with Retry
+//   failed_*           its `target_state` name ("Failed (temporary error)"), its reason code beneath, with Retry
 //   refused            "Declined by the model (<category>)", with Retry
 //   expired_unscored   "Expired before scoring"
 //   in_batch           "In batch (results within 24 h)"
@@ -14,14 +14,16 @@
 //
 // Any other state reads its `target_state.<state>` name. A card in the `not_a_job_ad` bucket (a verified "not a
 // job ad" result: no score, a published target) reads "Not a job ad (verified)". Score anyway asks first (a
-// `ConfirmDialog` naming the reason), then sends a keyed score-now with `force`; Retry sends a keyed retry.
-// The reason code and the refusal category are the server's, shown verbatim.
-import { type ReactNode, useState } from "react";
+// `ConfirmDialog` naming the reason), then sends a keyed score-now with `force`; like Score now, it is disabled
+// while the header's status has a `cap_reached` banner, with the same text beside it (`aria-describedby`).
+// Retry sends a keyed retry. The reason code and the refusal category are the server's, shown verbatim.
+import { type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { type TranslationKey, useServerText } from "../i18n/index";
-import { type ScoringBucket, type TargetOut, useRetryTarget, useScoreNow } from "./api";
+import { type ScoringBucket, type TargetOut, useCapReached, useRetryTarget, useScoreNow } from "./api";
+import { filteredText } from "./format";
 import styles from "./StateChip.module.css";
 
 export interface StateChipProps {
@@ -51,12 +53,16 @@ function isFailed(state: string): boolean {
 function ScoreAnyway({ jobId, reason }: { jobId: number; reason: string }) {
   const { t } = useTranslation();
   const scoreNow = useScoreNow();
+  const capReached = useCapReached();
+  const hintId = useId();
   const [confirming, setConfirming] = useState(false);
   return (
-    <>
-      <button type="button" className={styles.action} onClick={() => { setConfirming(true); }}>
+    <div className={styles.withHint}>
+      <button type="button" className={styles.action} disabled={capReached}
+        aria-describedby={capReached ? hintId : undefined} onClick={() => { setConfirming(true); }}>
         {t("card.score_anyway")}
       </button>
+      {capReached && <span id={hintId} className={styles.hint}>{t("card.score_now_cap")}</span>}
       <ConfirmDialog open={confirming} title={t("card.score_anyway_title")} confirmLabel={t("card.score_anyway")}
         busy={scoreNow.isPending}
         onCancel={() => { setConfirming(false); }}
@@ -65,7 +71,7 @@ function ScoreAnyway({ jobId, reason }: { jobId: number; reason: string }) {
         }}>
         {t("card.score_anyway_body", { reason })}
       </ConfirmDialog>
-    </>
+    </div>
   );
 }
 
@@ -96,15 +102,10 @@ export function StateChip({ jobId, target, bucket, filterKeyword, filterReasons 
     text = t(fixed[0]);
     tone = fixed[1];
   } else if (target.state === "filtered_out") {
-    text =
-      filterKeyword !== null
-        ? t("chip.filtered_keyword", { keyword: filterKeyword })
-        : filterReasons.length > 0
-          ? t("chip.filtered_reasons", { reasons: filterReasons.map((r) => serverText("filter_reason", r)).join(", ") })
-          : serverText("target_state", target.state);
+    text = filteredText(filterKeyword, filterReasons, t, serverText);
     action = <ScoreAnyway jobId={jobId} reason={text} />;
   } else if (isFailed(target.state)) {
-    text = t("chip.failed", { reason: serverText("target_state", target.state) });
+    text = serverText("target_state", target.state); // "Failed (temporary error)": §15.3's "Failed: <reason>"
     tone = "critical";
     reason = target.state_reason;
     action = <Retry targetId={target.id} />;

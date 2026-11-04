@@ -14,7 +14,7 @@ export function SimilarityBar({ value }: { value: number }) {
   }).format(value);
   return (
     <div className={styles.similarity}>
-      <span id={labelId} className={styles.label}>{t("card.similarity")}</span>
+      <span id={labelId}>{t("card.similarity")}</span>
       <span className={styles.value}>
         <meter className={styles.meter} min={0} max={1} value={value} aria-labelledby={labelId} aria-valuetext={text} />
         <span aria-hidden="true">{text}</span>

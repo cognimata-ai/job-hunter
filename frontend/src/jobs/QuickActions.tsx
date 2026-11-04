@@ -3,7 +3,7 @@
 //
 // A toggle writes only its own field (`PUT /api/jobs/{job_id}/actions`), with `apply_to_group: true` on a group
 // card, and the list is read again after the answer: nothing changes before it. Hiding raises the notice
-// "Hidden" with Undo, which writes `hidden: false` (the card has left the default list by then, so Undo is the
+// "Hidden: <title>" (the title as text) with Undo, which writes `hidden: false` (the card has left the default list by then, so Undo is the
 // mutation's, not the card's). A failure is the card's toast (`useCardFailure`): a merged job's says so, and the
 // list is read again.
 import { useTranslation } from "react-i18next";
@@ -34,7 +34,7 @@ export function QuickActions({ card }: { card: JobCardOut }) {
         onSuccess: () => {
           if (field === "hidden" && value) {
             toast({
-              message: t("card.hidden_toast"),
+              message: t("card.hidden_toast", { title: card.title }),
               action: {
                 label: t("action.undo"),
                 onAction: () => { actions.mutate({ jobId: card.job_id, body: { hidden: false, ...group } }); },

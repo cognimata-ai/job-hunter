@@ -223,7 +223,7 @@ describe("JobCard", () => {
       }),
     ]);
     expect(texts(within(card).getByRole("list", { name: en["card.knockouts"] }))).toEqual([
-      "⚑ Requires master (Computer Science) — you: bachelor",
+      "⚑ Requires master's degree (Computer Science) — you: bachelor's degree", // the levels by their codes
       `⚑ ${en["knockout.work_permit"]} (unconfirmed)`,
     ]);
   });
@@ -234,13 +234,37 @@ describe("JobCard", () => {
       scored({
         knockouts: [
           knockout({ requirement: "de C1" }),
-          knockout({ code: "work_permit", profile_value: "eu_citizen" }), // no requirement: the code's name
+          knockout({ code: "work_permit", profile_value: "requires_sponsorship" }), // no requirement: its name
         ],
       }),
     ]);
     expect(texts(within(card).getByRole("list", { name: en["card.knockouts"] }))).toEqual([
       "⚑ Requires German C1",
-      `⚑ ${en["knockout.work_permit"]} — you: eu_citizen`,
+      `⚑ ${en["knockout.work_permit"]} — you: requires sponsorship`,
+    ]);
+  });
+
+  it("knockout values are named by their codes, in German too, and an unknown one stays as it is", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.uiLanguage = "de";
+    api.jobs = jobsPage([
+      scored({
+        knockouts: [
+          knockout({ code: "degree", binding: false, requirement: "master (Informatik)", profile_value: "bachelor" }),
+          knockout({ code: "work_permit", profile_value: "requires_sponsorship" }),
+          knockout({ code: "degree", requirement: "diploma (Physik)", profile_value: "magister" }),
+          knockout({ code: "degree", requirement: "(Informatik)", profile_value: "none" }), // a field, no level
+        ],
+      }),
+    ]);
+    renderApp("/");
+    const list = await screen.findByRole("list", { name: de["jobs.title"] });
+    const [card] = within(list).getAllByRole("article");
+    expect(texts(within(card).getByRole("list", { name: de["card.knockouts"] }))).toEqual([
+      "⚑ Erfordert Master (Informatik) – Profil: Bachelor (unbestätigt)",
+      `⚑ ${de["knockout.work_permit"]} – Profil: benötigt Visa-Sponsoring`,
+      "⚑ Erfordert diploma (Physik) – Profil: magister",
+      `⚑ Erfordert (Informatik) – Profil: ${de["degree_level.none"]}`,
     ]);
   });
 
@@ -330,6 +354,49 @@ describe("the score or the chip", () => {
     expect(within(card).queryByRole("meter")).toBeNull();
     expect(within(card).queryByRole("button", { name: /^Score now/ })).toBeNull();
     expect(within(card).queryByText(en["target_state.published_accepted"])).toBeNull();
+  });
+
+  it("a scored card that fails its hard filter shows its score and the filtered badge, no chip", async () => {
+    const api = fakeApi({ signedIn: true });
+    const [byReason, byKeyword, passing] = await cardsOf(api, [
+      scored({ bucket: "filtered", filter_reasons: ["excluded_company"], badges: ["contested"] }),
+      scored({
+        job_id: 6,
+        title: "Praktikum Backend",
+        bucket: "filtered",
+        filter_reasons: ["excluded_keyword"],
+        filter_keyword: "Praktikum",
+      }),
+      scored({ job_id: 7, title: "Passing" }),
+    ]);
+    const badges = (card: HTMLElement) => texts(within(card).getByRole("list", { name: en["card.badges"] }));
+    expect(within(byReason).getByRole("img", { name: "Score 82, range 74 to 90" })).toBeTruthy();
+    expect(badges(byReason)).toEqual([en["badge.contested"], `Filtered: ${en["filter_reason.excluded_company"]}`]);
+    expect(badges(byKeyword)).toEqual(["Filtered: excluded keyword 'Praktikum'"]); // the chip's own text
+    for (const card of [byReason, byKeyword]) {
+      expect(within(card).queryByRole("button", { name: en["card.score_anyway"] })).toBeNull();
+      expect(within(card).queryByRole("meter")).toBeNull();
+      expect(within(card).queryByText(en["chip.pending"])).toBeNull();
+    }
+    expect(within(passing).queryByRole("list", { name: en["card.badges"] })).toBeNull();
+  });
+
+  it("Score anyway is disabled with the cap's text under cap_reached", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.status = statusOut({ banners: [{ code: "cap_reached", severity: "critical", params: {} }] });
+    const [card] = await cardsOf(api, [
+      jobCard({ target: target("filtered_out"), bucket: "filtered", filter_reasons: ["excluded_company"] }),
+    ]);
+    const button = within(card).getByRole("button", { name: en["card.score_anyway"] });
+    await waitFor(() => {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    });
+    const hint = document.getElementById(button.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toBe(en["card.score_now_cap"]);
+    expect(card.contains(hint)).toBe(true);
+    await userEvent.setup().click(button);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(requestsTo(api, "POST /api/jobs/5/score-now")).toHaveLength(0);
   });
 
   it("pending chip with the similarity label", async () => {
@@ -427,7 +494,8 @@ describe("the score or the chip", () => {
     const [card] = await cardsOf(api, [
       jobCard({ target: target("failed_transient", { id: 51, state_reason: "provider_overloaded" }), bucket: "failed" }),
     ]);
-    expect(within(card).getByText(`Failed: ${en["target_state.failed_transient"]}`)).toBeTruthy();
+    expect(within(card).getByText(en["target_state.failed_transient"])).toBeTruthy(); // "Failed (temporary error)"
+    expect(card.textContent).not.toContain("Failed: ");
     expect(within(card).getByText("provider_overloaded").tagName).toBe("CODE");
     expect(within(card).queryByRole("button", { name: /^Score now/ })).toBeNull();
     const user = userEvent.setup();
@@ -510,6 +578,37 @@ describe("Score now", () => {
     const hint = document.getElementById(button.getAttribute("aria-describedby") ?? "");
     expect(hint?.textContent).toBe(en["card.score_now_cap"]);
     expect(card.contains(hint)).toBe(true); // readable next to the button, not only on hover
+  });
+
+  it("follows a later status read: disabled when the cap arrives, enabled again when it leaves", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.jobs = jobsPage([jobCard()]);
+    const app = renderApp("/");
+    const card = await screen.findByRole("article", { name: "Senior Backend Engineer" });
+    const button = await within(card).findByRole<HTMLButtonElement>("button", { name: "Score now ~$0.05" });
+    await settled();
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-describedby")).toBeNull();
+    const reread = async () => {
+      await act(async () => {
+        await app.queryClient.invalidateQueries({ queryKey: ["system", "status"] });
+      });
+    };
+    api.status = statusOut({ banners: [{ code: "cap_reached", severity: "critical", params: {} }] });
+    await reread();
+    await waitFor(() => {
+      expect(button.disabled).toBe(true);
+    });
+    expect(document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent).toBe(
+      en["card.score_now_cap"],
+    );
+    api.status = statusOut();
+    await reread();
+    await waitFor(() => {
+      expect(button.disabled).toBe(false);
+    });
+    expect(button.getAttribute("aria-describedby")).toBeNull();
+    expect(within(card).queryByText(en["card.score_now_cap"])).toBeNull();
   });
 
   it("sends a keyed POST without force, and its answers toast", async () => {
@@ -608,7 +707,7 @@ describe("QuickActions", () => {
 
   it("Hide toasts with Undo that unhides", async () => {
     const api = fakeApi({ signedIn: true });
-    const shown = jobCard();
+    const shown = jobCard({ title: "Dev <img src=x onerror=alert(1)>" });
     api.routes.set("PUT /api/jobs/5/actions", (request) => {
       const body = JSON.parse(request.body ?? "{}") as { hidden?: boolean };
       api.jobs = jobsPage(body.hidden === true ? [] : [shown]); // the default list leaves hidden jobs out
@@ -619,14 +718,15 @@ describe("QuickActions", () => {
     const card = screen.getByRole("article", { name: shown.title });
     await user.click(within(card).getByRole("button", { name: en["card.hide"] }));
     const region = screen.getByRole("region", { name: en["toast.region"] });
-    expect(await within(region).findByText(en["card.hidden_toast"])).toBeTruthy();
+    expect(await within(region).findByText(`Hidden: ${shown.title}`)).toBeTruthy(); // the job, named as text
+    expect(region.querySelector("img")).toBeNull();
     await waitFor(() => {
       expect(screen.queryByRole("article", { name: shown.title })).toBeNull(); // the list was read again
     });
     await user.click(within(region).getByRole("button", { name: en["action.undo"] }));
     expect(await screen.findByRole("article", { name: shown.title })).toBeTruthy();
     expect(bodies(api, "PUT /api/jobs/5/actions")).toEqual([{ hidden: true }, { hidden: false }]);
-    expect(within(region).queryByText(en["card.hidden_toast"])).toBeNull(); // the notice left with its Undo
+    expect(within(region).queryByText(/^Hidden: /)).toBeNull(); // the notice left with its Undo
   });
 
   it("a merged job toasts and refetches", async () => {
@@ -639,7 +739,7 @@ describe("QuickActions", () => {
     await waitFor(() => {
       expect(requestsTo(api, "GET /api/jobs").length).toBe(reads + 1);
     });
-    expect(screen.queryByText(en["card.hidden_toast"])).toBeNull();
+    expect(screen.queryByText(/^Hidden: /)).toBeNull();
     expect(screen.queryByText(en["problem.not_found"])).toBeNull();
   });
 

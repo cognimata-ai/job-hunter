@@ -4,15 +4,23 @@
 // Without a `profile_value` the "— you: …" part is left out; without a `requirement` the badge names the
 // knockout's code. A `mandatory_language` requirement is "<iso> <level>" (`de C1`): its ISO code is named in
 // the UI language ("German", "Deutsch"), and a code `Intl` does not know, or an ad's own name of a language,
-// stays as it is.
+// stays as it is. A `degree` requirement's level ("master (Computer Science)") and the profile's side of a
+// `degree` or a `work_permit` knockout are codes, shown through `degree_level` and `work_authorization` (Ruling
+// T22-e); a value outside its namespace stays as it is.
 import { useTranslation } from "react-i18next";
 import { cx } from "../components/cx";
-import { intlLocale, useServerText } from "../i18n/index";
+import { type CodeNamespace, intlLocale, useServerText } from "../i18n/index";
 import type { KnockoutOut } from "./api";
+import type { ServerText } from "./format";
 import styles from "./KnockoutBadge.module.css";
 
 const SHOWN: ReadonlySet<string> = new Set(["unmet", "uncomparable"]);
 const ISO_LANGUAGE = /^[a-z]{2,3}$/;
+// The namespace of the profile's side (`profile_value`), by knockout code.
+const PROFILE_VALUE: ReadonlyMap<string, CodeNamespace> = new Map([
+  ["work_permit", "work_authorization"],
+  ["degree", "degree_level"],
+] as const);
 
 /** The knockouts a card shows, in the server's order. */
 export function shownKnockouts(knockouts: readonly KnockoutOut[]): KnockoutOut[] {
@@ -38,6 +46,26 @@ function namedLanguage(requirement: string, language: string): string {
   return name === null ? requirement : [name, ...rest].join(" ");
 }
 
+/** A `degree` requirement with its level named: "master (Computer Science)" → "master's degree (Computer
+ * Science)"; the field in parentheses stays as the ad states it. */
+function namedDegree(requirement: string, serverText: ServerText): string {
+  const at = requirement.indexOf(" (");
+  const level = at === -1 ? requirement : requirement.slice(0, at);
+  return serverText("degree_level", level) + (at === -1 ? "" : requirement.slice(at));
+}
+
+/** The requirement as the badge shows it. */
+function requirementText(code: string, requirement: string, language: string, serverText: ServerText): string {
+  switch (code) {
+    case "mandatory_language":
+      return namedLanguage(requirement, language);
+    case "degree":
+      return namedDegree(requirement, serverText);
+    default:
+      return requirement;
+  }
+}
+
 export function KnockoutBadge({ knockout }: { knockout: KnockoutOut }) {
   const { t, i18n } = useTranslation();
   const serverText = useServerText();
@@ -45,12 +73,11 @@ export function KnockoutBadge({ knockout }: { knockout: KnockoutOut }) {
   const parts = [
     requirement === null
       ? t("card.knockout_named", { name: serverText("knockout", code) })
-      : t("card.knockout_requires", {
-          requirement: code === "mandatory_language" ? namedLanguage(requirement, i18n.language) : requirement,
-        }),
+      : t("card.knockout_requires", { requirement: requirementText(code, requirement, i18n.language, serverText) }),
   ];
   if (profileValue !== null) {
-    parts.push(t("card.knockout_you", { value: profileValue }));
+    const namespace = PROFILE_VALUE.get(code);
+    parts.push(t("card.knockout_you", { value: namespace === undefined ? profileValue : serverText(namespace, profileValue) }));
   }
   if (!binding) {
     parts.push(t("card.knockout_unconfirmed"));

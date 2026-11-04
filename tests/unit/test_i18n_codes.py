@@ -32,6 +32,8 @@ from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
 from jobhunter.jobs.cards import Badge, ScoreOut
 from jobhunter.llm import gateway
+from jobhunter.llm.schemas import generator
+from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus
@@ -42,6 +44,7 @@ from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
 from jobhunter.scoring.cycles import PauseReason
 from jobhunter.scoring.filters import FilterCode
+from jobhunter.scoring.knockouts import DEGREE_RANK
 from jobhunter.sources import breaker
 from jobhunter.worker import runs
 
@@ -250,6 +253,14 @@ def issue_codes() -> set[str]:
     )
 
 
+def degree_levels() -> set[str]:
+    """The degree levels a knockout can show: the ad's (the generator's facts), the profile's education, and
+    the levels the degree knockout compares (`scoring.knockouts.DEGREE_RANK`, its `profile_level`)."""
+    ad = literal_values(generator.Degree.model_fields["level"].annotation)
+    profile = literal_values(profile_schema.Education.model_fields["level"].annotation)
+    return ad | profile | set(DEGREE_RANK)
+
+
 def check_values(path: Path, column: str) -> set[str]:
     """The values of a migration's `<column> text CHECK (<column> IN ('a','b',…))`, read from its text."""
     text = path.read_text(encoding="utf-8")
@@ -292,6 +303,12 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "group_unscorable": lambda: check_values(COLLECTION_MIGRATION, "unscorable_reason"),
     "confidence": lambda: literal_values(ScoreOut.model_fields["confidence"].annotation),
     "source": lambda: {source.id for source in SOURCES},
+    # the profile's side of a knockout (plan M4 Task 22, Ruling T22-e): `work_permit`'s work authorisation and
+    # `degree`'s level, also the level of a degree requirement
+    "work_authorization": lambda: literal_values(
+        profile_schema.UserEntered.model_fields["work_authorization_de"].annotation
+    ),
+    "degree_level": degree_levels,
 }
 
 

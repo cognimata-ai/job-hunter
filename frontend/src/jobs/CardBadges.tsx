@@ -1,5 +1,7 @@
 // The badges of a card (spec §15.3, §15.5, §7.18; plan M4 Task 22, Ruling g, B17, B27): `card.badges` in the
-// server's order (`jobs.cards.Badge`), each named by its `badge.<code>` text, then "previous: 72 (profile v3)"
+// server's order (`jobs.cards.Badge`), each named by its `badge.<code>` text; then, on a scored card that now
+// fails its hard filter (bucket `filtered`, spec §11.1: "shown … with its reasons"), the filtered chip's text
+// ("Filtered: <reasons>"; the card keeps its score, and has no chip); "previous: 72 (profile v3)"
 // while it is re-scored, "possible duplicate of <job>" for a group member with its own score, and "Not
 // scorable: <reason>" for a member of a group without a representative. Every badge is text; its colour only
 // repeats it. The Adzuna attribution badge links to the ad's Adzuna page (`links.adzuna`, at least 116×23 px,
@@ -11,7 +13,7 @@ import { OutboundLink } from "../components/OutboundLink";
 import { useServerText } from "../i18n/index";
 import type { JobCardOut } from "./api";
 import styles from "./CardBadges.module.css";
-import { scoreInt } from "./format";
+import { filteredText, scoreInt } from "./format";
 
 type Badge = JobCardOut["badges"][number];
 type Tone = "neutral" | "info" | "warn" | "critical" | "attribution";
@@ -45,6 +47,13 @@ export function CardBadges({ card }: { card: JobCardOut }) {
       content: href === null ? text : <OutboundLink href={href} className={styles.link}>{text}</OutboundLink>,
     };
   });
+  if (card.score !== null && card.bucket === "filtered") {
+    items.push({
+      key: "filtered",
+      tone: "warn",
+      content: filteredText(card.filter_keyword, card.filter_reasons, t, serverText),
+    });
+  }
   if (card.previous !== null) {
     const { mid, profile_version_no: version } = card.previous;
     items.push({
