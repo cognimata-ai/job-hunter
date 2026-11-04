@@ -316,5 +316,18 @@
     "principal",
     "senior",
     "working_student"
-  ]
+  ],
+  "order": {
+    "seniority": [
+      "intern",
+      "working_student",
+      "apprentice",
+      "junior",
+      "mid",
+      "senior",
+      "lead",
+      "principal",
+      "head"
+    ]
+  }
 }

@@ -4,8 +4,8 @@
 // <population>": at most three postal codes, then "+n" for the rest (none: the part is left out), and the
 // population in the UI language's numbers.
 //
-// The field shows the picked place's name; text typed and left without a pick goes back to it. The clear
-// button picks no place. `onChange` gets the place's id, name and coordinates, or `null`.
+// While the places are read the list says "Searching…", and a failed read says so. The field shows the
+// picked place's name; text typed and left without a pick goes back to it. The clear button picks no place. `onChange` gets the place's id, name and coordinates, or `null`.
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -84,6 +84,7 @@ export function PlacePicker({ label, value, onChange }: PlacePickerProps) {
       }}
       emptyText={t("filters.place_none")}
       loading={places.isFetching || q !== typed}
+      failed={places.isError && q === typed ? t("filters.place_failed") : undefined}
       onBlur={() => { setText(value?.label ?? ""); }}
       inputRef={input}
       after={

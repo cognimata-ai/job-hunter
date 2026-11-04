@@ -4,7 +4,8 @@ Each namespace equals its backend source, derived from the code and never typed 
 arguments (`typing.get_args`), a mapping's keys, or an AST walk of the calls that pass a code. A failure names
 the missing and the extra codes. The catalogue's own form is pinned too: exactly these namespaces, each a
 sorted list of distinct strings (the frontend's `i18n.test.ts` checks that both languages have a key for each
-code).
+code), and beside them `order`: the namespaces whose codes the UI lists in their backend's own order (the
+seniority ladder, plan M4 Task 23, Ruling T23-c), each equal to that order.
 
 The alert codes are the `code` of every `raise_alert` and `open_alert` call in `backend/src`, with a module
 constant resolved by importing its module, and the codes of a module's wrapper that forwards its own `code`
@@ -36,6 +37,7 @@ from jobhunter.llm import gateway
 from jobhunter.llm.schemas import generator
 from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.published import KnockoutCode
+from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
@@ -317,6 +319,13 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
 }
 
 
+# The namespaces the UI lists in an order of their own, with that order from the backend.
+ORDERS: Final[dict[str, Callable[[], list[str]]]] = {
+    "seniority": lambda: list(SENIORITY_LADDER),
+}
+ORDER_KEY: Final = "order"
+
+
 @pytest.fixture(scope="module")
 def catalogue() -> dict[str, Any]:
     loaded = json.loads(CODES.read_text(encoding="utf-8"))
@@ -325,7 +334,15 @@ def catalogue() -> dict[str, Any]:
 
 
 def test_the_catalogue_has_exactly_the_namespaces(catalogue: dict[str, Any]) -> None:
-    assert sorted(catalogue) == sorted(NAMESPACES)
+    assert sorted(set(catalogue) - {ORDER_KEY}) == sorted(NAMESPACES)
+
+
+def test_each_order_is_its_backend_order_of_its_namespace(catalogue: dict[str, Any]) -> None:
+    orders = catalogue.get(ORDER_KEY)
+    assert isinstance(orders, dict) and sorted(orders) == sorted(ORDERS), orders
+    for namespace, expected in ORDERS.items():
+        assert orders[namespace] == expected(), f"codes.json[order][{namespace}]"
+        assert sorted(orders[namespace]) == catalogue[namespace], f"order[{namespace}] is not its namespace"
 
 
 @pytest.mark.parametrize("namespace", sorted(NAMESPACES))

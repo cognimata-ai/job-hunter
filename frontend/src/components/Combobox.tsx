@@ -8,7 +8,10 @@
 //   field.
 // - The caller owns the text and the options; the list's open state and its active option are the
 //   component's.
+// - An open list without options says why: "Searching…" while its options are being read, the caller's
+//   `failed` text when their read failed, else the caller's `emptyText`.
 import { type ReactNode, type Ref, useId, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { cx } from "./cx";
 import styles from "./Combobox.module.css";
 
@@ -25,9 +28,12 @@ export interface ComboboxProps<T> {
   /** The option as it is read and shown. */
   optionText: (option: T) => string;
   onPick: (option: T) => void;
-  /** The text below the list when it holds no option (a search that found nothing); none while loading. */
+  /** The text in place of the options when a search found none. */
   emptyText: string;
+  /** The options are being read: "Searching…" in place of none. */
   loading?: boolean;
+  /** The text in place of the options when their read failed. */
+  failed?: string;
   /** The field's `aria-describedby` (a hint, an error). */
   describedBy?: string;
   /** Called when focus leaves the field. */
@@ -50,12 +56,14 @@ export function Combobox<T>({
   onPick,
   emptyText,
   loading = false,
+  failed,
   describedBy,
   onBlur,
   after,
   inputRef,
   className,
 }: ComboboxProps<T>) {
+  const { t } = useTranslation();
   const id = useId();
   const listId = `${id}-list`;
   const [open, setOpen] = useState(false);
@@ -136,7 +144,11 @@ export function Combobox<T>({
             </li>
           ))}
         </ul>
-        {options.length === 0 && !loading && <p className={styles.empty}>{emptyText}</p>}
+        {options.length === 0 && (
+          <p className={cx(styles.empty, failed !== undefined && styles.failed)}>
+            {failed ?? (loading ? t("combobox.searching") : emptyText)}
+          </p>
+        )}
       </div>
     </div>
   );

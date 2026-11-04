@@ -25,7 +25,9 @@ describe("the catalogues", () => {
 
   it("every catalogue code has a key in both", () => {
     const missing: string[] = [];
-    for (const [namespace, list] of Object.entries(codes)) {
+    // `order` is no namespace: its lists hold namespaces' codes in their backend order
+    const namespaces = Object.entries(codes).filter(([namespace]) => namespace !== "order") as [string, string[]][];
+    for (const [namespace, list] of namespaces) {
       for (const code of list) {
         for (const [lang, table] of [["en", en], ["de", de]] as const) {
           if (!(`${namespace}.${code}` in table)) {
@@ -45,6 +47,12 @@ describe("the catalogues", () => {
       expect(translated.trim(), key).not.toBe("");
       expect(placeholders(translated), key).toEqual(placeholders(text));
     }
+  });
+});
+
+describe("the catalogue's orders", () => {
+  it("each lists exactly its namespace's codes", () => {
+    expect([...codes.order.seniority].sort()).toEqual(codes.seniority);
   });
 });
 

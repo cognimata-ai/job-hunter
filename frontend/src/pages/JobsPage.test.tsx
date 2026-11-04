@@ -8,8 +8,12 @@ import en from "../i18n/en.json";
 import i18n from "../i18n/index";
 import { type FakeApi, fakeApi, jobCard, jobsPage, json, pagedJobs, problem, requestsTo } from "../test/api";
 import { NOW, renderApp, settled } from "../test/app";
+import { readText } from "../test/readText.mjs";
 
 type JobCardOut = components["schemas"]["JobCardOut"];
+
+// Through a variable: Vite rewrites a literal `new URL("…", import.meta.url)` as a served asset's URL.
+const HERE = import.meta.url;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"], now: NOW });
@@ -183,21 +187,24 @@ describe("JobsPage", () => {
     expect(await screen.findByRole("article", { name: "Job 1" })).toBeTruthy();
     cleanup();
 
-    // no cards under the defaults: nothing collected yet
+    // no cards under the defaults: the defaults are filters too, and say what they leave out
     api.jobs = jobsPage([]);
     renderApp("/");
-    expect(await screen.findByText(en["jobs.empty_title"])).toBeTruthy();
-    expect(screen.queryByRole("button", { name: en["jobs.reset_filters"] })).toBeNull();
+    expect(await screen.findByText(en["jobs.no_match"])).toBeTruthy();
+    expect(screen.getByText(en["jobs.defaults_hide"])).toBeTruthy();
+    expect(screen.queryByRole("button", { name: en["jobs.reset_filters"] })).toBeNull(); // nothing to reset
     cleanup();
 
-    // no cards under filters: Reset filters
+    // no cards under filters: Reset filters, then focus on the heading (the button leaves with the state)
     const app = renderApp("/?q=python&work_mode=remote&label=1");
     expect(await screen.findByText(en["jobs.no_match"])).toBeTruthy();
+    expect(screen.queryByText(en["jobs.defaults_hide"])).toBeNull();
     await userEvent.setup().click(screen.getByRole("button", { name: en["jobs.reset_filters"] }));
     await waitFor(() => {
       expect(app.router.state.location.searchStr).toBe("?label=1");
     });
-    expect(await screen.findByText(en["jobs.empty_title"])).toBeTruthy();
+    expect(await screen.findByText(en["jobs.defaults_hide"])).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: en["jobs.title"] }));
     cleanup();
 
     // no active profile: the notice above the unscored cards
@@ -220,17 +227,50 @@ describe("JobsPage", () => {
     renderQuick("/");
     await screen.findByRole("article", { name: "Job 2" });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: en["jobs.load_more"] }));
+    screen.getByRole("button", { name: en["jobs.load_more"] }).focus();
+    await user.keyboard("{Enter}");
     const box = await screen.findByRole("alert");
     expect(box.textContent).toContain(en["problem.internal"]);
     expect(articles()).toHaveLength(2); // the loaded cards stay
     expect(list().compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy(); // below the list
     expect(requestsTo(api, "GET /api/jobs").filter((r) => r.search.has("cursor"))).toHaveLength(4); // retried 3 times
+    const retry = within(box).getByRole("button", { name: en["action.retry"] });
+    expect(document.activeElement).toBe(retry); // Load more left with the failure: focus on its Retry
     down = false;
-    await user.click(within(box).getByRole("button", { name: en["action.retry"] }));
+    await user.keyboard("{Enter}");
     expect(await screen.findByRole("article", { name: "Job 3" })).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(articles()).toHaveLength(3);
+    expect(document.activeElement).toBe(screen.getByRole("article", { name: "Job 3" })); // the card it brought
+  });
+
+  it("keyboard Load more of the last page hands focus to its first card", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/jobs", pagedJobs([cards([1, 2]), cards([3, 4]), cards([5, 6])]).route);
+    renderApp("/");
+    await screen.findByRole("article", { name: "Job 2" });
+    const user = userEvent.setup();
+    const more = screen.getByRole("button", { name: en["jobs.load_more"] });
+    more.focus();
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("article", { name: "Job 4" })).toBeTruthy();
+    expect(document.activeElement).toBe(more); // more pages: the button stays, and focus with it
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("article", { name: "Job 6" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: en["jobs.load_more"] })).toBeNull(); // the last page
+    expect(document.activeElement).toBe(screen.getByRole("article", { name: "Job 5" }));
+    expect(screen.getByRole("article", { name: "Job 5" }).tabIndex).toBe(0);
+  });
+
+  it("never hides the Ranking changed live region in its CSS", () => {
+    // jsdom applies no stylesheet: the declarations of every selector that names the region's class (also
+    // inside a media query) are read instead
+    const pageCss = readText(new URL("./JobsPage.module.css", HERE));
+    const rules = [...pageCss.matchAll(/(\.status\b[^{]*)\{([^}]*)\}/g)];
+    expect(rules.length).toBeGreaterThan(0);
+    for (const [, selector, body] of rules) {
+      expect(body, selector).not.toMatch(/display\s*:\s*none|visibility\s*:\s*hidden|content-visibility\s*:\s*hidden/);
+    }
   });
 
   it("Hide the focused card by keyboard, and focus lands on the next card", async () => {

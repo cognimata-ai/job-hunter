@@ -4,7 +4,8 @@
  * Key scheme: one flat table per language. Every key is a whole string, `keySeparator: false`, so a dot is
  * part of the key and never a path: a server code is looked up as `"<namespace>.<code>"`, and a code that has
  * dots of its own (`alert.batch.retrieve_failing`) is still one key. `nsSeparator: false`, so a `:` in a code
- * is never read as a namespace either. The namespaces of the server's codes are the keys of `codes.json`;
+ * is never read as a namespace either. The namespaces of the server's codes are the keys of `codes.json` (but
+ * `order`, which lists the seniority codes in their ladder's order);
  * `useServerText` translates a code and falls back to the server's own text for a code the catalogue lacks.
  *
  * The language is the browser's on the login page (`browserLanguage`) and `settings.display.ui_language`
@@ -19,7 +20,8 @@ import en from "./en.json";
 
 export type Language = "en" | "de";
 export type TranslationKey = keyof typeof en;
-export type CodeNamespace = keyof typeof codes;
+/** A namespace of `codes.json`: its keys but `order`, which lists some namespaces' codes in their backend order. */
+export type CodeNamespace = Exclude<keyof typeof codes, "order">;
 
 declare module "i18next" {
   interface CustomTypeOptions {

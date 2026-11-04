@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, type AppParts, createApp } from "../app/App";
 import en from "../i18n/en.json";
 import { fakeApi, requestsTo } from "../test/api";
-import { DEFAULT_SEARCH, type JobsSearch, parseJobsSearch, toApiParams } from "./search";
+import { DEFAULT_SEARCH, type JobsSearch, parseJobsSearch, resetSearch, toApiParams } from "./search";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -152,6 +152,22 @@ describe("the Jobs search", () => {
       expect(parseJobsSearch(broken), JSON.stringify(broken)).toEqual(DEFAULT_SEARCH);
     }
     expect(() => parseJobsSearch({ score_min: { $gt: 1 }, work_mode: [1, null], q: 5 })).not.toThrow();
+  });
+
+  it("include_remote belongs to the location", () => {
+    const place = { loc_id: "geonames:2950159", loc_lat: "52.52437", loc_lon: "13.41053", radius_km: "30" };
+    expect(parseJobsSearch({ include_remote: "false" })).toEqual(DEFAULT_SEARCH); // no place: its default
+    expect(toApiParams(parseJobsSearch({ include_remote: "false" })).has("include_remote")).toBe(false);
+    expect(toApiParams({ ...DEFAULT_SEARCH, include_remote: false }).has("include_remote")).toBe(false);
+    const near = parseJobsSearch({ ...place, include_remote: "false" });
+    expect(near.include_remote).toBe(false);
+    expect(toApiParams(near).get("include_remote")).toBe("false");
+  });
+
+  it("resetSearch restores the defaults, keeps Label mode and closes the drawer", () => {
+    expect(resetSearch(EVERY_FILTER)).toEqual({ ...DEFAULT_SEARCH, label: 1 });
+    expect(resetSearch({ ...EVERY_FILTER, label: undefined })).toEqual(DEFAULT_SEARCH);
+    expect(resetSearch(DEFAULT_SEARCH)).toEqual(DEFAULT_SEARCH);
   });
 
   it("round trip of every filter", async () => {

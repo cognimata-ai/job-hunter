@@ -7,6 +7,9 @@
 //   `parseSearch`) or an already typed one, and never throws: each field that is unknown or invalid falls back
 //   to its default on its own. A set keeps its valid members in one order (a closed set in its declared order,
 //   an open one sorted), so two equal searches are equal, and the router leaves the defaults out of the URL.
+//   `include_remote` belongs to the location (the api reads it only with one): without a place it is at its
+//   default.
+// - `resetSearch` is Reset and Reset filters: the defaults, Label mode kept, the drawer closed.
 // - `toApiParams` is the list's query: no default, no label, drawer or Label mode, the keys and each set's values
 //   sorted, so equal searches give equal params (the list's query key).
 import type { operations } from "../api/schema";
@@ -55,10 +58,11 @@ export const SCORING_STATES = members<ScoringState>({
   expired: true,
   not_a_job_ad: true,
 });
-/** The employment types and `unknown`, and the seniority levels: the API types them as strings, the code
- * catalogue lists them (derived from `EMPLOYMENT_VALUES` and `SENIORITY_LADDER`). */
+/** The employment types and `unknown`, and the seniority levels in the ladder's order (intern to head): the API
+ * types them as strings, the code catalogue lists them (derived from `EMPLOYMENT_VALUES` and
+ * `SENIORITY_LADDER`, Ruling T23-c). */
 export const EMPLOYMENT_TYPES: readonly string[] = codes.employment;
-export const SENIORITY_LEVELS: readonly string[] = codes.seniority;
+export const SENIORITY_LEVELS: readonly string[] = codes.order.seniority;
 
 /** The largest search text, in characters (`JobsQuery.q`). */
 const MAX_Q = 200;
@@ -83,7 +87,8 @@ export interface JobsSearch {
   coverage_min: number;
   confidence: Confidence;
   /** The place: all four of `loc_id` (its `gazetteer_id`, as `GET /api/geo/places` gives it), `loc_lat`,
-   * `loc_lon` and `radius_km` (1 to 200), or none; `loc_label` (its name, for the picker) only with them. */
+   * `loc_lon` and `radius_km` (1 to 200), or none; `loc_label` (its name, for the picker) only with them, and
+   * `include_remote` off its default only with them. */
   loc_id?: string;
   loc_lat?: number;
   loc_lon?: number;
@@ -245,6 +250,7 @@ function scoreRange(raw: Record<string, unknown>): Pick<JobsSearch, "score_min" 
 /** The search of `raw` (module comment): never throws, each invalid field at its default. */
 export function parseJobsSearch(raw: Record<string, unknown>): JobsSearch {
   const q = text(raw.q, MAX_Q);
+  const place = location(raw);
   const employment = new Set(listed(raw.employment));
   const seniority = new Set(listed(raw.seniority));
   const job = integer(raw.job, 1, Number.MAX_SAFE_INTEGER);
@@ -255,8 +261,8 @@ export function parseJobsSearch(raw: Record<string, unknown>): JobsSearch {
     ...scoreRange(raw),
     coverage_min: integer(raw.coverage_min, 0, 100) ?? DEFAULT_SEARCH.coverage_min,
     confidence: oneOf(raw.confidence, CONFIDENCES, DEFAULT_SEARCH.confidence),
-    ...location(raw),
-    include_remote: oneOf(raw.include_remote, ["true", "false"], "true") === "true",
+    ...place,
+    include_remote: place.loc_id === undefined || oneOf(raw.include_remote, ["true", "false"], "true") === "true",
     work_mode: closedSet(raw.work_mode, WORK_MODES, DEFAULT_SEARCH.work_mode),
     company: openSet(raw.company),
     source: openSet(raw.source),
@@ -286,7 +292,7 @@ export function toApiParams(s: JobsSearch): URLSearchParams {
   const params = new URLSearchParams();
   for (const [name, value] of Object.entries(s) as [string, unknown][]) {
     const fallback = DEFAULTS.get(name);
-    if (NOT_API.has(name) || value === undefined || value === fallback) {
+    if (NOT_API.has(name) || value === undefined || value === fallback || (name === "include_remote" && s.loc_id === undefined)) {
       continue;
     }
     if (Array.isArray(value)) {
@@ -304,4 +310,10 @@ export function toApiParams(s: JobsSearch): URLSearchParams {
   }
   params.sort();
   return params;
+}
+
+/** Reset (the panel's) and Reset filters (the empty list's): `DEFAULT_SEARCH`, with Label mode kept and the
+ * drawer closed. */
+export function resetSearch(current: JobsSearch): JobsSearch {
+  return current.label === 1 ? { ...DEFAULT_SEARCH, label: 1 } : DEFAULT_SEARCH;
 }

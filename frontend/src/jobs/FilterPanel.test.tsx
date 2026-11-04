@@ -2,6 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppParts } from "../app/App";
+import codes from "../i18n/codes.json";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
 import i18n from "../i18n/index";
@@ -351,6 +352,45 @@ describe("FilterPanel", () => {
     await waitFor(() => {
       expect(requestsTo(api, "GET /api/jobs").at(-1)?.search.toString()).toBe("limit=50");
     });
+  });
+
+  it("lists the seniority levels in the ladder's order", async () => {
+    const api = fakeApi({ signedIn: true });
+    const { aside } = await panel(api);
+    const boxes = within(group(aside, en["filters.seniority"])).getAllByRole("checkbox");
+    expect(codes.order.seniority).toEqual(["intern", "working_student", "apprentice", "junior", "mid", "senior", "lead", "principal", "head"]);
+    expect(boxes.map((input) => input.closest("label")?.textContent)).toEqual(
+      codes.order.seniority.map((code) => en[`seniority.${code}` as keyof typeof en]),
+    );
+  });
+
+  it("clearing the place also clears include remote, which belongs to it", async () => {
+    const api = fakeApi({ signedIn: true });
+    const { app, aside } = await panel(
+      api,
+      "/?loc_id=geonames:2950159&loc_lat=52.52437&loc_lon=13.41053&radius_km=30&loc_label=Berlin&include_remote=false",
+    );
+    const location = group(aside, en["filters.location"]);
+    expect(box(location, en["filters.include_remote"]).checked).toBe(false);
+    await userEvent.setup().click(within(location).getByRole("button", { name: en["filters.location_clear"] }));
+    await waitFor(() => {
+      expect(url(app)).toEqual({});
+    });
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/jobs").at(-1)?.search.toString()).toBe("limit=50");
+    });
+  });
+
+  it("company counts read in the UI language's numbers", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.uiLanguage = "de";
+    api.jobs = jobsPage([jobCard()]);
+    api.facets = { companies: [{ company_key: "acme", display_name: "Acme GmbH", count: 1284 }], sources: [] };
+    renderApp("/");
+    const aside = await screen.findByRole("complementary", { name: de["filters.title"] });
+    const company = within(aside).getByRole("group", { name: de["filters.company"] });
+    await userEvent.setup().type(within(company).getByRole("combobox", { name: de["filters.company_search"] }), "ac");
+    expect((await within(company).findByRole("option")).textContent).toBe("Acme GmbH (1.284)");
   });
 
   it("collapses behind its Filters button on a narrow screen", async () => {

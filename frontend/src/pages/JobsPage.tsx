@@ -3,9 +3,12 @@
 // count is capped), the sort, "⟳ Ranking changed — refresh" when a later page says so, the cards and Load more.
 //
 // - While the first page is read: 8 skeleton cards. Its failure: the problem with Retry; a failed refetch keeps
-//   the cards (its toast is the query client's). A failed Load more: the problem below the cards, which stay.
-// - No cards: under the default filters, that nothing has been collected yet; under others, "No jobs match these
-//   filters" with Reset filters.
+//   the cards (its toast is the query client's). A failed Load more: the problem below the cards, which stay,
+//   with focus on its Retry (Load more has left with the failure).
+// - No cards: "No jobs match these filters" (Ruling T23-d). Under the default filters it says what they leave
+//   out, since they are filters too; under others it offers Reset filters, after which focus is on the heading.
+// - The Ranking changed region is rendered, empty, from the start, so its banner is announced: a live region
+//   has to be in the accessibility tree before its content changes.
 // - Without an active profile, "Upload your CV to start ranking" (a link to the CV section) above the cards,
 //   which are still listed, unscored (§15.8).
 // - The list's keyboard is `useListKeyboard`'s; Enter on a card writes `job=<id>` (the drawer's, Task 24).
@@ -19,7 +22,7 @@ import { Skeleton } from "../components/Skeleton";
 import type { TranslationKey } from "../i18n/index";
 import { FilterPanel } from "../jobs/FilterPanel";
 import { JobCard } from "../jobs/JobCard";
-import { DEFAULT_SEARCH, type JobSort, SORTS, toApiParams } from "../jobs/search";
+import { DEFAULT_SEARCH, type JobSort, resetSearch, SORTS, toApiParams } from "../jobs/search";
 import { type CountsOut, useJobsList } from "../jobs/useJobsList";
 import { useJobsSearch } from "../jobs/useJobsSearch";
 import { focusDropped, useListKeyboard } from "../jobs/useListKeyboard";
@@ -59,11 +62,24 @@ export function JobsPage() {
   const ids = useMemo(() => list.items.map((card) => card.job_id), [list.items]);
   const open = useCallback((jobId: number) => { write({ job: jobId }); }, [write]);
   const keyboard = useListKeyboard(ids, open);
-  const resetFilters = () => { write((current) => ({ ...DEFAULT_SEARCH, ...(current.label === 1 ? { label: 1 } : {}) })); };
-
-  // Load more's button leaves with the last page: focus then goes to the first card it brought
-  const firstNew = useRef<number | null>(null);
   const { focusCard, headingRef } = keyboard;
+  const resetFilters = () => {
+    write(resetSearch);
+    headingRef.current?.focus(); // the button leaves with the empty state
+  };
+
+  // Load more's button leaves with the last page, or with a failure: focus then goes to the first card the page
+  // brought, or to the failure's Retry
+  const firstNew = useRef<number | null>(null);
+  const moreFailed = useRef<HTMLDivElement>(null);
+  const loadMore = () => {
+    firstNew.current = ids.length;
+    list.loadMore();
+  };
+  const params = toApiParams(search).toString();
+  useLayoutEffect(() => {
+    firstNew.current = null; // another list: no page of the old one is awaited
+  }, [params]);
   useLayoutEffect(() => {
     const at = firstNew.current;
     if (at !== null && ids.length > at) {
@@ -73,6 +89,12 @@ export function JobsPage() {
       }
     }
   }, [ids, focusCard]);
+  const failedMore = list.loadMoreError !== null;
+  useLayoutEffect(() => {
+    if (failedMore && focusDropped()) {
+      moreFailed.current?.querySelector<HTMLElement>("button")?.focus();
+    }
+  }, [failedMore]);
 
   const filtered = toApiParams({ ...search, sort: DEFAULT_SEARCH.sort }).toString() !== "";
   const noProfile = profile.data !== undefined && profile.data.active === null;
@@ -86,7 +108,7 @@ export function JobsPage() {
       <EmptyState title={t("jobs.no_match")}
         action={<button type="button" className={styles.button} onClick={resetFilters}>{t("jobs.reset_filters")}</button>} />
     ) : (
-      <EmptyState title={t("jobs.empty_title")}>{t("jobs.empty_body")}</EmptyState>
+      <EmptyState title={t("jobs.no_match")}>{t("jobs.defaults_hide")}</EmptyState>
     );
   } else {
     content = (
@@ -98,14 +120,17 @@ export function JobsPage() {
             </li>
           ))}
         </ol>
-        {list.loadMoreError !== null && <ProblemBox error={list.loadMoreError} onRetry={list.loadMore} />}
-        {list.hasNextPage && list.loadMoreError === null && (
+        {failedMore && (
+          <div ref={moreFailed}>
+            <ProblemBox error={list.loadMoreError} onRetry={loadMore} />
+          </div>
+        )}
+        {list.hasNextPage && !failedMore && (
           <div className={styles.more}>
             <button type="button" className={styles.button} aria-disabled={list.loadingMore}
               onClick={() => {
                 if (!list.loadingMore) {
-                  firstNew.current = ids.length;
-                  list.loadMore();
+                  loadMore();
                 }
               }}>
               {list.loadingMore ? t("jobs.loading_more") : t("jobs.load_more")}
@@ -121,31 +146,33 @@ export function JobsPage() {
       <div className={styles.layout}>
         <FilterPanel />
         <div className={styles.results}>
-          <div className={styles.toolbar}>
-            {list.counts !== null && <CountsLine counts={list.counts} />}
-            <div className={styles.sort}>
-              <label htmlFor={sortId}>{t("jobs.sort")}</label>
-              <select id={sortId} className={styles.select} value={search.sort}
-                onChange={(event) => {
-                  const sort = SORTS.find((value) => value === event.target.value);
-                  if (sort !== undefined) {
-                    write({ sort });
-                  }
-                }}>
-                {SORTS.map((value) => <option key={value} value={value}>{t(SORT_LABELS[value])}</option>)}
-              </select>
+          <div className={styles.head}>
+            <div className={styles.toolbar}>
+              {list.counts !== null && <CountsLine counts={list.counts} />}
+              <div className={styles.sort}>
+                <label htmlFor={sortId}>{t("jobs.sort")}</label>
+                <select id={sortId} className={styles.select} value={search.sort}
+                  onChange={(event) => {
+                    const sort = SORTS.find((value) => value === event.target.value);
+                    if (sort !== undefined) {
+                      write({ sort });
+                    }
+                  }}>
+                  {SORTS.map((value) => <option key={value} value={value}>{t(SORT_LABELS[value])}</option>)}
+                </select>
+              </div>
             </div>
-          </div>
-          <div role="status" aria-label={t("jobs.ranking_status")} className={styles.status}>
-            {list.rankingChanged && (
-              <button type="button" className={styles.ranking}
-                onClick={() => {
-                  list.refresh();
-                  headingRef.current?.focus(); // the button leaves with the banner
-                }}>
-                {t("jobs.ranking_changed")}
-              </button>
-            )}
+            <div role="status" aria-label={t("jobs.ranking_status")} className={styles.status}>
+              {list.rankingChanged && (
+                <button type="button" className={styles.ranking}
+                  onClick={() => {
+                    list.refresh();
+                    headingRef.current?.focus(); // the button leaves with the banner
+                  }}>
+                  {t("jobs.ranking_changed")}
+                </button>
+              )}
+            </div>
           </div>
           {noProfile && (
             <p className={styles.notice}>

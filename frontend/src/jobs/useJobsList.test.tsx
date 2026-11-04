@@ -60,11 +60,18 @@ describe("useJobsList", () => {
     renderApp("/");
     await screen.findByRole("article", { name: "Job 2" });
     const status = screen.getByRole("status", { name: en["jobs.ranking_status"] });
-    expect(status.textContent).toBe(""); // the region is there before it says anything
+    // the live region is rendered, empty, before it says anything (and never hidden: its CSS is
+    // `JobsPage.test.tsx`'s), so the banner is announced into a region that already exists
+    expect(status.textContent).toBe("");
+    expect(status.hasAttribute("hidden")).toBe(false);
+    expect(status.hasAttribute("aria-hidden")).toBe(false);
     list.generation = 2; // a write elsewhere (another tab, a scoring run) moves the ranking
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: en["jobs.load_more"] }));
     const refresh = await within(status).findByRole("button", { name: en["jobs.ranking_changed"] });
+    expect(screen.getByRole("status", { name: en["jobs.ranking_status"] })).toBe(status); // the same region
+    expect(status.hasAttribute("hidden")).toBe(false);
+    expect(status.hasAttribute("aria-hidden")).toBe(false);
     expect(titles()).toEqual(["Job 1", "Job 2", "Job 3", "Job 4"]); // nothing moves under the reader
     list.pages = [cards([4, 1]), cards([2, 3]), cards([5])];
     await user.click(refresh);
@@ -101,6 +108,19 @@ describe("useJobsList", () => {
     await settled();
     expect(within(screen.getByRole("status", { name: en["jobs.ranking_status"] })).queryByRole("button")).toBeNull();
     expect(titles()).toEqual(["Job 1", "Job 2", "Job 3", "Job 4"]);
+  });
+
+  it("lists a job that moved between two pages once", async () => {
+    const api = fakeApi({ signedIn: true });
+    const errors = vi.spyOn(console, "error");
+    api.routes.set("GET /api/jobs", pagedJobs([cards([1, 2]), cards([2, 3])]).route); // job 2 moved down
+    renderApp("/");
+    await screen.findByRole("article", { name: "Job 2" });
+    await userEvent.setup().click(screen.getByRole("button", { name: en["jobs.load_more"] }));
+    expect(await screen.findByRole("article", { name: "Job 3" })).toBeTruthy();
+    expect(titles()).toEqual(["Job 1", "Job 2", "Job 3"]);
+    expect(screen.getAllByRole("article", { name: "Job 2" })).toHaveLength(1);
+    expect(errors.mock.calls.filter((call) => String(call[0]).includes("same key"))).toEqual([]);
   });
 
   it("is not read again on focus or reconnect, even once stale", async () => {

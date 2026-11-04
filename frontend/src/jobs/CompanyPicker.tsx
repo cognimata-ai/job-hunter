@@ -1,6 +1,7 @@
 // The Company filter (spec §15.3 "Multi-select on company key"; plan M4 Task 23, Ruling e): a combobox over the
 // listed cards' companies (`GET /api/jobs/facets?<the current filters>&company_q=…`, read 300 ms after the last
-// keystroke), each option "<display name> (<count>)", and the picked companies as removable chips.
+// keystroke), each option "<display name> (<count>)" (the count in the UI language's numbers), and the picked
+// companies as removable chips. A failed read says so in the list.
 //
 // The URL holds company keys only, so a chip names its company by the option it was picked from, else by the
 // panel's own facets, else by its key (a company picked before a reload, beyond the facets' first ones).
@@ -8,6 +9,7 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Combobox } from "../components/Combobox";
 import { useDebounced } from "../components/useDebounced";
+import { useFormat } from "../system/format";
 import { type FacetsOut, useFacets } from "./api";
 import styles from "./CompanyPicker.module.css";
 
@@ -30,6 +32,7 @@ export interface CompanyPickerProps {
 
 export function CompanyPicker({ params, value, onChange, known }: CompanyPickerProps) {
   const { t } = useTranslation();
+  const format = useFormat();
   const input = useRef<HTMLInputElement>(null);
   const [pickedNames, setPickedNames] = useState<ReadonlyMap<string, string>>(new Map());
   const [text, setText] = useState("");
@@ -50,7 +53,7 @@ export function CompanyPicker({ params, value, onChange, known }: CompanyPickerP
         onOpenChange={setOpen}
         options={options}
         optionKey={(company) => company.company_key}
-        optionText={(company) => t("filters.company_option", { name: company.display_name, count: company.count })}
+        optionText={(company) => t("filters.company_option", { name: company.display_name, number: format.number(company.count) })}
         onPick={(company) => {
           setText("");
           setPickedNames((names) => new Map(names).set(company.company_key, company.display_name));
@@ -58,6 +61,7 @@ export function CompanyPicker({ params, value, onChange, known }: CompanyPickerP
         }}
         emptyText={t("filters.company_none")}
         loading={found.isFetching || companyQ !== typed}
+        failed={found.isError && companyQ === typed ? t("filters.company_failed") : undefined}
         inputRef={input}
       />
       {value.length > 0 && (

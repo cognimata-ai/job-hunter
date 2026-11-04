@@ -49,9 +49,15 @@
   background: var(--color-surface);
 }
 
-/* The Ranking changed region holds nothing until it has something to say. */
-.status:empty {
-  display: none;
+/* The toolbar and, under it, the Ranking changed region: no gap between them, so the region, always rendered
+ * (a live region must be in the accessibility tree before it speaks), takes no room while it is empty. */
+.head {
+  display: grid;
+  min-width: 0;
+}
+
+.status:not(:empty) {
+  margin-top: var(--space-3);
 }
 
 .ranking {

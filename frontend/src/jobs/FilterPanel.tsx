@@ -33,6 +33,7 @@ import {
   type JobsSearch,
   POSTED_WINDOWS,
   type PostedWindow,
+  resetSearch,
   SCORING_STATES,
   type ScoringState,
   SENIORITY_LEVELS,
@@ -357,7 +358,14 @@ function Location({ search, write }: { search: JobsSearch; write: WriteSearch })
         onChange={(picked) => {
           write(
             picked === null
-              ? { loc_id: undefined, loc_lat: undefined, loc_lon: undefined, radius_km: undefined, loc_label: undefined }
+              ? {
+                  loc_id: undefined,
+                  loc_lat: undefined,
+                  loc_lon: undefined,
+                  radius_km: undefined,
+                  loc_label: undefined,
+                  include_remote: DEFAULT_SEARCH.include_remote, // it belongs to the place
+                }
               : {
                   loc_id: picked.gazetteer_id,
                   loc_lat: picked.lat,
@@ -437,7 +445,7 @@ export function FilterPanel() {
             onChange={(company) => { write({ company }); }} />
         </fieldset>
         <CheckboxGroup legend={t("filters.source")} values={sources} selected={search.source}
-          label={(id) => t("filters.source_option", { name: serverText("source", id), count: format.number(sourceCounts.get(id) ?? 0) })}
+          label={(id) => t("filters.source_option", { name: serverText("source", id), number: format.number(sourceCounts.get(id) ?? 0) })}
           empty={facets.data === undefined ? undefined : t("filters.source_none")}
           onChange={(source) => { write({ source }); }} />
         <CheckboxGroup legend={t("filters.lang")} values={AD_LANGUAGES} label={(value) => t(LANG_LABELS[value])}
@@ -454,7 +462,7 @@ export function FilterPanel() {
           selected={search.scoring_state} keepOne onChange={(scoring_state) => { write({ scoring_state }); }} />
         <div className={styles.buttons}>
           <button type="button" className={styles.button}
-            onClick={() => { write((current) => ({ ...DEFAULT_SEARCH, ...(current.label === 1 ? { label: 1 } : {}) })); }}>
+            onClick={() => { write(resetSearch); }}>
             {t("filters.reset")}
           </button>
           {/* Label mode is the `label=1` param alone until Task 26 builds the mode itself. */}

@@ -77,6 +77,10 @@
   font-size: var(--font-size-2);
 }
 
+.failed {
+  color: var(--color-critical);
+}
+
 .list:empty {
   display: none;
 }
