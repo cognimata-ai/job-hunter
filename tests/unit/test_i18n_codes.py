@@ -25,7 +25,7 @@ from types import UnionType
 from typing import Any, Final, Literal, TypeAliasType, Union, get_args, get_origin, get_type_hints
 
 import pytest
-from jobhunter.api.routes import profile_review
+from jobhunter.api.routes import profile_review, spend
 from jobhunter.api.routes import settings as settings_routes
 from jobhunter.db import ranking
 from jobhunter.db.seed import SOURCES
@@ -60,6 +60,10 @@ from jobhunter.scoring.routing import DerivedOutcome
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.steps import FACT_REJECTED, FACT_UNCERTAIN, FACT_UNREVIEWED
 from jobhunter.scoring.triggers import Trigger
+from jobhunter.settings import model as settings_model
+from jobhunter.settings.effects import EffectClass
+from jobhunter.settings.llm_projection import CHatSource
+from jobhunter.settings.validate import GateState
 from jobhunter.sources import breaker
 from jobhunter.sources.parsing.dates import Precision
 from jobhunter.sources.parsing.salary import Period
@@ -417,6 +421,15 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "skill_level": lambda: literal_values(profile_schema.Skill.model_fields["level"].annotation),
     "cefr": lambda: literal_values(profile_schema.Language.model_fields["cefr"].annotation),
     "language_code": lambda: literal_values(profile_schema.Language.model_fields["code"].annotation),
+    # the settings form (plan M4 Task 28, resolution h): the dry-run's effect chips, the source of `ĉ` (the
+    # dry-run's and the spend read's), the severity of a knockout or a working language, and the eval gate a
+    # gated change would check
+    "effect_class": lambda: literal_values(EffectClass),
+    "c_hat_source": lambda: (
+        literal_values(CHatSource) | literal_values(spend.SpendOut.model_fields["c_hat_source"].annotation)
+    ),
+    "severity": lambda: literal_values(settings_model.Severity),
+    "eval_gate": lambda: literal_values(GateState),
 }
 
 # The profile form's closed sets that an existing namespace covers (plan M4 Task 27, resolution g): each
@@ -427,6 +440,20 @@ PROFILE_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
     "work_authorization": lambda: literal_values(
         profile_schema.UserEntered.model_fields["work_authorization_de"].annotation
     ),
+}
+
+
+# The settings form's closed sets that an existing namespace covers (plan M4 Task 28): each literal of the
+# settings model is a subset of the namespace it is shown through. The knockout severities are keyed by the
+# knockout codes; the work modes are the Jobs list filter's own labels (`filters.work_mode.*`), held to the
+# model by the frontend's types.
+SETTINGS_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
+    "employment": lambda: literal_values(settings_model.EmploymentType),
+    "seniority": lambda: literal_values(settings_model.SeniorityLevel),
+    "language_code": lambda: (
+        literal_values(settings_model.LanguageCode) | literal_values(settings_model.AdLanguage)
+    ),
+    "knockout": lambda: set(settings_model.KnockoutSeverity.model_fields),
 }
 
 
@@ -476,6 +503,14 @@ def test_the_profile_form_s_reused_namespaces_cover_their_literals(
     catalogue: dict[str, Any], namespace: str
 ) -> None:
     missing = sorted(PROFILE_FORM_REUSED[namespace]() - set(catalogue[namespace]))
+    assert not missing, f"codes.json[{namespace}] lacks {missing}"
+
+
+@pytest.mark.parametrize("namespace", sorted(SETTINGS_FORM_REUSED))
+def test_the_settings_form_s_reused_namespaces_cover_their_literals(
+    catalogue: dict[str, Any], namespace: str
+) -> None:
+    missing = sorted(SETTINGS_FORM_REUSED[namespace]() - set(catalogue[namespace]))
     assert not missing, f"codes.json[{namespace}] lacks {missing}"
 
 

@@ -1,7 +1,7 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
-// can end, the session, settings, header-status, Jobs-list, facets, places, profile and spend reads, the
-// logout, the login's answers in the order a test gives them, and any other route a test answers itself
-// (`routes`). A route is matched by its path alone; the query string is the request's `search`.
+// can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend and quota reads, the
+// settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
+// answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -14,6 +14,11 @@ type FacetsOut = components["schemas"]["FacetsOut"];
 type PlaceOut = components["schemas"]["PlaceOut"];
 type ProfileListOut = components["schemas"]["ProfileListOut"];
 type CountsOut = components["schemas"]["CountsOut"];
+type Settings = components["schemas"]["Settings"];
+type SettingsOut = components["schemas"]["SettingsOut"];
+type DryRunOut = components["schemas"]["DryRunOut"];
+type ProjectionsOut = components["schemas"]["ProjectionsOut"];
+type QuotaDetailOut = components["schemas"]["QuotaDetailOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -22,16 +27,165 @@ export const SESSION: SessionOut = {
   absolute_expires_at: "2026-11-04T12:00:00Z",
 };
 
-export function settingsRead(uiLanguage: "en" | "de" = "en", timezone = "Europe/Berlin") {
+/** The default settings document (`Settings()`, the seed `settings_v1.json`): no location, remote work within
+ * Germany, every work mode and employment type, a 6-hour schedule from 06:00, model policy B (the CV section's
+ * "Extracting profile (<model>)" step shows its `extract_profile` model) and a $100.00 LLM cap. */
+export function defaultSettings(): Settings {
+  type NodeChoice = Settings["scoring"]["model_policy"]["nodes"]["generate"];
+  const node = (model: NodeChoice["model"]): NodeChoice => ({ model, effort: "medium" });
+  const stage = (max_tokens: number, max_tokens_retry: number, deadline_s: number) => ({ max_tokens, max_tokens_retry, deadline_s });
+  return {
+    schedule: { enabled: true, interval_hours: 6, anchor_local: "06:00", include_paid: true },
+    display: { timezone: "Europe/Berlin", ui_language: "en" },
+    scope: {
+      locations: [],
+      remote_within_germany: true,
+      work_modes: ["remote", "hybrid", "onsite"],
+      employment_types: ["full_time", "part_time", "contract", "temporary", "internship", "working_student", "apprenticeship", "freelance"],
+      seniority_range: { mode: "profile_relative", below: 1, above: 1, min: null, max: null },
+      industries_include: [],
+      industries_exclude: [],
+      accepted_ad_languages: ["de", "en"],
+      language_policy_default: "hard",
+      language_policy: {},
+      excluded_companies: [],
+      excluded_keywords: [],
+      exclude_keywords_in_description: false,
+      min_salary_eur_year: null,
+      knockout_severity: {
+        degree: "soft",
+        certification: "soft",
+        security_clearance: "hard",
+        work_permit: "hard",
+        onsite_required: "hard",
+        contract_type: "hard",
+      },
+      max_ad_age_days: 30,
+    },
+    evaluation: {
+      relevance_threshold: 60,
+      t2_band: 5,
+      t2_straddle_max_coverage: "0.7",
+      t3_min_mid: 80,
+      t8_sample_pct: 5,
+      critic_light_triggers: ["T2", "T8"],
+    },
+    sources: { enabled: { jsearch: true, serpapi: true, adzuna: true, arbeitnow: true, ats: true } },
+    queries: [],
+    watchlist: [],
+    collection: { stale_ttl_days: null },
+    quota: {
+      jsearch_monthly_limit: 200,
+      serpapi_monthly_limit: 250,
+      reserve_pct: 10,
+      serpapi_hourly_cap: 45,
+      adzuna_cap_minute: 20,
+      adzuna_cap_day: 225,
+      adzuna_cap_week: 900,
+      adzuna_cap_month: 2250,
+      paid_max_requests_per_run: "auto",
+    },
+    scoring: {
+      model_policy: {
+        preset: "B",
+        nodes: {
+          generate: node("claude-sonnet-5-5"),
+          revise: node("claude-sonnet-5-5"),
+          critic: node("claude-opus-5-5"),
+          extract_profile: node("claude-opus-5-5"),
+          propose_queries: node("claude-opus-5-5"),
+        },
+        critic_light_effort: "low",
+      },
+      execution: {
+        generate: stage(6000, 12000, 600),
+        revise: stage(6000, 12000, 600),
+        critic: stage(6000, 12000, 600),
+        extract_profile: stage(16000, 32000, 900),
+        propose_queries: stage(8000, 16000, 300),
+      },
+      max_targets_per_cycle: 60,
+      min_cycle_targets: 10,
+      batch_bulk_rescore: true,
+      batch_min_targets: 200,
+      batch_max_items: 500,
+      bulk_rescore_max_budget_share: "0.4",
+    },
+    llm: { cap_usd: "100.00", nonscoring_reserve_pct: 5, overrun_buffer_usd: "2.00", min_bucket_capacity_usd: "1.00" },
+    retention: { score_history_months: 12 },
+    notifications: { push_min_severity: "warn" },
+  };
+}
+
+/** `GET /api/settings`: version 12 (id 41) of the default document in `uiLanguage` and `timezone`, its scope
+ * applied. */
+export function settingsRead(uiLanguage: "en" | "de" = "en", timezone = "Europe/Berlin"): SettingsOut {
+  const payload = defaultSettings();
   return {
     version: { id: 41, version_no: 12, created_at: "2026-11-02T10:00:00Z", effect_classes: [] },
-    payload: {
-      display: { ui_language: uiLanguage, timezone },
-      // the one model the CV section shows (its "Extracting profile (<model>)" step)
-      scoring: { model_policy: { nodes: { extract_profile: { model: "claude-opus-5-5", effort: "medium" } } } },
-    },
+    payload: { ...payload, display: { ui_language: uiLanguage, timezone } },
     pending_scope: null,
     scope_applied: true,
+  };
+}
+
+/** The dry-run's projections of the default document: 12 paid cells, a JSearch window at 112 of 200 units, and
+ * the month's LLM figures at $38.20 of $100.00 counted. */
+export function projectionsOut(overrides: Partial<ProjectionsOut> = {}): ProjectionsOut {
+  return {
+    jsearch: {
+      units_per_run: 6,
+      refresh_cadence_days: 3.5,
+      cells: 12,
+      window: { used_units: 112, limit_units: 200, reset_at: "2026-11-16T09:00:00Z" },
+    },
+    adzuna: { calls_per_day: 48, allowance_per_day: 128.571, cadence_days: 0.25, cells: 12 },
+    arbeitnow: { page_cap: 3, expected_pages: 2.5 },
+    serpapi_fallback: {
+      units_per_run: 0,
+      hourly_cap: 45,
+      state: "validated",
+      window: { used_units: 3, limit_units: 250, reset_at: "2026-11-23T00:00:00Z" },
+    },
+    llm: {
+      bucket_rate_per_h: "0.129306",
+      bucket_capacity: "1.551667",
+      c_hat: "0.052646",
+      projected_critic_rate: "0.450",
+      targets_per_month: 1700,
+      arrival_per_month: 3000,
+      projected_month_spend: "92.400000",
+      month: "2026-11-01",
+      cap_usd: "100.00",
+      counted_usd: "38.200000",
+      headroom_usd: "56.800000",
+    },
+    ...overrides,
+  };
+}
+
+/** A dry-run answer: no error and no warning, the default projections, and no effect. */
+export function dryRunOut(overrides: Partial<DryRunOut> = {}): DryRunOut {
+  return { errors: [], warnings: [], projections: projectionsOut(), effects: ["none"], ...overrides };
+}
+
+/** `GET /api/system/quota`: each provider's current window with its ledger. */
+export function quotaOut(): Record<string, QuotaDetailOut | null> {
+  const window = (used: number, limit: number, start: string, end: string): QuotaDetailOut => ({
+    used,
+    limit_units: limit,
+    reserved: 2,
+    ambiguous: 1,
+    adjustments: 0,
+    tokens: limit - used,
+    state: "validated",
+    window_start: start,
+    window_end: end,
+  });
+  return {
+    jsearch: window(112, 200, "2026-10-16T09:00:00Z", "2026-11-16T09:00:00Z"),
+    serpapi: null,
+    adzuna: window(41, 2250, "2026-11-01T00:00:00Z", "2026-12-01T00:00:00Z"),
   };
 }
 
@@ -525,6 +679,10 @@ export interface FakeApi {
   jobs: JobsPageOut;
   /** What `GET /api/system/spend` answers. */
   spend: SpendOut;
+  /** What `GET /api/system/quota` answers. */
+  quota: Record<string, QuotaDetailOut | null>;
+  /** What `POST /api/settings/dry-run` answers (no error, no warning, by default). */
+  dryRun: DryRunOut;
   /** What `GET /api/jobs/facets` answers (none by default). */
   facets: FacetsOut;
   /** What `GET /api/geo/places` answers (none by default). */
@@ -553,6 +711,8 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     status: statusOut(),
     jobs: jobsPage(),
     spend: spendOut(),
+    quota: quotaOut(),
+    dryRun: dryRunOut(),
     facets: { companies: [], sources: [] },
     places: [],
     profileActive: true,
@@ -601,6 +761,12 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/system/spend") {
       return Promise.resolve(json(api.spend));
+    }
+    if (method === "GET" && path === "/api/system/quota") {
+      return Promise.resolve(json(api.quota));
+    }
+    if (method === "POST" && path === "/api/settings/dry-run") {
+      return Promise.resolve(json(api.dryRun));
     }
     if (method === "GET" && path === "/api/jobs/facets") {
       return Promise.resolve(json(api.facets));

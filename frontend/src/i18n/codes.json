@@ -513,6 +513,30 @@
     "pl",
     "pt"
   ],
+  "effect_class": [
+    "admission",
+    "budget",
+    "collection",
+    "evaluation_policy",
+    "execution",
+    "llm_tuple",
+    "none",
+    "schedule",
+    "scope"
+  ],
+  "c_hat_source": [
+    "central",
+    "history"
+  ],
+  "severity": [
+    "hard",
+    "soft"
+  ],
+  "eval_gate": [
+    "failed",
+    "passed",
+    "uncalibrated"
+  ],
   "order": {
     "seniority": [
       "intern",

@@ -5,7 +5,9 @@
 // population in the UI language's numbers.
 //
 // While the places are read the list says "Searching…", and a failed read says so. The field shows the
-// picked place's name; text typed and left without a pick goes back to it. The clear button picks no place. `onChange` gets the place's id, name and coordinates, or `null`.
+// picked place's name; text typed and left without a pick goes back to it. The clear button picks no place.
+// `onChange` gets the place's id, name and coordinates, or `null`, and with a pick the whole place as the
+// gazetteer answered it (its postal codes and population, which the scope's location rows show, Task 28).
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -39,7 +41,7 @@ export interface PlacePickerProps {
   /** The field's label. */
   label: string;
   value: PickedPlace | null;
-  onChange: (place: PickedPlace | null) => void;
+  onChange: (place: PickedPlace | null, found?: PlaceOut) => void;
 }
 
 export function PlacePicker({ label, value, onChange }: PlacePickerProps) {
@@ -80,7 +82,7 @@ export function PlacePicker({ label, value, onChange }: PlacePickerProps) {
       optionText={optionText}
       onPick={(place) => {
         setText(place.label);
-        onChange({ gazetteer_id: place.gazetteer_id, label: place.label, lat: place.lat, lon: place.lon });
+        onChange({ gazetteer_id: place.gazetteer_id, label: place.label, lat: place.lat, lon: place.lon }, place);
       }}
       emptyText={t("filters.place_none")}
       loading={places.isFetching || q !== typed}

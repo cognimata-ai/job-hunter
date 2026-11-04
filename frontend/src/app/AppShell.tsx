@@ -20,6 +20,11 @@ export type SettingsOut = components["schemas"]["SettingsOut"];
 
 export const SETTINGS_KEY = ["settings"] as const;
 
+/** The one read of the settings (`GET /api/settings`), under `SETTINGS_KEY`; a poll passes `background`. */
+export function readSettings({ signal, background }: { signal?: AbortSignal; background?: boolean } = {}): Promise<SettingsOut> {
+  return apiFetch<SettingsOut>("/api/settings", { signal, background });
+}
+
 export function AppShell() {
   // by route match, as the router matches the path (without regard to case): `/LOGIN` is the login too
   const login = useMatch({ from: "/login", shouldThrow: false });
@@ -38,7 +43,7 @@ function Shell() {
   const main = useRef<HTMLElement>(null);
   const settings = useQuery({
     queryKey: SETTINGS_KEY,
-    queryFn: ({ signal }) => apiFetch<SettingsOut>("/api/settings", { signal }),
+    queryFn: ({ signal }) => readSettings({ signal }),
   });
   const display = settings.data?.payload.display;
   const language = display?.ui_language;
