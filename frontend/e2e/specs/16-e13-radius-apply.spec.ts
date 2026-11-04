@@ -13,8 +13,8 @@
 // 4. From the 201 until the scope is applied, the list is read through the API again and again with no pause:
 //    every listed job of `S` keeps a score with its interval. The samples taken while the scope was pending are
 //    counted (annotated, not required: requiring one would bring the race back).
-// 5. The apply did what the dry-run said (`psql`, read only): `succeeded`, every job done, and `n` published
-//    results recomputed.
+// 5. The apply did what the dry-run said (`psql`, read only): `succeeded`, every job done, and every published
+//    result recomputed, at least the `n` the dry-run named (Ruling T34-c).
 // 6. After a reload (the status read again): no apply banner, and every card of `S` listed shows its interval.
 // At the end the radius goes back to 30 km through the API, and that apply is awaited (`withRestore`).
 import type { Page, Request, Response } from "@playwright/test";
@@ -69,17 +69,26 @@ function hasInterval(score: JobsPageOut["items"][number]["score"]): boolean {
 }
 
 /** The answer to the first status read the page sends after `trigger`'s answer (the save's): a request event
- * comes after the response event that made the page send it, so a poll sent before is never taken. */
-function statusReadAfter(page: Page, trigger: (response: Response) => boolean): Promise<Response> {
+ * comes after the response event that made the page send it, so a poll sent before is never taken. None within
+ * `timeoutMs` of the call rejects, naming the missing read. */
+function statusReadAfter(page: Page, trigger: (response: Response) => boolean, timeoutMs: number): Promise<Response> {
   return new Promise((resolve, reject) => {
     let after = false;
     const onResponse = (response: Response) => {
       after ||= trigger(response);
     };
+    const stop = () => {
+      clearTimeout(timer);
+      page.off("response", onResponse);
+      page.off("request", onRequest);
+    };
+    const timer = setTimeout(() => {
+      stop();
+      reject(new Error(`no status read (GET ${STATUS_PATH}) after the save within ${String(timeoutMs / 1000)} s`));
+    }, timeoutMs);
     const onRequest = (request: Request) => {
       if (after && request.method() === "GET" && new URL(request.url()).pathname === STATUS_PATH) {
-        page.off("response", onResponse);
-        page.off("request", onRequest);
+        stop();
         request.response().then(
           (response) => {
             if (response === null) {
@@ -173,7 +182,8 @@ test("E13: a radius change recomputes the scores without the LLM, and the interv
 
       const isSave = (response: Response) =>
         response.request().method() === "POST" && new URL(response.url()).pathname === "/api/settings";
-      const statusRead = statusReadAfter(page, isSave);
+      const statusRead = statusReadAfter(page, isSave, APPLIED_WITHIN_MS);
+      statusRead.catch(() => undefined); // its failure is step 3's, where it is awaited
       const answered = answerTo(page, "POST", "/api/settings");
       await save.click();
       const response = await answered;
@@ -225,18 +235,17 @@ test("E13: a radius change recomputes the scores without the LLM, and the interv
       console.log(`E13: the status read after the save: ${branch}`);
       await expectNoSeriousA11yViolations(page);
 
-      // 5. What the apply did, read only: succeeded, every job done, the n results the dry-run named.
+      // 5. What the apply did, read only: succeeded, every job done, every published result recomputed, and at
+      // least the n the dry-run named (Ruling T34-c: the apply counts the published set later, and a publish in
+      // between can only add to it; E13 changes no tuple).
       const done = await psql(
         "SELECT status || '|' || (progress->>'done') || '|' || (progress->>'total') || '|' || " +
           `(progress->>'det_done') || '|' || (progress->>'det_total') FROM operations WHERE id = ${String(operation)}`,
       );
       const [state, jobsDone, jobsTotal, resultsDone, resultsTotal] = done.split("|");
-      expect([state, jobsDone, resultsDone, resultsTotal], `operation ${String(operation)}: ${done}`).toEqual([
-        "succeeded",
-        jobsTotal,
-        String(n),
-        String(n),
-      ]);
+      const said = `operation ${String(operation)}: ${state} jobs ${jobsDone}/${jobsTotal}, det_done ${resultsDone}, det_total ${resultsTotal}, the dry-run's n ${String(n)}`;
+      expect([state, jobsDone, resultsDone], said).toEqual(["succeeded", jobsTotal, resultsTotal]);
+      expect(Number(resultsTotal), said).toBeGreaterThanOrEqual(n);
 
       // 6. After the flip: the status read again, no apply banner, and the intervals shown.
       const reread = answerTo(page, "GET", STATUS_PATH);
