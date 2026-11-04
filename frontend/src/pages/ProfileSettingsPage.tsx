@@ -1,8 +1,9 @@
-// Profile & Settings (spec §15.7): a sticky navigation over the nine sections, each its own anchor. The later
-// tasks fill each section's body.
+// Profile & Settings (spec §15.7): a sticky navigation over the nine sections, each its own anchor. Each task
+// fills its section's body: the CV & profile section is Task 27's (`settings/cv/CvSection`).
 import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import pages from "../app/Pages.module.css";
+import { CvSection } from "../settings/cv/CvSection";
 import styles from "./ProfileSettingsPage.module.css";
 
 export const SETTINGS_SECTIONS = [
@@ -40,6 +41,7 @@ export function ProfileSettingsPage() {
           {SETTINGS_SECTIONS.map((id) => (
             <section key={id} id={id} aria-labelledby={`${id}-heading`} className={styles.section}>
               <h2 id={`${id}-heading`} className={styles.sectionTitle}>{t(`settings.section.${id}`)}</h2>
+              {id === "cv" && <CvSection />}
             </section>
           ))}
         </div>

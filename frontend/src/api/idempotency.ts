@@ -45,10 +45,13 @@ export function actionId(vars: unknown): string {
  *
  * Each action has a key of its own (`crypto.randomUUID()`), held by its identity (`actionId`): the variables
  * compared as JSON, where a Blob or a File counts as its object, so the same file object with the same
- * fields is the same action and a different file is another (the CV upload relies on this), and a FormData
- * counts as its entries in order. A key is kept after a network failure or a 5xx, so that a manual retry of
- * that action, even after other actions in between, sends it again and the server replays instead of acting
- * twice; any other answer, a success or a 4xx, drops it, and the next time that action gets a new one.
+ * fields is the same action and a different file is another, and a FormData counts as its entries in order.
+ * A File appended to a FormData with a file name (`append(name, file, filename)`) is replaced by a new File, so a
+ * keyed FormData action made that way keeps its key only when the same FormData object is sent again (no M4
+ * caller: the CV upload is not keyed, plan M4 Task 27, Ruling T27-c). A key is kept after a network failure or
+ * a 5xx, so that a manual retry of that action, even after other actions in between, sends it again and the
+ * server replays instead of acting twice; any other answer, a success or a 4xx, drops it, and the next time that
+ * action gets a new one.
  * The mutation never retries by itself, and any failure is a `ProblemError` (`toProblem`).
  */
 export function useKeyedMutation<V, D>(

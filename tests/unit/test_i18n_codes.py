@@ -31,6 +31,7 @@ from jobhunter.db import ranking
 from jobhunter.db.seed import SOURCES
 from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
+from jobhunter.graphs.profile.nodes import llm_outcome
 from jobhunter.jobs.cards import Badge, ScoreOut
 from jobhunter.jobs.detail import DET_CRITERIA, DetailScoreOut
 from jobhunter.jobs.query import EMPLOYMENT_VALUES, SENIORITY_VALUES
@@ -43,6 +44,8 @@ from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
+from jobhunter.profile import review
+from jobhunter.profile.contacts import Category
 from jobhunter.profile.errors import RejectReason
 from jobhunter.profile.review import Repair
 from jobhunter.quota import windows
@@ -60,7 +63,7 @@ from jobhunter.scoring.triggers import Trigger
 from jobhunter.sources import breaker
 from jobhunter.sources.parsing.dates import Precision
 from jobhunter.sources.parsing.salary import Period
-from jobhunter.worker import runs
+from jobhunter.worker import operations, runs
 
 REPO: Final = Path(__file__).resolve().parents[2]
 SRC: Final = REPO / "backend/src"
@@ -299,6 +302,32 @@ def table_check_values(path: Path, table: str, column: str) -> set[str]:
     return _check_in(tables[0], column, f"{path.name} {table}", not_null=True)
 
 
+def operation_runner_codes() -> set[str]:
+    """The literal `error_code=` of every call in `worker/operations.py`: the codes the operation runner
+    itself ends or requeues an operation with (`no_handler`, `bug`, `already_executing`)."""
+    path = Path(str(operations.__file__))
+    codes: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), str(path))):
+        if isinstance(node, ast.Call) and isinstance(expr := keyword(node, "error_code"), ast.Constant):
+            assert isinstance(expr.value, str), f"{path}:{node.lineno}: error_code={expr.value!r}"
+            codes.add(expr.value)
+    return codes
+
+
+def draft_failure_codes() -> set[str]:
+    """Every literal code a failed draft's `failure_code` can hold (plan M4 Task 27, Ruling T27-b): the
+    document and model-outcome codes of `profile.review` and `low_text`; the extract node's other failures
+    (`llm_outcome`'s mapping of the gateway's errors) and its requeue code, which the failure hook writes
+    after the last attempt; and the hooks' own `attempts_exhausted` with the runner's codes.
+    `llm_request_<status>` is computed, so the UI shows it with its generic text."""
+    document = {*review.DOCUMENT_CODES, *review.MODEL_OUTCOME_CODES, review.LOW_TEXT}
+    model = {code for _, code in llm_outcome._FAILURES} | {
+        *llm_outcome.TERMINAL_CODES,
+        llm_outcome.LLM_TRANSIENT,
+    }
+    return document | model | {operations.ATTEMPTS_EXHAUSTED} | operation_runner_codes()
+
+
 def basis_values() -> set[str]:
     """The basis of a criterion: an LLM criterion's (the generator's) and a deterministic one's."""
     llm = literal_values(generator.Criterion.model_fields["basis"].annotation)
@@ -378,6 +407,26 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     # representative's `election_reason` has no closed set to derive from (a free `text` column whose writers
     # pass the constants of `dedup.groups`), so the UI shows it verbatim
     "completeness": lambda: table_check_values(COLLECTION_MIGRATION, "jobs", "completeness"),
+    # the CV and profile section (plan M4 Task 27): why a draft failed, the strip report's contact categories,
+    # and the closed sets of the profile form a namespace above does not cover (`seniority` covers the
+    # profile's, but not a role's `unspecified`; `degree_level` an education's level)
+    "draft_failure": draft_failure_codes,
+    "contact_category": lambda: literal_values(Category),
+    "role_seniority": lambda: literal_values(profile_schema.Role.model_fields["seniority"].annotation),
+    "skill_category": lambda: literal_values(profile_schema.Skill.model_fields["category"].annotation),
+    "skill_level": lambda: literal_values(profile_schema.Skill.model_fields["level"].annotation),
+    "cefr": lambda: literal_values(profile_schema.Language.model_fields["cefr"].annotation),
+    "language_code": lambda: literal_values(profile_schema.Language.model_fields["code"].annotation),
+}
+
+# The profile form's closed sets that an existing namespace covers (plan M4 Task 27, resolution g): each
+# literal is a subset of the namespace it is shown through.
+PROFILE_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
+    "seniority": lambda: literal_values(profile_schema.ProfileOut.model_fields["seniority"].annotation),
+    "degree_level": lambda: literal_values(profile_schema.Education.model_fields["level"].annotation),
+    "work_authorization": lambda: literal_values(
+        profile_schema.UserEntered.model_fields["work_authorization_de"].annotation
+    ),
 }
 
 
@@ -420,6 +469,24 @@ def test_each_namespace_equals_its_backend_source(catalogue: dict[str, Any], nam
     listed = set(catalogue.get(namespace, []))
     missing, extra = sorted(expected - listed), sorted(listed - expected)
     assert not missing and not extra, f"codes.json[{namespace}]: missing {missing}, extra {extra}"
+
+
+@pytest.mark.parametrize("namespace", sorted(PROFILE_FORM_REUSED))
+def test_the_profile_form_s_reused_namespaces_cover_their_literals(
+    catalogue: dict[str, Any], namespace: str
+) -> None:
+    missing = sorted(PROFILE_FORM_REUSED[namespace]() - set(catalogue[namespace]))
+    assert not missing, f"codes.json[{namespace}] lacks {missing}"
+
+
+def test_a_role_s_seniority_is_the_profile_s_and_unspecified(catalogue: dict[str, Any]) -> None:
+    """Why `role_seniority` is a namespace of its own: `seniority` lacks `unspecified`."""
+    assert set(catalogue["role_seniority"]) == set(catalogue["seniority"]) | {"unspecified"}
+
+
+def test_the_runner_s_codes_are_found() -> None:
+    """The walk finds the runner's three literal codes: a change in how they are passed cannot drop them."""
+    assert operation_runner_codes() == {"no_handler", "bug", "already_executing"}
 
 
 def test_the_alert_walk_sees_the_gateway_s_classified_alerts() -> None:

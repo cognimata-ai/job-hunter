@@ -3,6 +3,7 @@
 // polite status. Each is keyed by its code, so a poll updates a banner in place and its live region
 // announces the change (`applying_settings`' n/N).
 import { Link } from "@tanstack/react-router";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { ProblemBox } from "../components/ProblemBox";
 import { useAnnounce } from "../components/LiveRegion";
@@ -12,7 +13,10 @@ import { type BannerOut, type JsonValue, useRetryApply } from "./api";
 import styles from "./Banners.module.css";
 import { type Format, useFormat } from "./format";
 
-type T = ReturnType<typeof useTranslation>["t"];
+// The `t` of `useTranslation()` (the default namespace, no key prefix). Not `ReturnType<typeof useTranslation>`,
+// which instantiates the hook's key prefix with every prefix of the catalogue: too deep for the compiler once the
+// catalogue grows (TS2589, plan M4 Task 27).
+type T = TFunction;
 type ServerText = ReturnType<typeof useServerText>;
 
 // The pauses whose cause the System section's Needs attention list holds (Task 31).

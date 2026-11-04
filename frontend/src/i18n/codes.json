@@ -432,6 +432,87 @@
     "ok",
     "poor"
   ],
+  "draft_failure": [
+    "already_executing",
+    "attempts_exhausted",
+    "budget_exhausted",
+    "bug",
+    "cv_file_unreadable",
+    "encrypted",
+    "input_unbounded",
+    "invalid_output",
+    "llm_not_configured",
+    "llm_transient",
+    "low_text",
+    "max_tokens",
+    "model_mismatch",
+    "native_pdf_disabled",
+    "no_handler",
+    "parse_error",
+    "parse_limit",
+    "refused",
+    "timeout",
+    "too_many_pages",
+    "unexpected_stop_reason",
+    "unsupported"
+  ],
+  "contact_category": [
+    "address",
+    "email",
+    "name",
+    "personal",
+    "phone",
+    "url"
+  ],
+  "role_seniority": [
+    "apprentice",
+    "head",
+    "intern",
+    "junior",
+    "lead",
+    "mid",
+    "principal",
+    "senior",
+    "unspecified",
+    "working_student"
+  ],
+  "skill_category": [
+    "domain_knowledge",
+    "framework",
+    "method",
+    "other",
+    "platform",
+    "programming_language",
+    "soft_skill",
+    "tool"
+  ],
+  "skill_level": [
+    "advanced",
+    "basic",
+    "expert",
+    "intermediate"
+  ],
+  "cefr": [
+    "A1",
+    "A2",
+    "B1",
+    "B2",
+    "C1",
+    "C2",
+    "native",
+    "unspecified"
+  ],
+  "language_code": [
+    "de",
+    "en",
+    "es",
+    "fr",
+    "it",
+    "nl",
+    "other",
+    "pl",
+    "pt"
+  ],
   "order": {
     "seniority": [
       "intern",

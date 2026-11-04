@@ -5,6 +5,7 @@
 // every inner key is shown verbatim (ids, source keys and counter names), and every value is text (no markup
 // from a value is ever rendered). A top-level key outside the five is not shown.
 import { useId } from "react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { cx } from "../components/cx";
 import { useServerText } from "../i18n/index";
@@ -21,7 +22,10 @@ export interface RunReportProps {
   partialCauses: PartialCause[];
 }
 
-type T = ReturnType<typeof useTranslation>["t"];
+// The `t` of `useTranslation()` (the default namespace, no key prefix). Not `ReturnType<typeof useTranslation>`,
+// which instantiates the hook's key prefix with every prefix of the catalogue: too deep for the compiler once the
+// catalogue grows (TS2589, plan M4 Task 27).
+type T = TFunction;
 
 function isRecord(value: unknown): value is Record<string, JsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

@@ -453,6 +453,24 @@ def _rebuild_edited(
     return review.rebuild(store.decrypt_text(sealed, keys, cv_file_id=cv_file_id), edits)
 
 
+def review_segments(rebuilt: StripResult) -> list[SegmentOut]:
+    """The review map of a rebuilt text as `GET /drafts/{id}` answers it: its segments, offsets and
+    categories only (the SPA's text-review fixtures are checked against it, M4 Task 27)."""
+    return [
+        SegmentOut(
+            kind=s.kind,
+            category=s.category,
+            replacement_index=s.replacement_index,
+            restorable=s.restorable,
+            stripped_start=s.stripped_start,
+            stripped_end=s.stripped_end,
+            raw_start=s.raw_start,
+            raw_end=s.raw_end,
+        )
+        for s in rebuilt.segments
+    ]
+
+
 async def _review_map(
     row: Row[Any], edits: Edits, store: CvStore, keys: Sequence[bytes], draft_id: int
 ) -> list[SegmentOut]:
@@ -470,19 +488,7 @@ async def _review_map(
     if rebuilt.stripped_text != row.stripped_text:
         log.warning("profile_review_map_stale", draft_id=draft_id)
         return []
-    return [
-        SegmentOut(
-            kind=s.kind,
-            category=s.category,
-            replacement_index=s.replacement_index,
-            restorable=s.restorable,
-            stripped_start=s.stripped_start,
-            stripped_end=s.stripped_end,
-            raw_start=s.raw_start,
-            raw_end=s.raw_end,
-        )
-        for s in rebuilt.segments
-    ]
+    return review_segments(rebuilt)
 
 
 def _profile_or_none(stored: Any) -> ConfirmedProfile | None:

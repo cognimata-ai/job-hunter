@@ -25,7 +25,11 @@ export const SESSION: SessionOut = {
 export function settingsRead(uiLanguage: "en" | "de" = "en", timezone = "Europe/Berlin") {
   return {
     version: { id: 41, version_no: 12, created_at: "2026-11-02T10:00:00Z", effect_classes: [] },
-    payload: { display: { ui_language: uiLanguage, timezone } },
+    payload: {
+      display: { ui_language: uiLanguage, timezone },
+      // the one model the CV section shows (its "Extracting profile (<model>)" step)
+      scoring: { model_policy: { nodes: { extract_profile: { model: "claude-opus-5-5", effort: "medium" } } } },
+    },
     pending_scope: null,
     scope_applied: true,
   };
@@ -487,13 +491,15 @@ export function problem(status: number, code: string, extra: Record<string, unkn
   );
 }
 
-/** A request the stub received: its method, path (without the query string), query, headers and string body. */
+/** A request the stub received: its method, path (without the query string), query, headers and string body, or
+ * its form for a multipart body. */
 export interface FakeRequest {
   method: string;
   path: string;
   search: URLSearchParams;
   headers: Headers;
   body: string | null;
+  form: FormData | null;
 }
 
 /** A route a test answers itself, by `METHOD path`; it is asked before the stub's own routes. A promise holds
@@ -562,6 +568,7 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
       search: url.searchParams,
       headers: new Headers(init?.headers),
       body: typeof init?.body === "string" ? init.body : null,
+      form: init?.body instanceof FormData ? init.body : null,
     };
     api.calls.push(`${method} ${path}`);
     api.requests.push(request);
