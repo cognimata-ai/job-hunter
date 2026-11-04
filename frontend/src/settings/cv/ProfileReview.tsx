@@ -19,7 +19,7 @@ import type { components } from "../../api/schema";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { cx } from "../../components/cx";
 import { ProblemBox } from "../../components/ProblemBox";
-import { useServerText } from "../../i18n/index";
+import { useServerMessage, useServerText } from "../../i18n/index";
 import { useFormat } from "../../system/format";
 import {
   type ConfirmedProfile,
@@ -140,18 +140,21 @@ function proposalText(value: JsonValue): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-/** One issue: its `issue` text and the server's message, and a proposal with [Apply]. */
+/** One issue: its `issue` text and the server's message where §15.9 shows it (`useServerMessage`: in English,
+ * or for a code the catalogue lacks, whose message is then the whole text), and a proposal with [Apply]. */
 function IssueItem({ problem, showPath = false }: { problem: Problem; showPath?: boolean }) {
   const { t } = useTranslation();
   const serverText = useServerText();
+  const serverMessage = useServerMessage();
   const { apply } = useIssues();
   const title = serverText("issue", problem.code, "");
+  const message = serverMessage("issue", problem.code, problem.message);
   const proposal = problem.proposal;
   return (
     <li className={styles.issue}>
       <span aria-hidden="true">⚠ </span>
       {showPath && problem.path !== "" && <><code className={styles.path}>{problem.path}</code>{" "}</>}
-      {title === "" ? problem.message : `${title}: ${problem.message}`}
+      {title === "" ? problem.message : message === null ? title : `${title}: ${message}`}
       {proposal !== undefined && proposal !== null && (
         <span className={styles.proposal}>
           {" "}{t("cv.profile.suggested", { value: proposalText(proposal) })}{" "}
@@ -490,12 +493,25 @@ function ProfileForm({ draftId, draft, profile }: { draftId: number; draft: Draf
   const [savedIssues, setSavedIssues] = useState<ValidationIssueOut[] | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
   const [confirming, setConfirming] = useState(false);
+  // Confirm's save answered (set after its `base`), and whether the form changed while that save was pending
+  const [savedToConfirm, setSavedToConfirm] = useState(false);
+  const [changedWhileSaving, setChangedWhileSaving] = useState(false);
   const [openRoles, setOpenRoles] = useState<Record<number, boolean>>({});
   const dirty = JSON.stringify(state.form) !== state.base;
   if (state.seen !== server) {
     // the server's copy changed (after a save, repaired): the form takes it unless it has unsaved edits
     setState(dirty ? { ...state, seen: server } : { seen: server, base: JSON.stringify(formOf(profile)), form: formOf(profile) });
     setSavedIssues(null);
+  }
+  if (savedToConfirm) {
+    // The confirmation activates the saved draft, so it opens only when the form is what that save stored: an
+    // edit made while the save was pending is kept, unsaved, and the user is asked to confirm (save) again.
+    setSavedToConfirm(false);
+    if (dirty) {
+      setChangedWhileSaving(true);
+    } else {
+      setConfirming(true);
+    }
   }
   const form = state.form;
   const update = (patch: Partial<Profile>) => { setState((s) => ({ ...s, form: { ...s.form, ...patch } })); };
@@ -529,6 +545,7 @@ function ProfileForm({ draftId, draft, profile }: { draftId: number; draft: Draf
 
   const saveNow = async (): Promise<boolean> => {
     setFieldErrors([]);
+    setChangedWhileSaving(false);
     const sent = state.form;
     try {
       const answer = await save.mutateAsync(sent);
@@ -547,8 +564,10 @@ function ProfileForm({ draftId, draft, profile }: { draftId: number; draft: Draf
     if (save.isPending) {
       return;
     }
-    if (!dirty || (await saveNow())) {
+    if (!dirty) {
       setConfirming(true);
+    } else if (await saveNow()) {
+      setSavedToConfirm(true); // the next render compares the form with what was saved
     }
   };
 
@@ -723,6 +742,7 @@ function ProfileForm({ draftId, draft, profile }: { draftId: number; draft: Draf
         <IssueSummary count={issueCount} unplaced={unplaced} />
         {save.error !== null && save.error.status !== 422 && <ProblemBox error={save.error} />}
         {save.error !== null && save.error.status === 422 && <p role="alert" className={controls.error}>{t("cv.profile.save_refused")}</p>}
+        {dirty && changedWhileSaving && <p role="alert" className={controls.error}>{t("cv.profile.changed_while_saving")}</p>}
         <div className={styles.actions}>
           <button type="submit" className={controls.secondary} disabled={save.isPending} aria-busy={save.isPending}>
             {t("cv.profile.save")}

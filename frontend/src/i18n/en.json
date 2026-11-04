@@ -931,6 +931,7 @@
   "cv.profile.save": "Save draft",
   "cv.profile.save_refused": "The draft could not be saved; see the fields marked",
   "cv.profile.unsaved": "Unsaved changes",
+  "cv.profile.changed_while_saving": "The profile changed while it was being saved, so it was not confirmed. Confirm again to save these changes first.",
   "cv.profile.discard": "Discard",
   "cv.profile.confirm": "Confirm profile →",
   "cv.discard.title": "Discard this draft?",

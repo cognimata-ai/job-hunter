@@ -931,6 +931,7 @@
   "cv.profile.save": "Entwurf speichern",
   "cv.profile.save_refused": "Der Entwurf konnte nicht gespeichert werden; siehe die markierten Felder",
   "cv.profile.unsaved": "Ungespeicherte Änderungen",
+  "cv.profile.changed_while_saving": "Das Profil wurde während des Speicherns geändert und deshalb nicht bestätigt. Bestätigen Sie erneut, um diese Änderungen zuerst zu speichern.",
   "cv.profile.discard": "Verwerfen",
   "cv.profile.confirm": "Profil bestätigen →",
   "cv.discard.title": "Diesen Entwurf verwerfen?",

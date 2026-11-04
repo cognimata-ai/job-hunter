@@ -6,7 +6,8 @@
  * dots of its own (`alert.batch.retrieve_failing`) is still one key. `nsSeparator: false`, so a `:` in a code
  * is never read as a namespace either. The namespaces of the server's codes are the keys of `codes.json` (but
  * `order`, which lists the seniority codes in their ladder's order);
- * `useServerText` translates a code and falls back to the server's own text for a code the catalogue lacks.
+ * `useServerText` translates a code and falls back to the server's own text for a code the catalogue lacks, and
+ * `useServerMessage` decides whether the server's own English text that goes with a code is shown at all.
  *
  * The language is the browser's on the login page (`browserLanguage`) and `settings.display.ui_language`
  * once signed in (`AppShell`); `document.documentElement.lang` follows every change.
@@ -77,6 +78,25 @@ export function useServerText(): (ns: CodeNamespace, code: string, fallback?: st
       return i18n.exists(key) ? t(key as TranslationKey) : (fallback ?? code);
     },
     [t],
+  );
+}
+
+/** The server's own English text that goes with a code (a problem's `detail`, an issue's `message`), or `null`
+ * when it is not shown (§15.9, Ruling F4-b): server messages are shown through their stable codes, so in a German
+ * UI a code the catalogue translates (`<ns>.<code>`) shows its translation only, and the server's text is the
+ * fallback for a code it lacks. An English UI shows the text beside the translation as before: the server's
+ * specifics, in the UI's language. */
+export function useServerMessage(): (ns: CodeNamespace, code: string, message: string | null | undefined) => string | null {
+  const { i18n: instance } = useTranslation();
+  const english = instance.language === "en";
+  return useCallback(
+    (ns: CodeNamespace, code: string, message: string | null | undefined) => {
+      if (message === null || message === undefined || message === "") {
+        return null;
+      }
+      return english || !i18n.exists(`${ns}.${code}`) ? message : null;
+    },
+    [english],
   );
 }
 

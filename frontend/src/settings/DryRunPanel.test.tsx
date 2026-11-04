@@ -1,17 +1,22 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
+import { ProblemError } from "../api/client";
+import de from "../i18n/de.json";
 import en from "../i18n/en.json";
+import i18n from "../i18n/index";
 import { type FakeApi, dryRunOut, fakeApi, json, problem, requestsTo, settingsRead } from "../test/api";
 import { renderApp, settled } from "../test/app";
 import { dryRunPayloads, renderSettings } from "../test/settings";
+import { Problem } from "./DryRunPanel";
 
 type Settings = components["schemas"]["Settings"];
 type DryRunOut = components["schemas"]["DryRunOut"];
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await i18n.changeLanguage("en");
 });
 
 /** Answers the base document's dry-run with `base`, any other with `draft`. */
@@ -51,6 +56,44 @@ function warningIn(id: string, code: keyof typeof en): HTMLElement {
 const OUT_OF_RANGE = { field: "payload.schedule.interval_hours", code: "out_of_range" as const, message: "must be from 1 to 168" };
 
 describe("DryRunPanel", () => {
+  it("in German an error of a known code shows its translation only; an unknown code keeps the server's text", async () => {
+    await i18n.changeLanguage("de");
+    const api = fakeApi({ signedIn: true });
+    const unknown = { field: "payload.schedule.anchor_local", code: "brand_new_rule" as unknown as "out_of_range", message: "a rule the catalogue lacks" };
+    dryRuns(api, dryRunOut({ errors: [OUT_OF_RANGE, unknown], projections: null, effects: [] }));
+    renderSettings(["scope", "schedule"]);
+    const interval = await screen.findByRole("spinbutton", { name: de["settings_schedule.interval"] });
+    fireEvent.change(interval, { target: { value: "8" } });
+    const panel = section("schedule");
+    const known = await within(panel).findByRole("link", { name: new RegExp(de["issue.out_of_range"]) });
+    expect(known.textContent).toBe(de["issue.out_of_range"]);
+    expect(panel.textContent).not.toContain("must be from 1 to 168");
+    expect(within(panel).getByRole("link", { name: /a rule the catalogue lacks/ }).textContent).toBe(
+      "brand_new_rule – a rule the catalogue lacks",
+    );
+  });
+
+  it("the quiet problem shows the detail in English, in German a known code's translation only, else the server's text", async () => {
+    const known = new ProblemError({
+      status: 409, code: "conflict_state", title: "Conflict", detail: "the jobs changed; send it again", requestId: "req-1", errors: [],
+    });
+    const unknown = new ProblemError({
+      status: 418, code: "teapot", title: "I'm a teapot", detail: "Short and stout", requestId: null, errors: [],
+    });
+    const english = render(<Problem error={known} alert={false} />);
+    expect(english.container.textContent).toContain(en["problem.conflict_state"]);
+    expect(english.container.textContent).toContain("the jobs changed; send it again");
+    english.unmount();
+    await i18n.changeLanguage("de");
+    const german = render(<Problem error={known} alert={false} />);
+    expect(german.container.textContent).toContain(de["problem.conflict_state"]);
+    expect(german.container.textContent).not.toContain("the jobs changed");
+    german.unmount();
+    const fallback = render(<Problem error={unknown} alert={false} />);
+    expect(fallback.container.textContent).toContain("I'm a teapot");
+    expect(fallback.container.textContent).toContain("Short and stout");
+  });
+
   it("errors block Save and are linked to their fields", async () => {
     const api = fakeApi({ signedIn: true });
     dryRuns(api, dryRunOut({ errors: [OUT_OF_RANGE], projections: null, effects: [] }));

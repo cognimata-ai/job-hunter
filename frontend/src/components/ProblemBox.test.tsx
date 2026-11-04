@@ -1,9 +1,15 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProblemError } from "../api/client";
+import de from "../i18n/de.json";
 import en from "../i18n/en.json";
+import i18n from "../i18n/index";
 import { ProblemBox } from "./ProblemBox";
+
+afterEach(async () => {
+  await i18n.changeLanguage("en");
+});
 
 describe("ProblemBox", () => {
   it("shows the translated title, the detail as text and the request id, and retries", async () => {
@@ -32,6 +38,35 @@ describe("ProblemBox", () => {
     render(<ProblemBox error={error} />);
     expect(screen.getByRole("alert").textContent).toContain("I'm a teapot");
     expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("in German shows a known code's translation only, never the server's English detail (§15.9)", async () => {
+    await i18n.changeLanguage("de");
+    const error = new ProblemError({
+      status: 409,
+      code: "conflict_state",
+      title: "Conflict (server English)",
+      detail: "the jobs changed while this request was being applied; send it again",
+      requestId: "req-5f2c",
+      errors: [],
+    });
+    render(<ProblemBox error={error} />);
+    const box = screen.getByRole("alert");
+    expect(box.textContent).toContain(de["problem.conflict_state"]);
+    expect(box.textContent).not.toContain("server English");
+    expect(box.textContent).not.toContain("the jobs changed");
+    expect(box.textContent).toContain("req-5f2c"); // an id stays as it is
+  });
+
+  it("in German falls back to the server's English title and detail for a code the catalogue lacks", async () => {
+    await i18n.changeLanguage("de");
+    const error = new ProblemError({
+      status: 418, code: "teapot", title: "I'm a teapot", detail: "Short and stout", requestId: null, errors: [],
+    });
+    render(<ProblemBox error={error} />);
+    const box = screen.getByRole("alert");
+    expect(box.textContent).toContain("I'm a teapot");
+    expect(screen.getByText("Short and stout")).toBeTruthy();
   });
 
   it("names a network failure as such", () => {

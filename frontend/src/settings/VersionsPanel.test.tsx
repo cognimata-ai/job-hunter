@@ -1,12 +1,15 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import de from "../i18n/de.json";
 import en from "../i18n/en.json";
+import i18n from "../i18n/index";
 import { activationPreview, fakeApi, json, problem, promptSchemaVersion, requestsTo, rubricVersion, settingsRead } from "../test/api";
 import { renderSettings } from "../test/settings";
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await i18n.changeLanguage("en");
 });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -198,6 +201,31 @@ describe("VersionsPanel", () => {
     // the preview names no model: the server's title is the fallback (D39)
     expect(alert.textContent).toContain("generator on claude-haiku-5-5");
     expect(within(dialog).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("schema_dry_run_required in German shows its German text only, never the server's English title", async () => {
+    await i18n.changeLanguage("de");
+    const api = fakeApi({ signedIn: true });
+    newerRubric(api);
+    api.routes.set(ACTIVATE_2, () =>
+      problem(409, "conflict_state", {
+        title: "The model policy has no passed live schema dry-run for generator on claude-haiku-5-5",
+        detail: "schema_dry_run_required",
+      }),
+    );
+    renderSettings(["scoring"]);
+    const user = userEvent.setup();
+    const region = await screen.findByRole("region", { name: de["settings_scoring.versions"] });
+    const offer = await within(region).findByRole("group", { name: de["settings_scoring.new_rubric"].replace("{{version}}", "v2") });
+    await user.click(within(offer).getByRole("button", { name: de["settings_scoring.activate_rubric"].replace("{{version}}", "v2") }));
+    const dialog = await screen.findByRole("alertdialog", { name: de["activation.title_rubric"].replace("{{version}}", "v2") });
+    const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: de["activation.confirm"] });
+    await waitFor(() => {
+      expect(confirm.disabled).toBe(false);
+    });
+    await user.click(confirm);
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe(de["activation.schema_required"]);
   });
 
   it("schema_dry_run_required names the preview's unverified models as codes", async () => {

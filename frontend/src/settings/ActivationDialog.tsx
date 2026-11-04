@@ -29,7 +29,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import { useToast } from "../components/Toaster";
-import { useServerText } from "../i18n/index";
+import { useServerMessage, useServerText } from "../i18n/index";
 import { JOBS_KEY } from "../jobs/api";
 import { STATUS_KEY } from "../system/api";
 import { useFormat } from "../system/format";
@@ -215,6 +215,7 @@ export interface ActivationDialogProps {
 export function ActivationDialog({ kind, versionId, name, onClose }: ActivationDialogProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
+  const serverMessage = useServerMessage();
   const { preview, reading, fresh } = useFreshPreview(kind, versionId);
   const activation = useActivate(kind, versionId);
   const [override, setOverride] = useState(false);
@@ -268,7 +269,8 @@ export function ActivationDialog({ kind, versionId, name, onClose }: ActivationD
                 <Trans i18nKey="activation.schema_required_models" components={{ models: <Codes models={fresh.unverified_models} /> }} />
               </p>
             ) : (
-              <p>{error.message}</p>
+              // the server's title names the node and model pairs, in English: shown where §15.9 lets it
+              serverMessage("problem", error.code, error.message) !== null && <p>{error.message}</p>
             )}
           </div>
         )}

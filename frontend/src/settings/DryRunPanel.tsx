@@ -22,7 +22,7 @@ import { NETWORK_CODE, toProblem } from "../api/client";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
-import i18n, { intlLocale, type TranslationKey, useServerText } from "../i18n/index";
+import i18n, { intlLocale, type TranslationKey, useServerMessage, useServerText } from "../i18n/index";
 import type { SettingsSection } from "../pages/ProfileSettingsPage";
 import { type Format, useFormat } from "../system/format";
 import styles from "./DryRunPanel.module.css";
@@ -247,15 +247,17 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
 export function Problem({ error, alert, onRetry }: { error: unknown; alert: boolean; onRetry?: () => void }) {
   const { t } = useTranslation();
   const serverText = useServerText();
+  const serverMessage = useServerMessage();
   if (alert) {
     return <ProblemBox error={error} onRetry={onRetry} />;
   }
   const problem = toProblem(error);
   const title = problem.code === NETWORK_CODE ? t("problem_box.network") : serverText("problem", problem.code, problem.message);
+  const detail = serverMessage("problem", problem.code, problem.detail);
   return (
     <div className={styles.quietProblem}>
       <p className={styles.problemTitle}>{title}</p>
-      {problem.detail !== null && <p>{problem.detail}</p>}
+      {detail !== null && <p>{detail}</p>}
       {problem.requestId !== null && (
         <p className={styles.requestId}>{t("problem_box.request_id", { id: problem.requestId })}</p>
       )}
@@ -269,7 +271,10 @@ export function Problem({ error, alert, onRetry }: { error: unknown; alert: bool
 function IssueItem({ issue, index, section }: { issue: Issue; index: number; section: SettingsSection }) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const text = t("settings_form.issue", { issue: serverText("issue", issue.code, issue.code), message: issue.message });
+  const serverMessage = useServerMessage();
+  const label = serverText("issue", issue.code, issue.code);
+  const message = serverMessage("issue", issue.code, issue.message);
+  const text = message === null ? label : t("settings_form.issue", { issue: label, message });
   const home = sectionOf(issue.path);
   let content: ReactNode = text;
   if (home === section) {
@@ -350,6 +355,7 @@ export function DryRunPanel() {
   const { t, i18n: { language } } = useTranslation();
   const form = useSettingsForm();
   const serverText = useServerText();
+  const serverMessage = useServerMessage();
   const format = useFormat();
   const section = useSection() ?? "scope";
   const reasonId = useId();
@@ -374,6 +380,7 @@ export function DryRunPanel() {
   const reason = blockedReason(form, t);
   const [asking, setAsking] = useState(false);
   const asks = effects.includes("llm_tuple");
+  const gateDetail = form.saveError === null ? null : serverMessage("problem", form.saveError.code, form.saveError.detail);
   return (
     <div className={cx(styles.panel, form.checking && styles.checking)}>
       <p className={styles.status} role={alert ? "status" : undefined}>{status}</p>
@@ -389,7 +396,7 @@ export function DryRunPanel() {
       {form.evalGateFailed && form.saveError !== null && (
         <div className={styles.offer} role={alert ? "alert" : undefined}>
           <p className={styles.offerTitle}>{serverText("problem", form.saveError.code, form.saveError.message)}</p>
-          {form.saveError.detail !== null && <p>{form.saveError.detail}</p>}
+          {gateDetail !== null && <p>{gateDetail}</p>}
           <label className={styles.tick}>
             <input type="checkbox" checked={form.evalOverride}
               onChange={(event) => { form.setEvalOverride(event.target.checked); }} />

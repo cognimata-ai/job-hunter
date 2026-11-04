@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import codes from "../../i18n/codes.json";
 import de from "../../i18n/de.json";
 import en from "../../i18n/en.json";
+import i18n from "../../i18n/index";
 import { fakeApi, json, problem, requestsTo } from "../../test/api";
 import { renderInProviders, settled } from "../../test/app";
 import { profile, readyDraft, rescoreEstimate } from "../../test/fixtures/drafts";
@@ -20,8 +21,9 @@ import {
   WORK_AUTHORIZATIONS,
 } from "./ProfileReview";
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await i18n.changeLanguage("en");
 });
 
 function Harness({ onPaste = vi.fn() }: { onPaste?: () => void }) {
@@ -155,6 +157,23 @@ describe("ProfileReview", () => {
     expect(describedBy(chip("Softwareentwickler Backend"))).toContain("Holds a NUL in the title");
   });
 
+  it("in German an issue of a known code shows its translation only; an unknown code keeps the server's text", async () => {
+    await i18n.changeLanguage("de");
+    const issues = [
+      { path: "skills[0].evidence", code: "ungrounded" as const, message: "The quote is not in the CV text.", proposal: null },
+      { path: "roles[7].title", code: "brand_new_rule" as unknown as "limit", message: "A rule the catalogue lacks.", proposal: null },
+    ];
+    draftRoute(() => readyDraft(issues));
+    renderInProviders(<Harness />);
+    const skill = await screen.findByRole("group", { name: de["cv.profile.skill_n"].replace("{{n}}", "1") });
+    const evidence = within(skill).getByRole("textbox", { name: de["cv.profile.evidence"] });
+    expect(describedBy(evidence)).toContain(de["issue.ungrounded"]);
+    expect(describedBy(evidence)).not.toContain("The quote is not in the CV text.");
+    const summary = screen.getByRole("region", { name: de["cv.profile.issues_other"].replace("{{count}}", "2") });
+    expect(within(summary).getByText(/A rule the catalogue lacks\./)).toBeTruthy();
+    expect(within(summary).getByText("roles[7].title", { selector: "code" })).toBeTruthy();
+  });
+
   it("a confirm's 422 closes the modal and shows its errors at their fields", async () => {
     const api = draftRoute(() => readyDraft());
     api.routes.set("GET /api/profile/drafts/7/rescore-estimate", () => json(rescoreEstimate()));
@@ -240,6 +259,44 @@ describe("ProfileReview", () => {
       "GET /api/profile/drafts/7/rescore-estimate",
     ]);
     expect((sentDraft(api) as { summary: string }).summary).toBe("Backend engineer building Python services. Fintech.");
+  });
+
+  it("an edit made while confirm's save is pending keeps the confirmation closed and survives", async () => {
+    const api = draftRoute(() => readyDraft());
+    const answers: (() => void)[] = [];
+    api.routes.set("PUT /api/profile/drafts/7", () =>
+      new Promise<Response>((resolve) => {
+        answers.push(() => { resolve(json({ validation_issues: [] })); });
+      }),
+    );
+    api.routes.set("GET /api/profile/drafts/7/rescore-estimate", () => json(rescoreEstimate()));
+    renderInProviders(<Harness />);
+    const user = userEvent.setup();
+    const summary = await screen.findByRole<HTMLTextAreaElement>("textbox", { name: en["cv.profile.summary"] });
+    await user.type(summary, " A");
+    await user.click(screen.getByRole("button", { name: en["cv.profile.confirm"] }));
+    await waitFor(() => {
+      expect(answers).toHaveLength(1);
+    });
+    await user.type(summary, " B"); // while the save of " A" is pending
+    answers[0]();
+    await settled();
+    // the saved draft is not what the form shows: no confirmation on it, and the edit is kept
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(requestsTo(api, "GET /api/profile/drafts/7/rescore-estimate")).toHaveLength(0);
+    expect(summary.value).toBe("Backend engineer building Python services. A B");
+    expect(screen.getByRole("alert").textContent).toBe(en["cv.profile.changed_while_saving"]);
+    expect(screen.getByText(en["cv.profile.unsaved"])).toBeTruthy();
+    // Confirm again saves the edit first, then opens the confirmation on it
+    await user.click(screen.getByRole("button", { name: en["cv.profile.confirm"] }));
+    await waitFor(() => {
+      expect(answers).toHaveLength(2);
+    });
+    answers[1]();
+    expect(await screen.findByRole("alertdialog", { name: en["cv.confirm.title"] })).toBeTruthy();
+    expect((sentDraft(api, 0) as { summary: string }).summary).toBe("Backend engineer building Python services. A");
+    expect((sentDraft(api, 1) as { summary: string }).summary).toBe("Backend engineer building Python services. A B");
+    expect(screen.queryByText(en["cv.profile.changed_while_saving"])).toBeNull();
   });
 
   it("confirm without edits opens the modal at once; a save's 422 keeps it closed", async () => {
