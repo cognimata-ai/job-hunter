@@ -1,8 +1,9 @@
 // The E2E stack from a spec (plan M4 Task 32): the four-file dev stack's compose command, psql as the bootstrap
-// role, the score lane's bucket, polling, the fake Batches API's script, the smoke user's credentials and E9's
-// grounded job. It only runs `exec` and `run` against the running stack, never `up`, so a local override
-// layered at `up` (the SPA served from the host's build) survives. A command's stdout is returned, never printed; a failure
-// names the command's first words, its exit status and the tail of its stderr.
+// role, the score lane's bucket, polling, the fake Batches API's script, the smoke user's credentials, E9's
+// grounded job and whether the worker is on both fakes (Task 33). It only runs `exec` and `run` against the
+// running stack, never `up`, so a local override layered at `up` (the SPA served from the host's build)
+// survives. A command's stdout is returned, never printed; a failure names the command's first words, its exit
+// status and the tail of its stderr.
 import { spawn } from "node:child_process";
 import { REPO_ROOT } from "./paths";
 
@@ -112,6 +113,13 @@ export async function groundedJobId(): Promise<number> {
     throw new Error("m4_seeds.grounded_job_id() answered no job id");
   }
   return found;
+}
+
+/** Whether the running worker is on both fakes (`smoke_m2.worker_flags`: `JOBHUNTER_FAKE_LLM` and
+ * `JOBHUNTER_FAKE_SOURCES` set to `1`), compared in Python and never printed. A spec posts a run only then: on a
+ * worker without the fixtures overlay a run would reach the providers. */
+export async function workerOnBothFakes(): Promise<boolean> {
+  return (await scriptValue("smoke_m2", "all(smoke_m2.worker_flags().values())")) === "True";
 }
 
 /** The score lane's bucket refilled (`smoke_m3.ADVANCE_BUCKET`, Ruling T28-f): the month row's clock a month

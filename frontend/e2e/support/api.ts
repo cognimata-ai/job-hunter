@@ -25,6 +25,16 @@ export async function apiContext(page: Page): Promise<ApiContext> {
   return Object.assign(context, { key: () => crypto.randomUUID() });
 }
 
+/** `GET path` through `api`: its JSON, typed by the caller (a `components["schemas"]` type); any status but 200
+ * throws with the path and the status, never the body. */
+export async function getJson<T>(api: APIRequestContext, path: string): Promise<T> {
+  const response = await api.get(path);
+  if (response.status() !== 200) {
+    throw new Error(`GET ${path} answered ${String(response.status())}, not 200`);
+  }
+  return (await response.json()) as T;
+}
+
 /** The smoke user signed in through the API, its session saved to `AUTH_STATE` (what `scenarios` start on). */
 export async function saveAuthState(user: SmokeUser): Promise<void> {
   const context = await request.newContext({ baseURL: ORIGIN });

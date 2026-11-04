@@ -16,10 +16,30 @@ export const LOW_TEXT_PDF = fileURLToPath(new URL("../fixtures/low-text.pdf", im
 /** The phone number of `cv.docx` that the contact stripper misses (`scripts/e2e_fixtures.PLANTED_PHONE`). */
 export const PLANTED_PHONE = "+49 30 123";
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** `template` (an `en` string) as a pattern that matches it with each `{{name}}` replaced by digits. */
 export function textPattern(template: string): RegExp {
-  const escaped = template.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^${escaped.replace(/\\\{\\\{\w+\\\}\\\}/g, "\\d+")}$`);
+  return new RegExp(`^${escapeRegExp(template).replace(/\\\{\\\{\w+\\\}\\\}/g, "\\d+")}$`);
+}
+
+/** `template` (an `en` string) as an anchored pattern: each `{{name}}` is `values[name]`, a string matched as
+ * written or a RegExp inserted as it is (a capture group, say), and any text for a name `values` does not give. */
+export function templateMatch(template: string, values: Readonly<Partial<Record<string, string | RegExp>>> = {}): RegExp {
+  const body = template
+    .split(/(\{\{\w+\}\})/)
+    .map((part) => {
+      const name = /^\{\{(\w+)\}\}$/.exec(part)?.[1];
+      if (name === undefined) {
+        return escapeRegExp(part);
+      }
+      const value = values[name];
+      return value === undefined ? ".+?" : value instanceof RegExp ? value.source : escapeRegExp(value);
+    })
+    .join("");
+  return new RegExp(`^${body}$`);
 }
 
 /** The login form of the page filled with `user`'s name and `password` (the user's own by default) and sent,

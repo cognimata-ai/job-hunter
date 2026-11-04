@@ -10,5 +10,11 @@ export const EXPECTED_SPECS: Record<"first-use" | "stack-setup" | "scenarios", r
     "03-e19-session-expiry.spec.ts",
   ],
   "stack-setup": ["stack.setup.ts"],
-  scenarios: [],
+  scenarios: [
+    "04-e05-run-now.spec.ts",
+    "05-e16-watchlist.spec.ts",
+    "06-e03-cv-confirm.spec.ts",
+    "07-e04-low-text-pdf.spec.ts",
+    "08-e06-scored-cards.spec.ts",
+  ],
 };
