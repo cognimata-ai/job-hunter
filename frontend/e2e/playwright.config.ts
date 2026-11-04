@@ -8,6 +8,10 @@
 // `globalSetup` waits for the stack, creates the smoke user and saves its session (`AUTH_STATE`). The report
 // goes to frontend/playwright-report and the test output (traces, screenshots) to frontend/test-results, both
 // git-ignored; a reporter's relative `outputFolder` resolves against this file's directory.
+// No credential in an artefact (spec §16 L5486, Ruling F4-a): e2e.yml uploads both directories after a failure,
+// and a trace holds the requests' cookies, the login bodies and every typed value, so under CI no trace is
+// recorded (a failure keeps its screenshot and page snapshot); a local run keeps a failed test's trace, which
+// holds the stack's credentials and never leaves the machine. `npm run e2e:sentinel` checks what CI keeps.
 import { defineConfig } from "@playwright/test";
 import process from "node:process";
 import { AUTH_STATE } from "./support/paths";
@@ -21,7 +25,7 @@ export default defineConfig({
   expect: { timeout: 15_000 },
   use: {
     baseURL: "http://localhost:8080",
-    trace: "retain-on-failure",
+    trace: process.env.CI ? "off" : "retain-on-failure",
     screenshot: "only-on-failure",
     locale: "en-GB",
   },
