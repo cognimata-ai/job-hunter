@@ -110,6 +110,174 @@ export function jobCard(overrides: Partial<JobCardOut> = {}): JobCardOut {
   };
 }
 
+type JobDetailOut = components["schemas"]["JobDetailOut"];
+type DetailScoreOut = components["schemas"]["DetailScoreOut"];
+type HistoryItemOut = components["schemas"]["HistoryItemOut"];
+type UserActionsOut = components["schemas"]["UserActionsOut"];
+
+/** The description of `jobDetail`: two stored paragraphs, one per line (`normalize/html.py`). "Python" is
+ * [20, 26), "FastAPI" [35, 42) and "PostgreSQL" [47, 57) in code points. */
+export const DESCRIPTION = "Backend services in Python.\nWe use FastAPI and PostgreSQL.";
+
+/** The score of `jobDetail`: 82 [74, 90], accepted by the critic, the six LLM criteria and the two
+ * deterministic ones with evidence on `skills` and the profile side of `role_fit`. */
+export function detailScore(overrides: Partial<DetailScoreOut> = {}): DetailScoreOut {
+  const llm = (criterion: string, weight: number | null, level: number | null, basis: string) =>
+    ({ criterion, weight, level, basis, rationale: "", evidence: [] });
+  return {
+    mid: "82.40",
+    low: "74.00",
+    high: "89.50",
+    coverage: "0.850",
+    confidence: "high",
+    result_status: "accepted",
+    result_id: 31,
+    det_result_id: 61,
+    critic_outcome: "accepted",
+    injection_suspected: false,
+    versions: {
+      profile_version_no: 4,
+      rubric_version: "v1",
+      prompt_schema_hash: "3f2a1b2c9d8e7f60a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718",
+      generator: { model: "gen-model", effort: "medium" },
+      critic: { model: "critic-model", effort: "high" },
+    },
+    summary_en: "A strong match for backend work.",
+    summary_de: "Eine starke Passung für Backend-Arbeit.",
+    criteria: [
+      {
+        ...llm("role_fit", 20, 4, "observed"),
+        evidence: [
+          { subject: "role_fit", source_kind: "description", field_name: null, quote: "Backend services", span_start: 0, span_end: 16 },
+          { subject: "role_fit", source_kind: "profile", field_name: "roles", quote: "Backend Engineer", span_start: null, span_end: null },
+        ],
+      },
+      {
+        ...llm("skills", 25, 3, "observed"),
+        evidence: [
+          { subject: "skills", source_kind: "description", field_name: null, quote: "FastAPI", span_start: 35, span_end: 42 },
+        ],
+      },
+      llm("experience_seniority", 15, 3, "observed"),
+      llm("domain", 10, null, "unknown"),
+      llm("languages", 10, 4, "observed"),
+      llm("education_certifications", 5, 4, "unconstrained"),
+    ],
+    fact_evidence: [],
+    det_criteria: [
+      { criterion: "location_work_mode", weight: 10, level: 4, basis: "observed", inputs: { compat: { hybrid: 4 }, hybrid_band: 4, onsite_band: 4 } },
+      { criterion: "employment_salary", weight: 5, level: 4, basis: "observed", inputs: { et: 4, sal: 4 } },
+    ],
+    knockouts: [],
+    caps_applied: [],
+    industry_match: "neutral",
+    shortened_fields: [],
+    corrected_fields: [],
+    scored_via_job_id: null,
+    ...overrides,
+  };
+}
+
+/** A result of a job's history: published the day before `NOW`, with its current instance. */
+export function historyItem(overrides: Partial<HistoryItemOut> = {}): HistoryItemOut {
+  return {
+    result_id: 31,
+    published_at: "2026-11-02T09:00:00Z",
+    profile_version_no: 4,
+    rubric_version: "v1",
+    llm_tuple_id: 2,
+    status: "accepted",
+    instances: [
+      {
+        det_result_id: 61,
+        scope_version_id: 3,
+        is_current: true,
+        mid: "82.40",
+        low: "74.00",
+        high: "89.50",
+        coverage: "0.850",
+        confidence: "high",
+        computed_at: "2026-11-02T09:00:00Z",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+/** The user's actions on a job as the api answers them: none set, unless `row` sets some. */
+export function userActions(jobId: number, row: Partial<UserActionsOut> = {}): UserActionsOut {
+  return {
+    job_id: jobId,
+    seen_at: null,
+    saved_at: null,
+    applied_at: null,
+    hidden_at: null,
+    note: null,
+    updated_at: "2026-11-03T06:00:00Z",
+    ...row,
+  };
+}
+
+/** The detail of `jobCard()`'s job 5 (`GET /api/jobs/5`), scored (`detailScore`), never opened (`user: null`): in
+ * Berlin, hybrid by Lever's structured field, full-time at €70,000–85,000 a year (stated), posted on 1 Nov (day
+ * precision), with one Lever posting and one page of history. */
+export function jobDetail(overrides: Partial<JobDetailOut> = {}): JobDetailOut {
+  const provenance = (rule: string) => ({
+    source_id: "lever",
+    source_instance_id: 7,
+    posting_id: 50,
+    observation_id: 900,
+    observed_at: "2026-11-03T05:00:00Z",
+    rule,
+  });
+  return {
+    job: {
+      job_id: 5,
+      title: "Senior Backend Engineer",
+      company: "Acme GmbH",
+      company_key: "acme",
+      locations: ["Berlin"],
+      location_kind: "city",
+      work_modes: ["hybrid"],
+      work_mode_known: true,
+      work_mode_source_id: "lever",
+      posted_at: "2026-11-01T07:00:00Z",
+      posted_precision: "day",
+      first_seen_at: "2026-11-02T07:00:00Z",
+      last_seen_at: "2026-11-03T05:00:00Z",
+      source_ids: ["lever"],
+      availability: "active",
+      completeness: "full",
+      ad_language: "en",
+      employment_types: ["full_time"],
+      salary: { min: "70000", max: "85000", currency: "EUR", period: "year", kind: "stated" },
+      field_provenance: { title: provenance("source_rank"), work_mode_possible: provenance("structured_intersection") },
+    },
+    description: { text: DESCRIPTION, lang: "en", completeness: "full", from_job_id: 5 },
+    postings: [
+      {
+        id: 50,
+        source_id: "lever",
+        native_id: "abc-123",
+        first_seen_at: "2026-11-02T07:00:00Z",
+        last_seen_at: "2026-11-03T05:00:00Z",
+        availability: "active",
+        link: "https://jobs.lever.co/acme/abc-123",
+      },
+    ],
+    links: { open_ad: "https://jobs.lever.co/acme/abc-123/apply", adzuna: null },
+    score: detailScore(),
+    contested: null,
+    target: { id: 50, state: "published_accepted", state_reason: null, refusal_category: null, similarity: 0.7, override: "none" },
+    group: null,
+    merge_events: [],
+    user: null,
+    feedback: [],
+    history: { items: [historyItem()], next_cursor: null },
+    ...overrides,
+  };
+}
+
 /** A first page of the Jobs list holding `items`, with no further page. */
 export function jobsPage(items: JobCardOut[] = []): JobsPageOut {
   return {

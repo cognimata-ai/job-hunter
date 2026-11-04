@@ -134,8 +134,10 @@ export function useCardFailure(): (error: ProblemError) => void {
   );
 }
 
-/** What a card's quick action writes: one of the toggles, and `apply_to_group` on a group card. */
+/** What a card's quick action writes: one of the toggles, and `apply_to_group` on a group card; the drawer's
+ * Seen toggle writes `seen` (Task 24). */
 export interface CardActionBody {
+  seen?: boolean;
   saved?: boolean;
   applied?: boolean;
   hidden?: boolean;

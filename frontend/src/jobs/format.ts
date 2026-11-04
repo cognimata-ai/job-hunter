@@ -5,7 +5,8 @@
 // can hold "82.49999999999999999" only as 82.5). Dates are compared as calendar dates in the display time zone.
 import type { TFunction } from "i18next";
 import { relativeText } from "../components/RelativeTime";
-import i18n, { type CodeNamespace, intlLocale } from "../i18n/index";
+import i18n, { type CodeNamespace, intlLocale, type TranslationKey } from "../i18n/index";
+import type { Availability } from "./search";
 
 /** `useServerText`'s function: a server code's text, else the fallback, else the code. */
 export type ServerText = (ns: CodeNamespace, code: string, fallback?: string) => string;
@@ -91,4 +92,17 @@ export function filteredText(
     return t("chip.filtered_reasons", { reasons: reasons.map((r) => serverText("filter_reason", r)).join(", ") });
   }
   return serverText("target_state", "filtered_out");
+}
+
+const AVAILABILITY_LABELS = {
+  active: "filters.availability.active",
+  unknown: "filters.availability.unknown",
+  stale: "filters.availability.stale",
+  closed: "filters.availability.closed",
+} as const satisfies Record<Availability, TranslationKey>;
+
+/** An ad's availability in the Availability filter's words (Task 23); a value outside them as the server sends it. */
+export function availabilityText(availability: string, t: TFunction): string {
+  const key = new Map<string, TranslationKey>(Object.entries(AVAILABILITY_LABELS)).get(availability);
+  return key === undefined ? availability : t(key);
 }

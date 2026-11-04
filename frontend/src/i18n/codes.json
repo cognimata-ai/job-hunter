@@ -317,6 +317,117 @@
     "senior",
     "working_student"
   ],
+  "criterion": [
+    "domain",
+    "education_certifications",
+    "employment_salary",
+    "experience_seniority",
+    "languages",
+    "location_work_mode",
+    "role_fit",
+    "skills"
+  ],
+  "basis": [
+    "observed",
+    "unconstrained",
+    "unknown"
+  ],
+  "posted_precision": [
+    "day",
+    "exact",
+    "hour",
+    "ingest",
+    "relative_day",
+    "unknown"
+  ],
+  "salary_period": [
+    "day",
+    "hour",
+    "month",
+    "week",
+    "year"
+  ],
+  "result_status": [
+    "accepted",
+    "contested"
+  ],
+  "critic_outcome": [
+    "accepted",
+    "contested",
+    "not_run"
+  ],
+  "critic_trigger": [
+    "T0",
+    "T1",
+    "T2",
+    "T3",
+    "T4",
+    "T5",
+    "T6",
+    "T7",
+    "T8"
+  ],
+  "critic_verdict": [
+    "accept",
+    "revise"
+  ],
+  "round_outcome": [
+    "accept",
+    "incomplete",
+    "revise"
+  ],
+  "critic_issue": [
+    "anchor_misapplied",
+    "evidence_overlooked",
+    "evidence_ungrounded",
+    "fact_rejected",
+    "fact_uncertain",
+    "fact_unreviewed",
+    "level_too_high",
+    "level_too_low",
+    "should_be_unknown"
+  ],
+  "cap": [
+    "certification",
+    "contract_type",
+    "degree",
+    "industry",
+    "mandatory_language",
+    "onsite_required",
+    "security_clearance",
+    "work_permit"
+  ],
+  "cap_kind": [
+    "hard",
+    "soft"
+  ],
+  "industry_match": [
+    "excluded",
+    "neutral",
+    "outside_include",
+    "unknown"
+  ],
+  "profile_section": [
+    "certifications",
+    "domains",
+    "education",
+    "languages",
+    "roles",
+    "seniority",
+    "skills",
+    "summary",
+    "target_titles"
+  ],
+  "merge_kind": [
+    "strong_key_merge",
+    "unmerge",
+    "user_confirmed_merge"
+  ],
+  "feedback_label": [
+    "good",
+    "ok",
+    "poor"
+  ],
   "order": {
     "seniority": [
       "intern",

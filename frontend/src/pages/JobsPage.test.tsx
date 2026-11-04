@@ -121,7 +121,14 @@ describe("JobsPage", () => {
       expect(app.router.state.location.search).toMatchObject({ job: "7", sort: "posted" });
     });
     expect(app.router.history.length).toBe(before + 1); // a history entry: Back closes the drawer
-    expect(document.activeElement).toBe(second);
+    const drawer = await screen.findByRole("dialog");
+    expect(drawer.contains(document.activeElement)).toBe(true); // the drawer has focus (Task 24)
+    await user.keyboard("j"); // a key inside the drawer is the drawer's
+    expect(drawer.contains(document.activeElement)).toBe(true);
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(second);
+    });
     // a held modifier is the browser's or another shortcut's
     await user.keyboard("{Control>}j{/Control}");
     expect(document.activeElement).toBe(second);

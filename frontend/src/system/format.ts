@@ -19,6 +19,8 @@ export interface Format {
   slot: (instant: string, now?: Date) => string;
   /** A full date and time with seconds: `3 Nov 2026, 06:00:00` (en), `03.11.2026, 06:00:00` (de). */
   dateTime: (instant: string) => string;
+  /** A full date and time to the minute: `3 Nov 2026, 06:00` (en), `03.11.2026, 06:00` (de). */
+  dateTimeMinutes: (instant: string) => string;
 }
 
 export function makeFormat(locale: string, timeZone: string): Format {
@@ -29,6 +31,7 @@ export function makeFormat(locale: string, timeZone: string): Format {
   const dayMonth = new Intl.DateTimeFormat(locale, { day: "numeric", month: "short", timeZone });
   const dayMonthTime = new Intl.DateTimeFormat(locale, { day: "numeric", month: "short", ...clock, timeZone });
   const dateTime = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium", timeZone });
+  const dateTimeMinutes = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short", hourCycle: "h23", timeZone });
   const localDay = new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit", timeZone });
   return {
     number: (n) => numbers.format(n),
@@ -40,6 +43,7 @@ export function makeFormat(locale: string, timeZone: string): Format {
       return localDay.format(date) === localDay.format(now) ? time.format(date) : dayMonthTime.format(date);
     },
     dateTime: (instant) => dateTime.format(new Date(instant)),
+    dateTimeMinutes: (instant) => dateTimeMinutes.format(new Date(instant)),
   };
 }
 

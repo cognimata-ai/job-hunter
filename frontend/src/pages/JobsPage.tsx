@@ -11,15 +11,21 @@
 //   has to be in the accessibility tree before its content changes.
 // - Without an active profile, "Upload your CV to start ranking" (a link to the CV section) above the cards,
 //   which are still listed, unscored (§15.8).
-// - The list's keyboard is `useListKeyboard`'s; Enter on a card writes `job=<id>` (the drawer's, Task 24).
-import { Link } from "@tanstack/react-router";
-import { useCallback, useId, useLayoutEffect, useMemo, useRef } from "react";
+// - The list's keyboard is `useListKeyboard`'s; Enter on a card pushes `job=<id>`.
+// - The detail drawer (Task 24, resolution e) is open while the search has `job`. Closing it goes Back when this
+//   page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL without `job`; showing
+//   another job in it (a survivor, a representative) replaces `job`. The drawer gives focus back to what held it
+//   before (the card it was opened from); when that is nothing (a pasted URL), focus goes to the job's card if
+//   the list shows it, else to the heading.
+import { Link, useRouter } from "@tanstack/react-router";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import pageStyles from "../app/Pages.module.css";
 import { EmptyState } from "../components/EmptyState";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import type { TranslationKey } from "../i18n/index";
+import { DetailDrawer } from "../jobs/DetailDrawer";
 import { FilterPanel } from "../jobs/FilterPanel";
 import { JobCard } from "../jobs/JobCard";
 import { DEFAULT_SEARCH, type JobSort, resetSearch, SORTS, toApiParams } from "../jobs/search";
@@ -57,12 +63,55 @@ export function JobsPage() {
   const headingId = useId();
   const sortId = useId();
   const { search, write } = useJobsSearch();
+  const router = useRouter();
   const list = useJobsList(search);
   const profile = useProfile();
   const ids = useMemo(() => list.items.map((card) => card.job_id), [list.items]);
-  const open = useCallback((jobId: number) => { write({ job: jobId }); }, [write]);
+  // whether this page pushed the drawer's history entry (a card opened it), so closing goes Back
+  const pushedJob = useRef(false);
+  const open = useCallback((jobId: number) => {
+    pushedJob.current = true;
+    write({ job: jobId });
+  }, [write]);
+  const closeDrawer = useCallback(() => {
+    if (pushedJob.current) {
+      pushedJob.current = false;
+      router.history.back();
+    } else {
+      write({ job: undefined }, { replace: true });
+    }
+  }, [router, write]);
+  const showJob = useCallback((jobId: number) => { write({ job: jobId }, { replace: true }); }, [write]);
   const keyboard = useListKeyboard(ids, open);
   const { focusCard, headingRef } = keyboard;
+
+  // after the drawer closed (by any way, Back included): when it gave focus back to nothing, the job's card or
+  // the heading takes it. The drawer gives focus back in a timer of its own after it unmounts, so this runs after.
+  const shownIds = useRef(ids);
+  useLayoutEffect(() => {
+    shownIds.current = ids;
+  }, [ids]);
+  const openJob = search.job;
+  const drawerJob = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const closed = drawerJob.current;
+    drawerJob.current = openJob;
+    if (openJob !== undefined || closed === undefined) {
+      return undefined;
+    }
+    pushedJob.current = false; // closed by Back: the entry is gone
+    const timer = setTimeout(() => {
+      if (!focusDropped()) {
+        return;
+      }
+      if (shownIds.current.includes(closed)) {
+        focusCard(closed);
+      } else {
+        headingRef.current?.focus();
+      }
+    }, 0);
+    return () => { clearTimeout(timer); };
+  }, [openJob, focusCard, headingRef]);
   const resetFilters = () => {
     write(resetSearch);
     headingRef.current?.focus(); // the button leaves with the empty state
@@ -182,6 +231,7 @@ export function JobsPage() {
           {content}
         </div>
       </div>
+      {openJob !== undefined && <DetailDrawer jobId={openJob} onClose={closeDrawer} onNavigate={showJob} />}
     </div>
   );
 }

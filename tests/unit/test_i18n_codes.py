@@ -22,7 +22,7 @@ import textwrap
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from types import UnionType
-from typing import Any, Final, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Any, Final, Literal, TypeAliasType, Union, get_args, get_origin, get_type_hints
 
 import pytest
 from jobhunter.api.routes import profile_review
@@ -32,10 +32,12 @@ from jobhunter.db.seed import SOURCES
 from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
 from jobhunter.jobs.cards import Badge, ScoreOut
+from jobhunter.jobs.detail import DET_CRITERIA, DetailScoreOut
 from jobhunter.jobs.query import EMPLOYMENT_VALUES, SENIORITY_VALUES
 from jobhunter.llm import gateway
 from jobhunter.llm.schemas import generator
 from jobhunter.llm.schemas import profile as profile_schema
+from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.observability.health import RunStatus
@@ -45,10 +47,19 @@ from jobhunter.profile.errors import RejectReason
 from jobhunter.profile.review import Repair
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
+from jobhunter.scoring import aggregate, validator
 from jobhunter.scoring.cycles import PauseReason
+from jobhunter.scoring.det_criteria import DetCriterion
 from jobhunter.scoring.filters import FilterCode
+from jobhunter.scoring.golden import Label as FeedbackLabel
 from jobhunter.scoring.knockouts import DEGREE_RANK
+from jobhunter.scoring.routing import DerivedOutcome
+from jobhunter.scoring.rubric import LLM_CRITERIA
+from jobhunter.scoring.steps import FACT_REJECTED, FACT_UNCERTAIN, FACT_UNREVIEWED
+from jobhunter.scoring.triggers import Trigger
 from jobhunter.sources import breaker
+from jobhunter.sources.parsing.dates import Precision
+from jobhunter.sources.parsing.salary import Period
 from jobhunter.worker import runs
 
 REPO: Final = Path(__file__).resolve().parents[2]
@@ -264,14 +275,34 @@ def degree_levels() -> set[str]:
     return ad | profile | set(DEGREE_RANK)
 
 
+def _check_in(text: str, column: str, where: str, *, not_null: bool = False) -> set[str]:
+    """The values of the one `<column> text [NOT NULL] CHECK (<column> IN ('a','b',…))` of `text`."""
+    null = r"NOT\s+NULL\s+" if not_null else ""
+    found = re.findall(rf"\b{column}\s+text\s+{null}CHECK\s*\(\s*{column}\s+IN\s*\(([^)]*)\)\s*\)", text)
+    assert len(found) == 1, f"{where}: {len(found)} CHECKs of {column}"
+    values = re.findall(r"'([^']*)'", found[0])
+    assert values, f"{where}: the CHECK of {column} lists no value"
+    return set(values)
+
+
 def check_values(path: Path, column: str) -> set[str]:
     """The values of a migration's `<column> text CHECK (<column> IN ('a','b',…))`, read from its text."""
+    return _check_in(path.read_text(encoding="utf-8"), column, path.name)
+
+
+def table_check_values(path: Path, table: str, column: str) -> set[str]:
+    """The values of `<column> text NOT NULL CHECK (<column> IN (…))` in a migration's `CREATE TABLE <table>`
+    (a column name that other tables of the migration use too, as `kind`)."""
     text = path.read_text(encoding="utf-8")
-    found = re.findall(rf"\b{column}\s+text\s+CHECK\s*\(\s*{column}\s+IN\s*\(([^)]*)\)\s*\)", text)
-    assert len(found) == 1, f"{path.name}: {len(found)} CHECKs of {column}"
-    values = re.findall(r"'([^']*)'", found[0])
-    assert values, f"{path.name}: the CHECK of {column} lists no value"
-    return set(values)
+    tables = re.findall(rf"CREATE TABLE {table} \((.*?)\n\);", text, flags=re.DOTALL)
+    assert len(tables) == 1, f"{path.name}: {len(tables)} CREATE TABLE {table}"
+    return _check_in(tables[0], column, f"{path.name} {table}", not_null=True)
+
+
+def basis_values() -> set[str]:
+    """The basis of a criterion: an LLM criterion's (the generator's) and a deterministic one's."""
+    llm = literal_values(generator.Criterion.model_fields["basis"].annotation)
+    return llm | literal_values(get_type_hints(DetCriterion)["basis"])
 
 
 # Each namespace of codes.json with its backend source.
@@ -316,6 +347,33 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     # employment types: the employment types plus `unknown`, and the seniority ladder
     "employment": lambda: set(EMPLOYMENT_VALUES),
     "seniority": lambda: set(SENIORITY_VALUES),
+    # the detail drawer (plan M4 Task 24, resolution g): the criteria (§11.2's eight), their basis; the
+    # posted date's precision and the salary's period; the result's status and its critic outcome; a critic
+    # round's triggers, verdict, derived outcome and issues (a grounded dispute's assessment, or a required
+    # fact it did not confirm, `jobs.detail._issues`); the caps (a binding knockout's code, or the industry
+    # penalty) and their kind, the industry preference, the profile section of an evidence row, a merge
+    # event's kind (the `merge_events.kind` CHECK) and a feedback label
+    "criterion": lambda: {*LLM_CRITERIA, *DET_CRITERIA},
+    "basis": basis_values,
+    "posted_precision": lambda: literal_values(Precision),
+    "salary_period": lambda: literal_values(Period),
+    "result_status": lambda: literal_values(ScoreOut.model_fields["result_status"].annotation),
+    "critic_outcome": lambda: literal_values(DetailScoreOut.model_fields["critic_outcome"].annotation),
+    "critic_trigger": lambda: literal_values(Trigger),
+    "critic_verdict": lambda: literal_values(CriticOut.model_fields["verdict"].annotation),
+    "round_outcome": lambda: literal_values(DerivedOutcome),
+    "critic_issue": lambda: {
+        *validator.CRITERION_ASSESSMENTS,
+        FACT_REJECTED,
+        FACT_UNREVIEWED,
+        FACT_UNCERTAIN,
+    },
+    "cap": lambda: literal_values(KnockoutCode) | {aggregate.INDUSTRY_CODE},
+    "cap_kind": lambda: literal_values(aggregate.CapKind),
+    "industry_match": lambda: literal_values(aggregate.IndustryMatch),
+    "profile_section": lambda: set(validator.PROFILE_SECTIONS),
+    "merge_kind": lambda: table_check_values(COLLECTION_MIGRATION, "merge_events", "kind"),
+    "feedback_label": lambda: literal_values(FeedbackLabel),
 }
 
 

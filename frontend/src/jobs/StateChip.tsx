@@ -17,13 +17,14 @@
 // `ConfirmDialog` naming the reason), then sends a keyed score-now with `force`; like Score now, it is disabled
 // while the header's status has a `cap_reached` banner, with the same text beside it (`aria-describedby`).
 // Retry sends a keyed retry. The reason code and the refusal category are the server's, shown verbatim.
+import type { TFunction } from "i18next";
 import { type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { type TranslationKey, useServerText } from "../i18n/index";
 import { type ScoringBucket, type TargetOut, useCapReached, useRetryTarget, useScoreNow } from "./api";
-import { filteredText } from "./format";
+import { filteredText, type ServerText } from "./format";
 import styles from "./StateChip.module.css";
 
 export interface StateChipProps {
@@ -86,38 +87,55 @@ function Retry({ targetId }: { targetId: number }) {
   );
 }
 
+/** The chip's text (the module comment's table): the card's chip, and the drawer's for a job without a score. */
+export function chipText(
+  target: TargetOut | null,
+  bucket: ScoringBucket,
+  filterKeyword: string | null,
+  filterReasons: readonly string[],
+  t: TFunction,
+  serverText: ServerText,
+): string {
+  const fixed = target === null ? undefined : FIXED.get(target.state);
+  if (bucket === "not_a_job_ad") {
+    return t("chip.not_a_job_ad");
+  }
+  if (target === null) {
+    return t("chip.not_queued");
+  }
+  if (fixed !== undefined) {
+    return t(fixed[0]);
+  }
+  if (target.state === "filtered_out") {
+    return filteredText(filterKeyword, filterReasons, t, serverText);
+  }
+  if (target.state === "refused") {
+    return target.refusal_category === null ? t("chip.refused_plain") : t("chip.refused", { category: target.refusal_category });
+  }
+  return serverText("target_state", target.state); // a failed one's too: "Failed (temporary error)", §15.3's "Failed: <reason>"
+}
+
 export function StateChip({ jobId, target, bucket, filterKeyword, filterReasons }: StateChipProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const fixed = target === null ? undefined : FIXED.get(target.state);
-  let text: string;
+  const text = chipText(target, bucket, filterKeyword, filterReasons, t, serverText);
   let tone: Tone = "neutral";
   let action: ReactNode = null;
   let reason: string | null = null;
-  if (bucket === "not_a_job_ad") {
-    text = t("chip.not_a_job_ad");
-  } else if (target === null) {
-    text = t("chip.not_queued");
-  } else if (fixed !== undefined) {
-    text = t(fixed[0]);
-    tone = fixed[1];
-  } else if (target.state === "filtered_out") {
-    text = filteredText(filterKeyword, filterReasons, t, serverText);
-    action = <ScoreAnyway jobId={jobId} reason={text} />;
-  } else if (isFailed(target.state)) {
-    text = serverText("target_state", target.state); // "Failed (temporary error)": §15.3's "Failed: <reason>"
-    tone = "critical";
-    reason = target.state_reason;
-    action = <Retry targetId={target.id} />;
-  } else if (target.state === "refused") {
-    text =
-      target.refusal_category === null
-        ? t("chip.refused_plain")
-        : t("chip.refused", { category: target.refusal_category });
-    tone = "critical";
-    action = <Retry targetId={target.id} />;
-  } else {
-    text = serverText("target_state", target.state);
+  if (bucket !== "not_a_job_ad" && target !== null) {
+    const fixed = FIXED.get(target.state);
+    if (fixed !== undefined) {
+      tone = fixed[1];
+    } else if (target.state === "filtered_out") {
+      action = <ScoreAnyway jobId={jobId} reason={text} />;
+    } else if (isFailed(target.state)) {
+      tone = "critical";
+      reason = target.state_reason;
+      action = <Retry targetId={target.id} />;
+    } else if (target.state === "refused") {
+      tone = "critical";
+      action = <Retry targetId={target.id} />;
+    }
   }
   return (
     <div className={styles.state}>
