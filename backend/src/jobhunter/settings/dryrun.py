@@ -4,9 +4,10 @@ settings page shows on every change and that a save runs again (Task 17).
 `dry_run` composes §6.8's pseudo-code in its order:
 1. `validate_fields` (with the eval gate of the payload's candidate, `payload_gate`: the active rubric and
    prompt-schema versions with the payload's model and evaluation policies by hash, M3 Task 20), then
-   `unknown_references` (Task 17): an entry of `queries[]` or `watchlist[]` whose id names no row is an
-   `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview and the
-   save (which runs this again) refuse the same documents;
+   `unknown_references` (Task 17): an entry of `queries[]` whose id names no live query (no row, or a
+   retired one: an edit retires its row, plan M4 Task 29 Ruling T29-c) or of `watchlist[]` whose id names no
+   row is an `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview
+   and the save (which runs this again) refuse the same documents;
 2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `eval_failed`,
    `serpapi_disabled_no_fallback`); both read `active`, which tells a selection of generator effort `low` from
    a kept one (Ruling T20-d);
@@ -144,9 +145,10 @@ _DAYS_PER_MONTH: Final = 30
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
 )
+# A query id is missing when it names no row or a retired one: the document names live queries only.
 _MISSING_QUERIES: Final = q(
     "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
-    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id)"
+    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id AND q.retired_at IS NULL)"
 )
 _MISSING_COMPANIES: Final = q(
     "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
@@ -239,8 +241,9 @@ async def active_settings(conn: AsyncConnection) -> Settings:
 
 
 async def unknown_references(conn: AsyncConnection, settings: Settings) -> list[FieldIssue]:
-    """An `invalid` issue at each `queries[]` or `watchlist[]` entry of `settings` whose id names no row
-    (plain reads; the ids are bounded by the model, so they fit `bigint`)."""
+    """An `invalid` issue at each `queries[]` entry of `settings` whose id names no live query (no row, or a
+    retired one) and each `watchlist[]` entry whose id names no row (plain reads; the ids are bounded by the
+    model, so they fit `bigint`)."""
     query_ids = [entry.query_id for entry in settings.queries]
     company_ids = [entry.watchlist_company_id for entry in settings.watchlist]
     missing_queries = set((await conn.execute(_MISSING_QUERIES, {"ids": query_ids})).scalars())

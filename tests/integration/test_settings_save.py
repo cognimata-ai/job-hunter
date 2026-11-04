@@ -302,6 +302,20 @@ async def test_unknown_queries_and_watchlist_companies_are_refused(logged_in_cli
     assert await count_rows(engine, "source_instances") == 4
 
 
+async def test_a_retired_query_id_is_refused_like_a_missing_one(logged_in_client, engine) -> None:
+    """An edit retires its query (plan M4 Task 29, Ruling T29-c): the document names live queries only."""
+    insert = text("INSERT INTO queries (text, lang, origin) VALUES (:text, 'en', 'user') RETURNING id")
+    async with engine.begin() as conn:
+        retired = (await conn.execute(insert, {"text": "Backend Engineer"})).scalar_one()
+        live = (await conn.execute(insert, {"text": "Backend Developer"})).scalar_one()
+        await conn.execute(text("UPDATE queries SET retired_at = now() WHERE id = :i"), {"i": retired})
+    payload = await active_payload(logged_in_client)
+    payload["queries"] = [{"query_id": retired, "enabled": True}, {"query_id": live, "enabled": True}]
+    await assert_refused_like_the_dry_run(
+        logged_in_client, engine, payload, [("payload.queries[0].query_id", "invalid")]
+    )
+
+
 @pytest.mark.parametrize(
     ("group", "entry", "path"),
     [
