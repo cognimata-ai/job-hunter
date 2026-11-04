@@ -5,19 +5,24 @@
 // - Evidence quotes are in the UI language's quotation marks; a profile row ends "⇄ <its section>", a
 //   structured-field row "⇄ <its field>" (the field's name is the server's, verbatim in a <code>).
 // - A deterministic criterion shows its inputs as "key: value" (the keys are the server's, verbatim): a scalar as
-//   its text, an array joined, an object as "key value" pairs, a null as "—".
+//   its text, an array joined, an object as "key value" pairs, a null as "—". `compat`'s keys are work modes,
+//   named by the card's work-mode texts (a mode outside them stays verbatim in a <code>).
 // - A criterion whose fields were corrected (`corrected_fields`) or shortened (`shortened_fields`, B22) is
 //   marked so; a corrected or shortened path that names no criterion and no summary is listed under the table.
 // - In a narrow drawer each row is restacked (name; weight, level and basis with their headers; evidence) by a
 //   container query. The explicit table roles keep the table's semantics, which a browser may drop from an
 //   element whose `display` changes.
+import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { cx } from "../components/cx";
 import { useServerText } from "../i18n/index";
 import styles from "./CriteriaTable.module.css";
 import type { DetailScoreOut, EvidenceOut } from "./detailApi";
+import { workModeLabel } from "./format";
 
 const SUMMARY_PATHS: ReadonlySet<string> = new Set(["summary_en", "summary_de"]);
+/** `location_work_mode`'s compatibility by work mode (`scoring/det_criteria.py`). */
+const COMPAT = "compat";
 
 /** Whether a corrected or shortened `path` lies under criterion `key` (`criteria.<key>`, `criteria.<key>.…`). */
 function under(path: string, key: string): boolean {
@@ -42,6 +47,25 @@ function valueText(value: unknown, none: string): string {
     return Object.entries(value).map(([key, item]) => `${key} ${valueText(item, none)}`).join(", ");
   }
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** `compat`'s levels by work mode: "on-site 2, remote —". */
+function Compat({ levels, none }: { levels: Record<string, unknown>; none: string }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {Object.entries(levels).map(([mode, level], i) => (
+        <Fragment key={mode}>
+          {i > 0 && ", "}
+          {workModeLabel(mode, t) ?? <code className={styles.code}>{mode}</code>} {valueText(level, none)}
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 function Quote({ evidence }: { evidence: EvidenceOut }) {
@@ -163,7 +187,8 @@ export function CriteriaTable({ score }: { score: DetailScoreOut }) {
                     <ul role="list" className={styles.evidence}>
                       {inputs.map(([key, value]) => (
                         <li key={key}>
-                          <code className={styles.code}>{key}</code>: {valueText(value, none)}
+                          <code className={styles.code}>{key}</code>:{" "}
+                          {key === COMPAT && isRecord(value) ? <Compat levels={value} none={none} /> : valueText(value, none)}
                         </li>
                       ))}
                     </ul>

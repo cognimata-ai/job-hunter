@@ -596,6 +596,7 @@
   "drawer.score": "Bewertung",
   "drawer.score_facts": "L {{low}} · U {{high}} · Abdeckung {{percent}} % · Konfidenz {{confidence}}",
   "drawer.status": "{{status}} ({{critic}})",
+  "drawer.score_pending": "Bewertung ausstehend",
   "drawer.scored_via": "bewertet über",
   "drawer.job_ref": "Stelle {{id}}",
   "drawer.versions": "Profil v{{profile}} · Rubrik {{rubric}} · Prompt {{prompt}}… · {{generator}}",

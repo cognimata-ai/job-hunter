@@ -2844,6 +2844,8 @@ export interface components {
          * @description A job's detail.
          */
         JobDetailOut: {
+            /** Bucket */
+            bucket: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad") | null;
             contested: components["schemas"]["ContestedOut"] | null;
             description: components["schemas"]["DescriptionOut"];
             /** Feedback */

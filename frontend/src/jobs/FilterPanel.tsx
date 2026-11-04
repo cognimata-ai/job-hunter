@@ -20,11 +20,11 @@ import { useFormat } from "../system/format";
 import { useFacets } from "./api";
 import { CompanyPicker } from "./CompanyPicker";
 import styles from "./FilterPanel.module.css";
+import { AVAILABILITY_LABELS } from "./format";
 import { PlacePicker } from "./PlacePicker";
 import {
   AD_LANGUAGES,
   type AdLanguage,
-  type Availability,
   AVAILABILITIES,
   type Confidence,
   CONFIDENCES,
@@ -87,12 +87,6 @@ const STATUS_LABELS = {
   applied: "filters.status.applied",
   hidden: "filters.status.hidden",
 } as const satisfies Record<UserStatus, TranslationKey>;
-const AVAILABILITY_LABELS = {
-  active: "filters.availability.active",
-  unknown: "filters.availability.unknown",
-  stale: "filters.availability.stale",
-  closed: "filters.availability.closed",
-} as const satisfies Record<Availability, TranslationKey>;
 const TRI_LABELS = {
   any: "filters.tri.any",
   only: "filters.tri.only",

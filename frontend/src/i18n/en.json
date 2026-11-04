@@ -596,6 +596,7 @@
   "drawer.score": "Score",
   "drawer.score_facts": "L {{low}} · U {{high}} · coverage {{percent}}% · confidence {{confidence}}",
   "drawer.status": "{{status}} ({{critic}})",
+  "drawer.score_pending": "Score pending",
   "drawer.scored_via": "scored via",
   "drawer.job_ref": "job {{id}}",
   "drawer.versions": "Profile v{{profile}} · rubric {{rubric}} · prompt {{prompt}}… · {{generator}}",

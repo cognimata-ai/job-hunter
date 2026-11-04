@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
@@ -79,6 +79,21 @@ describe("CriteriaTable", () => {
     const inputs = within(within(table()).getAllByRole("row")[7]).getAllByRole("listitem").map((li) => li.textContent);
     expect(inputs).toEqual(["compat: hybrid 4, remote —", "hybrid_band: 4", "modes: hybrid, remote", "known: false"]);
     expect(employment[4]).toBe("et: 4sal: 4");
+  });
+
+  it("names the work modes of compat by their texts, and keeps an unknown mode's code", async () => {
+    const score = detailScore();
+    score.det_criteria[0] = { ...score.det_criteria[0], inputs: { compat: { onsite: 2, remote: null, moon: 0 } } };
+    renderInProviders(<CriteriaTable score={score} />);
+    const row = within(table()).getAllByRole("row")[7]; // the same element after the language changes
+    const compat = () => within(row).getAllByRole("listitem")[0];
+    expect(compat().textContent).toBe(`compat: ${en["card.mode.onsite"]} 2, ${en["card.mode.remote"]} —, moon 0`);
+    expect(within(compat()).getByText("moon").tagName).toBe("CODE");
+    expect(within(compat()).queryByText("onsite")).toBeNull();
+    await act(async () => {
+      await i18n.changeLanguage("de");
+    });
+    expect(compat().textContent).toBe(`compat: ${de["card.mode.onsite"]} 2, ${de["card.mode.remote"]} —, moon 0`);
   });
 
   it("marks a corrected and a shortened criterion", () => {

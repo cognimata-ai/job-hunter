@@ -6,15 +6,18 @@
 //
 // Every server string is rendered as text. A group card (`kind: "group"`) is its representative's card here
 // (Task 25 frames it). The card takes part in the list's roving focus: `tabIndex` 0 when `focused`, else -1;
-// Enter on the card itself (not on one of its controls) opens it.
+// Enter on the card itself (not on one of its controls) opens it. The title is a link to the card's drawer
+// (`href`, the Jobs URL with `job=<id>`, Ruling T24-f), a tab stop like the quick actions: a plain primary click
+// (or Enter on the link) opens it through `onOpen`, as Enter on the card does, and a modifier or middle click is
+// the browser's (a new tab).
 import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { useDisplay } from "../app/display";
 import { RelativeTime } from "../components/RelativeTime";
-import { type TranslationKey, useServerText } from "../i18n/index";
+import { useServerText } from "../i18n/index";
 import type { JobCardOut } from "./api";
 import { CardBadges } from "./CardBadges";
-import { postedLabel, seenToday } from "./format";
+import { postedLabel, seenToday, workModesText } from "./format";
 import styles from "./JobCard.module.css";
 import { KnockoutBadges } from "./KnockoutBadge";
 import { QuickActions } from "./QuickActions";
@@ -25,18 +28,15 @@ import { StateChip } from "./StateChip";
 
 // The target states Score now serves; the server decides the rest (spec §9.6.4).
 const SCORE_NOW_STATES: ReadonlySet<string> = new Set(["pending", "budget_deferred", "expired_unscored"]);
-const MODE_KEYS: ReadonlyMap<string, TranslationKey> = new Map([
-  ["remote", "card.mode.remote"],
-  ["hybrid", "card.mode.hybrid"],
-  ["onsite", "card.mode.onsite"],
-] as const);
 
 export interface JobCardProps {
   card: JobCardOut;
   /** The list's one card in the tab order (roving focus). */
   focused: boolean;
-  /** Opens the card's detail (Enter on the card). */
+  /** Opens the card's detail (Enter on the card, a click on its title). */
   onOpen: (jobId: number) => void;
+  /** The URL of the card's detail: the Jobs page's with `job=<id>`. */
+  href: string;
 }
 
 function Unscored({ card }: { card: JobCardOut }) {
@@ -52,15 +52,13 @@ function Unscored({ card }: { card: JobCardOut }) {
   );
 }
 
-export function JobCard({ card, focused, onOpen }: JobCardProps) {
+export function JobCard({ card, focused, onOpen, href }: JobCardProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
   const { timezone } = useDisplay();
   const headingId = useId();
   const now = new Date();
-  const modes = card.work_mode_known
-    ? card.work_modes.map((mode) => { const key = MODE_KEYS.get(mode); return key === undefined ? mode : t(key); }).join(" / ")
-    : t("card.mode_unknown");
+  const modes = workModesText(card.work_modes, card.work_mode_known, t);
   const where = [...card.locations, modes].filter((part) => part !== "").join(" · ");
   const unseen = card.user === null || card.user.seen_at === null;
   return (
@@ -72,7 +70,18 @@ export function JobCard({ card, focused, onOpen }: JobCardProps) {
         }
       }}>
       <div className={styles.main}>
-        <h2 id={headingId} className={styles.title}>{card.title}</h2>
+        <h2 id={headingId} className={styles.title}>
+          <a href={href} className={styles.titleLink}
+            onClick={(event) => {
+              if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                return; // a new tab or window: the browser's
+              }
+              event.preventDefault();
+              onOpen(card.job_id);
+            }}>
+            {card.title}
+          </a>
+        </h2>
         <p className={styles.company}>{card.company}</p>
         <p className={styles.where}>{where}</p>
         <p className={styles.dates}>

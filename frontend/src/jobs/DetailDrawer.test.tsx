@@ -1,5 +1,5 @@
 import { createMemoryHistory } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -147,6 +147,38 @@ describe("DetailDrawer: opening and closing", () => {
     });
   });
 
+  it("a click on the card's title pushes job=<id> and opens the drawer, and Back closes it", async () => {
+    stack();
+    const app = renderApp("/?sort=posted");
+    const card = await screen.findByRole("article", { name: TITLE });
+    const link = within(card).getByRole("link", { name: TITLE });
+    const href = new URL(link.getAttribute("href") ?? "", "http://app.test");
+    expect([href.pathname, href.searchParams.get("job"), href.searchParams.get("sort")]).toEqual(["/", "5", "posted"]);
+    // a modifier click is the browser's (a new tab): nothing prevents it, and the page does not move
+    let leftToTheBrowser = false;
+    const stop = (event: MouseEvent) => {
+      leftToTheBrowser = !event.defaultPrevented;
+      event.preventDefault(); // jsdom does not navigate
+    };
+    document.addEventListener("click", stop);
+    fireEvent.click(link, { ctrlKey: true });
+    document.removeEventListener("click", stop);
+    expect(leftToTheBrowser).toBe(true);
+    expect(app.router.state.location.search).toEqual({ sort: "posted" });
+    const before = app.router.history.length;
+    await userEvent.setup().click(link);
+    expect(await screen.findByRole("dialog", { name: TITLE })).toBeTruthy();
+    expect(app.router.state.location.search).toEqual({ sort: "posted", job: "5" });
+    expect(app.router.history.length).toBe(before + 1); // pushed
+    act(() => {
+      app.router.history.back();
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(app.router.state.location.search).toEqual({ sort: "posted" });
+  });
+
   it("reopens on the survivor of a merged job", async () => {
     const api = stack();
     api.routes.set("GET /api/jobs/5", () => problem(404, "not_found", { merged_into_job_id: 9 }));
@@ -159,6 +191,9 @@ describe("DetailDrawer: opening and closing", () => {
     expect(app.router.history.length).toBe(1); // replaced
     expect(await screen.findByText(en["drawer.merged"])).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
+    await settled();
+    expect(requestsTo(api, "GET /api/jobs/5")).toHaveLength(1); // redirected once, never read again
+    expect(screen.getAllByText(en["drawer.merged"])).toHaveLength(1);
   });
 
   it("a vanished job shows the gone state, not a problem", async () => {
@@ -264,6 +299,27 @@ describe("DetailDrawer: the header and the score", () => {
     expect(badge.getAttribute("rel")).toBe(REL);
   });
 
+  it("Seen clears a job seen at open, and the refetch that follows sends no seen_on_open", async () => {
+    const api = stack();
+    let seenAt: string | null = "2026-11-02T08:00:00Z";
+    api.routes.set("GET /api/jobs/5", () => json(jobDetail({ user: userActions(5, { seen_at: seenAt }) })));
+    api.routes.set("PUT /api/jobs/5/actions", (request) => {
+      const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>;
+      seenAt = body.seen === false ? null : NOW.toISOString();
+      return json({ job: userActions(5, { seen_at: seenAt }), members: [] });
+    });
+    const { dialog, user } = await openPasted();
+    const seen = within(dialog).getByRole("button", { name: en["drawer.seen"] });
+    expect(seen.getAttribute("aria-pressed")).toBe("true");
+    await user.click(seen);
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/jobs/5").length).toBeGreaterThan(1); // the write read the detail again
+    });
+    await settled();
+    expect(bodies(api, "PUT /api/jobs/5/actions")).toEqual([{ seen: false }]);
+    expect(within(screen.getByRole("dialog")).getByRole("button", { name: en["drawer.seen"] }).getAttribute("aria-pressed")).toBe("false");
+  });
+
   it("Seen sends seen, never with seen_on_open", async () => {
     const api = stack(jobDetail({ user: userActions(5, { seen_at: "2026-11-02T08:00:00Z" }) }));
     const { dialog, user } = await openPasted();
@@ -305,7 +361,7 @@ describe("DetailDrawer: the header and the score", () => {
     );
     const { dialog } = await openPasted();
     const text = within(dialog).getByRole("region", { name: en["drawer.score"] }).textContent;
-    expect(text).toContain(en["critic_outcome.not_run"]);
+    expect(text).toContain(`${en["result_status.accepted"]} (${en["critic_outcome.not_run"]})`); // "accepted (not reviewed)"
     expect(text).toContain("gen-model/medium");
     expect(text).not.toContain("critic-model");
     expect(text).toContain(en["card.knockout_requires"].replace("{{requirement}}", en["degree_level.master"]));
@@ -320,7 +376,9 @@ describe("DetailDrawer: the header and the score", () => {
     const summary = await screen.findByText("Eine starke Passung für Backend-Arbeit.");
     expect(summary.getAttribute("lang")).toBe("de");
     expect(screen.queryByText("A strong match for backend work.")).toBeNull();
-    expect(screen.getByRole("dialog", { name: TITLE }).textContent).toContain(de["critic_outcome.accepted"]);
+    expect(screen.getByRole("dialog", { name: TITLE }).textContent).toContain(
+      `${de["result_status.accepted"]} (${de["critic_outcome.accepted"]})`, // "angenommen (Prüfung ✓)"
+    );
   });
 
   it("a job without a score shows its state chip text and no criteria", async () => {
@@ -328,6 +386,7 @@ describe("DetailDrawer: the header and the score", () => {
       jobDetail({
         score: null,
         target: { id: 50, state: "pending", state_reason: null, refusal_category: null, similarity: 0.6, override: "none" },
+        bucket: "unscored",
         history: { items: [], next_cursor: null },
         user: userActions(5, { seen_at: NOW.toISOString() }),
       }),
@@ -337,6 +396,32 @@ describe("DetailDrawer: the header and the score", () => {
     expect(within(score).getByText(en["chip.pending"])).toBeTruthy();
     expect(within(score).queryByRole("table")).toBeNull();
     expect(within(score).queryByRole("img")).toBeNull();
+  });
+
+  it("a verified not-a-job-ad says so, by the card's bucket", async () => {
+    stack(jobDetail({ score: null, bucket: "not_a_job_ad", user: userActions(5, { seen_at: NOW.toISOString() }) }));
+    const { dialog } = await openPasted();
+    const score = within(dialog).getByRole("region", { name: en["drawer.score"] });
+    expect(within(score).getByText(en["chip.not_a_job_ad"])).toBeTruthy();
+  });
+
+  it("a published result without a bucket reads Score pending, never a verified not-a-job-ad", async () => {
+    // the T4-c gap: published, but no current instance under the active scope
+    stack(jobDetail({ score: null, bucket: null, user: userActions(5, { seen_at: NOW.toISOString() }) }));
+    const { dialog } = await openPasted();
+    const score = within(dialog).getByRole("region", { name: en["drawer.score"] });
+    expect(within(score).getByText(en["drawer.score_pending"])).toBeTruthy();
+    expect(within(score).queryByText(en["chip.not_a_job_ad"])).toBeNull();
+  });
+
+  it("a contested result's status line says contested once", async () => {
+    const score = detailScore({ result_status: "contested", critic_outcome: "contested" });
+    stack(jobDetail({ score, user: userActions(5, { seen_at: NOW.toISOString() }) }));
+    const { dialog } = await openPasted();
+    const region = within(dialog).getByRole("region", { name: en["drawer.score"] });
+    const line = within(region).getByText(en["result_status.contested"]);
+    expect(line.textContent).toBe(en["result_status.contested"]); // not "contested (contested)"
+    expect(region.textContent).not.toContain(`${en["result_status.contested"]} (`);
   });
 });
 

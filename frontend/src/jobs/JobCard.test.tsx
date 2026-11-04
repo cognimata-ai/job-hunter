@@ -103,6 +103,13 @@ async function cardsOf(api: FakeApi, items: JobCardOut[]): Promise<HTMLElement[]
   return within(list).getAllByRole("article");
 }
 
+/** A card's links but its title's, which links inside the app to the card's drawer (Task 24, Ruling T24-f). */
+function outboundLinks(card: HTMLElement, title: string): HTMLElement[] {
+  const own = within(card).getByRole("link", { name: title });
+  expect(own.hasAttribute("target")).toBe(false);
+  return within(card).queryAllByRole("link").filter((link) => link !== own);
+}
+
 function bodies(api: FakeApi, call: string): unknown[] {
   return requestsTo(api, call).map((r) => JSON.parse(r.body ?? "null") as unknown);
 }
@@ -133,7 +140,7 @@ describe("JobCard", () => {
       jobCard({ source_ids: ["adzuna"], badges: ["partial", "adzuna"], links: { open_ad: adzuna, adzuna } }),
       jobCard({ job_id: 6, title: "No link", links: { open_ad: null, adzuna: null } }),
     ]);
-    const links = within(linked).getAllByRole("link");
+    const links = outboundLinks(linked, "Senior Backend Engineer");
     expect(links).toHaveLength(2); // Open ad and the Adzuna attribution
     for (const link of links) {
       expect(link.getAttribute("rel")).toBe(REL);
@@ -141,7 +148,7 @@ describe("JobCard", () => {
       expect(link.getAttribute("href")).toBe(adzuna);
     }
     expect(within(linked).getByRole("link", { name: `${en["card.open_ad"]} ${en["link.new_tab"]}` })).toBeTruthy();
-    expect(within(bare).queryByRole("link")).toBeNull(); // no Open ad without a link
+    expect(outboundLinks(bare, "No link")).toHaveLength(0); // no Open ad without a link
   });
 
   it("NEW for an unseen card and markers for saved and applied", async () => {
@@ -363,7 +370,7 @@ describe("JobCard", () => {
     expect(link.getAttribute("href")).toBe(href);
     expect(link.getAttribute("rel")).toBe(REL);
     expect(link.getAttribute("target")).toBe("_blank");
-    expect(within(plain).queryByRole("link")).toBeNull();
+    expect(outboundLinks(plain, "Plain")).toHaveLength(0);
     expect(within(within(plain).getByRole("list", { name: en["card.badges"] })).getByText(en["badge.adzuna"])).toBeTruthy();
   });
 });
@@ -787,8 +794,8 @@ describe("the card's focus", () => {
     const onOpen = vi.fn();
     renderInProviders(
       <>
-        <JobCard card={jobCard()} focused onOpen={onOpen} />
-        <JobCard card={jobCard({ job_id: 6, title: "Second" })} focused={false} onOpen={onOpen} />
+        <JobCard card={jobCard()} focused onOpen={onOpen} href="/?job=5" />
+        <JobCard card={jobCard({ job_id: 6, title: "Second" })} focused={false} onOpen={onOpen} href="/?job=6" />
       </>,
     );
     const [first, second] = screen.getAllByRole("article");

@@ -94,15 +94,35 @@ export function filteredText(
   return serverText("target_state", "filtered_out");
 }
 
-const AVAILABILITY_LABELS = {
+/** The availabilities' texts: the Availability filter's (Task 23), and an ad's availability in the drawer. */
+export const AVAILABILITY_LABELS = {
   active: "filters.availability.active",
   unknown: "filters.availability.unknown",
   stale: "filters.availability.stale",
   closed: "filters.availability.closed",
 } as const satisfies Record<Availability, TranslationKey>;
 
-/** An ad's availability in the Availability filter's words (Task 23); a value outside them as the server sends it. */
+/** An ad's availability in the Availability filter's words; a value outside them as the server sends it. */
 export function availabilityText(availability: string, t: TFunction): string {
   const key = new Map<string, TranslationKey>(Object.entries(AVAILABILITY_LABELS)).get(availability);
   return key === undefined ? availability : t(key);
+}
+
+// The texts of the known work modes (`settings.model.WorkMode`), as a card names them.
+const WORK_MODE_KEYS: ReadonlyMap<string, TranslationKey> = new Map([
+  ["remote", "card.mode.remote"],
+  ["hybrid", "card.mode.hybrid"],
+  ["onsite", "card.mode.onsite"],
+] as const);
+
+/** A work mode's text, `null` for a code outside the known modes. */
+export function workModeLabel(mode: string, t: TFunction): string | null {
+  const key = WORK_MODE_KEYS.get(mode);
+  return key === undefined ? null : t(key);
+}
+
+/** An ad's work modes ("remote / hybrid"), a code outside the known modes as it is; "work mode unknown" when
+ * the ad does not state them. The card and the drawer show them so. */
+export function workModesText(modes: readonly string[], known: boolean, t: TFunction): string {
+  return known ? modes.map((mode) => workModeLabel(mode, t) ?? mode).join(" / ") : t("card.mode_unknown");
 }

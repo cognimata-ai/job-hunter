@@ -218,8 +218,9 @@ class JobCardOut(BaseModel):
 
 # --- the statements ---------------------------------------------------------------------------------------
 
-# The scoring bucket of a card's score row: the listing's exclusive buckets (B8), each its own WHEN
-_BUCKET: Final = (
+# The scoring bucket of a card's score row: the listing's exclusive buckets (B8), each its own WHEN, over the
+# aliases of `_sql.CARD_FROM` (the drawer's detail reads it there too, `jobs.detail`)
+BUCKET_CASE: Final = (
     "CASE " + " ".join(f"WHEN {_sql.BUCKET_SQL[b]} THEN '{b}'" for b in _sql.BUCKET_ORDER) + " END"
 )
 _CARDS: Final = q(
@@ -234,7 +235,7 @@ _CARDS: Final = q(
     "h.reasons, u.job_id IS NOT NULL AS acted, u.seen_at, u.saved_at, u.applied_at, u.hidden_at, "
     "coalesce(u.note, '') <> '' AS has_note, g.id AS group_id, g.representative_job_id, "
     "g.unscorable_reason, rep.title AS rep_title, rep.source_ids AS rep_source_ids, "
-    + _BUCKET
+    + BUCKET_CASE
     + " AS bucket"
     + _sql.CARD_FROM
     + " LEFT JOIN duplicate_groups g ON g.id = j.duplicate_group_id AND g.status = 'active'"

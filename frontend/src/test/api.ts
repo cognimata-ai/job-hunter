@@ -269,6 +269,7 @@ export function jobDetail(overrides: Partial<JobDetailOut> = {}): JobDetailOut {
     score: detailScore(),
     contested: null,
     target: { id: 50, state: "published_accepted", state_reason: null, refusal_category: null, similarity: 0.7, override: "none" },
+    bucket: "scored",
     group: null,
     merge_events: [],
     user: null,

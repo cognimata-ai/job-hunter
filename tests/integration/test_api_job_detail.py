@@ -676,6 +676,45 @@ async def test_a_contested_result_without_a_current_instance_has_neither_score_n
     assert body["target"]["state"] == "published_contested"
 
 
+# --- the bucket (Ruling T24-e) ----------------------------------------------------------------------------
+
+
+async def test_the_bucket_is_the_card_s_a_verified_not_a_job_ad_is_not_a_job_ad(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    """The detail names the card's bucket: a scored job `scored`, a verified not-a-job-ad (a current instance
+    without a score) `not_a_job_ad`, which has no score in the drawer either."""
+    scored_id, not_an_ad = await seed_cards(
+        engine, [scored(40, 60), Card(state="published_accepted", not_a_job_ad=True)]
+    )
+    assert (await detail(logged_in_client, scored_id))["bucket"] == "scored"
+    body = await detail(logged_in_client, not_an_ad)
+    assert (body["bucket"], body["score"], body["target"]["state"]) == (
+        "not_a_job_ad",
+        None,
+        "published_accepted",
+    )
+
+
+async def test_a_published_result_without_a_current_instance_has_no_bucket(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    """The T4-c gap (a scope flip before its recompute): the result is published, but no current instance
+    under the active scope gives it a score or a bucket, so the drawer cannot call it a verified
+    not-a-job-ad."""
+    (job_id,) = await seed_cards(engine, [scored(40, 60)])
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        await c.execute(
+            sa.text(
+                "UPDATE det_results SET is_current = false, superseded_at = now() WHERE llm_result_id = :r"
+            ),
+            {"r": p.result_id},
+        )
+    body = await detail(logged_in_client, job_id)
+    assert (body["bucket"], body["score"], body["target"]["state"]) == (None, None, "published_accepted")
+
+
 # --- fact evidence ----------------------------------------------------------------------------------------
 
 

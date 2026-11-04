@@ -11,7 +11,8 @@
 //   has to be in the accessibility tree before its content changes.
 // - Without an active profile, "Upload your CV to start ranking" (a link to the CV section) above the cards,
 //   which are still listed, unscored (§15.8).
-// - The list's keyboard is `useListKeyboard`'s; Enter on a card pushes `job=<id>`.
+// - The list's keyboard is `useListKeyboard`'s; Enter on a card, or a click on its title (a link to the same
+//   URL, Ruling T24-f), pushes `job=<id>`.
 // - The detail drawer (Task 24, resolution e) is open while the search has `job`. Closing it goes Back when this
 //   page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL without `job`; showing
 //   another job in it (a survivor, a representative) replaces `job`. The drawer gives focus back to what held it
@@ -82,6 +83,11 @@ export function JobsPage() {
     }
   }, [router, write]);
   const showJob = useCallback((jobId: number) => { write({ job: jobId }, { replace: true }); }, [write]);
+  // a card's title links to its drawer: this search with `job=<id>`, as the router writes it
+  const jobHref = useCallback(
+    (jobId: number) => router.buildLocation({ to: "/", search: { ...search, job: jobId } }).href,
+    [router, search],
+  );
   const keyboard = useListKeyboard(ids, open);
   const { focusCard, headingRef } = keyboard;
 
@@ -165,7 +171,7 @@ export function JobsPage() {
         <ol role="list" className={styles.list} aria-labelledby={headingId}>
           {list.items.map((card) => (
             <li key={card.job_id} {...keyboard.itemProps(card.job_id)}>
-              <JobCard card={card} {...keyboard.cardProps(card.job_id)} />
+              <JobCard card={card} {...keyboard.cardProps(card.job_id)} href={jobHref(card.job_id)} />
             </li>
           ))}
         </ol>

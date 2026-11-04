@@ -134,3 +134,15 @@
     padding: var(--space-3);
   }
 }
+
+/* The title links to the card's drawer: it reads as the title, and shows itself as a link on hover. */
+.titleLink {
+  color: inherit;
+  text-decoration: none;
+}
+
+.titleLink:hover {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}

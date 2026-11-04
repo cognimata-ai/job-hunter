@@ -54,6 +54,16 @@ describe("EvidenceHighlighter", () => {
     expect(container.querySelectorAll("p")[0].querySelector("mark")).toBeNull();
   });
 
+  it("an astral character in an earlier paragraph shifts no later span", () => {
+    // "👋🏽" is two code points and four UTF-16 units: a UTF-16 offset would land two units early
+    const text = "Hallo 👋🏽 Team.\nWir nutzen Python.";
+    const start = Array.from(text).indexOf("P");
+    expect(start).toBe(26);
+    const { container } = render(<EvidenceHighlighter text={text} lang="de" spans={[{ start, end: start + 6 }]} />);
+    expect(marks(container)).toEqual(["Python"]);
+    expect(container.querySelectorAll("p")[1].querySelector("mark")?.textContent).toBe("Python");
+  });
+
   it("a span across a line break is marked in each paragraph it touches", () => {
     const text = "in Python.\nWe use";
     const { container } = render(<EvidenceHighlighter text={text} lang="en" spans={[{ start: 3, end: 13 }]} />);

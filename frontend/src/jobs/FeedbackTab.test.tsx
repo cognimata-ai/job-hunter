@@ -3,8 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
-import { fakeApi, json, problem, requestsTo } from "../test/api";
+import { fakeApi, jobDetail, json, problem, requestsTo } from "../test/api";
 import { NOW, renderInProviders } from "../test/app";
+import { useJobDetail } from "./detailApi";
 import { FeedbackTab } from "./FeedbackTab";
 
 type JobFeedbackOut = components["schemas"]["JobFeedbackOut"];
@@ -22,6 +23,12 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
+
+/** The tab over job 5's detail as the drawer reads it, so a write's invalidation reads the feedback again. */
+function Harness() {
+  const detail = useJobDetail(5);
+  return detail.data === undefined ? null : <FeedbackTab jobId={5} feedback={detail.data.feedback} />;
+}
 
 function form(): HTMLElement {
   return screen.getByRole("form", { name: en["feedback.title"] });
@@ -123,6 +130,58 @@ describe("FeedbackTab", () => {
     await waitFor(() => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["jobs", "detail", 5] });
     });
+  });
+
+  it("after a Delete, focus is on the next item's Delete, else the previous one's, else the list heading", async () => {
+    const api = fakeApi({ signedIn: true });
+    let items: JobFeedbackOut[] = [
+      { id: 79, kind: "wrong_score", label: "ok", comment: null, created_at: "2026-11-03T06:30:00Z" },
+      ...FEEDBACK,
+    ];
+    api.routes.set("GET /api/jobs/5", () => json(jobDetail({ feedback: items })));
+    for (const id of [77, 78, 79]) {
+      api.routes.set(`DELETE /api/feedback/${String(id)}`, () => {
+        items = items.filter((item) => item.id !== id);
+        return new Response(null, { status: 204 });
+      });
+    }
+    renderInProviders(<Harness />);
+    const user = userEvent.setup();
+    const deletes = async () => within(await screen.findByRole("list", { name: en["feedback.list"] })).getAllByRole("button", { name: en["feedback.delete"] });
+    // the middle one (78): the next one (77) takes focus
+    let [, middle] = await deletes();
+    await user.click(middle);
+    await waitFor(async () => {
+      expect(await deletes()).toHaveLength(2);
+    });
+    await waitFor(async () => {
+      expect(document.activeElement).toBe((await deletes())[1]);
+    });
+    // the last one (77): the previous one (79) takes focus
+    [, middle] = await deletes();
+    await user.click(middle);
+    await waitFor(async () => {
+      expect(document.activeElement).toBe((await deletes())[0]);
+    });
+    // the only one: the list's heading
+    await user.click((await deletes())[0]);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: en["feedback.list"] }));
+    });
+    expect(screen.getByText(en["feedback.none"])).toBeTruthy();
+  });
+
+  it("after a sent label, focus is on the first radio", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("POST /api/jobs/5/feedback", () => json({ feedback_id: 80, golden_case_id: 3 }, 201));
+    renderInProviders(<FeedbackTab jobId={5} feedback={[]} />);
+    const user = userEvent.setup();
+    await user.click(within(form()).getByRole("radio", { name: en["feedback_label.poor"] }));
+    await user.click(within(form()).getByRole("button", { name: en["feedback.submit"] }));
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(form()).getByRole("radio", { name: en["feedback_label.good"] }));
+    });
+    expect(within(form()).getByRole<HTMLInputElement>("radio", { name: en["feedback_label.poor"] }).checked).toBe(false);
   });
 
   it("without feedback says so", () => {

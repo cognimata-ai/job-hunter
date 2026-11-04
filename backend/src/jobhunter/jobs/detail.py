@@ -19,6 +19,13 @@ job stores it (§8.10) with its amounts as decimal strings and its `kind` `state
 source of the work-mode provenance when the modes are known (`work_mode_source <> 'none'`, its rule not
 `none`).
 
+**The bucket** (`bucket`, Ruling T24-e) is the job's own card's scoring bucket: the card's CASE
+(`cards.BUCKET_CASE`, over `_sql.BUCKET_SQL`) over the card's joins (`_sql.CARD_FROM`) for its current
+revision's active-tuple target, so the drawer names the state the list does (a verified not-a-job-ad is
+`not_a_job_ad`). It is `None` where no bucket matches: a published result with no current instance under
+the active scope (the T4-c gap a recompute closes, which no list page shows), and a target in no bucket of
+the list (`deferred_duplicate`, whose card is its representative's, or `cancelled`).
+
 **The score.** A job whose current revision's active-tuple target is `deferred_duplicate` in an active group
 with another representative is **scored via** that representative (B26): its score, contested data and
 description are the representative's, and `score.scored_via_job_id` and `description.from_job_id` name it;
@@ -86,11 +93,21 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.errors import DomainError
-from jobhunter.jobs.cards import KnockoutOut, LinksOut, ScoreOut, TargetOut, instance_knockouts, target_of
+from jobhunter.jobs import _sql
+from jobhunter.jobs.cards import (
+    BUCKET_CASE,
+    KnockoutOut,
+    LinksOut,
+    ScoreOut,
+    TargetOut,
+    instance_knockouts,
+    target_of,
+)
 from jobhunter.jobs.groups import GroupOut, group_view, location_labels
 from jobhunter.jobs.history import HistoryPageOut, Position, history_page
 from jobhunter.jobs.links import HTTP_URL, POSTING_LINK, OutboundLinks, outbound_links
 from jobhunter.jobs.listing import Active, read_active
+from jobhunter.jobs.query import ScoringBucket
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.steps import FACT_REJECTED, FACT_UNCERTAIN, FACT_UNREVIEWED
@@ -318,6 +335,7 @@ class JobDetailOut(BaseModel):
     score: DetailScoreOut | None
     contested: ContestedOut | None
     target: TargetOut | None
+    bucket: ScoringBucket | None
     group: GroupOut | None
     merge_events: list[MergeEventOut]
     user: UserActionsOut | None
@@ -352,6 +370,10 @@ _JOB: Final = q(
     "LEFT JOIN user_job_actions u ON u.job_id = j.id WHERE j.id = :job"
 )
 # The end of a merged job's chain: the first job of it that is not merged (`_MERGE_DEPTH` bounds a cycle)
+# The job's card bucket (module docstring, The bucket): the card's own CASE over the card's own joins
+_BUCKET: Final = q(
+    "/* jobs_detail.bucket */ SELECT " + BUCKET_CASE + " AS bucket" + _sql.CARD_FROM + " WHERE j.id = :job"
+)
 _SURVIVOR: Final = q(
     "/* jobs_detail.survivor */ WITH RECURSIVE chain(id, next_id, depth) AS ("
     "SELECT id, merged_into_job_id, 0 FROM jobs WHERE id = :job "
@@ -879,6 +901,8 @@ async def job_detail(conn: AsyncConnection, job_id: int, *, now: datetime) -> Jo
         JobFeedbackOut.model_validate(f._asdict()) for f in await conn.execute(_FEEDBACK, {"job": job_id})
     ]
     group = None if row.duplicate_group_id is None else await group_view(conn, int(row.duplicate_group_id))
+    params = {"job": job_id, "tuple": active.llm_tuple_id, "scope": active.scope_version_id}
+    bucket: ScoringBucket | None = (await conn.execute(_BUCKET, params)).scalar_one()
     items, history_next = await history_page(conn, job_id, after=None, limit=HISTORY_LIMIT)
     detail = JobDetailOut(
         job=_job(row, provenance, sources),
@@ -888,6 +912,7 @@ async def job_detail(conn: AsyncConnection, job_id: int, *, now: datetime) -> Jo
         score=score,
         contested=contested,
         target=target_of(row),
+        bucket=bucket,
         group=group,
         merge_events=merges,
         user=_user(row),

@@ -12,9 +12,15 @@
 // - The tabs: Description, Contested, Provenance, History and Feedback, the same for every job, back at
 //   Description for each new job.
 //
-// Opening a job that has never been seen sends `seen_on_open` once per open of that job (a ref, so StrictMode's
-// second effect sends nothing). A 404 is no problem box (B28): a merged job shows its survivor instead, with a
-// notice, and a job that no longer exists says so with a way back.
+// Opening a job decides `seen_on_open` once per open of that job, on its first loaded detail: sent when that
+// detail says unseen, and never on a later read (a refetch after Seen was cleared must not mark it seen again).
+// A ref keeps the decision, so StrictMode's second effect sends nothing; a new open of the drawer decides again.
+// A 404 is no problem box (B28): a merged job shows its survivor instead, with a notice, and a job that no
+// longer exists says so with a way back.
+//
+// Without a score, the score section names the job's card bucket (Ruling T24-e): a verified not-a-job-ad says
+// so; a published result without a bucket (no current instance yet under the active scope, T4-c) reads "Score
+// pending"; any other state is the state chip's text.
 import * as Tabs from "@radix-ui/react-tabs";
 import type { TFunction } from "i18next";
 import { type ReactNode, useEffect, useId, useRef } from "react";
@@ -35,7 +41,15 @@ import { DescriptionTab } from "./DescriptionTab";
 import styles from "./DetailDrawer.module.css";
 import { type DetailScoreOut, goneOf, type JobDetailOut, type JobOut, useJobDetail, useSeenOnOpen } from "./detailApi";
 import { FeedbackTab } from "./FeedbackTab";
-import { availabilityText, percentInt, postedLabel, scoreInt, seenToday, type ServerText } from "./format";
+import {
+  availabilityText,
+  percentInt,
+  postedLabel,
+  scoreInt,
+  seenToday,
+  type ServerText,
+  workModesText,
+} from "./format";
 import { HistoryTab } from "./HistoryTab";
 import { JobRef } from "./JobRef";
 import { KnockoutBadges, shownKnockouts } from "./KnockoutBadge";
@@ -50,11 +64,6 @@ export interface DetailDrawerProps {
   onNavigate: (jobId: number) => void;
 }
 
-const MODE_KEYS: ReadonlyMap<string, TranslationKey> = new Map([
-  ["remote", "card.mode.remote"],
-  ["hybrid", "card.mode.hybrid"],
-  ["onsite", "card.mode.onsite"],
-] as const);
 // The precisions a posted label already states ("date unknown", "(ingest date)").
 const PRECISION_IN_LABEL: ReadonlySet<string> = new Set(["unknown", "ingest"]);
 const TABS = ["description", "contested", "provenance", "history", "feedback"] as const;
@@ -103,9 +112,7 @@ function Facts({ job }: { job: JobOut }) {
   const { timezone } = useDisplay();
   const locale = intlLocale(i18n.language);
   const now = new Date();
-  let modes = job.work_mode_known
-    ? job.work_modes.map((mode) => { const key = MODE_KEYS.get(mode); return key === undefined ? mode : t(key); }).join(" / ")
-    : t("card.mode_unknown");
+  let modes = workModesText(job.work_modes, job.work_mode_known, t);
   if (job.work_mode_known && job.work_mode_source_id !== null) {
     modes = `${modes} ${t("drawer.structured", { source: serverText("source", job.work_mode_source_id) })}`;
   }
@@ -214,10 +221,13 @@ function Scored({ detail, score, onNavigate }: { detail: JobDetailOut; score: De
             })}
           </p>
           <p>
-            {t("drawer.status", {
-              status: serverText("result_status", score.result_status),
-              critic: serverText("critic_outcome", score.critic_outcome),
-            })}
+            {/* a contested result's critic outcome is always contested (the llm_results CHECK): said once */}
+            {score.result_status === "contested"
+              ? serverText("result_status", score.result_status)
+              : t("drawer.status", {
+                  status: serverText("result_status", score.result_status),
+                  critic: serverText("critic_outcome", score.critic_outcome),
+                })}
           </p>
           {score.scored_via_job_id !== null && (
             <p>
@@ -263,14 +273,15 @@ function ScoreSection({ detail, onNavigate }: { detail: JobDetailOut; onNavigate
   const { t } = useTranslation();
   const serverText = useServerText();
   const headingId = useId();
-  const { score, target } = detail;
-  // a published target without a score is a verified not-a-job-ad (the card's `not_a_job_ad` bucket)
-  const bucket = target?.state.startsWith("published_") === true ? "not_a_job_ad" : "unscored";
+  const { score, target, bucket } = detail;
+  const pending = bucket === null && target?.state.startsWith("published_") === true;
   return (
     <section aria-labelledby={headingId} className={styles.score}>
       <h3 id={headingId} className={styles.heading}>{t("drawer.score")}</h3>
       {score === null ? (
-        <p className={styles.chip}>{chipText(target, bucket, null, [], t, serverText)}</p>
+        <p className={styles.chip}>
+          {pending ? t("drawer.score_pending") : chipText(target, bucket ?? "unscored", null, [], t, serverText)}
+        </p>
       ) : (
         <Scored detail={detail} score={score} onNavigate={onNavigate} />
       )}
@@ -335,17 +346,19 @@ export function DetailDrawer({ jobId, onClose, onNavigate }: DetailDrawerProps) 
     }
   }, [survivor, jobId, onNavigate, toast, t]);
 
-  // never seen: `seen_on_open`, once per job for this open of the drawer
+  // `seen_on_open`: decided once per job for this open of the drawer, on its first loaded detail
   const { mutate: markSeen } = useSeenOnOpen();
-  const sent = useRef(new Set<number>());
+  const checked = useRef(new Set<number>());
   const data = detail.data;
-  const unseen = data !== undefined && (data.user === null || data.user.seen_at === null);
   useEffect(() => {
-    if (unseen && !sent.current.has(jobId)) {
-      sent.current.add(jobId);
+    if (data === undefined || checked.current.has(jobId)) {
+      return;
+    }
+    checked.current.add(jobId);
+    if (data.user === null || data.user.seen_at === null) {
       markSeen(jobId);
     }
-  }, [unseen, jobId, markSeen]);
+  }, [data, jobId, markSeen]);
 
   const untitled = <h2 id={titleId} className="visually-hidden">{t("drawer.title")}</h2>;
   let content: ReactNode;
