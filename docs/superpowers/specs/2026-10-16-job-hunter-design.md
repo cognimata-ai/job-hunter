@@ -283,7 +283,7 @@ Three review findings cannot be fixed literally. The chair decided:
 |---|---|---|
 | `collect` | 1 | `run_collect(run_id, attempt_no)`, with `lock="collect"` |
 | `score` | 1 | `score_cycle(cycle_id)`, with `lock="score"`. LLM concurrency happens inside the graph via `Send` with `max_concurrency=3`. |
-| `aux` | 2 | `run_operation(operation_id)`, which dispatches by operation kind: `extract_profile_text`, `extract_profile`, `embed_profile`, `propose_queries`, `apply_scope`, `create_targets_for_tuple`, `batch_submit` (`lock="batch"`), `export`, `purge`, `eval_run`, `watchlist_validate`; plus `batch_poll`, `batch_reconcile_ambiguous`, `deadman_sync`, `maintenance_*` |
+| `aux` | 2 | `run_operation(operation_id)`, which dispatches by operation kind: `extract_profile_text`, `extract_profile`, `embed_profile`, `propose_queries`, `apply_scope`, `create_targets_for_tuple`, `batch_submit` (`lock="batch"`), `export`, `purge`, `eval_run`, `watchlist_validate`, `replay_raw_items` (`lock="replay"`); plus `batch_poll`, `batch_reconcile_ambiguous`, `deadman_sync`, `maintenance_*` |
 | `tick` | — | Periodic `tick` (`cron="* * * * *"`), plus periodic `reconcile_heavy` (`*/10`), `retention_daily` (`17 3 * * *`) and `canary_daily` (`41 6 * * *`) |
 
 - **Durable intents.** Every mutation that requires follow-up work inserts an `operations` row (§7.3) **in the same transaction** as the mutation. Examples: a scope save (`apply_scope`), a profile confirmation (`create_targets_for_tuple`, `embed_profile`, `propose_queries`), an upload, an export request, a purge. The procrastinate job carries only the `operation_id`. Whether procrastinate can defer inside the caller's transaction (spike V1) then only affects latency, not correctness: the light reconciler re-defers every `pending` operation without a live job after 2 min, and every operation kind is idempotent. Collection runs are covered by the same rule through `runs` (§17.4 `queued_runs`).
@@ -5011,7 +5011,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 
 | Method | Path | Purpose | Request → Response (summary) |
 |---|---|---|---|
-| POST | `/api/auth/login` | Log in | `{username, password, totp?}` → 204 + Set-Cookie. 401 generic, 429 throttled (with `retry_after_s`). Origin check only; no session yet. |
+| POST | `/api/auth/login` | Log in | `{username, password, totp?}` → 204 + Set-Cookie. 401 `totp_required` when TOTP is on and no code was sent (§16.3), else 401 generic, 429 throttled (with `retry_after_s`). Origin check only; no session yet. |
 | POST | `/api/auth/logout` | Log out | → 204 |
 | GET | `/api/auth/session` | Session info | → `{username, totp_enabled, idle_expires_at, absolute_expires_at}` |
 | GET | `/api/jobs` | List / search | Query: filters (§15.3), `sort`, `cursor`, `limit` (≤ 100, default 50) → `{items: JobCard[], next_cursor, ranking_generation, ranking_changed, counts: {total_estimate, unscored, capped} \| null}` (the counts of §15.3) |
@@ -5166,7 +5166,7 @@ The UI is a React 19 SPA served same-origin. The api serves the built SPA (`api/
 | Applying settings… n/N | A pending scope exists. n/N counts both apply phases (the jobs, then the published results); the banner shows no count until the apply reports its first, and "Applying the settings failed" once the apply failed for good | info |
 | LLM cap reached — scoring paused | The score lane is paused as `cap_reached` (§6.9.4) | critical |
 | Scoring paused — reservation bound violated | Paused as `reservation_bound_violated` (lifted by the acknowledgement, §10.7) | critical |
-| Scoring paused — <reason> | Paused as `auth_failed`, `schema_unverified` or `global_fence` | critical; warn for `global_fence` |
+| Scoring paused — <reason> | Paused as `auth_failed` (`llm.auth_failed`, §10.4), `schema_unverified` (no passed live schema dry-run, §10.11) or `global_fence` (a `global` purge fence, §20.2) | critical; warn for `global_fence` |
 | Search scope not applied — [Retry apply] | No scope is pending, and the scope that the active settings and the active profile derive is not the applied active scope (`scope_applied`, §14.2) | warn |
 | Deletion not yet confirmed offsite | A deletion manifest is `completed` but not `shipped` (§19.5) | warn |
 | Paid search paused until <date> | JSearch exhausted, and SerpApi disabled, without a validated window, unhealthy or exhausted; the date is JSearch's reset, or SerpApi's when SerpApi is exhausted and resets first | warn |
@@ -5908,7 +5908,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 
 ### 18.7 E2E (Playwright)
 
-E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) against the E2E stack, the dev stack with its overlays (`deploy/compose.dev.yaml`, `compose.fixtures.yaml`, `compose.fakellm.yaml`, `compose.e2e.yaml`), with `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger). E2E uses a deterministic test embedder (`EMBEDDER_FAKE=1`, refused outside dev and test). `@playwright/cli` takes the visual checks of the UI.
+E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) against the E2E stack, the dev stack with its overlays (`deploy/compose.dev.yaml`, `compose.fixtures.yaml`, `compose.fakellm.yaml`, `compose.e2e.yaml`), with `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger). E2E uses a deterministic test embedder (`EMBEDDER_FAKE=1`, refused outside dev and test). `@playwright/cli` takes the visual checks of the UI. The network tests N1/N2 and the crash cases C32, C37 and C39 run on the compose test stack (`deploy/compose.yaml` + `deploy/compose.test.yaml`, `JOBHUNTER_ENV=test`, M5).
 
 | # | Scenario | Page |
 |---|---|---|

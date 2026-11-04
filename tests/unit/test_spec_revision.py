@@ -156,15 +156,21 @@ LOST_BATCH_RELEASE = (
     "submitted ──explicit user release while batch.retrieve_failing is open and now > expires_at + 1 h"
     "──► released     (in_batch targets → pending; spend stays ambiguous; provider_batch_id kept)"
 )
-# An edge of a state machine block, `a | b ──label──► c`; a target that is no state ("(same state; …)")
-# is none.
+# An edge of a state machine block (whitespace collapsed), `a | b ──label──► c`; a target that is no state
+# ("(same state; …)") is none.
 EDGE = re.compile(r"^([a-z_]+(?: \| [a-z_]+)*) ──.*──► ([a-z_]+)\b")
 
 
+def _collapsed(line: str) -> str:
+    """`line` with every run of whitespace one space, and none at its ends: its alignment is no content."""
+    return " ".join(line.split())
+
+
 def test_7_16_6_releases_a_lost_batch_and_its_edges_are_the_transition_table_s() -> None:
-    body = _section("#### 7.16.6 ")
-    assert body.count(LOST_BATCH_RELEASE) == 1
-    assert body[body.index(QUARANTINE_RELEASE) + 1] == LOST_BATCH_RELEASE
+    body = [_collapsed(line) for line in _section("#### 7.16.6 ")]
+    lost, quarantine = _collapsed(LOST_BATCH_RELEASE), _collapsed(QUARANTINE_RELEASE)
+    assert body.count(lost) == 1
+    assert body[body.index(quarantine) + 1] == lost
     edges: set[tuple[str, str]] = set()
     for line in body:
         if (match := EDGE.match(line)) is not None:
@@ -185,7 +191,7 @@ M4_ROUTES = frozenset(
         ("GET", "/api/settings/prompt-schema-versions/{}/activation-preview"),
     }
 )
-ROUTE_ROW = re.compile(r"^\| (GET|POST|PUT|PATCH|DELETE) \| `([^`]+)` \|")
+ROUTE_ROW = re.compile(r"^\|\s*(GET|POST|PUT|PATCH|DELETE)\s*\|\s*`([^`]+)`\s*\|")
 ALTERNATIVES = re.compile(r"\{([^{},]+(?:,[^{},]+)+)\}")  # `{rubric,prompt-schema}`, never a parameter
 PARAMETER = re.compile(r"\{[^{}]*\}")
 
@@ -273,9 +279,14 @@ def test_4_1_frontend_rows_hold_the_package_json_pins() -> None:
 
 
 def test_13_1_range_of_batch_min_targets_is_the_settings_model_s() -> None:
-    rows = [line for line in _section("### 13.1 ") if "| `scoring.batch_min_targets` |" in line]
+    table = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in _section("### 13.1 ")
+        if line.startswith("|")
+    ]
+    rows = [cells for cells in table if len(cells) > 1 and cells[1] == "`scoring.batch_min_targets`"]
     assert len(rows) == 1
-    cells = [cell.strip() for cell in rows[0].strip().strip("|").split("|")]
+    cells = rows[0]
     field = Scoring.model_fields["batch_min_targets"]
     low = next(item.ge for item in field.metadata if hasattr(item, "ge"))
     high = next(item.le for item in field.metadata if hasattr(item, "le"))
@@ -285,8 +296,8 @@ def test_13_1_range_of_batch_min_targets_is_the_settings_model_s() -> None:
 
 # §15.7's confirm modal: the ads, the batch allocation, the batch's ads and the online rest.
 MODAL = re.compile(
-    r"re-scores ([\d,]+) retained ads\. Batch allocation \$([\d.]+) .*?about (\d+) ads in one batch"
-    r".*?the other ~([\d,]+) are scored online",
+    r"re-scores\s+([\d,]+)\s+retained\s+ads\.\s+Batch\s+allocation\s+\$([\d.]+)\s.*?"
+    r"about\s+(\d+)\s+ads\s+in\s+one\s+batch.*?the\s+other\s+~([\d,]+)\s+are\s+scored\s+online",
     re.DOTALL,
 )
 
