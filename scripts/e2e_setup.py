@@ -730,16 +730,23 @@ def data_error(exc: Exception, last: list[str]) -> str:
     return f"{what} after {last[0]}" if last else f"{what} before any API answer"
 
 
-def run(client: httpx.Client) -> int:
-    """Every step in order on `client` (module docstring); the exit status. A data error (an answer that is
-    no JSON, a missing key, a wrong type) names the last answer the API gave: its method, path and status."""
-    ctx = Context(client)
+def last_answer(client: httpx.Client) -> list[str]:
+    """A list that holds, from now on, the last answer `client` received (its method, path and status), the
+    context `data_error` names; empty before any answer."""
     last: list[str] = []
 
     def note(response: httpx.Response) -> None:
         last[:] = [f"{response.request.method} {response.request.url.path} answered {response.status_code}"]
 
     client.event_hooks = {**client.event_hooks, "response": [*client.event_hooks["response"], note]}
+    return last
+
+
+def run(client: httpx.Client) -> int:
+    """Every step in order on `client` (module docstring); the exit status. A data error (an answer that is
+    no JSON, a missing key, a wrong type) names the last answer the API gave: its method, path and status."""
+    ctx = Context(client)
+    last = last_answer(client)
     for name, step in STEPS:
         try:
             detail = step(ctx)

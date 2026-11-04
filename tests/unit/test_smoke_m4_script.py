@@ -3,8 +3,8 @@ then its own eight), the values it copies pinned to the code's, each check's pre
 whole run against a stubbed stack that prints twenty-three `ok` lines and never the cookie, the password, a
 key, an `Idempotency-Key`, an ad's text, a CV text or a draft; `subprocess` and the HTTP transport stubbed.
 
-The stubbed stack is `test_smoke_m3_script`'s (`Stack`, `Database`: every M2 and M3 route and statement) with
-the M4 routes and statements added here (`M4Stack`, `M4Database`)."""
+The stubbed stack is `tests.support.smoke_stack`'s (`Stack`, `Database`: every M2 and M3 route and statement)
+with the M4 routes and statements added here (`M4Stack`, `M4Database`)."""
 
 import hashlib
 import importlib.util
@@ -26,11 +26,20 @@ from jobhunter.api.edge import SECURITY_HEADERS
 from jobhunter.auth.sessions import SLIDE_EVERY
 from jobhunter.jobs.query import WorkMode
 from jobhunter.observability.attention import AttentionOut
-from jobhunter.scoring.targets import ACCEPTED_STATES, RETRYABLE_STATES
+from jobhunter.scoring.targets import ACCEPTED_STATES, RESUMABLE_DRAFT_SQL, RETRYABLE_STATES
 
-from tests.unit.test_e2e_setup_script import DESCRIPTION, detail_body
-from tests.unit.test_smoke_m3_script import AD_TEXT, CONTENT, COOKIE, KEY, TOKEN, Database, Stack
-from tests.unit.test_smoke_m3_script import CHECK_NAMES as M3_CHECK_NAMES
+from tests.support.smoke_stack import (
+    AD_TEXT,
+    CONTENT,
+    COOKIE,
+    DESCRIPTION,
+    KEY,
+    M3_CHECK_NAMES,
+    TOKEN,
+    Database,
+    Stack,
+    detail_body,
+)
 
 SCRIPTS: Final = Path(__file__).resolve().parents[2] / "scripts"
 M4_CHECK_NAMES: Final = [
@@ -372,7 +381,9 @@ def stub(smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, stack: M4Stack) -> 
         stack.slept.append(seconds)
         stack.db.quiet += seconds
 
-    monkeypatch.setattr(smoke, "time", SimpleNamespace(sleep=sleep, monotonic=time.monotonic))
+    clock = SimpleNamespace(sleep=sleep, monotonic=time.monotonic)
+    monkeypatch.setattr(smoke, "time", clock)
+    monkeypatch.setattr(sys.modules["e2e_setup"], "time", clock)  # its `wait_rows` (check 22)
     return docker
 
 
@@ -478,12 +489,22 @@ def test_inline_scripts_are_counted(smoke: ModuleType) -> None:
         ({"csp": "default-src 'self'"}, "the §16.6 CSP"),
         ({"index_html": INDEX_HTML.replace('<div id="root">', "<main>")}, '<div id="root">'),
         ({"index_html": INDEX_HTML.replace("</head>", "<script>boot()</script></head>")}, "1 inline script"),
+        ({"index_html": INDEX_HTML.replace("/assets/", "/static/")}, "names no hashed asset"),
         ({"asset_cache": "no-cache"}, "immutable"),
         ({"deep_link_html": "<html>404</html>"}, "/settings"),
         ({"nope": httpx.Response(404, json={"code": "not_found"})}, "application/problem+json"),
         ({"nope": httpx.Response(200, text=INDEX_HTML)}, "/api/nope"),
     ],
-    ids=["csp", "no-root", "inline-script", "asset-cached", "deep-link", "problem-type", "api-deep-linked"],
+    ids=[
+        "csp",
+        "no-root",
+        "inline-script",
+        "no-hashed-asset",
+        "asset-cached",
+        "deep-link",
+        "problem-type",
+        "api-deep-linked",
+    ],
 )
 def test_check_16_needs_the_spa_served_safely(
     smoke: ModuleType,
@@ -551,6 +572,83 @@ def test_check_18_pages_on_with_the_same_filters_only(
     run_one(smoke, monkeypatch, stack, "jobs_list")
     line = outcome(capsys, "jobs_list")
     assert line["ok"] is False and reason in line["detail"]
+
+
+def first_page_items(stack: M4Stack, items: list[dict[str, Any]], next_cursor: str | None) -> None:
+    """The first page of the stubbed list answered with `items` and `next_cursor` instead."""
+    jobs = stack.jobs
+
+    def answer(params: dict[str, list[str]]) -> httpx.Response:
+        if "cursor" in params:
+            return jobs(params)
+        body = jobs(params).json()
+        return httpx.Response(200, json={**body, "items": items, "next_cursor": next_cursor})
+
+    stack.jobs = answer  # type: ignore[method-assign]
+
+
+def test_check_18_needs_a_next_cursor_and_a_second_page_of_other_jobs(
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stack = M4Stack(M4Database(smoke))
+    first_page_items(stack, [card(job) for job in FIRST_PAGE], None)
+    run_one(smoke, monkeypatch, stack, "jobs_list")
+    line = outcome(capsys, "jobs_list")
+    assert (
+        line["ok"] is False and f"the first page of {smoke.LIST_LIMIT} has no next_cursor" in line["detail"]
+    )
+
+    capsys.readouterr()
+    stack = M4Stack(M4Database(smoke))
+    first_page_items(stack, [card(job) for job in [*FIRST_PAGE[:4], SECOND_PAGE[0]]], CURSOR)
+    run_one(smoke, monkeypatch, stack, "jobs_list")
+    line = outcome(capsys, "jobs_list")
+    assert line["ok"] is False and "page 2 has 5 items, 1 of page 1" in line["detail"]
+
+
+def reordered_page(stack: M4Stack, ids: list[int], *, moved: int) -> None:
+    """Page 2 with the work modes reversed answered with the jobs `ids`, its generation moved by `moved`."""
+    jobs = stack.jobs
+    order = ["remote", "hybrid", "onsite", "unknown"]
+
+    def answer(params: dict[str, list[str]]) -> httpx.Response:
+        if "cursor" not in params or params.get("work_mode") != order[::-1]:
+            return jobs(params)
+        body = jobs(params).json()
+        items = [card(job) for job in ids]
+        return httpx.Response(
+            200, json={**body, "items": items, "ranking_generation": body["ranking_generation"] + moved}
+        )
+
+    stack.jobs = answer  # type: ignore[method-assign]
+
+
+def test_check_18_compares_the_reordered_page_only_under_the_same_generation(
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A publish between the two page-2 reads may reorder a keyset page by score (its review, Minor 2): the
+    reordered request's page is compared with page 2 only when both answers carry the same
+    `ranking_generation`; under another one any page of items pages on."""
+    reshuffled = [*SECOND_PAGE[1:], 199]
+    stack = M4Stack(M4Database(smoke))
+    reordered_page(stack, reshuffled, moved=1)
+    run_one(smoke, monkeypatch, stack, "jobs_list")
+    line = outcome(capsys, "jobs_list")
+    assert line["ok"] is True, line
+    assert "another ranking generation" in line["detail"]
+
+    capsys.readouterr()
+    stack = M4Stack(M4Database(smoke))
+    reordered_page(stack, reshuffled, moved=0)
+    run_one(smoke, monkeypatch, stack, "jobs_list")
+    line = outcome(capsys, "jobs_list")
+    assert line["ok"] is False and "reordered work_mode" in line["detail"]
+
+    capsys.readouterr()
+    stack = M4Stack(M4Database(smoke))
+    reordered_page(stack, [], moved=1)  # another generation, but no items
+    run_one(smoke, monkeypatch, stack, "jobs_list")
+    assert outcome(capsys, "jobs_list")["ok"] is False
 
 
 def test_check_18_sends_the_work_modes_in_both_orders(
@@ -661,6 +759,34 @@ def test_check_19_grounds_the_lowest_candidate_score_now_scores_afresh(
     assert key not in line["detail"]
 
 
+def test_check_19_s_resumes_is_the_scoring_code_s_predicate_over_any_policy(smoke: ModuleType) -> None:
+    """`resumes` is `targets.RESUMABLE_DRAFT_SQL` without its policy restriction (its review, Minor 1): a
+    `resume_draft_id`, or a draft on any attempt of the target, so a candidate the scoring code may resume is
+    never chosen, whatever the policy its draft ran under."""
+    any_policy = RESUMABLE_DRAFT_SQL.replace(" AND a.evaluation_policy_id = :policy", "")
+    assert any_policy != RESUMABLE_DRAFT_SQL and ":policy" not in any_policy
+    assert f"'resumes', {any_policy}" in smoke.CANDIDATES
+
+
+def test_check_19_passes_over_a_failed_candidate_with_a_draft(
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lower candidate in `refused`, `failed_transient` or a backed-off `pending` whose attempt left a draft
+    (`resumes`: Score now's retry would resume it on the default recordings) is passed over."""
+    database = M4Database(smoke)
+    database.candidates = [
+        candidate(JOB - 3, "refused", resumes=True),
+        candidate(JOB - 2, "failed_transient", resumes=True),
+        candidate(JOB - 1, "pending", resumes=True),
+        candidate(JOB, "failed_request"),
+    ]
+    stack = M4Stack(database)
+    run_one(smoke, monkeypatch, stack, "job_detail")
+    line = outcome(capsys, "job_detail")
+    assert line["ok"] is True, line
+    assert line["detail"].startswith(f"job {JOB} (failed_request): grounded answers written")
+
+
 def test_check_19_reads_a_grounded_publish_first(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -685,7 +811,7 @@ def test_check_19_names_the_states_when_no_candidate_can_be_grounded(
     line = outcome(capsys, "job_detail")
     assert line["ok"] is False
     assert "candidates=2 with_three_sentences=2" in line["detail"]
-    assert "states=['filtered_out', 'pending (resumes a batch draft)']" in line["detail"]
+    assert "states=['filtered_out', 'pending (resumes a draft)']" in line["detail"]
     assert database.writes == [] and stack.keys == []
 
 
@@ -696,7 +822,8 @@ def test_check_20_saves_and_opens_and_restores_both(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """`saved: true` on the first unsaved card moves the generation by one; `seen_on_open` on the next card
-    moves it by none; then the first is unsaved again and the second, unseen before, unseen again."""
+    moves it by none; then the first is unsaved again, and the second, seen already before the check (job 103
+    of the stub's first page), is left as it is."""
     stack = M4Stack(M4Database(smoke))
     run_one(smoke, monkeypatch, stack, "actions")
     line = outcome(capsys, "actions")
@@ -729,6 +856,28 @@ def test_check_20_restores_an_unseen_card_and_restores_even_after_a_failure(
     assert line["ok"] is False
     assert "seen_on_open on job 103 moved the generation by [1, 1, 1], not 0" in line["detail"]
     assert stack.puts[-2:] == [(102, {"saved": False}), (103, {"seen": False})]
+
+
+def test_check_20_fails_when_saved_moves_the_generation_by_none(
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = M4Database(smoke)
+    stack = M4Stack(database)
+    actions = stack.m4
+
+    def no_bump(request: httpx.Request, route: tuple[str, str]) -> httpx.Response | None:
+        generation = database.generation
+        answer = actions(request, route)
+        if route[1].endswith("/actions"):
+            database.generation = generation
+        return answer
+
+    stack.m4 = no_bump  # type: ignore[method-assign]
+    run_one(smoke, monkeypatch, stack, "actions")
+    line = outcome(capsys, "actions")
+    assert line["ok"] is False
+    assert "saved on job 102 moved the generation by [0, 0, 0], not 1" in line["detail"]
+    assert stack.puts[-1] == (102, {"saved": False})  # restored all the same
 
 
 def test_check_20_tolerates_a_concurrent_bump(
@@ -886,6 +1035,48 @@ def test_check_23_needs_items_without_a_score(
     run_one(smoke, monkeypatch, stack, "labelling")
     line = outcome(capsys, "labelling")
     assert line["ok"] is False and reason in line["detail"]
+
+
+@pytest.mark.parametrize(
+    ("check", "change", "reason"),
+    [
+        ("actions", "no_job_id", "KeyError 'job_id' after GET /api/jobs answered 200"),
+        ("job_detail", "no_int_job_id", "TypeError after POST /api/auth/login answered 204"),
+    ],
+    ids=["missing-key", "wrong-type"],
+)
+def test_an_unexpected_answer_prints_one_json_line_never_a_traceback(
+    smoke: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    check: str,
+    change: str,
+    reason: str,
+) -> None:
+    """A `KeyError` or a `TypeError` from an answer of an unexpected shape is a failed check's one JSON line
+    naming the error and the last API answer (`e2e_setup.data_error`), as the E2E setup prints it."""
+    database = M4Database(smoke)
+    stack = M4Stack(database)
+    if change == "no_job_id":
+        jobs = stack.jobs
+
+        def no_ids(params: dict[str, list[str]]) -> httpx.Response:
+            body = jobs(params).json()
+            for item in body["items"]:
+                del item["job_id"]
+            return httpx.Response(200, json=body)
+
+        stack.jobs = no_ids  # type: ignore[method-assign]
+    else:
+        database.candidates = [{**candidate(JOB, "pending"), "job_id": None}]
+    stub(smoke, monkeypatch, stack)
+    names = dict(smoke.CHECKS)
+    monkeypatch.setattr(smoke, "CHECKS", [("login", names["login"]), (check, names[check])])
+    assert smoke.main() == 1
+    captured = capsys.readouterr()
+    lines = [json.loads(line) for line in captured.out.splitlines()]
+    assert lines[-1] == {"check": check, "ok": False, "detail": reason}
+    assert "Traceback" not in captured.out + captured.err
 
 
 def test_a_failed_check_never_shows_the_session_token(

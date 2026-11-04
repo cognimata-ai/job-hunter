@@ -24,6 +24,8 @@ from typing import Any, Final
 import httpx
 import pytest
 
+from tests.support.smoke_stack import DESCRIPTION, detail_body
+
 SCRIPTS: Final = Path(__file__).resolve().parents[2] / "scripts"
 TOKEN: Final = "c2Vzc2lvbi10b2tlbi1vZi10aGUtZTJlLXN0dWI"
 STEPS: Final = [
@@ -45,12 +47,6 @@ RESULT: Final = 90
 RESPONSE: Final = 55
 SKILL: Final = "Python"
 KEYED_DIR: Final = "/tmp/fake-keyed"  # noqa: S108 - the worker's tmpfs path (deploy/compose.e2e.yaml), faked
-# An invented description: three sentences of 30 to 160 code points, then a short one.
-DESCRIPTION: Final = (
-    "Wir entwickeln eine Plattform für erfundene Reiseerlebnisse in Berlin.\n"
-    "Du baust Dienste mit Python und PostgreSQL. Du arbeitest eng mit dem Produktteam zusammen.\n"
-    "Kurz."
-)
 
 
 def load(name: str) -> ModuleType:
@@ -70,40 +66,6 @@ def setup(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         monkeypatch.delitem(sys.modules, name, raising=False)
         monkeypatch.setitem(sys.modules, name, load(name))
     return load("e2e_setup")
-
-
-def detail_body(quotes: list[str]) -> dict[str, Any]:
-    """`GET /api/jobs/{JOB}` of the grounded job, as the API answers it: contested, with three critic rounds
-    (the first with T1), a rejected draft of `role_fit` 3 -> 2, and the quotes spanned in the description."""
-    criteria = []
-    for i, key in enumerate(("role_fit", "skills", "experience_seniority", "domain", "languages")):
-        quote = quotes[i % 3]
-        start = DESCRIPTION.index(quote)
-        criteria.append(
-            {
-                "criterion": key,
-                "evidence": [
-                    {
-                        "source_kind": "description",
-                        "quote": quote,
-                        "span_start": start,
-                        "span_end": start + len(quote),
-                    }
-                ],
-            }
-        )
-    rounds = [{"round": n, "triggers": ["T1"] if n == 1 else ["T0"]} for n in (1, 2, 3)]
-    return {
-        "description": {"text": DESCRIPTION},
-        "score": {"result_status": "contested", "criteria": criteria},
-        "contested": {
-            "rounds": rounds,
-            "rejected_drafts": [
-                {"round": 0, "level_diff": [{"criterion": "role_fit", "from_level": 3, "to_level": 2}]},
-                {"round": 1, "level_diff": []},
-            ],
-        },
-    }
 
 
 class FakeStack:

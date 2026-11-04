@@ -23,8 +23,10 @@ for check 19). Each check prints exactly one JSON line, `{"check": <name>, "ok":
     `/api/jobs` and `/api/system/status`;
 18. `jobs_list`: `GET /api/jobs` with every work mode (`WORK_MODES`, in order) and `LIST_LIMIT` has items,
     `ranking_generation`, `counts` and a `next_cursor`; that cursor gives page 2 (other jobs); the same
-    filters with the work-mode values reversed page on to the same page 2; the cursor with another filter
-    (the work modes without `unknown`) is 400 `invalid_cursor`;
+    filters with the work-mode values reversed page on: to the same page 2 when both answers carry the same
+    `ranking_generation`, and to a page of items when a writer bumped it in between (a publish may reorder a
+    keyset page by score); the cursor with another filter (the work modes without `unknown`) is 400
+    `invalid_cursor`;
 19. `job_detail` (E9's grounding, F11): a grounded candidate (`grounded_job`, below) is published with its
     grounded answers; its detail (`GET /api/jobs/{id}`) has at least one criterion whose description evidence
     has spans that slice the description to its quote, and no span that slices another text
@@ -55,14 +57,18 @@ description has three quotes (`m4_seeds.grounded_quotes`), read with its active-
 Whether grounded answers exist yet is read first: a candidate published with its grounded quotes as its
 description evidence (`e2e_setup.grounded_published`: a stack that ran the E2E setup, or a second run) is
 read as it is. Otherwise the lowest candidate whose target Score now takes (`SCORE_NOW_STATES`: `pending`,
-`budget_deferred`, `expired_unscored` and the retryable states; not a grouped one) and that resumes no batch
-draft (after smoke_m3's check 14 a follow-up of the batch resumes the draft the batch made on the default
-recordings, which no answer written now changes) gets its grounded answers in the worker's keyed directory
+`budget_deferred`, `expired_unscored` and the retryable states; not a grouped one) and that resumes no draft
+(after smoke_m3's check 14 a follow-up of the batch resumes the draft the batch made on the default
+recordings, and a retry the draft an earlier attempt made, which no answer written now changes; `resumes` is
+`targets.RESUMABLE_DRAFT_SQL` over any policy, so it is conservative) gets its grounded answers in the
+worker's keyed directory
 (`m4_seeds.write_grounded_answers`, unless they are there), then `POST /api/jobs/{id}/score-now` with a fresh
 `Idempotency-Key` (a 409 `conflict_state`, a cycle having claimed it since, is awaited alike: it scores on
 the same answers), and its publish is awaited (`e2e_setup.await_publish`).
 
-It stops at the first failed check (exit 1); after twenty-three `ok` lines it exits 0. A `detail` holds ids,
+It stops at the first failed check (exit 1); after twenty-three `ok` lines it exits 0. An answer of an
+unexpected shape (no JSON, a missing key, a wrong type) fails its check with one JSON line too, naming the
+error and the last API answer (`e2e_setup.data_error`), never a traceback. A `detail` holds ids,
 states, counts, codes and paths, and fixed text: never the password, the session cookie or its token
 (`Context.scrub`), an `Idempotency-Key`, a key, an ad's text, a CV text or a draft."""
 
@@ -81,7 +87,7 @@ import e2e_setup  # scripts/ is the script's directory, the first entry of sys.p
 import httpx
 import m4_seeds
 import smoke_m3
-from smoke_m0 import HTTP_TIMEOUT_S, ORIGIN, POLL_INTERVAL_S, CheckFailed, Context, emit, pick
+from smoke_m0 import HTTP_TIMEOUT_S, ORIGIN, CheckFailed, Context, emit, pick
 from smoke_m2 import json_object, mutating
 
 USER_AGENT: Final = "jobhunter-smoke-m4"  # `main` adds a fresh id per run (check 21 finds its session by it)
@@ -124,11 +130,17 @@ SCORE_NOW_STATES: Final = (
     "failed_attempts_exhausted",
 )
 # Every candidate (`m4_seeds.GROUNDED_JOB_SQL`) with its active-tuple target: its state, its published result,
-# whether it resumes a batch draft, and its description (never printed); one JSON array, by job id. As
-# `e2e_setup.GROUNDED_CANDIDATES`, with `resumes`.
+# whether it resumes a draft, and its description (never printed); one JSON array, by job id. As
+# `e2e_setup.GROUNDED_CANDIDATES`, with `resumes`: `targets.RESUMABLE_DRAFT_SQL` without its policy (a
+# `resume_draft_id`, or a draft on any attempt of the target), so it holds wherever the scoring code's does.
+RESUMES: Final = (
+    "(t.resume_draft_id IS NOT NULL OR EXISTS (SELECT 1 FROM score_attempts a "
+    "JOIN score_drafts d ON d.attempt_id = a.id "
+    "WHERE a.target_id = t.id))"
+)
 CANDIDATES: Final = f"""\
 /* smoke_m4.candidates */ SELECT coalesce(json_agg(json_build_object('job_id', j.id,
-  'state', t.state, 'result_id', t.published_result_id, 'resumes', t.resume_draft_id IS NOT NULL,
+  'state', t.state, 'result_id', t.published_result_id, 'resumes', {RESUMES},
   'description', r.description_text) ORDER BY j.id), '[]')::text
 FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id
 JOIN active_config a ON a.id = 1
@@ -181,13 +193,6 @@ SCORE_MEMBER: Final = re.compile(r"score|band", re.IGNORECASE)
 def fresh_key() -> str:
     """A new `Idempotency-Key`: never printed."""
     return f"smoke-m4-{uuid.uuid4().hex}"
-
-
-def sql_row(statement: str, columns: int, *, what: str) -> list[str]:
-    found = m4_seeds.one_row(m4_seeds.stack_sql(statement), columns, what=what)
-    if found is None:
-        raise CheckFailed(f"{what}: no row")
-    return found
 
 
 def get(ctx: Context, path: str, **kwargs: Any) -> httpx.Response:
@@ -292,17 +297,26 @@ def check_jobs_list(ctx: Context) -> str | None:
         raise CheckFailed("the first page has no items, ranking_generation or counts")
     if not isinstance(cursor, str):
         raise CheckFailed(f"the first page of {LIST_LIMIT} has no next_cursor")
-    second = job_ids(json_object(list_page(ctx, WORK_MODES, cursor), 200))
+    page_2 = json_object(list_page(ctx, WORK_MODES, cursor), 200)
+    second = job_ids(page_2)
     if not second or set(second) & set(job_ids(first)):
         raise CheckFailed(
             f"page 2 has {len(second)} items, {len(set(second) & set(job_ids(first)))} of page 1"
         )
     reordered = list_page(ctx, WORK_MODES[::-1], cursor)
-    if reordered.status_code != 200 or job_ids(reordered.json()) != second:
+    again = reordered.json() if reordered.status_code == 200 else None
+    # a writer's bump between the two reads may reorder a keyset page by score: then any page of items will do
+    compared = again is not None and pick(again, "ranking_generation") == pick(page_2, "ranking_generation")
+    if again is None or not job_ids(again) or (compared and job_ids(again) != second):
         raise CheckFailed(
             f"reordered work_mode values: expected 200 with page 2 again, got HTTP {reordered.status_code} "
             f"(code {e2e_setup.problem_code(reordered)!r})"
         )
+    paged_on = (
+        "the same with the work_mode values reversed"
+        if compared
+        else "the work_mode values reversed page on under another ranking generation (ids not compared)"
+    )
     other = list_page(ctx, WORK_MODES[:-1], cursor)
     code = e2e_setup.problem_code(other)
     if other.status_code != 400 or code != INVALID_CURSOR:
@@ -313,7 +327,7 @@ def check_jobs_list(ctx: Context) -> str | None:
     return (
         f"page 1: {len(job_ids(first))} items, ranking_generation {generation}, counts "
         f"total_estimate={pick(counts, 'total_estimate')!r} capped={pick(counts, 'capped')!r}; page 2: "
-        f"{len(second)} other items, the same with the work_mode values reversed; another filter: 400 {code}"
+        f"{len(second)} other items, {paged_on}; another filter: 400 {code}"
     )
 
 
@@ -344,7 +358,7 @@ def spanned_criteria(detail: Any) -> tuple[int, int, int]:
 
 def candidate_state(candidate: Any) -> str:
     state = str(pick(candidate, "state"))
-    return f"{state} (resumes a batch draft)" if pick(candidate, "resumes") is True else state
+    return f"{state} (resumes a draft)" if pick(candidate, "resumes") is True else state
 
 
 def grounded_job(ctx: Context) -> tuple[int, str]:
@@ -405,7 +419,8 @@ def check_job_detail(ctx: Context) -> str | None:
 
 
 def generation() -> int:
-    (value,) = m4_seeds.ints(sql_row(GENERATION, 1, what="the ranking generation"), what="the generation")
+    found = e2e_setup.row(GENERATION, 1, what="the ranking generation")
+    (value,) = m4_seeds.ints(found, what="the generation")
     return value
 
 
@@ -461,7 +476,7 @@ def check_actions(ctx: Context) -> str | None:
 
 def session_of(statement: str) -> tuple[Decimal, Decimal]:
     """The smoke's session: its idle expiry and the seconds since its last slide (epoch seconds)."""
-    count, idle, quiet = sql_row(statement, 3, what="the smoke's session")
+    count, idle, quiet = e2e_setup.row(statement, 3, what="the smoke's session")
     if count != "1":
         raise CheckFailed(f"expected one session of the smoke's user agent, found {count}")
     try:
@@ -551,16 +566,7 @@ def check_needs_attention(ctx: Context) -> str | None:
         )
 
     statement = REPLAY_STATE.format(operation=int(operation), item=int(item_id))
-    deadline = time.monotonic() + REPLAY_WITHIN_S
-    while True:
-        finished, last = done(sql_row(statement, 3, what="the replay"))
-        if finished:
-            break
-        if time.monotonic() >= deadline:
-            raise CheckFailed(
-                f"the replay's linked item not reached within {REPLAY_WITHIN_S} s (last: {last})"
-            )
-        time.sleep(POLL_INTERVAL_S)
+    e2e_setup.wait_rows(statement, 3, done, within_s=REPLAY_WITHIN_S, what="the replay's linked item")
     after = json_object(get(ctx, "/api/system/needs-attention"), 200)
     if response_id in listed_responses(after):
         raise CheckFailed(f"raw response {response_id} is still listed after the replay")
@@ -622,6 +628,7 @@ def main() -> int:
     agent = f"{USER_AGENT}/{uuid.uuid4().hex}"
     with httpx.Client(timeout=HTTP_TIMEOUT_S, trust_env=False, headers={"User-Agent": agent}) as client:
         ctx = Context(client)
+        last = e2e_setup.last_answer(client)
         for name, check in CHECKS:
             try:
                 detail = check(ctx)
@@ -631,8 +638,11 @@ def main() -> int:
             except subprocess.TimeoutExpired as exc:
                 emit(ctx, name, False, f"{Path(str(exc.cmd[0])).name} timed out after {exc.timeout:g} s")
                 return 1
-            except (httpx.HTTPError, OSError, ValueError) as exc:  # transport, a missing docker, bad JSON
+            except (httpx.HTTPError, OSError) as exc:  # transport, a missing docker
                 emit(ctx, name, False, type(exc).__name__)
+                return 1
+            except (ValueError, KeyError, TypeError) as exc:  # data: no JSON, a missing key, a wrong type
+                emit(ctx, name, False, e2e_setup.data_error(exc, last))
                 return 1
             emit(ctx, name, True, detail)
     return 0

@@ -44,8 +44,8 @@ Every path starts at **Profile & Settings** (`/settings`, the second item of the
 **System** (`/settings#system`). System holds, in this order, Display & notifications, **Needs attention**
 (`#needs-attention`), **Runs** (`#runs`), **Score cycles** (`#score-cycles`), **Alerts** (`#alerts`), **Golden
 set** (`#golden-set`) and **Health** (`#health`). Each action button is disabled while its request runs; once it
-is answered, Needs attention and the header strip are read again, and a refusal shows at the item. The
-labels below are the English UI's.
+succeeds, Needs attention and the header strip are read again, and a refusal shows at the item without them
+being read again. The labels below are the English UI's.
 
 **Alerts and [Acknowledge].** System → Alerts has three tabs: **Open** (unresolved and unacknowledged),
 **Acknowledged** and **Resolved**. Each alert shows its severity, its text, its first and last time and how
@@ -72,7 +72,8 @@ links here with **Needs attention**.
 **The run report.** System → Runs lists the runs, newest first; **[Report]** on a run's row opens its report
 below the row (status and reason, the partial causes, then Sources, Identity, Revisions, Quota and Execution;
 `GET /api/runs/{id}`), and **[Report]** again closes it. While a run is active, the header's **Run in progress
-(view)** opens the same report in a drawer, read again every 10 s. Score cycles lists the score cycles alike.
+(view)** opens the same report in a drawer, read again every 10 s. Score cycles lists the score cycles, newest
+first (no report).
 
 **The golden set.** System → Golden set lists the golden cases with their label and source ("Your label",
 "Wrong-score report", "Synthetic (eval seed)"); **Active** and **Canary** are checkboxes (`PATCH
