@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SETTINGS_KEY } from "../app/AppShell";
+import { STATUS_KEY } from "../system/api";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
 import {
@@ -433,5 +434,208 @@ describe("useSettingsForm", () => {
     expect(reads()).toHaveLength(ended);
     expect((await intervalField()).value).toBe("8");
     expect(screen.queryByText(en["settings_form.changed_elsewhere"])).toBeNull();
+  });
+
+  it("a failed re-read after a save shows the problem and retries", async () => {
+    const api = fakeApi({ signedIn: true });
+    const settings = served(api);
+    let readsDown = false;
+    api.routes.set("GET /api/settings", () => (readsDown ? problem(503, "internal") : json(settings.current)));
+    dryRuns(api, () => dryRunOut({ effects: ["schedule"] }));
+    api.routes.set("POST /api/settings", (request) => {
+      settings.current = version(42, 13, saveBody(request).payload);
+      readsDown = true; // the save commits, then the api stops answering for a while
+      return saved(42, 13);
+    });
+    const { probe } = renderSettings(["schedule"], { retryDelay: 0 });
+    await typeInterval("8");
+    await waitFor(() => {
+      expect(saveButton().disabled).toBe(false);
+    });
+    await userEvent.setup().click(saveButton());
+    expect(await screen.findByText("Settings saved (v13)")).toBeTruthy();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(en["problem.internal"]);
+    expect(screen.getByText(en["settings_form.reread_failed"])).toBeTruthy();
+    expect(screen.queryByText(en["settings_form.saving"])).toBeNull(); // not stuck at "Saving…"
+    expect(saveButton().disabled).toBe(true); // the base is the old version: a save would be stale
+    expect(formOf(probe).base.version.id).toBe(41);
+    const reads = requestsTo(api, "GET /api/settings").length;
+    readsDown = false;
+    await userEvent.setup().click(within(alert).getByRole("button", { name: en["action.retry"] }));
+    expect(await screen.findByText(en["settings_form.no_changes"])).toBeTruthy();
+    expect(requestsTo(api, "GET /api/settings").length).toBeGreaterThan(reads);
+    expect(formOf(probe).base.version.id).toBe(42);
+    expect(formOf(probe).draft.schedule.interval_hours).toBe(8);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("an edit made while a save is in flight survives the adopt", async () => {
+    const api = fakeApi({ signedIn: true });
+    const settings = served(api);
+    dryRuns(api, () => dryRunOut({ effects: ["schedule"] }));
+    let answer: (() => void) | null = null;
+    api.routes.set("POST /api/settings", (request) =>
+      new Promise<Response>((resolve) => {
+        answer = () => {
+          settings.current = version(42, 13, saveBody(request).payload);
+          resolve(saved(42, 13));
+        };
+      }),
+    );
+    const { probe } = renderSettings(["schedule"]);
+    await typeInterval("8");
+    await waitFor(() => {
+      expect(saveButton().disabled).toBe(false);
+    });
+    await userEvent.setup().click(saveButton());
+    await waitFor(() => {
+      expect(answer).not.toBeNull();
+    });
+    // while the save is in flight: the interval again, and another field
+    await typeInterval("9");
+    fireEvent.click(screen.getByRole("checkbox", { name: en["settings_schedule.include_paid"] }));
+    await act(async () => {
+      answer?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(formOf(probe).base.version.id).toBe(42);
+    });
+    expect(formOf(probe).draft.schedule).toMatchObject({ interval_hours: 9, include_paid: false });
+    expect([...formOf(probe).dirty].sort()).toEqual(["schedule.include_paid", "schedule.interval_hours"]);
+    expect((await intervalField()).value).toBe("9");
+    await waitFor(() => {
+      expect(dryRunPayloads(api).at(-1)?.schedule).toMatchObject({ interval_hours: 9, include_paid: false });
+    });
+    expect(screen.getByText(en["settings_form.unsaved"])).toBeTruthy();
+  });
+
+  it("an out-of-order older answer is ignored", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fakeApi({ signedIn: true });
+    const base = settingsRead().payload;
+    const progress = { done: 10, total: 100, det_done: 0, det_total: 0 };
+    const older = version(41, 12, base, { version_id: 9, progress });
+    const settings = served(api, older);
+    let releasePoll: (() => void) | null = null;
+    api.routes.set("GET /api/settings", (request) => {
+      if (request.headers.get("X-JH-Background") === "1" && releasePoll === null) {
+        // the poll's first answer, held: version 41 while a newer version is read meanwhile
+        return new Promise<Response>((resolve) => {
+          releasePoll = () => { resolve(json(older)); };
+        });
+      }
+      return json(settings.current);
+    });
+    const { probe, queryClient } = renderSettings(["schedule"]);
+    await intervalField();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    await waitFor(() => {
+      expect(releasePoll).not.toBeNull();
+    });
+    const newer = version(42, 13, base, { version_id: 9, progress: { ...progress, done: 50 } });
+    settings.current = newer;
+    act(() => {
+      queryClient.setQueryData(SETTINGS_KEY, newer); // a save's re-read lands first
+    });
+    await waitFor(() => {
+      expect(formOf(probe).base.version.id).toBe(42);
+    });
+    await act(async () => {
+      releasePoll?.();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(queryClient.getQueryData<SettingsOut>(SETTINGS_KEY)?.version.id).toBe(42); // the poll did not write it
+    // and an older version that reaches the cache anyway is no newer one: no offer, no adopt
+    await typeInterval("8");
+    act(() => {
+      queryClient.setQueryData(SETTINGS_KEY, version(41, 12, base));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(screen.queryByText(en["settings_form.changed_elsewhere"])).toBeNull();
+    expect(formOf(probe).base.version.id).toBe(42);
+  });
+
+  it("the work after a save survives leaving the page", async () => {
+    const api = fakeApi({ signedIn: true });
+    served(api);
+    dryRuns(api, () => dryRunOut({ effects: ["schedule"] }));
+    let answer: (() => void) | null = null;
+    api.routes.set("POST /api/settings", () =>
+      new Promise<Response>((resolve) => {
+        answer = () => { resolve(saved(42, 13)); };
+      }),
+    );
+    const { queryClient, unmount } = renderSettings(["schedule"]);
+    await typeInterval("8");
+    await waitFor(() => {
+      expect(saveButton().disabled).toBe(false);
+    });
+    await userEvent.setup().click(saveButton());
+    await waitFor(() => {
+      expect(answer).not.toBeNull();
+    });
+    unmount(); // the user clicks away before the answer
+    await act(async () => {
+      answer?.();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(await screen.findByText("Settings saved (v13)")).toBeTruthy();
+    expect(queryClient.getQueryState(SETTINGS_KEY)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(STATUS_KEY)?.isInvalidated).toBe(true);
+  });
+
+  it("a rebase keeps a location's radius edit by gazetteer id after the list changed", async () => {
+    const api = fakeApi({ signedIn: true });
+    const base = settingsRead().payload;
+    const at = (locations: Settings["scope"]["locations"]) => ({ ...base, scope: { ...base.scope, locations } });
+    const berlin = { label: "Berlin", gazetteer_id: "geonames:2950159", lat: 52.52437, lon: 13.41053, radius_km: 30 };
+    const munich = { label: "München", gazetteer_id: "geonames:2867714", lat: 48.13743, lon: 11.57549, radius_km: 30 };
+    const hamburg = { label: "Hamburg", gazetteer_id: "geonames:2911298", lat: 53.55073, lon: 9.99302, radius_km: 30 };
+    const settings = served(api, version(41, 12, at([berlin, munich])));
+    const { probe } = renderSettings(["schedule"]);
+    await intervalField();
+    act(() => {
+      formOf(probe).set("scope.locations[1].radius_km", 50); // München's radius
+    });
+    // another tab removed Berlin and added Hamburg
+    settings.current = version(42, 13, at([munich, hamburg]));
+    await act(async () => {
+      await formOf(probe).rebase();
+    });
+    expect(formOf(probe).draft.scope.locations).toEqual([{ ...munich, radius_km: 50 }, hamburg]);
+    expect([...formOf(probe).dirty]).toEqual(["scope.locations[0].radius_km"]);
+    // a mark whose place the new base no longer has is dropped
+    act(() => {
+      formOf(probe).set("scope.locations[1].radius_km", 70); // Hamburg's radius
+    });
+    settings.current = version(43, 14, at([munich]));
+    await act(async () => {
+      await formOf(probe).rebase();
+    });
+    expect(formOf(probe).draft.scope.locations).toEqual([{ ...munich, radius_km: 50 }]);
+    expect([...formOf(probe).dirty]).toEqual(["scope.locations[0].radius_km"]);
+  });
+
+  it("the beforeunload guard is registered while dirty only", async () => {
+    const api = fakeApi({ signedIn: true });
+    served(api);
+    renderSettings(["schedule"]);
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    await intervalField();
+    expect(leave()).toBe(false);
+    await typeInterval("8");
+    expect(leave()).toBe(true);
+    await typeInterval("6");
+    expect(leave()).toBe(false);
   });
 });

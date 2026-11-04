@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
-import { type FakeApi, dryRunOut, fakeApi, json, settingsRead } from "../test/api";
+import { type FakeApi, dryRunOut, fakeApi, json, problem, requestsTo, settingsRead } from "../test/api";
 import { dryRunPayloads, renderSettings } from "../test/settings";
 
 type Settings = components["schemas"]["Settings"];
@@ -192,5 +192,60 @@ describe("DryRunPanel", () => {
     await change();
     const code = await within(section("schedule")).findByText("brand_new_warning");
     expect(code.tagName).toBe("CODE");
+  });
+
+  it("a quiet panel keeps Retry and the request id", async () => {
+    const api = fakeApi({ signedIn: true });
+    const basePayload = JSON.stringify(settingsRead().payload);
+    let down = true;
+    api.routes.set("POST /api/settings/dry-run", (request) => {
+      const { payload } = JSON.parse(request.body ?? "{}") as { payload: Settings };
+      return JSON.stringify(payload) === basePayload || !down ? json(dryRunOut({ effects: ["schedule"] })) : problem(503, "internal");
+    });
+    renderSettings(["scope", "schedule"]);
+    await change(); // a change in Schedule: its panel raises the alert
+    const alert = await within(section("schedule")).findByRole("alert");
+    expect(alert.textContent).toContain(en["problem.internal"]);
+    expect(within(section("scope")).queryByRole("alert")).toBeNull();
+    const requestId = en["problem_box.request_id"].replace("{{id}}", "r-1");
+    expect(within(section("scope")).getByText(requestId)).toBeTruthy();
+    const before = requestsTo(api, "POST /api/settings/dry-run").length;
+    down = false;
+    await userEvent.setup().click(within(section("scope")).getByRole("button", { name: en["action.retry"] }));
+    await waitFor(() => {
+      expect(requestsTo(api, "POST /api/settings/dry-run").length).toBeGreaterThan(before);
+    });
+    await waitFor(() => {
+      expect(saveIn("scope").disabled).toBe(false);
+    });
+    expect(within(section("scope")).queryByText(requestId)).toBeNull();
+  });
+
+  it("the active panel's status line is a live region", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ effects: ["schedule"] }));
+    renderSettings(["scope", "schedule"]);
+    await change();
+    await waitFor(() => {
+      expect(within(section("schedule")).getByText(en["settings_form.unsaved"]).getAttribute("role")).toBe("status");
+    });
+    expect(within(section("scope")).getByText(en["settings_form.unsaved"]).getAttribute("role")).toBeNull();
+  });
+
+  it("a settings load failure raises one alert", async () => {
+    const api = fakeApi({ signedIn: true });
+    let down = true;
+    api.routes.set("GET /api/settings", () => (down ? problem(503, "internal") : json(settingsRead())));
+    renderSettings(["scope", "schedule"], { retryDelay: 0 });
+    await waitFor(() => {
+      expect(screen.getAllByText(en["problem.internal"])).toHaveLength(2); // the same text in both sections
+    });
+    const alerts = screen.getAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(section("scope").contains(alerts[0])).toBe(true); // the first section's
+    down = false;
+    await userEvent.setup().click(within(section("schedule")).getByRole("button", { name: en["action.retry"] }));
+    expect(await screen.findByRole("spinbutton", { name: en["settings_schedule.interval"] })).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

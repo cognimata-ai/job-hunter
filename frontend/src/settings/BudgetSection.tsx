@@ -3,9 +3,11 @@
 // and the scoring group's budget fields); then the live state, read-only and never part of the form: the month's
 // counted spend and headroom, the USD bucket (balance, capacity, rate), `ĉ` and its source, the active bulk
 // re-score's budget and spend, the amount a quarantined batch holds (with Needs attention), and each provider's
-// quota window (usage, reset, reserved, ambiguous, adjustments). The live reads (`GET /api/system/spend`,
-// `GET /api/system/quota`) are fresh for 60 s and read again every 60 s in the background while shown.
+// quota window (usage, reset, reserved, ambiguous, adjustments). The live reads (`GET /api/system/spend`, the Jobs
+// list's `useSpend` read live, and `GET /api/system/quota`) are fresh for 60 s and read again every 60 s in the
+// background while shown. No field writes out a bound: the dry-run's errors are the check.
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { type ReactNode, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { apiFetch } from "../api/client";
@@ -13,7 +15,7 @@ import type { components } from "../api/schema";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import { intlLocale, useServerText } from "../i18n/index";
-import { SPEND_KEY, type SpendOut } from "../jobs/api";
+import { type SpendOut, useSpend } from "../jobs/api";
 import { PROVIDERS } from "../system/api";
 import { useFormat } from "../system/format";
 import styles from "./BudgetSection.module.css";
@@ -26,15 +28,6 @@ type QuotaOut = Partial<Record<string, QuotaDetailOut | null>>;
 
 export const QUOTA_KEY = ["system", "quota"] as const;
 export const LIVE_MS = 60_000;
-
-function useLiveSpend(): UseQueryResult<SpendOut> {
-  return useQuery({
-    queryKey: SPEND_KEY,
-    queryFn: ({ signal }) => apiFetch<SpendOut>("/api/system/spend", { signal, background: true }),
-    staleTime: LIVE_MS,
-    refetchInterval: LIVE_MS,
-  });
-}
 
 function useQuota(): UseQueryResult<QuotaOut> {
   return useQuery({
@@ -102,7 +95,7 @@ function Spend({ spend }: { spend: SpendOut }) {
           {quarantined && (
             <>
               {" · "}
-              <a href="/settings#system" className={fields.link}>{t("banner.needs_attention")}</a>
+              <Link to="/settings" hash="system" className={fields.link}>{t("banner.needs_attention")}</Link>
             </>
           )}
         </dd>
@@ -159,7 +152,7 @@ function QuotaWindows({ quota, labelledBy }: { quota: QuotaOut; labelledBy: stri
 
 export function BudgetSection() {
   const { t } = useTranslation();
-  const spend = useLiveSpend();
+  const spend = useSpend({ live: true });
   const quota = useQuota();
   const quotaHeading = useId();
   const usd = t("settings_budget.unit_usd");
@@ -167,18 +160,17 @@ export function BudgetSection() {
     <div className={styles.budget}>
       <div className={fields.grid}>
         <NumberField path="llm.cap_usd" label={t("settings_budget.cap")} unit={usd} decimal />
-        <NumberField path="llm.nonscoring_reserve_pct" label={t("settings_budget.reserve")} min={0} max={20}
-          unit={t("settings_budget.unit_percent")} />
+        <NumberField path="llm.nonscoring_reserve_pct" label={t("settings_budget.reserve")} unit={t("settings_budget.unit_percent")} />
         <NumberField path="llm.overrun_buffer_usd" label={t("settings_budget.overrun_buffer")} unit={usd} decimal />
         <NumberField path="llm.min_bucket_capacity_usd" label={t("settings_budget.bucket_floor")} unit={usd} decimal />
-        <NumberField path="scoring.max_targets_per_cycle" label={t("settings_budget.max_targets")} min={1} max={500} />
-        <NumberField path="scoring.min_cycle_targets" label={t("settings_budget.min_targets")} min={1} max={100} />
+        <NumberField path="scoring.max_targets_per_cycle" label={t("settings_budget.max_targets")} />
+        <NumberField path="scoring.min_cycle_targets" label={t("settings_budget.min_targets")} />
       </div>
       <h3 className={fields.heading}>{t("settings_budget.batch")}</h3>
       <div className={fields.grid}>
         <ToggleField path="scoring.batch_bulk_rescore" label={t("settings_budget.batch_bulk")} />
-        <NumberField path="scoring.batch_min_targets" label={t("settings_budget.batch_min")} min={20} max={100000} />
-        <NumberField path="scoring.batch_max_items" label={t("settings_budget.batch_max")} min={200} max={10000} />
+        <NumberField path="scoring.batch_min_targets" label={t("settings_budget.batch_min")} />
+        <NumberField path="scoring.batch_max_items" label={t("settings_budget.batch_max")} />
         <NumberField path="scoring.bulk_rescore_max_budget_share" label={t("settings_budget.bulk_share")} decimal
           hint={t("settings_budget.bulk_share_hint")} />
       </div>

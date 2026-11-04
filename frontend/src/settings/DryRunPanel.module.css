@@ -57,6 +57,17 @@
   color: var(--color-critical);
 }
 
+.requestId {
+  color: var(--color-text-muted);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+}
+
+.retry {
+  justify-self: start;
+  margin-top: var(--space-1);
+}
+
 .issues,
 .warnings {
   display: grid;

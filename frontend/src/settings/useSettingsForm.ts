@@ -35,6 +35,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useState,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { apiFetch, type ProblemError, toProblem } from "../api/client";
@@ -261,16 +262,34 @@ function depth(path: string): number {
   return parsePath(path).length;
 }
 
-/** The dirty paths' values of `draft` written onto `base` (module docstring): the plain paths shallowest first,
- * then the entries by id; a path whose place `base` lacks is dropped with its mark. */
+const LOCATION_PATH = /^scope\.locations\[(\d+)\](.+)$/;
+
+/** Where the mark `path` of `draft` lands in `next`: a mark inside a location (`scope.locations[i].…`) at the
+ * index of the same place (`gazetteer_id`, Ruling T28-g), `null` when `next` has no such place; any other mark at
+ * its own path. */
+function remapped(path: string, draft: Settings, next: Settings): string | null {
+  const inside = LOCATION_PATH.exec(path);
+  if (inside === null) {
+    return path;
+  }
+  const [, index, rest] = inside as unknown as [string, string, string];
+  const place = draft.scope.locations.at(Number(index));
+  const at = place === undefined ? -1 : next.scope.locations.findIndex((other) => other.gazetteer_id === place.gazetteer_id);
+  return at < 0 ? null : `scope.locations[${String(at)}]${rest}`;
+}
+
+/** The dirty paths' values of `draft` written onto `base` (module docstring): the plain paths shallowest first
+ * (a location's by its place, Ruling T28-g), then the entries by id; a path whose place `base` lacks is dropped
+ * with its mark. */
 export function overlay(base: Settings, draft: Settings, dirty: ReadonlySet<string>): { draft: Settings; dirty: Set<string> } {
   let next = base;
   const kept: string[] = [];
   const plain = [...dirty].filter((path) => !ENTRY_PATH.test(path)).sort((a, b) => depth(a) - depth(b));
   for (const path of plain) {
-    if (reachable(next, path)) {
-      next = setAt(next, path, getAt(draft, path));
-      kept.push(path);
+    const target = remapped(path, draft, next);
+    if (target !== null && reachable(next, target)) {
+      next = setAt(next, target, getAt(draft, path));
+      kept.push(target);
     }
   }
   for (const path of [...dirty].filter((p) => ENTRY_PATH.test(p))) {
@@ -319,6 +338,11 @@ interface State {
   stale: boolean;
   /** A read of the settings the form is waiting for: the saved version, or a rebase's. */
   adopting: Adopting | null;
+  /** The save in flight or waiting for its version (Ruling T28-f): the document it posted, and the marks of the
+   * edits made since, which the adopt keeps. */
+  posted: { payload: Settings; edited: ReadonlySet<string> } | null;
+  /** The saved version's re-read failed past its retries: its version and the problem (Retry reads again). */
+  reread: { version: number; error: ProblemError } | null;
   saveError: ProblemError | null;
   saveIssues: readonly Issue[];
   /** The section of the last change or Save: where the panel raises its alerts. */
@@ -339,7 +363,8 @@ type Action =
   | { type: "adopting"; adopting: Adopting }
   | { type: "adoptFailed" }
   | { type: "saveFailed"; error: ProblemError }
-  | { type: "saving"; from: SettingsSection | null };
+  | { type: "saving"; from: SettingsSection | null; posted: Settings }
+  | { type: "rereadFailed"; version: number; error: ProblemError };
 
 const NOTHING: ReadonlySet<string> = new Set();
 
@@ -365,6 +390,8 @@ function initial(data: SettingsOut): State {
     evalOverride: false,
     stale: false,
     adopting: null,
+    posted: null,
+    reread: null,
     saveError: null,
     saveIssues: [],
     active: null,
@@ -373,6 +400,22 @@ function initial(data: SettingsOut): State {
 
 function adoptClean(state: State, data: SettingsOut): State {
   return { ...initial(data), baseEpoch: state.baseEpoch + 1, nonce: state.nonce, active: state.active };
+}
+
+/** The saved version taken as the base (Ruling T28-f): every path where the draft differs from what the save
+ * posted (an edit made while the save was in flight or read) is written onto it, and stays dirty. */
+function adoptSaved(state: State, data: SettingsOut): State {
+  const clean = adoptClean(state, data);
+  const posted = state.posted;
+  if (posted === null) {
+    return clean;
+  }
+  const edited = new Set([...state.dirty, ...posted.edited].filter((path) => isDirty(posted.payload, state.draft, path)));
+  if (edited.size === 0) {
+    return clean;
+  }
+  const next = overlay(data.payload, state.draft, edited);
+  return { ...clean, draft: next.draft, dirty: next.dirty };
 }
 
 function adoptReapply(state: State, data: SettingsOut, clearTicks: boolean): State {
@@ -389,6 +432,8 @@ function adoptReapply(state: State, data: SettingsOut, clearTicks: boolean): Sta
     ticks: clearTicks ? NOTHING : state.ticks,
     stale: false,
     adopting: null,
+    posted: null,
+    reread: null,
     saveError: null,
     saveIssues: [],
   };
@@ -409,6 +454,7 @@ function changed(state: State, draft: Settings, path: string, candidates: readon
     saveError: null,
     saveIssues: [],
     active: sectionOf(path) ?? state.active,
+    posted: state.posted === null ? null : { ...state.posted, edited: new Set([...state.posted.edited, path]) },
   };
 }
 
@@ -421,13 +467,19 @@ function reducer(state: State, action: Action): State {
     case "settings": {
       const { data } = action;
       const adopting = state.adopting;
-      if (adopting?.mode === "clean") {
-        return data.version.id >= adopting.version ? adoptClean(state, data) : state;
+      const saved = adopting?.mode === "clean" ? adopting.version : state.reread?.version;
+      if (saved !== undefined) {
+        return data.version.id >= saved ? adoptSaved(state, data) : state;
       }
       if (adopting?.mode === "reapply") {
         return action.settled ? adoptReapply(state, data, adopting.clearTicks) : state;
       }
-      if (data.version.id === state.base.version.id) {
+      // a save in flight: its answer decides what a read means (the saved version, or a stale base)
+      if (state.posted !== null) {
+        return state;
+      }
+      // a newer version has a greater id (ids are serial, M1): the same or a late older answer changes nothing
+      if (data.version.id <= state.base.version.id) {
         return state;
       }
       if (state.dirty.size === 0) {
@@ -497,15 +549,18 @@ function reducer(state: State, action: Action): State {
     case "evalOverride":
       return { ...state, evalOverride: action.on };
     case "adopting":
-      return { ...state, adopting: action.adopting };
+      return { ...state, adopting: action.adopting, reread: null };
+    case "rereadFailed":
+      return { ...state, adopting: null, reread: { version: action.version, error: action.error } };
     case "adoptFailed":
       return { ...state, adopting: null };
     case "saving":
-      return { ...state, active: action.from ?? state.active, saveError: null };
+      return { ...state, active: action.from ?? state.active, saveError: null, posted: { payload: action.posted, edited: NOTHING } };
     case "saveFailed": {
       const { error } = action;
+      const unsent = { ...state, posted: null };
       if (error.status === 409 && error.code === "stale_base_version") {
-        return { ...state, stale: true, saveError: null };
+        return { ...unsent, stale: true, saveError: null };
       }
       if (error.status === 422) {
         const issues = error.errors
@@ -513,9 +568,9 @@ function reducer(state: State, action: Action): State {
           .map((issue) => ({ path: issue.field.slice(ROOT.length), code: issue.code, message: issue.message }));
         // a refusal of the acknowledgements: the dry-run is read again, and the problem shown beside it
         const other = issues.length < error.errors.length || issues.length === 0;
-        return { ...state, saveIssues: issues, saveError: other ? error : null, nonce: state.nonce + 1, dryRunError: null };
+        return { ...unsent, saveIssues: issues, saveError: other ? error : null, nonce: state.nonce + 1, dryRunError: null };
       }
-      return { ...state, saveError: error };
+      return { ...unsent, saveError: error };
     }
   }
 }
@@ -551,6 +606,9 @@ export interface SettingsForm {
   saveError: ProblemError | null;
   /** The last save failed the eval gate: the override is offered. */
   evalGateFailed: boolean;
+  /** The saved version could not be read again (Ruling T28-f): the problem, with Retry (`retryReread`); Save
+   * stays disabled until a read brings the saved version. */
+  rereadError: ProblemError | null;
   /** The section of the last change or Save: the one panel that raises alerts (the others show them quietly). */
   activeSection: SettingsSection | null;
   canSave: boolean;
@@ -570,12 +628,18 @@ export interface SettingsForm {
   /** The offer's Reload and reapply: as `rebase`, and the ticks are cleared. */
   reapply: () => Promise<void>;
   retryDryRun: () => void;
+  /** Reads the saved version again after a failed re-read. */
+  retryReread: () => void;
 }
 
-/** What a section shows before the form is there: the settings read's state. */
+/** What a section shows before the form is there: the settings read's state. A failed read is one alert for
+ * the page: the first framed section's (`alertFor`); each frame registers itself while the read has failed. */
 export interface SettingsLoad {
   error: unknown;
   retry: () => void;
+  alertFor: SettingsSection | null;
+  /** Registers a frame; the function it returns unregisters it. */
+  frame: (section: SettingsSection) => () => void;
 }
 
 const FormContext = createContext<SettingsForm | null>(null);
@@ -618,6 +682,7 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
   const { t } = useTranslation();
   const toast = useToast();
   const queryClient = useQueryClient();
+  const [frames, setFrames] = useState<readonly SettingsSection[]>([]);
   // the shell's own query (the same key and read); a second observer reads nothing more on mount
   const settings = useQuery({ queryKey: SETTINGS_KEY, queryFn: ({ signal }) => readSettings({ signal }), refetchOnMount: false });
   const data = settings.data;
@@ -692,7 +757,13 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
     const controller = new AbortController();
     const timer = setInterval(() => {
       readSettings({ signal: controller.signal, background: true }).then(
-        (read) => { queryClient.setQueryData(SETTINGS_KEY, read); },
+        (read) => {
+          // a late answer older than the version read meanwhile (a save's re-read) is never written (M1)
+          const cached = queryClient.getQueryData<SettingsOut>(SETTINGS_KEY);
+          if (!controller.signal.aborted && (cached === undefined || read.version.id >= cached.version.id)) {
+            queryClient.setQueryData(SETTINGS_KEY, read);
+          }
+        },
         () => undefined, // the next poll tries again
       );
     }, SCOPE_POLL_MS);
@@ -714,19 +785,47 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
     return () => { window.removeEventListener("beforeunload", guard); };
   }, [dirtyNow]);
 
-  const mutation = useKeyedMutation((body: SaveBody, key: string) =>
-    apiFetch<SaveOut>("/api/settings", { method: "POST", body: JSON.stringify(body), idempotencyKey: key }),
+  // What a committed save must do even when the page is left before its answer (M2): the notice, and the status
+  // and the settings read again (the hook's own `onSuccess`, which runs without an observer). The form's own
+  // adopt is the `mutate` call's.
+  const mutation = useKeyedMutation(
+    (body: SaveBody, key: string) =>
+      apiFetch<SaveOut>("/api/settings", { method: "POST", body: JSON.stringify(body), idempotencyKey: key }),
+    {
+      onSuccess: (out) => {
+        toast({ message: t("settings_form.saved", { version: out.version.version_no }) });
+        void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
+        void queryClient.invalidateQueries({ queryKey: SETTINGS_KEY, exact: true });
+      },
+    },
   );
 
-  // Reads the settings for a save (the saved version, which any later read also brings) or a rebase.
-  const refetch = useCallback(async (adopting: Adopting) => {
-    dispatch({ type: "adopting", adopting });
+  // Takes the saved version `version` (Ruling T28-f): from the cache when a read already brought it, else from the
+  // read in flight (the hook's invalidation) or a new one. A read failing past its retries is the panel's problem.
+  const reread = useCallback(async (version: number) => {
+    dispatch({ type: "adopting", adopting: { mode: "clean", version } });
+    const cached = queryClient.getQueryData<SettingsOut>(SETTINGS_KEY);
+    if (cached === undefined || cached.version.id < version) {
+      try {
+        await queryClient.refetchQueries({ queryKey: SETTINGS_KEY, exact: true }, { throwOnError: true, cancelRefetch: false });
+      } catch (error) {
+        dispatch({ type: "rereadFailed", version, error: toProblem(error) });
+        return;
+      }
+    }
+    const read = queryClient.getQueryData<SettingsOut>(SETTINGS_KEY);
+    if (read !== undefined) {
+      dispatch({ type: "settings", data: read, settled: true });
+    }
+  }, [queryClient]);
+
+  // Reads the settings for a rebase, then writes the dirty paths onto them.
+  const rebase = useCallback(async (clearTicks: boolean) => {
+    dispatch({ type: "adopting", adopting: { mode: "reapply", clearTicks } });
     try {
       await queryClient.refetchQueries({ queryKey: SETTINGS_KEY, exact: true }, { throwOnError: true });
     } catch {
-      if (adopting.mode === "reapply") {
-        dispatch({ type: "adoptFailed" });
-      }
+      dispatch({ type: "adoptFailed" });
       return;
     }
     const read = queryClient.getQueryData<SettingsOut>(SETTINGS_KEY);
@@ -751,6 +850,7 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
       !state.stale &&
       !saving &&
       state.adopting === null &&
+      state.reread === null &&
       current !== null &&
       current.errors.length === 0 &&
       state.saveIssues.length === 0 &&
@@ -779,6 +879,7 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
       saving,
       saveError: state.saveError,
       evalGateFailed: state.saveError !== null && isEvalGate(state.saveError),
+      rereadError: state.reread?.error ?? null,
       activeSection: state.active,
       canSave,
       pendingScope: data === undefined ? state.base.pending_scope : data.pending_scope,
@@ -791,7 +892,7 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
         if (!canSave) {
           return;
         }
-        dispatch({ type: "saving", from: from ?? null });
+        dispatch({ type: "saving", from: from ?? null, posted: state.draft });
         const codes = codesOf(current);
         const body: SaveBody = {
           payload: state.draft,
@@ -800,24 +901,34 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
           ...(state.evalOverride ? { eval_override_ack: true as const } : {}),
         };
         mutation.mutate(body, {
-          onSuccess: (out) => {
-            toast({ message: t("settings_form.saved", { version: out.version.version_no }) });
-            void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
-            void refetch({ mode: "clean", version: out.version.id });
-          },
+          onSuccess: (out) => { void reread(out.version.id); },
           onError: (error) => { dispatch({ type: "saveFailed", error }); },
         });
       },
-      rebase: () => refetch({ mode: "reapply", clearTicks: false }),
-      reapply: () => refetch({ mode: "reapply", clearTicks: true }),
+      rebase: () => rebase(false),
+      reapply: () => rebase(true),
       retryDryRun: () => { dispatch({ type: "retryDryRun" }); },
+      retryReread: () => {
+        if (state.reread !== null) {
+          void reread(state.reread.version);
+        }
+      },
     };
     return value;
-  }, [state, data, mutation, queryClient, refetch, t, toast]);
+  }, [state, data, mutation, rebase, reread]);
 
+  const frame = useCallback((section: SettingsSection) => {
+    setFrames((current) => (current.includes(section) ? current : [...current, section]));
+    return () => { setFrames((current) => current.filter((other) => other !== section)); };
+  }, []);
   const load = useMemo(
-    (): SettingsLoad => ({ error: settings.error, retry: () => { void settings.refetch(); } }),
-    [settings],
+    (): SettingsLoad => ({
+      error: settings.error,
+      retry: () => { void settings.refetch(); },
+      alertFor: frames.at(0) ?? null,
+      frame,
+    }),
+    [settings, frames, frame],
   );
 
   return createElement(

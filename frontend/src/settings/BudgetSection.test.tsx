@@ -2,8 +2,10 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import en from "../i18n/en.json";
 import { fakeApi, requestsTo, spendOut } from "../test/api";
-import { dryRunPayloads, renderSettings } from "../test/settings";
+import { renderApp } from "../test/app";
+import { dryRunPayloads } from "../test/settings";
 
+// The section's Needs attention link is the router's `Link`: these tests render the app at Profile & Settings.
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -36,7 +38,7 @@ describe("BudgetSection", () => {
       },
       quarantined_batch_usd: "0.840000",
     });
-    renderSettings(["budget"]);
+    renderApp("/settings#budget");
     await waitFor(() => {
       expect(figure(en["settings_budget.counted"])).toBe("$38.20 of $100.00");
     });
@@ -54,6 +56,8 @@ describe("BudgetSection", () => {
       ["SerpApi", en["settings_budget.quota_none"]],
       ["Adzuna", "41 of 2,250", "1 Dec", "2", "1", "0"],
     ]);
+    // one spend read (the Jobs list's query, read live here), in the background as a poll
+    expect(requestsTo(api, "GET /api/system/spend")).toHaveLength(1);
     for (const read of [...requestsTo(api, "GET /api/system/spend"), ...requestsTo(api, "GET /api/system/quota")]) {
       expect(read.headers.get("X-JH-Background")).toBe("1");
     }
@@ -61,15 +65,17 @@ describe("BudgetSection", () => {
     expect(within(budget()).getByText(en["settings_form.no_changes"])).toBeTruthy();
   });
 
-  it("edits the cap as a decimal string", async () => {
+  it("edits the cap as a decimal string, with no bound written out", async () => {
     const api = fakeApi({ signedIn: true });
-    renderSettings(["budget"]);
-    const cap = await within(budget()).findByRole("textbox", { name: en["settings_budget.cap"] });
+    renderApp("/settings#budget");
+    const cap = await screen.findByRole("textbox", { name: en["settings_budget.cap"] });
     expect((cap as HTMLInputElement).value).toBe("100.00");
     fireEvent.change(cap, { target: { value: "120,50" } });
     await waitFor(() => {
       expect(dryRunPayloads(api).at(-1)?.llm.cap_usd).toBe("120.50");
     });
-    expect(screen.getByRole("spinbutton", { name: en["settings_budget.max_targets"] })).toBeTruthy();
+    // the bounds are the dry-run's errors, never a copy of the model's ranges
+    const most = screen.getByRole("spinbutton", { name: en["settings_budget.max_targets"] });
+    expect([most.getAttribute("min"), most.getAttribute("max")]).toEqual([null, null]);
   });
 });

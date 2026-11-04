@@ -110,6 +110,30 @@ describe("ScopeSection", () => {
     expect((within(scope()).getByRole<HTMLButtonElement>("button", { name: en["settings_scope.add_place"] })).disabled).toBe(false);
   });
 
+  it("moves focus to the new row when the tenth place fills the list", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.places = [place()];
+    const base = settingsRead();
+    const locations = Array.from({ length: 9 }, (_, i) => ({
+      label: `Ort ${String(i + 1)}`,
+      gazetteer_id: `geonames:${String(i + 1)}`,
+      lat: 50 + i / 10,
+      lon: 10,
+      radius_km: 30,
+    }));
+    api.routes.set("GET /api/settings", () => json({ ...base, payload: { ...base.payload, scope: { ...base.payload.scope, locations } } }));
+    renderSettings(["scope"]);
+    const user = userEvent.setup();
+    await user.click(await within(scope()).findByRole("button", { name: en["settings_scope.add_place"] }));
+    await user.type(within(scope()).getByRole("combobox", { name: en["settings_scope.place_to_add"] }), "Ber");
+    await user.click(await within(scope()).findByRole("option", { name: /^Berlin/ }));
+    const rows = within(within(scope()).getByRole("list", { name: en["settings_scope.locations"] })).getAllByRole("listitem");
+    expect(rows).toHaveLength(10);
+    expect(within(scope()).getByRole<HTMLButtonElement>("button", { name: en["settings_scope.add_place"] }).disabled).toBe(true);
+    // not left on a disabled Add (the body): on the new row's first control
+    expect(document.activeElement).toBe(within(rows[9]).getByRole("button", { name: "Remove Berlin" }));
+  });
+
   it("keeps one work mode ticked and writes the set in its order", async () => {
     const api = fakeApi({ signedIn: true });
     renderSettings(["scope"]);

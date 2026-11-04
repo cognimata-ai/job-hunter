@@ -1123,5 +1123,6 @@
   "settings_budget.quota_reserved": "Reserviert",
   "settings_budget.quota_ambiguous": "Unklar",
   "settings_budget.quota_adjustments": "Korrekturen",
-  "settings_budget.quota_none": "Noch kein Fenster"
+  "settings_budget.quota_none": "Noch kein Fenster",
+  "settings_form.reread_failed": "Gespeichert – die gespeicherten Einstellungen konnten nicht erneut gelesen werden"
 }

@@ -70,12 +70,15 @@ export function useFacets(
   });
 }
 
-/** The month's spend (`GET /api/system/spend`), for `c_hat`: one read for the page, fresh for 60 s. */
-export function useSpend(): UseQueryResult<SpendOut> {
+/** The month's spend (`GET /api/system/spend`), for `c_hat`: one read for the page, fresh for 60 s. With `live`
+ * (Budget & quota's live figures, plan M4 Task 28) it is also read again every 60 s while shown, a poll, so in the
+ * background (`X-JH-Background: 1`); the two are never on one page. */
+export function useSpend({ live = false }: { live?: boolean } = {}): UseQueryResult<SpendOut> {
   return useQuery({
     queryKey: SPEND_KEY,
-    queryFn: ({ signal }) => apiFetch<SpendOut>("/api/system/spend", { signal }),
+    queryFn: ({ signal }) => apiFetch<SpendOut>("/api/system/spend", { signal, background: live }),
     staleTime: SPEND_STALE_MS,
+    refetchInterval: live ? SPEND_STALE_MS : false,
   });
 }
 

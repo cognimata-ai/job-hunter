@@ -2,16 +2,19 @@
 // section. Every panel shows the one form's state, so a tick in one is a tick in all; only the panel of the
 // section last changed or saved raises an alert, the others show the same text quietly.
 //
+// - The active panel's status line is a polite live region ("Checking…", "Unsaved changes", "Saving…"); a quiet
+//   panel shows a problem with the same text, request id and Retry, but not as an alert.
 // - With nothing dirty: "No unsaved changes", and the standing warnings of the base document's own dry-run.
 // - Else, in order: the "Settings changed elsewhere" offer, a refused save (the eval-gate override, or the
-//   problem), the dry-run's failure, its errors in red (each linked to its field in its own section, and to the
+//   problem), a saved version that could not be read again (Ruling T28-f: the problem with Retry, Save disabled),
+//   the dry-run's failure, its errors in red (each linked to its field in its own section, and to the
 //   section's anchor from any other), its warnings (amber with "I understand", or one compact line with its tick
 //   for a standing one), the projections as compact rows, the effect chips, and Save. While the current draft's
 //   dry-run is not in, the panel says "Checking…" over the last answer, and Save is disabled.
 import type { TFunction } from "i18next";
 import { type MouseEvent, type ReactNode, useId } from "react";
 import { useTranslation } from "react-i18next";
-import { NETWORK_CODE, type ProblemError, toProblem } from "../api/client";
+import { NETWORK_CODE, toProblem } from "../api/client";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import i18n, { intlLocale, type TranslationKey, useServerText } from "../i18n/index";
@@ -140,13 +143,16 @@ interface Row {
 function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverText: ServerText, locale: string): Row[] {
   const fine = usdFine(locale);
   const percent = new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 1 });
+  // the projections' rates and days, to a hundredth (the dry-run sends up to three places)
+  const decimal = new Intl.NumberFormat(locale, { maximumFractionDigits: 2 });
+  const figure = (n: number) => decimal.format(n);
   const join = (parts: (string | null)[]) => parts.filter((part): part is string => part !== null).join(" · ");
   const window = (w: ProjectionsOut["jsearch"]["window"]) =>
     w === null
       ? null
       : t("dry_run.window", { used: format.number(w.used_units), limit: format.number(w.limit_units), reset: format.dayMonth(w.reset_at) });
   const cadence = (days: number | null) =>
-    days === null ? t("dry_run.cadence_never") : t("dry_run.cadence", { count: days, value: format.number(days) });
+    days === null ? t("dry_run.cadence_never") : t("dry_run.cadence", { count: days, value: figure(days) });
   const serpapi = p.serpapi_fallback;
   const llm = p.llm;
   const rows: Row[] = [
@@ -154,7 +160,7 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
       key: "jsearch",
       label: t("provider.jsearch"),
       text: join([
-        t("dry_run.units_per_run", { value: format.number(p.jsearch.units_per_run) }),
+        t("dry_run.units_per_run", { value: figure(p.jsearch.units_per_run) }),
         cadence(p.jsearch.refresh_cadence_days),
         t("dry_run.cells", { value: format.number(p.jsearch.cells) }),
         window(p.jsearch.window),
@@ -164,7 +170,7 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
       key: "adzuna",
       label: t("provider.adzuna"),
       text: join([
-        t("dry_run.calls_per_day", { calls: format.number(p.adzuna.calls_per_day), allowance: format.number(p.adzuna.allowance_per_day) }),
+        t("dry_run.calls_per_day", { calls: figure(p.adzuna.calls_per_day), allowance: figure(p.adzuna.allowance_per_day) }),
         cadence(p.adzuna.cadence_days),
         t("dry_run.cells", { value: format.number(p.adzuna.cells) }),
       ]),
@@ -172,7 +178,7 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
     {
       key: "arbeitnow",
       label: t("source.arbeitnow"),
-      text: t("dry_run.pages", { expected: format.number(p.arbeitnow.expected_pages), cap: format.number(p.arbeitnow.page_cap) }),
+      text: t("dry_run.pages", { expected: figure(p.arbeitnow.expected_pages), cap: format.number(p.arbeitnow.page_cap) }),
     },
     {
       key: "serpapi",
@@ -181,7 +187,7 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
         serpapi === null
           ? t("dry_run.serpapi_none")
           : join([
-              t("dry_run.units_per_run", { value: format.number(serpapi.units_per_run) }),
+              t("dry_run.units_per_run", { value: figure(serpapi.units_per_run) }),
               t("dry_run.hourly_cap", { value: format.number(serpapi.hourly_cap) }),
               serverText("window_state", serpapi.state),
               window(serpapi.window),
@@ -231,8 +237,9 @@ function projectionRows(p: ProjectionsOut, t: TFunction, format: Format, serverT
   return rows;
 }
 
-/** A problem: the `ProblemBox` (an alert) in the active panel, the same title and detail quietly elsewhere. */
-function Problem({ error, alert, onRetry }: { error: ProblemError; alert: boolean; onRetry?: () => void }) {
+/** A problem: the `ProblemBox` (an alert) where `alert`, elsewhere the same title, detail, request id and Retry
+ * quietly (the settings page shows one state in several places, and announces it once). */
+export function Problem({ error, alert, onRetry }: { error: unknown; alert: boolean; onRetry?: () => void }) {
   const { t } = useTranslation();
   const serverText = useServerText();
   if (alert) {
@@ -244,6 +251,12 @@ function Problem({ error, alert, onRetry }: { error: ProblemError; alert: boolea
     <div className={styles.quietProblem}>
       <p className={styles.problemTitle}>{title}</p>
       {problem.detail !== null && <p>{problem.detail}</p>}
+      {problem.requestId !== null && (
+        <p className={styles.requestId}>{t("problem_box.request_id", { id: problem.requestId })}</p>
+      )}
+      {onRetry !== undefined && (
+        <button type="button" className={cx(fields.button, styles.retry)} onClick={onRetry}>{t("action.retry")}</button>
+      )}
     </div>
   );
 }
@@ -308,7 +321,15 @@ function WarningItem({ warning, standing, form }: { warning: WarningOut; standin
 
 /** Why Save is disabled, when the panel does not already say it ("Checking…", the offer, a problem). */
 function blockedReason(form: SettingsForm, t: TFunction): string | null {
-  if (form.dirty.size === 0 || form.canSave || form.checking || form.saving || form.stale || form.dryRunError !== null) {
+  if (
+    form.dirty.size === 0 ||
+    form.canSave ||
+    form.checking ||
+    form.saving ||
+    form.stale ||
+    form.dryRunError !== null ||
+    form.rereadError !== null
+  ) {
     return null;
   }
   if (form.issues.length > 0) {
@@ -331,20 +352,23 @@ export function DryRunPanel() {
   const dirty = form.dirty.size > 0;
   const result = form.dryRun;
   const warnings = dirty ? (result?.warnings ?? []) : (form.baseDryRun?.warnings ?? []);
-  const status = form.saving
-    ? t("settings_form.saving")
-    : !dirty
-      ? t("settings_form.no_changes")
-      : form.checking
-        ? t("settings_form.checking")
-        : t("settings_form.unsaved");
+  let status: string;
+  if (form.saving) {
+    status = t("settings_form.saving");
+  } else if (form.rereadError !== null) {
+    status = t("settings_form.reread_failed");
+  } else if (!dirty) {
+    status = t("settings_form.no_changes");
+  } else {
+    status = form.checking ? t("settings_form.checking") : t("settings_form.unsaved");
+  }
   const rescore = warnings.find((warning) => warning.code === "llm_rescore");
   const rescoreUsd = rescore === undefined ? null : str(rescore.detail.est_usd);
   const effects = dirty ? (result?.effects ?? []).filter((effect) => effect !== "none") : [];
   const reason = blockedReason(form, t);
   return (
     <div className={cx(styles.panel, form.checking && styles.checking)}>
-      <p className={styles.status}>{status}</p>
+      <p className={styles.status} role={alert ? "status" : undefined}>{status}</p>
       {form.stale && (
         <div className={styles.offer} role={alert ? "alert" : undefined}>
           <p className={styles.offerTitle}>{t("settings_form.changed_elsewhere")}</p>
@@ -366,6 +390,7 @@ export function DryRunPanel() {
         </div>
       )}
       {!form.evalGateFailed && form.saveError !== null && <Problem error={form.saveError} alert={alert} />}
+      {form.rereadError !== null && <Problem error={form.rereadError} alert={alert} onRetry={form.retryReread} />}
       {form.dryRunError !== null && <Problem error={form.dryRunError} alert={alert} onRetry={form.retryDryRun} />}
       {form.issues.length > 0 && (
         <ul role="list" className={styles.issues} aria-label={t("settings_form.errors")}>

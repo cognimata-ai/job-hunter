@@ -38,6 +38,7 @@ export function ScheduleSection() {
     <div className={styles.schedule}>
       <div className={fields.grid}>
         <ToggleField path="schedule.enabled" label={t("settings_schedule.enabled")} />
+        {/* the brief's interval, 1–168 h (`settings/model.py` `Schedule.interval_hours`, ge=1, le=168) */}
         <NumberField path="schedule.interval_hours" label={t("settings_schedule.interval")} min={1} max={168}
           unit={t("settings_schedule.hours")} />
         <TextField path="schedule.anchor_local" type="time" label={t("settings_schedule.anchor")}

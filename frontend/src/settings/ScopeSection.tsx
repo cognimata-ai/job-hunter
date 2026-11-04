@@ -4,7 +4,8 @@
 // - **Locations**: at most 10, each a gazetteer place with a radius slider (1 to 200 km, 30 for a new place).
 //   Each row shows the place's name, its postal codes (three, then "+n") and its population: for a place just
 //   picked, as the picker answered it; for a saved one, from a search of its name in the gazetteer. At 10 places
-//   Add place is disabled, and says why.
+//   Add place is disabled, and says why; the place that fills the list takes the focus to its row.
+// - Only the brief's ranges are written out (the radius, 1 to 200 km); every other bound is the dry-run's.
 // - **The rest**: remote work within Germany, work modes, employment types, the seniority range (relative to the
 //   profile, or an explicit ladder range with open bounds), industries to include and exclude, the accepted ad
 //   languages, the language requirements (a severity per language, or the default), the maximum ad age, the
@@ -141,6 +142,7 @@ function LocationRow({ location, index, onRemove }: { location: Location; index:
           <span aria-hidden="true">×</span>
         </button>
       </div>
+      {/* the brief's radius slider, 1–200 km (`settings/model.py` `ScopeLocation.radius_km`, ge=1, le=200) */}
       <RangeSlider path={`${path}.radius_km`} label={t("settings_scope.radius")} min={1} max={200}
         valueText={(km) => t("settings_scope.km", { value: format.number(km) })} />
     </li>
@@ -155,6 +157,7 @@ function Locations() {
   const [adding, setAdding] = useState(false);
   const picker = useRef<HTMLDivElement>(null);
   const addButton = useRef<HTMLButtonElement>(null);
+  const placesList = useRef<HTMLUListElement>(null);
   const returnFocus = useRef(false);
   const fullId = useId();
   const full = locations.length >= MAX_LOCATIONS;
@@ -164,7 +167,13 @@ function Locations() {
       picker.current?.querySelector("input")?.focus();
     } else if (returnFocus.current) {
       returnFocus.current = false;
-      addButton.current?.focus();
+      // back to Add; when the new place filled the list (Add disabled), to the new row's first control
+      const add = addButton.current;
+      if (add !== null && !add.disabled) {
+        add.focus();
+      } else {
+        placesList.current?.lastElementChild?.querySelector<HTMLElement>("button, input, select, [role='slider']")?.focus();
+      }
     }
   }, [adding]);
   const close = () => {
@@ -174,7 +183,7 @@ function Locations() {
   return (
     <div id={fieldId("scope.locations")} className={styles.locations} aria-describedby={describedBy(list.issueIds)}>
       <h4 id={`${fieldId("scope.locations")}-heading`} className={fields.subheading}>{t("settings_scope.locations")}</h4>
-      <ul role="list" className={styles.places} aria-labelledby={`${fieldId("scope.locations")}-heading`}>
+      <ul ref={placesList} role="list" className={styles.places} aria-labelledby={`${fieldId("scope.locations")}-heading`}>
         {locations.map((location, index) => (
           <LocationRow key={`${location.gazetteer_id}-${String(index)}`} location={location} index={index}
             onRemove={() => { form.set("scope.locations", locations.filter((_, other) => other !== index)); }} />
@@ -225,8 +234,8 @@ function Seniority() {
           optionLabel={(value) => t(SENIORITY_MODE_LABELS[value])} />
         {mode === "profile_relative" ? (
           <>
-            <NumberField path="scope.seniority_range.below" label={t("settings_scope.seniority_below")} min={0} max={3} />
-            <NumberField path="scope.seniority_range.above" label={t("settings_scope.seniority_above")} min={0} max={3} />
+            <NumberField path="scope.seniority_range.below" label={t("settings_scope.seniority_below")} />
+            <NumberField path="scope.seniority_range.above" label={t("settings_scope.seniority_above")} />
           </>
         ) : (
           <>
@@ -303,10 +312,9 @@ export function ScopeSection() {
       <div className={styles.group} role="group" aria-labelledby="scope-exclusions">
         <h3 id="scope-exclusions" className={fields.heading}>{t("settings_scope.group.exclusions")}</h3>
         <div className={fields.grid}>
-          <NumberField path="scope.max_ad_age_days" label={t("settings_scope.max_ad_age")} min={1} max={90}
-            unit={t("settings_scope.days")} />
-          <NumberField path="scope.min_salary_eur_year" label={t("settings_scope.min_salary")} min={0} max={500000}
-            step={1000} unit={t("settings_scope.eur_year")} hint={t("settings_scope.min_salary_hint")} />
+          <NumberField path="scope.max_ad_age_days" label={t("settings_scope.max_ad_age")} unit={t("settings_scope.days")} />
+          <NumberField path="scope.min_salary_eur_year" label={t("settings_scope.min_salary")}
+            unit={t("settings_scope.eur_year")} hint={t("settings_scope.min_salary_hint")} />
         </div>
         <div className={fields.grid}>
           <TextListField path="scope.excluded_companies" label={t("settings_scope.excluded_companies")} />

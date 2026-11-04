@@ -1123,5 +1123,6 @@
   "settings_budget.quota_reserved": "Reserved",
   "settings_budget.quota_ambiguous": "Ambiguous",
   "settings_budget.quota_adjustments": "Adjustments",
-  "settings_budget.quota_none": "No window yet"
+  "settings_budget.quota_none": "No window yet",
+  "settings_form.reread_failed": "Saved — the saved settings could not be read again"
 }

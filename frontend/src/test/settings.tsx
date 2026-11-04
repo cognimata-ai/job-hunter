@@ -1,25 +1,28 @@
 // The settings form under test (plan M4 Task 28): `SettingsFormProvider` with the sections a test names, each in
-// its `SectionFrame`, inside the app's providers (`renderInProviders`), against the `fetch` stub of `test/api.ts`;
-// and the stub's settings requests, parsed.
-import type { ReactNode } from "react";
+// its `SectionFrame`, inside the app's providers (as `renderInProviders` renders them, with no router: the Budget
+// section's link needs one, so its tests render the app), against the `fetch` stub of `test/api.ts`; and the
+// stub's settings requests, parsed.
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createMemoryHistory } from "@tanstack/react-router";
+import { act, render } from "@testing-library/react";
+import { type ReactNode, useState } from "react";
 import type { components } from "../api/schema";
+import { type AppParts, createApp } from "../app/App";
+import { LiveRegion } from "../components/LiveRegion";
+import { Toaster } from "../components/Toaster";
 import en from "../i18n/en.json";
 import type { SettingsSection } from "../pages/ProfileSettingsPage";
-import { BudgetSection } from "../settings/BudgetSection";
 import { ScheduleSection } from "../settings/ScheduleSection";
 import { ScopeSection } from "../settings/ScopeSection";
 import { SectionFrame } from "../settings/SectionFrame";
 import { type SettingsForm, SettingsFormProvider, useSettingsForm } from "../settings/useSettingsForm";
 import { type FakeApi, type FakeRequest, requestsTo } from "./api";
-import { renderInProviders } from "./app";
-import type { AppParts } from "../app/App";
 
 type Settings = components["schemas"]["Settings"];
 
 const BODIES: Partial<Record<SettingsSection, ReactNode>> = {
   scope: <ScopeSection />,
   schedule: <ScheduleSection />,
-  budget: <BudgetSection />,
 };
 
 /** Hands the form to the test on every render (`probe.form`), as a section of a later task holds it. */
@@ -32,22 +35,52 @@ function FormProbe({ probe }: { probe: Probe }) {
   return null;
 }
 
-/** Renders the form with `sections` (each framed, its own body or none), and a probe of the form. */
+/** Shows its children until `control.hide()` (the user leaving the page). */
+function Mounted({ control, children }: { control: { hide: () => void }; children: ReactNode }) {
+  const [shown, setShown] = useState(true);
+  control.hide = () => { setShown(false); };
+  return shown ? children : null;
+}
+
+/**
+ * Renders the form with `sections` (each framed, its own body or none) and a probe of the form; `unmount()`
+ * removes the form and leaves the providers (the toasts). `retryDelay` replaces the queries' backoff (a test of a
+ * read that fails past its retries).
+ */
 export function renderSettings(
-  sections: readonly SettingsSection[] = ["scope", "schedule", "budget"],
-): AppParts & { probe: Probe } {
+  sections: readonly SettingsSection[] = ["scope", "schedule"],
+  { retryDelay }: { retryDelay?: number } = {},
+): AppParts & { probe: Probe; unmount: () => void } {
   const probe: Probe = { form: null };
-  const app = renderInProviders(
-    <SettingsFormProvider>
-      {sections.map((id) => (
-        <SectionFrame key={id} id={id} title={en[`settings.section.${id}`]}>
-          {BODIES[id]}
-          {id === sections[0] && <FormProbe probe={probe} />}
-        </SectionFrame>
-      ))}
-    </SettingsFormProvider>,
+  const control = {
+    hide: () => {
+      throw new Error("the form is not rendered yet");
+    },
+  };
+  const app = createApp({ history: createMemoryHistory({ initialEntries: ["/"] }) });
+  if (retryDelay !== undefined) {
+    const queries = app.queryClient.getDefaultOptions().queries;
+    app.queryClient.setDefaultOptions({ queries: { ...queries, retryDelay } });
+  }
+  render(
+    <QueryClientProvider client={app.queryClient}>
+      <Toaster store={app.toasts}>
+        <LiveRegion>
+          <Mounted control={control}>
+            <SettingsFormProvider>
+              {sections.map((id) => (
+                <SectionFrame key={id} id={id} title={en[`settings.section.${id}`]}>
+                  {BODIES[id]}
+                  {id === sections[0] && <FormProbe probe={probe} />}
+                </SectionFrame>
+              ))}
+            </SettingsFormProvider>
+          </Mounted>
+        </LiveRegion>
+      </Toaster>
+    </QueryClientProvider>,
   );
-  return { ...app, probe };
+  return { ...app, probe, unmount: () => { act(() => { control.hide(); }); } };
 }
 
 /** The form the probe holds (once the settings are read). */

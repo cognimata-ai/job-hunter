@@ -68,6 +68,9 @@ describe("ScheduleSection", () => {
     renderSettings(["schedule"]);
     const anchor = await within(schedule()).findByLabelText(en["settings_schedule.anchor"]);
     expect((anchor as HTMLInputElement).value).toBe("06:00");
+    // the interval's range is the brief's (1–168 h), the only bound the section writes out
+    const interval = within(schedule()).getByRole("spinbutton", { name: en["settings_schedule.interval"] });
+    expect([interval.getAttribute("min"), interval.getAttribute("max")]).toEqual(["1", "168"]);
     expect(within(schedule()).getByText("Local time in Europe/Berlin")).toBeTruthy();
     fireEvent.change(anchor, { target: { value: "07:30" } });
     await waitFor(() => {
