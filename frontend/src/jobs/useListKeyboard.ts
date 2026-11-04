@@ -41,7 +41,9 @@ export function focusDropped(): boolean {
   return active === null || active === document.body || !active.isConnected;
 }
 
-function ignored(event: KeyboardEvent): boolean {
+/** Whether a key is not the list's (module comment): a modifier held, typing, a dialog's, or handled already.
+ * Label mode's `1`/`2`/`3` follow the same rule. */
+export function ignoredKey(event: KeyboardEvent): boolean {
   if (event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
     return true;
   }
@@ -84,7 +86,7 @@ export function useListKeyboard(ids: readonly number[], onOpen: (jobId: number) 
       lastFocused.current = cardWith(event.target);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.key !== "j" && event.key !== "k") || ignored(event)) {
+      if ((event.key !== "j" && event.key !== "k") || ignoredKey(event)) {
         return;
       }
       const { ids: listed, focusedId: roving } = shown.current;

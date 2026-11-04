@@ -1,0 +1,164 @@
+/* A card to label: the ad's facts and excerpt, then the three label buttons across the card and the comment;
+ * once labelled, the label given with Reveal score and Change label. */
+.card {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.card:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.title {
+  font-size: var(--font-size-4);
+  overflow-wrap: anywhere;
+}
+
+.company {
+  margin-top: calc(-1 * var(--space-2));
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.where {
+  margin-top: calc(-1 * var(--space-2));
+  font-size: var(--font-size-2);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.form {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+/* Three equal buttons in a row, at every width: they stay large, and side by side, like the keys they name. */
+.labels {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+/* Where a third of the card is too narrow for the key beside the name ("Schlecht" on a phone), the name goes
+ * under the key, whole: a word breaks only when it cannot fit a line of its own. */
+.choice {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+  min-height: 52px;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-size: var(--font-size-3);
+  font-weight: var(--font-weight-bold);
+  overflow-wrap: break-word;
+  cursor: pointer;
+}
+
+.choice:hover:not([aria-disabled="true"]) {
+  background: var(--color-surface-sunken);
+}
+
+.choice[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.choice[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+.labels[aria-busy="true"] .choice {
+  cursor: progress;
+}
+
+/* The key that labels with this button: a keycap beside its name. */
+.key {
+  flex: none;
+  min-width: 1.75em;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-1);
+  color: var(--color-text-muted);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.6;
+  text-align: center;
+}
+
+.error {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}
+
+.done {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
+  min-width: 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.given {
+  color: var(--color-success);
+  font-weight: var(--font-weight-bold);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.button {
+  justify-self: start;
+  min-height: 36px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+}
+
+/* Reveal score is a disclosure: the chevron says whether the score is shown. */
+.chevron {
+  margin-left: var(--space-2);
+  color: var(--color-text-muted);
+}
+
+.score {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.score:empty {
+  display: none;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}

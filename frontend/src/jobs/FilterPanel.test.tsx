@@ -6,7 +6,7 @@ import codes from "../i18n/codes.json";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
 import i18n from "../i18n/index";
-import { type FakeApi, fakeApi, jobCard, jobsPage, place, requestsTo } from "../test/api";
+import { type FakeApi, fakeApi, jobCard, jobsPage, json, place, requestsTo } from "../test/api";
 import { NOW, renderApp } from "../test/app";
 
 beforeEach(() => {
@@ -334,6 +334,13 @@ describe("FilterPanel", () => {
 
   it("reset restores the defaults", async () => {
     const api = fakeApi({ signedIn: true });
+    // Label mode (Task 26) shows the labelling queue in the list's place: here the same job, to label
+    api.routes.set("GET /api/labelling/queue", () =>
+      json({
+        items: [{ job_id: 5, title: "Senior Backend Engineer", company: "Acme GmbH", locations: ["Berlin"], ad_language: "en", excerpt: "" }],
+        progress: { labelled: 0, target: 50 },
+      }),
+    );
     const { app, aside } = await panel(
       api,
       "/?q=python&sort=posted&work_mode=remote&score_min=40&loc_id=geonames:2950159&loc_lat=52.5&loc_lon=13.4&radius_km=30&loc_label=Berlin&job=5&label=1",

@@ -459,7 +459,7 @@ export function FilterPanel() {
             onClick={() => { write(resetSearch); }}>
             {t("filters.reset")}
           </button>
-          {/* Label mode is the `label=1` param alone until Task 26 builds the mode itself. */}
+          {/* Label mode (`label=1`): the labelling queue takes the list's place (`LabelMode`, Task 26). */}
           <button type="button" className={styles.button} aria-pressed={search.label === 1}
             onClick={() => { write((current) => ({ ...current, label: current.label === 1 ? undefined : 1 })); }}>
             {t("filters.label_mode")}

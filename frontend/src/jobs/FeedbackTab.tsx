@@ -1,11 +1,12 @@
 // The Feedback tab (spec §15.4, §11.13; plan M4 Task 24, resolution f): "wrong score" with the label the user
 // expected, Good · OK · Poor, and an optional comment of at most 2,000 characters, counted as the api counts them
-// (code points, not UTF-16 units), with the count shown. It posts `{kind: "wrong_score", label, comment?}`; a 409
-// (no published score to label) says "No score to label yet" in the form. Below, the job's feedback newest first,
-// as served, each with Delete (no confirmation: the golden case it made stays, §11.13). Both writes read the
-// detail again. A comment is the user's own text, shown as text. Focus stays in the tab: after a sent label on
-// the first radio (the submit button is disabled with the form cleared), after a Delete on the next item's
-// Delete, else the previous one's, else the list's heading (the item leaves with the read).
+// (code points, not UTF-16 units), with the count shown (`CommentField`, shared with Label mode). It posts
+// `{kind: "wrong_score", label, comment?}`; a 409 (no published score to label) says "No score to label yet" in
+// the form. Below, the job's feedback newest first, as served, each with Delete (no confirmation: the golden case
+// it made stays, §11.13). Both writes read the detail again. A comment is the user's own text, shown as text.
+// Focus stays in the tab: after a sent label on the first radio (the submit button is disabled with the form
+// cleared), after a Delete on the next item's Delete, else the previous one's, else the list's heading (the item
+// leaves with the read).
 import { type SyntheticEvent, useId, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isProblem } from "../api/client";
@@ -13,33 +14,28 @@ import { ProblemBox } from "../components/ProblemBox";
 import { useToast } from "../components/Toaster";
 import { useServerText } from "../i18n/index";
 import { useFormat } from "../system/format";
+import { CommentField, commentTooLong } from "./CommentField";
 import { type FeedbackIn, type JobFeedbackOut, useDeleteFeedback, useRecordFeedback } from "./detailApi";
 import styles from "./FeedbackTab.module.css";
 import { TabSection } from "./TabSection";
 
+export { COMMENT_MAX } from "./CommentField";
+
 type Label = FeedbackIn["label"];
 
-/** The longest comment, in code points (`api/routes/golden.py`'s `Comment`). */
-export const COMMENT_MAX = 2000;
 const LABELS: readonly Label[] = ["good", "ok", "poor"];
 
 function FeedbackForm({ jobId }: { jobId: number }) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const format = useFormat();
   const toast = useToast();
   const record = useRecordFeedback(jobId);
   const [label, setLabel] = useState<Label | null>(null);
   const [comment, setComment] = useState("");
   const headingId = useId();
   const groupId = useId();
-  const commentId = useId();
-  const countId = useId();
-  const hintId = useId();
   const firstRadio = useRef<HTMLInputElement>(null);
-  const length = Array.from(comment).length;
-  const tooLong = length > COMMENT_MAX;
-  const max = format.number(COMMENT_MAX);
+  const tooLong = commentTooLong(comment);
   const submit = (event: SyntheticEvent) => {
     event.preventDefault();
     if (label === null || tooLong || record.isPending) {
@@ -72,12 +68,7 @@ function FeedbackForm({ jobId }: { jobId: number }) {
           </label>
         ))}
       </div>
-      <label htmlFor={commentId} className={styles.label}>{t("feedback.comment")}</label>
-      <textarea id={commentId} className={styles.comment} rows={3} value={comment} aria-invalid={tooLong}
-        aria-describedby={tooLong ? `${countId} ${hintId}` : countId}
-        onChange={(event) => { setComment(event.target.value); }} />
-      <p id={countId} className={styles.count}>{t("feedback.count", { count: format.number(length), max })}</p>
-      {tooLong && <p id={hintId} className={styles.error}>{t("feedback.too_long", { max })}</p>}
+      <CommentField value={comment} onChange={setComment} />
       {record.error !== null &&
         (isProblem(record.error, "conflict_state") ? (
           <p role="alert" className={styles.error}>{t("feedback.no_score")}</p>

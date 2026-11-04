@@ -15,6 +15,10 @@
 //   URL, Ruling T24-f), pushes `job=<id>`. Every card is rendered through `GroupCard` (Task 25): a duplicate
 //   group's card (`kind: "group"`) is framed by its group, one card under its representative's id, and any other
 //   is the plain `JobCard`, so a card that stops being a group card keeps its article and the focus in it.
+// - Label mode (`label=1`, Task 26) takes the list's place, its toolbar included: `LabelMode`, below the
+//   no-profile notice, beside the filter panel and its Label mode toggle. The list is still read under the
+//   search (its query is kept), but its keyboard has no cards meanwhile, so `j`/`k` are Label mode's; leaving
+//   (the toggle again, or Back) shows the list as it was. When the switch takes focus with it, the heading has it.
 // - The detail drawer (Task 24, resolution e) is open while the search has `job`. Closing it goes Back when this
 //   page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL without `job`; showing
 //   another job in it (a survivor, a representative) replaces `job`. The drawer gives focus back to what held it
@@ -31,6 +35,7 @@ import type { TranslationKey } from "../i18n/index";
 import { DetailDrawer } from "../jobs/DetailDrawer";
 import { FilterPanel } from "../jobs/FilterPanel";
 import { GroupCard } from "../jobs/GroupCard";
+import { LabelMode } from "../jobs/LabelMode";
 import { DEFAULT_SEARCH, type JobSort, resetSearch, SORTS, toApiParams } from "../jobs/search";
 import { type CountsOut, useJobsList } from "../jobs/useJobsList";
 import { useJobsSearch } from "../jobs/useJobsSearch";
@@ -40,6 +45,7 @@ import { useFormat } from "../system/format";
 import styles from "./JobsPage.module.css";
 
 const SKELETON_CARDS = 8;
+const NO_IDS: readonly number[] = [];
 
 const SORT_LABELS = {
   score_mid: "jobs.sort.score_mid",
@@ -90,8 +96,19 @@ export function JobsPage() {
     (jobId: number) => router.buildLocation({ to: "/", search: { ...search, job: jobId } }).href,
     [router, search],
   );
-  const keyboard = useListKeyboard(ids, open);
+  const labelMode = search.label === 1;
+  const keyboard = useListKeyboard(labelMode ? NO_IDS : ids, open);
   const { focusCard, headingRef } = keyboard;
+  // a switch of mode by Back or Forward drops the focus that was in the other one
+  const shownMode = useRef(labelMode);
+  useLayoutEffect(() => {
+    if (shownMode.current !== labelMode) {
+      shownMode.current = labelMode;
+      if (focusDropped()) {
+        headingRef.current?.focus();
+      }
+    }
+  }, [labelMode, headingRef]);
 
   // after the drawer closed (by any way, Back included): when it gave focus back to nothing, the job's card or
   // the heading takes it. The drawer gives focus back in a timer of its own after it unmounts, so this runs after.
@@ -155,6 +172,11 @@ export function JobsPage() {
 
   const filtered = toApiParams({ ...search, sort: DEFAULT_SEARCH.sort }).toString() !== "";
   const noProfile = profile.data !== undefined && profile.data.active === null;
+  const notice = noProfile && (
+    <p className={styles.notice}>
+      <Link to="/settings" hash="cv">{t("jobs.no_profile")}</Link>
+    </p>
+  );
   let content;
   if (list.pending) {
     content = <Skeleton variant="card" count={SKELETON_CARDS} />;
@@ -197,46 +219,55 @@ export function JobsPage() {
       </>
     );
   }
+  // the list's counts, its sort and the Ranking changed region
+  const head = (
+    <div className={styles.head}>
+      <div className={styles.toolbar}>
+        {list.counts !== null && <CountsLine counts={list.counts} />}
+        <div className={styles.sort}>
+          <label htmlFor={sortId}>{t("jobs.sort")}</label>
+          <select id={sortId} className={styles.select} value={search.sort}
+            onChange={(event) => {
+              const sort = SORTS.find((value) => value === event.target.value);
+              if (sort !== undefined) {
+                write({ sort });
+              }
+            }}>
+            {SORTS.map((value) => <option key={value} value={value}>{t(SORT_LABELS[value])}</option>)}
+          </select>
+        </div>
+      </div>
+      <div role="status" aria-label={t("jobs.ranking_status")} className={styles.status}>
+        {list.rankingChanged && (
+          <button type="button" className={styles.ranking}
+            onClick={() => {
+              list.refresh();
+              headingRef.current?.focus(); // the button leaves with the banner
+            }}>
+            {t("jobs.ranking_changed")}
+          </button>
+        )}
+      </div>
+    </div>
+  );
   return (
     <div className={styles.page}>
       <h1 id={headingId} ref={headingRef} tabIndex={-1} className={pageStyles.title}>{t("jobs.title")}</h1>
       <div className={styles.layout}>
         <FilterPanel />
         <div className={styles.results}>
-          <div className={styles.head}>
-            <div className={styles.toolbar}>
-              {list.counts !== null && <CountsLine counts={list.counts} />}
-              <div className={styles.sort}>
-                <label htmlFor={sortId}>{t("jobs.sort")}</label>
-                <select id={sortId} className={styles.select} value={search.sort}
-                  onChange={(event) => {
-                    const sort = SORTS.find((value) => value === event.target.value);
-                    if (sort !== undefined) {
-                      write({ sort });
-                    }
-                  }}>
-                  {SORTS.map((value) => <option key={value} value={value}>{t(SORT_LABELS[value])}</option>)}
-                </select>
-              </div>
-            </div>
-            <div role="status" aria-label={t("jobs.ranking_status")} className={styles.status}>
-              {list.rankingChanged && (
-                <button type="button" className={styles.ranking}
-                  onClick={() => {
-                    list.refresh();
-                    headingRef.current?.focus(); // the button leaves with the banner
-                  }}>
-                  {t("jobs.ranking_changed")}
-                </button>
-              )}
-            </div>
-          </div>
-          {noProfile && (
-            <p className={styles.notice}>
-              <Link to="/settings" hash="cv">{t("jobs.no_profile")}</Link>
-            </p>
+          {labelMode ? (
+            <>
+              {notice}
+              <LabelMode />
+            </>
+          ) : (
+            <>
+              {head}
+              {notice}
+              {content}
+            </>
           )}
-          {content}
         </div>
       </div>
       {openJob !== undefined && <DetailDrawer jobId={openJob} onClose={closeDrawer} onNavigate={showJob} />}

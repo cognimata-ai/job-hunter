@@ -203,12 +203,12 @@ describe("JobsPage", () => {
     cleanup();
 
     // no cards under filters: Reset filters, then focus on the heading (the button leaves with the state)
-    const app = renderApp("/?q=python&work_mode=remote&label=1");
+    const app = renderApp("/?q=python&work_mode=remote");
     expect(await screen.findByText(en["jobs.no_match"])).toBeTruthy();
     expect(screen.queryByText(en["jobs.defaults_hide"])).toBeNull();
     await userEvent.setup().click(screen.getByRole("button", { name: en["jobs.reset_filters"] }));
     await waitFor(() => {
-      expect(app.router.state.location.searchStr).toBe("?label=1");
+      expect(app.router.state.location.searchStr).toBe("");
     });
     expect(await screen.findByText(en["jobs.defaults_hide"])).toBeTruthy();
     expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1, name: en["jobs.title"] }));
