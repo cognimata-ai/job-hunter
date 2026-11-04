@@ -18,6 +18,8 @@ import { ScopeSection } from "../settings/ScopeSection";
 import { ScoringSection } from "../settings/ScoringSection";
 import { SectionFrame } from "../settings/SectionFrame";
 import { WatchlistSection } from "../settings/WatchlistSection";
+import { DisplaySection } from "../system/DisplaySection";
+import { PrivacySection } from "../system/PrivacySection";
 import { type SettingsForm, SettingsFormProvider, useSettingsForm } from "../settings/useSettingsForm";
 import { type FakeApi, type FakeRequest, requestsTo } from "./api";
 
@@ -29,6 +31,8 @@ const BODIES: Partial<Record<SettingsSection, ReactNode>> = {
   watchlist: <WatchlistSection />,
   schedule: <ScheduleSection />,
   scoring: <ScoringSection />,
+  system: <DisplaySection />,
+  privacy: <PrivacySection />,
 };
 
 /** Hands the form to the test on every render (`probe.form`), as a section of a later task holds it. */

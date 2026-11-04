@@ -1,6 +1,7 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
-// stats, watchlist, golden-run and shipped-version reads, the settings dry-run, the logout, the login's answers
+// stats, watchlist, golden-run and shipped-version reads, the System section's reads (needs attention, runs,
+// score cycles, alerts by status, golden cases, health), the settings dry-run, the logout, the login's answers
 // in the order a test gives them, and any other route a test answers itself (`routes`). A route is matched by
 // its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
@@ -28,6 +29,14 @@ type EvalRunsPageOut = components["schemas"]["EvalRunsPageOut"];
 type RubricVersionOut = components["schemas"]["RubricVersionOut"];
 type PromptSchemaVersionOut = components["schemas"]["PromptSchemaVersionOut"];
 type ActivationPreviewOut = components["schemas"]["ActivationPreviewOut"];
+type AttentionOut = components["schemas"]["AttentionOut"];
+type RunOut = components["schemas"]["RunOut"];
+type RunsPageOut = components["schemas"]["RunsPageOut"];
+type ScoreCycleOut = components["schemas"]["ScoreCycleOut"];
+type ScoreCyclesPageOut = components["schemas"]["ScoreCyclesPageOut"];
+type AlertOut = components["schemas"]["AlertOut"];
+type GoldenCaseOut = components["schemas"]["GoldenCaseOut"];
+type SystemHealthOut = components["schemas"]["SystemHealthOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -779,6 +788,154 @@ export function activationPreview(overrides: Partial<ActivationPreviewOut> = {})
   };
 }
 
+/** `GET /api/system/needs-attention` with nothing to attend to; `overrides` replace whole sections. */
+export function attentionOut(overrides: Partial<AttentionOut> = {}): AttentionOut {
+  const none = { count: 0, items: [] };
+  return {
+    raw_items: none,
+    identity_conflicts: none,
+    failed_targets: none,
+    quarantined_batches: none,
+    retrieve_failing: none,
+    mass_disappearances: none,
+    unscorable_groups: none,
+    broken_sources: none,
+    paused_lane: null,
+    scope_apply_failed: null,
+    ...overrides,
+  };
+}
+
+/** A scheduled run that succeeded on 3 Nov 2026 at 06:00 UTC after 2 min 5 s. */
+export function runRow(overrides: Partial<RunOut> = {}): RunOut {
+  return {
+    id: 7,
+    kind: "collect",
+    trigger: "schedule",
+    status: "succeeded",
+    status_reason: null,
+    scheduled_slot: "2026-11-03T06:00:00Z",
+    include_paid: true,
+    attempt_no: 1,
+    queued_at: "2026-11-03T06:00:00Z",
+    started_at: "2026-11-03T06:00:01Z",
+    finished_at: "2026-11-03T06:02:06Z",
+    ...overrides,
+  };
+}
+
+export function runsPage(items: RunOut[] = [], next_cursor: string | null = null): RunsPageOut {
+  return { items, next_cursor };
+}
+
+/** A periodic score cycle that admitted 12 targets and spent $0.63. */
+export function cycleRow(overrides: Partial<ScoreCycleOut> = {}): ScoreCycleOut {
+  return {
+    id: 4,
+    trigger: "periodic",
+    status: "completed",
+    status_reason: null,
+    llm_tuple_id: 2,
+    admission_size: 12,
+    admitted: { periodic: 10, score_now: 2 },
+    spent_usd: "0.630000",
+    report: null,
+    started_at: "2026-11-03T06:10:00Z",
+    finished_at: "2026-11-03T06:11:30Z",
+    ...overrides,
+  };
+}
+
+export function cyclesPage(items: ScoreCycleOut[] = [], next_cursor: string | null = null): ScoreCyclesPageOut {
+  return { items, next_cursor };
+}
+
+/** An open warning: the provider reports less remaining quota than the ledger counts. */
+export function alertRow(overrides: Partial<AlertOut> = {}): AlertOut {
+  return {
+    id: 3,
+    code: "quota.unaccounted_usage",
+    severity: "warn",
+    message: "the provider reports less remaining than the ledger counts",
+    context: { provider: "jsearch" },
+    first_at: "2026-11-03T05:00:00Z",
+    last_at: "2026-11-03T06:30:00Z",
+    occurrences: 2,
+    acknowledged_at: null,
+    resolved_at: null,
+    status: "open",
+    ...overrides,
+  };
+}
+
+/** A golden case labelled "good" in the first weeks, active, not a canary. */
+export function goldenCase(overrides: Partial<GoldenCaseOut> = {}): GoldenCaseOut {
+  return {
+    id: 1,
+    job_id: 31,
+    title: "Backend Engineer (Python)",
+    company: "Beispiel GmbH",
+    label: "good",
+    comment: null,
+    profile_version: 2,
+    scope_version: 4,
+    source: "week1",
+    active: true,
+    is_canary: false,
+    ...overrides,
+  };
+}
+
+/** `GET /api/system/health` of a ready stack: the last run 2 h ago, empty queues, an idle score lane. */
+export function healthOut(overrides: Partial<SystemHealthOut> = {}): SystemHealthOut {
+  return {
+    ready: { ok: true, failing: [] },
+    last_run: runRow(),
+    last_run_age_s: 7200,
+    last_successful_run_age_s: 7080,
+    last_fully_successful_run_age_s: 7080,
+    run_age_state: "ok",
+    queue_depths: { collect: { todo: 0, doing: 0 }, score: { todo: 1, doing: 0 } },
+    quota: {
+      jsearch: {
+        window_start: "2026-11-01T00:00:00Z",
+        window_end: "2026-12-01T00:00:00Z",
+        state: "validated",
+        limit_units: 200,
+        used_units: 112,
+        remaining_units: 88,
+        tokens: 1.5,
+      },
+      serpapi: null,
+      adzuna: null,
+    },
+    llm: { month: "2026-11-01", counted: "38.200000", cap: "100.00", headroom: "61.800000", bucket_usd: "1.200000" },
+    scoring: {
+      running_cycle_id: null,
+      pause_reason: null,
+      oldest_pending_target_age_s: 5400,
+      pending_targets: 12,
+      in_batch_targets: 0,
+      quarantined_batch_usd: "0.000000",
+    },
+    alerts_open: { info: 1, warn: 2, critical: 0 },
+    disk: { path: "/", total_bytes: 250_000_000_000, free_bytes: 12_500_000_000 },
+    database_bytes: 58_742_451,
+    table_bytes: { jobs: 1_548_288, runs: 172_032 },
+    versions: {
+      app: "0.1.0",
+      python: "3.13.16",
+      fastapi: "0.143.2",
+      sqlalchemy: "2.1.4",
+      psycopg: "3.3.6",
+      procrastinate: "3.10.0",
+      langgraph: "1.2.15",
+    },
+    embedder: { ok: true, model_id: "embedder-model@abc/fp32", checksum_ok: true },
+    ...overrides,
+  };
+}
+
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -846,6 +1003,18 @@ export interface FakeApi {
   rubricVersions: RubricVersionOut[];
   /** What `GET /api/settings/prompt-schema-versions` answers (id 1, active, by default). */
   promptSchemaVersions: PromptSchemaVersionOut[];
+  /** What `GET /api/system/needs-attention` answers (nothing to attend to, by default). */
+  attention: AttentionOut;
+  /** What `GET /api/runs` answers (no run, by default). */
+  runs: RunsPageOut;
+  /** What `GET /api/score-cycles` answers (no cycle, by default). */
+  cycles: ScoreCyclesPageOut;
+  /** The alerts `GET /api/alerts?status=…` lists, those of the asked status (none, by default). */
+  alerts: AlertOut[];
+  /** What `GET /api/golden-cases` answers (none, by default). */
+  goldenCases: GoldenCaseOut[];
+  /** What `GET /api/system/health` answers. */
+  health: SystemHealthOut;
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -879,6 +1048,12 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     evalRuns: evalRunsPage(),
     rubricVersions: [rubricVersion()],
     promptSchemaVersions: [promptSchemaVersion()],
+    attention: attentionOut(),
+    runs: runsPage(),
+    cycles: cyclesPage(),
+    alerts: [],
+    goldenCases: [],
+    health: healthOut(),
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -957,6 +1132,25 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/settings/prompt-schema-versions") {
       return Promise.resolve(json(api.promptSchemaVersions));
+    }
+    if (method === "GET" && path === "/api/system/needs-attention") {
+      return Promise.resolve(json(api.attention));
+    }
+    if (method === "GET" && path === "/api/runs") {
+      return Promise.resolve(json(api.runs));
+    }
+    if (method === "GET" && path === "/api/score-cycles") {
+      return Promise.resolve(json(api.cycles));
+    }
+    if (method === "GET" && path === "/api/alerts") {
+      const status = url.searchParams.get("status");
+      return Promise.resolve(json({ items: api.alerts.filter((alert) => status === null || alert.status === status), next_cursor: null }));
+    }
+    if (method === "GET" && path === "/api/golden-cases") {
+      return Promise.resolve(json({ items: api.goldenCases, next_cursor: null }));
+    }
+    if (method === "GET" && path === "/api/system/health") {
+      return Promise.resolve(json(api.health));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

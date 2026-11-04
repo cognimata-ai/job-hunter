@@ -44,8 +44,10 @@ from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.normalize.titles import SENIORITY_LADDER
+from jobhunter.observability import alerts as observability_alerts
+from jobhunter.observability import attention, health
 from jobhunter.observability.health import RunStatus
-from jobhunter.observability.lists import AlertStatus
+from jobhunter.observability.lists import AlertStatus, CycleStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
 from jobhunter.profile import review
 from jobhunter.profile.contacts import Category
@@ -55,9 +57,10 @@ from jobhunter.queries import authoring
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
 from jobhunter.scoring import aggregate, eval_runs, validator
-from jobhunter.scoring.cycles import PauseReason
+from jobhunter.scoring.cycles import CycleTrigger, PauseReason
 from jobhunter.scoring.det_criteria import DetCriterion
 from jobhunter.scoring.filters import FilterCode
+from jobhunter.scoring.golden import CaseSource
 from jobhunter.scoring.golden import Label as FeedbackLabel
 from jobhunter.scoring.knockouts import DEGREE_RANK
 from jobhunter.scoring.routing import DerivedOutcome
@@ -72,11 +75,14 @@ from jobhunter.sources import breaker, watchlist_listing, watchlist_patterns
 from jobhunter.sources.parsing.dates import Precision
 from jobhunter.sources.parsing.salary import Period
 from jobhunter.worker import operations, runs
+from jobhunter.worker.tasks import QUEUES
+from procrastinate.jobs import Status as QueueJobStatus
 
 REPO: Final = Path(__file__).resolve().parents[2]
 SRC: Final = REPO / "backend/src"
 PACKAGE: Final = SRC / "jobhunter"
 CODES: Final = REPO / "frontend/src/i18n/codes.json"
+BASELINE_MIGRATION: Final = PACKAGE / "db/migrations/versions/0001_m0_baseline.py"
 COLLECTION_MIGRATION: Final = PACKAGE / "db/migrations/versions/0005_m1_collection.py"
 ALERT_FUNCTIONS: Final = frozenset({"raise_alert", "open_alert"})
 
@@ -494,6 +500,25 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "model_preset": lambda: literal_values(settings_model.PolicyLabel),
     "eval_run_status": lambda: literal_values(eval_runs.EvalStatus),
     "schema_transport": lambda: literal_values(schema_dry_run.Transport),
+    # System, Display & notifications (plan M4 Task 31, resolutions c to g): the sections of Needs attention
+    # in `AttentionOut`'s order; why an identity conflict holds when its evidence names no key namespace (the
+    # namespaces it names are shown verbatim); a quarantined batch's state; a run's trigger (the
+    # `runs.trigger` CHECK); a score cycle's trigger and status; a golden case's source; an alert's severity
+    # (also the notification threshold's and a broken source's); the health panel's readiness probes, its
+    # run-age state, the worker's queues and their jobs' statuses (procrastinate's); and the UI languages
+    "attention_section": lambda: set(attention.AttentionOut.model_fields),
+    "conflict_reason": lambda: {attention.NO_NAMESPACE_REASON},
+    "batch_state": lambda: literal_values(attention.QuarantinedBatchOut.model_fields["state"].annotation),
+    "run_trigger": lambda: table_check_values(BASELINE_MIGRATION, "runs", "trigger"),
+    "cycle_trigger": lambda: literal_values(CycleTrigger),
+    "cycle_status": lambda: literal_values(CycleStatus),
+    "golden_source": lambda: literal_values(CaseSource),
+    "alert_severity": lambda: literal_values(observability_alerts.Severity),
+    "readiness": lambda: literal_values(health.ReadinessCode),
+    "run_age_state": lambda: literal_values(health.RunAgeState),
+    "queue": lambda: set(QUEUES),
+    "queue_status": lambda: {status.value for status in QueueJobStatus},
+    "ui_language": lambda: literal_values(settings_model.Display.model_fields["ui_language"].annotation),
 }
 
 # The profile form's closed sets that an existing namespace covers (plan M4 Task 27, resolution g): each
@@ -533,6 +558,21 @@ SETTINGS_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
     ),
     # the critic's light-effort triggers (Scoring & models, plan M4 Task 30)
     "critic_trigger": lambda: literal_values(settings_model.LightTrigger),
+}
+
+
+# The closed sets of System and Display & notifications that an existing namespace covers (plan M4 Task 31,
+# resolution g): each is a subset of the namespace it is shown through.
+SYSTEM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
+    # the notification threshold, and a broken source's severity
+    "alert_severity": lambda: (
+        literal_values(settings_model.Notifications.model_fields["push_min_severity"].annotation)
+        | literal_values(attention.BrokenSeverity)
+    ),
+    # the reason of the score lane's acknowledgeable pause (the health panel's is `PauseReason` itself)
+    "pause": lambda: literal_values(attention.PausedReason),
+    "group_unscorable": lambda: literal_values(attention.UnscorableReason),
+    "instance_health": lambda: literal_values(attention.BrokenHealth),
 }
 
 
@@ -607,6 +647,22 @@ def test_the_settings_form_s_reused_namespaces_cover_their_literals(
 ) -> None:
     missing = sorted(SETTINGS_FORM_REUSED[namespace]() - set(catalogue[namespace]))
     assert not missing, f"codes.json[{namespace}] lacks {missing}"
+
+
+@pytest.mark.parametrize("namespace", sorted(SYSTEM_REUSED))
+def test_the_system_section_s_reused_namespaces_cover_their_literals(
+    catalogue: dict[str, Any], namespace: str
+) -> None:
+    missing = sorted(SYSTEM_REUSED[namespace]() - set(catalogue[namespace]))
+    assert not missing, f"codes.json[{namespace}] lacks {missing}"
+
+
+def test_the_attention_sections_are_the_module_s_in_its_order() -> None:
+    """Needs attention shows one block per section in `AttentionOut`'s order (plan M4 Task 31, resolution d),
+    and has no failed-purges section (U1)."""
+    sections = list(attention.AttentionOut.model_fields)
+    assert sections[0] == "raw_items" and sections[-1] == "scope_apply_failed", sections
+    assert not [name for name in sections if "purge" in name], sections
 
 
 def test_a_role_s_seniority_is_the_profile_s_and_unspecified(catalogue: dict[str, Any]) -> None:

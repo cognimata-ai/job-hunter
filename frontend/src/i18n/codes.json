@@ -592,6 +592,83 @@
     "fake",
     "live"
   ],
+  "attention_section": [
+    "broken_sources",
+    "failed_targets",
+    "identity_conflicts",
+    "mass_disappearances",
+    "paused_lane",
+    "quarantined_batches",
+    "raw_items",
+    "retrieve_failing",
+    "scope_apply_failed",
+    "unscorable_groups"
+  ],
+  "conflict_reason": [
+    "exclusive_conflict"
+  ],
+  "batch_state": [
+    "released",
+    "submit_ambiguous"
+  ],
+  "run_trigger": [
+    "catch_up",
+    "manual",
+    "schedule"
+  ],
+  "cycle_trigger": [
+    "batch_followup",
+    "manual",
+    "periodic",
+    "score_now"
+  ],
+  "cycle_status": [
+    "completed",
+    "failed",
+    "running"
+  ],
+  "golden_source": [
+    "adversarial",
+    "feedback",
+    "week1"
+  ],
+  "alert_severity": [
+    "critical",
+    "info",
+    "warn"
+  ],
+  "readiness": [
+    "db",
+    "embedder",
+    "migrations",
+    "worker_heartbeat"
+  ],
+  "run_age_state": [
+    "critical",
+    "grace",
+    "none",
+    "ok",
+    "warn"
+  ],
+  "queue": [
+    "aux",
+    "collect",
+    "score",
+    "tick"
+  ],
+  "queue_status": [
+    "aborted",
+    "aborting",
+    "cancelled",
+    "doing",
+    "failed",
+    "succeeded",
+    "todo"
+  ],
+  "ui_language": [
+    "de",
+    "en"
+  ],
   "order": {
     "effort": {
       "claude-opus-5-5": [

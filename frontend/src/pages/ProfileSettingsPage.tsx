@@ -2,7 +2,8 @@
 // fills its section's body: the CV & profile section is Task 27's (`settings/cv/CvSection`), first; the sections
 // of the settings document share one form (`SettingsFormProvider`, Task 28, D32), each in a `SectionFrame` that
 // ends with the dry-run panel and Save: Search scope, Schedule and Budget & quota are Task 28's, Queries & sources
-// and Watchlist Task 29's, Scoring & models Task 30's.
+// and Watchlist Task 29's, Scoring & models Task 30's, Privacy & data Task 31's. System (Task 31, Ruling T31-a)
+// holds the framed Display & notifications part (`#display`), then its operational parts, which have no panel.
 import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -16,6 +17,8 @@ import { ScoringSection } from "../settings/ScoringSection";
 import { SectionFrame } from "../settings/SectionFrame";
 import { SettingsFormProvider } from "../settings/useSettingsForm";
 import { WatchlistSection } from "../settings/WatchlistSection";
+import { PrivacySection } from "../system/PrivacySection";
+import { SystemSection } from "../system/SystemSection";
 import styles from "./ProfileSettingsPage.module.css";
 
 export const SETTINGS_SECTIONS = [
@@ -33,7 +36,7 @@ export const SETTINGS_SECTIONS = [
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 
 /** The body of a section of the settings document, framed with the dry-run panel; `null` for a section that is
- * not one (CV & profile) or has no body yet. */
+ * not one (CV & profile) or holds its own frames (System). */
 function documentSection(id: SettingsSection): ReactNode {
   switch (id) {
     case "scope":
@@ -48,6 +51,8 @@ function documentSection(id: SettingsSection): ReactNode {
       return <ScoringSection />;
     case "budget":
       return <BudgetSection />;
+    case "privacy":
+      return <PrivacySection />;
     default:
       return null;
   }
@@ -88,6 +93,7 @@ function SettingsPage() {
               <section key={id} id={id} aria-labelledby={`${id}-heading`} className={styles.section}>
                 <h2 id={`${id}-heading`} className={styles.sectionTitle}>{t(`settings.section.${id}`)}</h2>
                 {id === "cv" && <CvSection />}
+                {id === "system" && <SystemSection />}
               </section>
             );
           })}

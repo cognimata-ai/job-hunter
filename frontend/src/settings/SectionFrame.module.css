@@ -13,6 +13,16 @@
   font-size: var(--font-size-5);
 }
 
+/* A part of a page section (Display & notifications in System): under the section's heading, no rule above. */
+.part {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.partTitle {
+  font-size: var(--font-size-4);
+}
+
 .body {
   display: grid;
   gap: var(--space-5);

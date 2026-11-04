@@ -1,0 +1,7 @@
+/* The golden set: the shared settings tables (`settings/tables.module.css`); the flags as checkboxes. */
+.toggle {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--color-accent);
+}

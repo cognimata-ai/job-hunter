@@ -1,0 +1,28 @@
+/* The run history: the shared settings tables (`settings/tables.module.css`); a status's reason code below it. */
+.reason {
+  display: block;
+  width: fit-content;
+  margin-top: 2px;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-1);
+  background: var(--color-surface-sunken);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+  overflow-wrap: anywhere;
+}
+
+/* The open report's button. */
+.toggle[aria-expanded="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+/* Narrow screens and 200 % zoom (the shared tables' cards): the run's number heads its card. */
+@media (max-width: 760px) {
+  .id {
+    grid-column: 1 / -1;
+    padding: 0;
+    border: 0;
+  }
+}
