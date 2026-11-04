@@ -207,6 +207,25 @@ describe("NeedsAttention", () => {
     expect(release.headers.get("Idempotency-Key")).toMatch(UUID);
   });
 
+  it("an item's time never breaks inside: its day, month and time are joined by no-break spaces", async () => {
+    // Task 36's visual pass: in a narrow item column "sent 3 Nov, 05:00" broke between "3" and "Nov"
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({
+      quarantined_batches: QUARANTINED,
+      mass_disappearances: {
+        count: 1,
+        items: [{ snapshot_id: 11, instance_label: "Beispiel GmbH", absent_count: 18, baseline_active_count: 20, taken_at: "2026-11-03T05:00:00Z" }],
+      },
+    });
+    renderApp("/settings#system");
+    const batch = item(await block("quarantined_batches"), /Batch 3/);
+    // 04:00 UTC is 05:00 in Berlin
+    expect(batch.textContent).toContain("sent 3 Nov, 05:00");
+    expect(batch.textContent).not.toMatch(/3 Nov|Nov, 05/);
+    const mass = item(await block("mass_disappearances"), "Beispiel GmbH");
+    expect(mass.textContent).toContain("snapshot 3 Nov, 06:00");
+  });
+
   it("a retrieve-failing item without releasable has no Release; a releasable one confirms its own amount first", async () => {
     const api = fakeApi({ signedIn: true });
     api.attention = attentionOut({ retrieve_failing: RETRIEVE_FAILING });

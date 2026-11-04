@@ -26,7 +26,7 @@
 // read again every 60 s in the background while it shows, so a batch's "from" time turns into its Release.
 import { useNavigate } from "@tanstack/react-router";
 import type { TFunction } from "i18next";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
@@ -77,6 +77,18 @@ export const SECTIONS = codes.order.attention_section.filter((name): name is Sec
 
 /** The target states the retry route takes back (`order.retryable_target_state`). */
 const RETRYABLE: ReadonlySet<string> = new Set(codes.order.retryable_target_state);
+
+/** `text` with no-break spaces for its spaces: a short date and time, which an item's narrow column must not break
+ * inside ("sent 3 / Nov, 05:00"; Task 36's visual pass). */
+function glued(text: string): string {
+  return text.replace(/ /g, "\u00a0");
+}
+
+/** `useFormat`, its `dayMonthTime` glued: an item's time never breaks across lines. */
+function useItemFormat(): Format {
+  const format = useFormat();
+  return useMemo(() => ({ ...format, dayMonthTime: (instant: string) => glued(format.dayMonthTime(instant)) }), [format]);
+}
 
 /** How long after its expiry a lost batch can be released (`releasable`: "more than 1 h past its expiry";
  * `scoring.batches.RETRIEVE_FAILING_AFTER`). */
@@ -131,7 +143,7 @@ function Block({ name, count, shown, children }: { name: Section; count: number;
 function RawItem({ item }: { item: Item<"raw_items"> }) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const format = useFormat();
+  const format = useItemFormat();
   const toast = useToast();
   const replay = useReplay();
   return (
@@ -164,7 +176,7 @@ function RawItem({ item }: { item: Item<"raw_items"> }) {
 function ConflictItem({ item }: { item: Item<"identity_conflicts"> }) {
   const { t, i18n } = useTranslation();
   const serverText = useServerText();
-  const format = useFormat();
+  const format = useItemFormat();
   const toast = useToast();
   const openJob = useOpenJob();
   const resolve = useResolveConflict();
@@ -275,7 +287,7 @@ function ReleaseButton({ submissionId, reservedUsd, release }: {
 function QuarantinedItem({ item }: { item: Item<"quarantined_batches"> }) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const format = useFormat();
+  const format = useItemFormat();
   const release = useReleaseBatch();
   return (
     <ItemRow error={release.error}
@@ -312,7 +324,7 @@ function releasableFrom(expiresAt: string | null, format: Format): string | null
 
 function RetrieveFailingItem({ item }: { item: Item<"retrieve_failing"> }) {
   const { t } = useTranslation();
-  const format = useFormat();
+  const format = useItemFormat();
   const release = useReleaseBatch();
   const from = item.releasable ? null : releasableFrom(item.expires_at, format);
   return (
@@ -336,7 +348,7 @@ function RetrieveFailingItem({ item }: { item: Item<"retrieve_failing"> }) {
 
 function MassItem({ item }: { item: Item<"mass_disappearances"> }) {
   const { t } = useTranslation();
-  const format = useFormat();
+  const format = useItemFormat();
   const toast = useToast();
   const closure = useConfirmClosure();
   const [asking, setAsking] = useState(false);
@@ -406,7 +418,7 @@ function GroupItem({ item }: { item: Item<"unscorable_groups"> }) {
 function BrokenItem({ item }: { item: Item<"broken_sources"> }) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const format = useFormat();
+  const format = useItemFormat();
   const warn = item.severity === "warn";
   return (
     <li className={cx(styles.item, styles.info, warn ? styles.warn : styles.critical)}>
