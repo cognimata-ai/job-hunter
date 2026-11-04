@@ -9,8 +9,9 @@
 import type { Locator, Page, Response } from "@playwright/test";
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { type ApiContext, apiContext, getJson, ORIGIN } from "../support/api";
+import { type ApiContext, apiContext, getJson } from "../support/api";
 import { en, expect, templateMatch, test, textPattern } from "../support/fixtures";
+import { cardJobId, SCORE_LABEL } from "../support/jobs";
 import { advanceBucket, psql, waitFor } from "../support/stack";
 
 type JobsPageOut = components["schemas"]["JobsPageOut"];
@@ -36,8 +37,6 @@ const SORT_LABEL: Record<ScoreSort, string> = {
   score_mid: en["jobs.sort.score_mid"],
   score_low: en["jobs.sort.score_low"],
 };
-// The badge's image: "Score 82, range 74 to 90".
-const SCORE_LABEL = templateMatch(en["score.label"], { mid: /(\d+)/, low: /(\d+)/, high: /(\d+)/ });
 const CONFIDENCE = new RegExp(`^(${[en["confidence.low"], en["confidence.medium"], en["confidence.high"]].join("|")})$`);
 
 interface ShownCard {
@@ -77,11 +76,10 @@ async function shownCards(page: Page): Promise<ShownCard[]> {
   const cards = page.getByRole("article").filter({ has: page.getByRole("img", { name: SCORE_LABEL }) });
   const shown: ShownCard[] = [];
   for (const card of await cards.all()) {
-    const href = await card.getByRole("heading", { level: 2 }).getByRole("link").getAttribute("href");
     const bar = card.getByRole("img", { name: SCORE_LABEL });
     const [, mid, low, high] = SCORE_LABEL.exec((await bar.getAttribute("aria-label")) ?? "") ?? [];
     shown.push({
-      jobId: Number(new URL(href ?? "", ORIGIN).searchParams.get("job")),
+      jobId: await cardJobId(card),
       mid: Number(mid),
       low: Number(low),
       high: Number(high),

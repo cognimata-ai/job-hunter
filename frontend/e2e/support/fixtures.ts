@@ -25,6 +25,11 @@ export function textPattern(template: string): RegExp {
   return new RegExp(`^${escapeRegExp(template).replace(/\\\{\\\{\w+\\\}\\\}/g, "\\d+")}$`);
 }
 
+/** `template` (an `en` string) with each `{{name}}` replaced by `values[name]`: the text the UI shows. */
+export function filled(template: string, values: Readonly<Record<string, string>>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, name: string) => values[name] ?? "");
+}
+
 /** `template` (an `en` string) as an anchored pattern: each `{{name}}` is `values[name]`, a string matched as
  * written or a RegExp inserted as it is (a capture group, say), and any text for a name `values` does not give. */
 export function templateMatch(template: string, values: Readonly<Partial<Record<string, string | RegExp>>> = {}): RegExp {

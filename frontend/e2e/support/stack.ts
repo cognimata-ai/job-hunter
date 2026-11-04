@@ -1,6 +1,7 @@
 // The E2E stack from a spec (plan M4 Task 32): the four-file dev stack's compose command, psql as the bootstrap
 // role, the score lane's bucket, polling, the fake Batches API's script, the smoke user's credentials, E9's
-// grounded job and whether the worker is on both fakes (Task 33). It only runs `exec` and `run` against the
+// grounded job and whether the worker is on both fakes (Task 33), E10's re-ingest pair, E17's seeded rejected
+// item and overrun buffer bound, and a posting's job (Task 34). It only runs `exec` and `run` against the
 // running stack, never `up`, so a local override layered at `up` (the SPA served from the host's build)
 // survives. A command's stdout is returned, never printed; a failure names the command's first words, its exit
 // status and the tail of its stderr.
@@ -113,6 +114,64 @@ export async function groundedJobId(): Promise<number> {
     throw new Error("m4_seeds.grounded_job_id() answered no job id");
   }
   return found;
+}
+
+/** E10's re-ingest pair as the setup's step 9 checks it (`e2e_setup.REINGEST_PAIR`, `reingest_problem`): what
+ * it lacks (`problem`, the setup's own detail), or its group, representative and member. */
+export interface ReingestPair {
+  problem: string | null;
+  groupId: number;
+  representative: number;
+  member: number;
+}
+
+export async function reingestPair(): Promise<ReingestPair> {
+  const expression =
+    '(lambda pair: __import__("json").dumps({"problem": e2e_setup.reingest_problem(pair), "rows": pair}))' +
+    '(e2e_setup.m4_seeds.json_line(e2e_setup.sql(e2e_setup.REINGEST_PAIR), what="the re-ingest pair"))';
+  const read = JSON.parse(await scriptValue("e2e_setup", expression)) as {
+    problem: string | null;
+    rows: { job_id: number; group_id: number | null; representative_job_id: number | null }[];
+  };
+  const representative = read.rows.at(0)?.representative_job_id ?? 0;
+  const member = read.rows.find((row) => row.job_id !== representative)?.job_id ?? 0;
+  return { problem: read.problem, groupId: read.rows.at(0)?.group_id ?? 0, representative, member };
+}
+
+/** E17's seeded rejected item (`m4_seeds.REJECTED_SEED`, read only): its raw response and raw item, or `null`
+ * when the setup seeded none. */
+export async function seededRejectedItem(): Promise<{ response: number; item: number } | null> {
+  const found = await psql(await scriptConstant("m4_seeds", "REJECTED_SEED"));
+  if (found === "") {
+    return null;
+  }
+  const [response, item] = found.split("|").map(Number);
+  return { response, item };
+}
+
+/** The least `llm.overrun_buffer_usd` the settings document `payload` may hold (`settings.validate.
+ * overrun_buffer_bound`, §6.9.1: it grows with the policy's costliest model and the batch size), as the
+ * backend computes it: a decimal string to the cent. */
+export async function overrunBufferBound(payload: object): Promise<string> {
+  const code =
+    "import json, sys; from jobhunter.settings.model import Settings; " +
+    "from jobhunter.settings.validate import overrun_buffer_bound; " +
+    "sys.stdout.write(str(overrun_buffer_bound(Settings.model_validate(json.load(sys.stdin)))))";
+  const ran = await run(["uv", "run", "python", "-c", code], { input: JSON.stringify(payload) });
+  if (ran.code !== 0 || !/^\d+\.\d{2}$/.test(ran.stdout)) {
+    throw new Error(`the overrun buffer bound exited ${String(ran.code)}: ${tail(ran.stderr)}`);
+  }
+  return ran.stdout;
+}
+
+/** The job that holds the posting `nativeId` of a source (`postings.job_id`, which a merge moves), or `null`. */
+export async function jobOfPosting(sourceId: string, nativeId: string): Promise<number | null> {
+  const quoted = (text: string) => `'${text.replace(/'/g, "''")}'`;
+  const found = await psql(
+    "SELECT p.job_id FROM postings p JOIN source_instances s ON s.id = p.source_instance_id " +
+      `WHERE s.source_id = ${quoted(sourceId)} AND p.native_id = ${quoted(nativeId)}`,
+  );
+  return found === "" ? null : Number(found);
 }
 
 /** Whether the running worker is on both fakes (`smoke_m2.worker_flags`: `JOBHUNTER_FAKE_LLM` and
