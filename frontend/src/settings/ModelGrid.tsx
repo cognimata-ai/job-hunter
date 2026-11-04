@@ -10,60 +10,33 @@
 // - **The generator's effort** carries, beside its row, the copy of the generator's `low` (§10.3 L3897): the
 //   `conflict` error of selecting it under a failed gate, else the warning `eval_failed` (a kept `low` under a
 //   failed gate) or `eval_uncalibrated`, of the draft's dry-run while anything is dirty, else of the base's.
-//   The select names that line and the panel's issues in `aria-describedby` (Task 28's error linking).
-// - On a wide screen a header row names the columns and each select's own label is visually hidden; on a narrow
-//   one (and at 200 % zoom) each row is a card with its labels.
+//   The select names that line and the panel's issues in `aria-describedby` (Task 28's error linking, through
+//   `SelectField`'s `describedBy`).
+// - Each cell is a `SelectField`: a model pick goes through its `onPick` (it writes the node's model with its
+//   effort). On a wide screen a header row names the columns and each select's own label is visually hidden; on
+//   a narrow one (and at 200 % zoom) each row is a card with its labels.
 import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { cx } from "../components/cx";
 import { useServerText } from "../i18n/index";
-import { describedBy, useFieldIssues } from "./fields";
+import { SelectField } from "./fields";
 import fields from "./fields.module.css";
 import styles from "./ModelGrid.module.css";
-import { type Effort, type LlmNode, type Model, MODELS, NODES, effortFor, effortsOf } from "./presets";
-import { fieldId, useSettingsForm } from "./useSettingsForm";
+import { type LlmNode, type Model, MODELS, NODES, effortFor, effortsOf } from "./presets";
+import { useSettingsForm } from "./useSettingsForm";
 
 const POLICY = "scoring.model_policy";
 const GENERATOR_EFFORT = `${POLICY}.nodes.generate.effort`;
 const LIGHT_EFFORT = `${POLICY}.critic_light_effort`;
 
-/** A native select of a grid cell: its label, its issues (Task 28's linking) and what a pick writes. */
-function GridSelect<T extends string>({
-  path,
-  label,
-  options,
-  value,
-  onPick,
-  note,
-}: {
-  path: string;
-  label: string;
-  options: readonly T[];
-  value: T;
-  onPick: (value: T) => void;
-  /** The id of a line about the cell (the generator's `low`). */
-  note?: string;
-}) {
-  const id = fieldId(path);
-  const { invalid, issueIds } = useFieldIssues(path);
-  // a stored value the options lack stays shown (the dry-run's error marks it)
-  const shown = options.includes(value) ? options : [...options, value];
-  return (
-    <div className={fields.field}>
-      <label htmlFor={id} className={cx(fields.label, styles.cellLabel)}>{label}</label>
-      <select id={id} className={fields.select} value={value} aria-invalid={invalid || undefined}
-        aria-describedby={describedBy(issueIds, note)}
-        onChange={(event) => {
-          const picked = shown.find((option) => option === event.target.value);
-          if (picked !== undefined) {
-            onPick(picked);
-          }
-        }}>
-        {shown.map((option) => <option key={option} value={option}>{option}</option>)}
-      </select>
-    </div>
-  );
+/** A cell's options: a stored value they lack stays one, so the select shows the draft (the dry-run's error marks
+ * it). */
+function withValue<T extends string>(options: readonly T[], value: T): readonly T[] {
+  return options.includes(value) ? options : [...options, value];
 }
+
+/** Models and efforts are API words: an option shows its code. */
+const code = (value: string) => value;
 
 /** The generator's line (module docstring), `null` without one. */
 function useGeneratorNote(): { text: string; tone: "critical" | "warn" } | null {
@@ -103,11 +76,11 @@ function NodeRow({ node }: { node: LlmNode }) {
   return (
     <div role="group" aria-labelledby={nameId} className={styles.row} data-tone={shown?.tone}>
       <span id={nameId} className={styles.node}>{serverText("llm_node", node)}</span>
-      <GridSelect path={`${path}.model`} label={t("settings_scoring.model")} options={MODELS} value={choice.model}
-        onPick={pickModel} />
-      <GridSelect path={`${path}.effort`} label={t("settings_scoring.effort")} options={effortsOf(choice.model)}
-        value={choice.effort} onPick={(effort: Effort) => { form.set(`${path}.effort`, effort); }}
-        note={shown === null ? undefined : noteId} />
+      <SelectField path={`${path}.model`} label={t("settings_scoring.model")} options={withValue(MODELS, choice.model)}
+        optionLabel={code} onPick={pickModel} />
+      <SelectField path={`${path}.effort`} label={t("settings_scoring.effort")}
+        options={withValue(effortsOf(choice.model), choice.effort)} optionLabel={code}
+        describedBy={shown === null ? undefined : noteId} />
       {shown !== null && <p id={noteId} className={cx(styles.note, shown.tone === "critical" && styles.critical)}>{shown.text}</p>}
     </div>
   );
@@ -123,8 +96,8 @@ function LightRow() {
     <div role="group" aria-labelledby={nameId} className={styles.row}>
       <span id={nameId} className={styles.node}>{t("settings_scoring.critic_light")}</span>
       <span className={styles.same}>{t("settings_scoring.critic_light_model", { model: critic })}</span>
-      <GridSelect path={LIGHT_EFFORT} label={t("settings_scoring.effort")} options={effortsOf(critic)}
-        value={policy.critic_light_effort} onPick={(effort: Effort) => { form.set(LIGHT_EFFORT, effort); }} />
+      <SelectField path={LIGHT_EFFORT} label={t("settings_scoring.effort")}
+        options={withValue(effortsOf(critic), policy.critic_light_effort)} optionLabel={code} />
     </div>
   );
 }

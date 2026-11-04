@@ -1,19 +1,27 @@
 // The activation of a shipped rubric or prompt/schema version (spec §13.3 L4916, §14.2, §11.13; plan M4 Task
-// 30, resolution e). It reads the version's `GET …/{id}/activation-preview` (one read: the notice's, when the
-// version has one) and shows what the activation checks and re-scores: the eval gate of the candidate, the
-// latest golden run, the schema verification and the models it does not cover, and the ads re-scored with their
-// cost. A failed gate needs the override tick first ("Activate anyway — I accept the failed evaluation").
+// 30, resolution e). It shows what the activation checks and re-scores, from the version's `GET …/{id}/
+// activation-preview`: the eval gate of the candidate, the latest golden run, the schema verification and the
+// models it does not cover, and the ads re-scored with their cost. A failed gate needs the override tick first
+// ("Activate anyway — I accept the failed evaluation").
+//
+// **The preview is current when the dialog decides** (Ruling T30-d: an acknowledgement is given against the
+// current figures). The preview is keyed by the version and by the form's base settings version, so a save reads
+// it again, and the dialog reads it again every time it opens. Until that read is in, the dialog shows
+// "Checking…" over a skeleton, never the figures of an older read: the override tick is not decided and
+// Activate is busy. A failed read is a `ProblemBox` with Retry, and Activate is disabled (not busy) beside it.
 //
 // [Activate] sends the keyed `POST …/{id}/activate {expected_rescore_ack: true, eval_override_ack?: true}`
 // (`eval_override_ack` only when ticked). On 201: the notice "Activated", then the form's `rebase()` (the
 // activation saved a settings version), and the version lists, the header status and the Jobs list are read
 // again, since the re-score starts. These run in the hook's own `onSuccess`, so also when the dialog is gone. A
 // refusal stays in the dialog: 409 `conflict_state` with the detail `schema_dry_run_required` is "This
-// version's schema is not verified for every model in use", with the server's title naming the pairs; 409
-// `eval_gate_failed` (`isEvalGate`) offers the tick; any other problem is a `ProblemBox`.
+// version's schema is not verified for every model in use", naming the preview's unverified models as codes
+// (the server's title only when the preview names none, D39); 409 `eval_gate_failed` (`isEvalGate`) offers the
+// tick; any other problem is a `ProblemBox`. The notice, the eval status (`GOLDEN_RUNS_KEY`), the version
+// lists, the header status and the Jobs list are read again after an activation.
 import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
-import { useState } from "react";
-import { useTranslation } from "react-i18next";
+import { Fragment, useEffect, useState } from "react";
+import { Trans, useTranslation } from "react-i18next";
 import { apiSend, type ProblemError } from "../api/client";
 import { useKeyedMutation } from "../api/idempotency";
 import type { components } from "../api/schema";
@@ -27,7 +35,7 @@ import { STATUS_KEY } from "../system/api";
 import { useFormat } from "../system/format";
 import styles from "./ActivationDialog.module.css";
 import routing from "./CriticRouting.module.css";
-import { useEvalResult } from "./EvalStatus";
+import { GOLDEN_RUNS_KEY, useEvalResult } from "./EvalStatus";
 import { isEvalGate, useSettingsForm } from "./useSettingsForm";
 
 export type ActivationPreviewOut = components["schemas"]["ActivationPreviewOut"];
@@ -49,23 +57,51 @@ const PATHS = {
 /** The 409 `conflict_state` detail of a model policy without a passed live schema dry-run (`settings.save`). */
 const SCHEMA_DRY_RUN_REQUIRED = "schema_dry_run_required";
 
-/** The shipped versions' reads: each kind's list, and below it each version's preview. */
+/** The shipped versions' reads: each kind's list, and below it each version's preview under each base settings
+ * version. */
 export const SHIPPED_KEY = ["shipped-versions"] as const;
 export const shippedListKey = (kind: ShippedKind) => [...SHIPPED_KEY, kind] as const;
-const previewKey = (kind: ShippedKind, id: number) => [...SHIPPED_KEY, kind, id, "preview"] as const;
+const previewKey = (kind: ShippedKind, id: number, base: number) => [...SHIPPED_KEY, kind, id, "preview", base] as const;
 
 /** The list of `kind`'s versions, by id. */
 export function shippedPath(kind: ShippedKind): string {
   return PATHS[kind];
 }
 
-/** What activating `kind`'s version `id` would check and re-score, read once (until an activation). */
+/** What activating `kind`'s version `id` would check and re-score under the form's base settings version, read
+ * once for each base (the notice's figures); the dialog reads it again on each open. */
 export function useActivationPreview(kind: ShippedKind, id: number): UseQueryResult<ActivationPreviewOut, ProblemError> {
+  const base = useSettingsForm().base.version.id;
   return useQuery({
-    queryKey: previewKey(kind, id),
+    queryKey: previewKey(kind, id, base),
     queryFn: ({ signal }) => apiSend<ActivationPreviewOut>(`${PATHS[kind]}/${String(id)}/activation-preview`, { signal }),
     staleTime: Infinity,
   });
+}
+
+/** The preview as the dialog decides on it (module docstring): read again since it opened, else `reading`. */
+function useFreshPreview(kind: ShippedKind, id: number): {
+  preview: UseQueryResult<ActivationPreviewOut, ProblemError>;
+  reading: boolean;
+  fresh: ActivationPreviewOut | undefined;
+} {
+  const preview = useActivationPreview(kind, id);
+  const { refetch } = preview;
+  const [opened, setOpened] = useState(false);
+  useEffect(() => {
+    let open = true;
+    // a new read, whatever an earlier one holds or still waits for (the notice's)
+    void refetch().then(() => {
+      if (open) {
+        setOpened(true);
+      }
+    });
+    return () => {
+      open = false;
+    };
+  }, [refetch]);
+  const reading = !opened || preview.isFetching;
+  return { preview, reading, fresh: !reading && preview.isSuccess ? preview.data : undefined };
 }
 
 /** The activation of `kind`'s version `id` (module docstring). */
@@ -82,6 +118,7 @@ function useActivate(kind: ShippedKind, id: number) {
         toast({ message: t("activation.activated") });
         void form.rebase();
         void queryClient.invalidateQueries({ queryKey: SHIPPED_KEY });
+        void queryClient.invalidateQueries({ queryKey: GOLDEN_RUNS_KEY });
         void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
         void queryClient.invalidateQueries({ queryKey: JOBS_KEY });
       },
@@ -149,6 +186,20 @@ function Preview({ preview }: { preview: ActivationPreviewOut }) {
   );
 }
 
+/** Models as codes, in a list a translated sentence holds (`activation.schema_required_models`). */
+function Codes({ models }: { models: readonly string[] }) {
+  return (
+    <>
+      {models.map((model, index) => (
+        <Fragment key={model}>
+          {index > 0 && ", "}
+          <code>{model}</code>
+        </Fragment>
+      ))}
+    </>
+  );
+}
+
 function schemaRequired(error: ProblemError): boolean {
   return error.status === 409 && error.code === "conflict_state" && error.detail === SCHEMA_DRY_RUN_REQUIRED;
 }
@@ -164,15 +215,16 @@ export interface ActivationDialogProps {
 export function ActivationDialog({ kind, versionId, name, onClose }: ActivationDialogProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
-  const preview = useActivationPreview(kind, versionId);
+  const { preview, reading, fresh } = useFreshPreview(kind, versionId);
   const activation = useActivate(kind, versionId);
   const [override, setOverride] = useState(false);
   // a refusal of the gate is kept once seen: the tick stays while a retry runs and after it fails otherwise
   const [gateRefused, setGateRefused] = useState(false);
   const error = activation.error;
-  const needsOverride = preview.data?.gate_state === "failed" || gateRefused;
+  const failed = !reading && preview.isError;
+  const needsOverride = fresh?.gate_state === "failed" || gateRefused;
   const submit = () => {
-    if (preview.data === undefined || activation.isPending || (needsOverride && !override)) {
+    if (fresh === undefined || activation.isPending || (needsOverride && !override)) {
       return;
     }
     const body: ActivateBody = { expected_rescore_ack: true, ...(needsOverride && override ? { eval_override_ack: true as const } : {}) };
@@ -189,11 +241,16 @@ export function ActivationDialog({ kind, versionId, name, onClose }: ActivationD
   const title = kind === "rubric" ? t("activation.title_rubric", { version: name }) : t("activation.title_prompt", { hash: name });
   return (
     <ConfirmDialog open title={title} confirmLabel={t("activation.confirm")} onCancel={onClose} onConfirm={submit}
-      busy={activation.isPending || preview.data === undefined} confirmDisabled={needsOverride && !override}>
+      busy={activation.isPending || reading} confirmDisabled={failed || (needsOverride && !override)}>
       <div className={styles.content}>
-        {preview.data !== undefined && <Preview preview={preview.data} />}
-        {preview.isPending && <Skeleton variant="line" count={3} />}
-        {preview.isError && <ProblemBox error={preview.error} onRetry={() => { void preview.refetch(); }} />}
+        {fresh !== undefined && <Preview preview={fresh} />}
+        {reading && (
+          <>
+            <p className={styles.checking}>{t("settings_form.checking")}</p>
+            <Skeleton variant="line" count={3} />
+          </>
+        )}
+        {failed && <ProblemBox error={preview.error} onRetry={() => { void preview.refetch(); }} />}
         {needsOverride && (
           <div className={styles.override}>
             {gateRefused && <p className={styles.overrideTitle}>{serverText("problem", "eval_gate_failed")}</p>}
@@ -206,7 +263,13 @@ export function ActivationDialog({ kind, versionId, name, onClose }: ActivationD
         {error !== null && schemaRequired(error) && (
           <div role="alert" className={styles.problem}>
             <p className={styles.problemTitle}>{t("activation.schema_required")}</p>
-            <p>{error.message}</p>
+            {fresh !== undefined && fresh.unverified_models.length > 0 ? (
+              <p>
+                <Trans i18nKey="activation.schema_required_models" components={{ models: <Codes models={fresh.unverified_models} /> }} />
+              </p>
+            ) : (
+              <p>{error.message}</p>
+            )}
           </div>
         )}
         {error !== null && !isEvalGate(error) && !schemaRequired(error) && <ProblemBox error={error} />}

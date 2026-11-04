@@ -1363,6 +1363,7 @@
   "activation.confirm": "Activate",
   "activation.activated": "Activated",
   "activation.schema_required": "This version's schema is not verified for every model in use",
+  "activation.schema_required_models": "No passed live schema dry-run yet for <models></models>.",
   "settings_form.rescore_title": "Re-score with the LLM?",
   "settings_form.rescore_body_one": "This change re-scores {{value}} ad with the LLM, about {{est_usd}}. Continue?",
   "settings_form.rescore_body_other": "This change re-scores {{value}} ads with the LLM, about {{est_usd}}. Continue?",

@@ -66,8 +66,8 @@
   font-weight: var(--font-weight-medium);
 }
 
-/* The header names the columns: each cell's own label is for screen readers only. */
-.cellLabel {
+/* The header names the columns: each cell's own label (its field's) is for screen readers only. */
+.row label {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -96,7 +96,7 @@
     align-self: end;
   }
 
-  .cellLabel {
+  .row label {
     position: static;
     width: auto;
     height: auto;

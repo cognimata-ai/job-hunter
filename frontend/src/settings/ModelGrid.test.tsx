@@ -59,4 +59,20 @@ describe("ModelGrid", () => {
     expect(control(light, en["settings_scoring.effort"]).value).toBe("low");
     expect(light.textContent).toContain("claude-haiku-5-5");
   });
+
+  it("a critic model whose light options lack the light effort moves it", async () => {
+    const api = fakeApi({ signedIn: true });
+    renderSettings(["scoring"]);
+    const light = await row(en["settings_scoring.critic_light"]);
+    const user = userEvent.setup();
+    await user.selectOptions(control(light, en["settings_scoring.effort"]), "high");
+    await user.selectOptions(control(await row(en["llm_node.critic"]), en["settings_scoring.model"]), "claude-haiku-5-5");
+    // `high` is not among Haiku's light options: the default effort, `medium`
+    expect(control(light, en["settings_scoring.effort"]).value).toBe("medium");
+    await waitFor(() => {
+      const policy = dryRunPayloads(api).at(-1)?.scoring.model_policy;
+      expect(policy?.critic_light_effort).toBe("medium");
+      expect(policy?.nodes.critic).toEqual({ model: "claude-haiku-5-5", effort: "medium" });
+    });
+  });
 });

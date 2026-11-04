@@ -10,6 +10,7 @@ import {
   fakeApi,
   goldenRun,
   json,
+  problem,
   projectionsOut,
   requestsTo,
   settingsRead,
@@ -152,6 +153,24 @@ describe("ScoringSection", () => {
     expect((await select(await modelRow(en["llm_node.critic"]), en["settings_scoring.model"])).value).toBe("claude-opus-5-5");
   });
 
+  it("a preset chosen from a custom grid writes its light effort", async () => {
+    const api = fakeApi({ signedIn: true });
+    const served = settingsRead();
+    served.payload.scoring.model_policy.critic_light_effort = "medium";
+    served.payload.scoring.model_policy.preset = "custom";
+    api.routes.set("GET /api/settings", () => json(served));
+    renderSettings(["scoring"]);
+    const light = await select(await modelRow(en["settings_scoring.critic_light"]), en["settings_scoring.effort"]);
+    expect(light.value).toBe("medium");
+    expect(radio(en["model_preset.custom"]).checked).toBe(true);
+    await userEvent.setup().click(radio(en["model_preset.B"]));
+    expect(light.value).toBe("low");
+    expect(radio(en["model_preset.B"]).checked).toBe(true);
+    await waitFor(() => {
+      expect(dryRunPayloads(api).at(-1)?.scoring.model_policy.critic_light_effort).toBe("low");
+    });
+  });
+
   it("eval_failed and eval_uncalibrated copy", async () => {
     const api = fakeApi({ signedIn: true });
     // the saved generator is on `low` under a failed gate: the standing warning `eval_failed`
@@ -253,6 +272,42 @@ describe("ScoringSection", () => {
     expect(dialog.textContent).toContain("1,180 ads");
     await user.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
     expect(saves(api)).toHaveLength(0);
+  });
+
+  it("a save refused by the eval gate asks again before it is sent with the override", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, rescoring);
+    let answers = 0;
+    api.routes.set("POST /api/settings", () =>
+      answers++ === 0
+        ? problem(409, "eval_gate_failed")
+        : json({ version: { id: 42, version_no: 13, effect_classes: ["llm_tuple"] }, apply_scope_operation_id: null }, 201),
+    );
+    renderSettings(["scoring"]);
+    const user = userEvent.setup();
+    await user.click(await within(section()).findByRole("radio", { name: en["model_preset.C"] }));
+    await tickRescore("scoring");
+    await user.click(saveIn("scoring"));
+    await user.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: en["settings_form.rescore_confirm"] }));
+    // refused: the panel offers the override
+    const override = await within(section()).findByRole("checkbox", { name: en["settings_form.eval_override"] });
+    expect(saves(api)).toHaveLength(1);
+    expect(saveBody(saves(api)[0]).eval_override_ack).toBeUndefined();
+    await user.click(override);
+    // each send acknowledges its own re-score (Ruling T30-e): Save asks again
+    await user.click(saveIn("scoring"));
+    const again = await screen.findByRole("alertdialog", { name: en["settings_form.rescore_title"] });
+    expect(again.textContent).toContain("This change re-scores 1,180 ads with the LLM, about $41.30. Continue?");
+    expect(saves(api)).toHaveLength(1);
+    await user.click(within(again).getByRole("button", { name: en["settings_form.rescore_confirm"] }));
+    await waitFor(() => {
+      expect(saves(api)).toHaveLength(2);
+    });
+    const [first, second] = saves(api);
+    expect(saveBody(second).eval_override_ack).toBe(true);
+    expect(saveBody(second).payload.scoring.model_policy.nodes).toEqual(PRESETS.C.nodes);
+    expect(second.headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.headers.get("Idempotency-Key")).not.toBe(first.headers.get("Idempotency-Key"));
   });
 
   it("a save without an llm_tuple effect does not ask", async () => {

@@ -1363,6 +1363,7 @@
   "activation.confirm": "Aktivieren",
   "activation.activated": "Aktiviert",
   "activation.schema_required": "Das Schema dieser Version ist nicht für jedes verwendete Modell verifiziert",
+  "activation.schema_required_models": "Noch kein bestandener Live-Schema-Probelauf für <models></models>.",
   "settings_form.rescore_title": "Per LLM neu bewerten?",
   "settings_form.rescore_body_one": "Diese Änderung bewertet {{value}} Anzeige per LLM neu, etwa {{est_usd}}. Fortfahren?",
   "settings_form.rescore_body_other": "Diese Änderung bewertet {{value}} Anzeigen per LLM neu, etwa {{est_usd}}. Fortfahren?",

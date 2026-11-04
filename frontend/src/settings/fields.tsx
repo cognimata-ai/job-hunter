@@ -195,7 +195,9 @@ export function CheckboxSetField<T extends string>({
 
 /**
  * A native select of a closed set. `empty` adds a first option for no value: `null` (an open bound) or
- * `undefined` (the key left out, so its default applies).
+ * `undefined` (the key left out, so its default applies). `onPick` replaces what picking an option writes (a
+ * pick that writes more than its own path: a model with its effort, plan M4 Task 30); `describedBy` adds the
+ * ids of lines about the field outside it.
  */
 export function SelectField<T extends string>({
   path,
@@ -204,10 +206,14 @@ export function SelectField<T extends string>({
   options,
   optionLabel,
   empty,
+  onPick,
+  describedBy: about,
 }: FieldProps & {
   options: readonly T[];
   optionLabel: (value: T) => string;
   empty?: { label: string; value: null | undefined };
+  onPick?: (value: T) => void;
+  describedBy?: string;
 }) {
   const form = useSettingsForm();
   const id = fieldId(path);
@@ -218,10 +224,14 @@ export function SelectField<T extends string>({
     <div className={styles.field}>
       <label htmlFor={id} className={styles.label}>{label}</label>
       <select id={id} className={styles.select} value={typeof value === "string" ? value : ""}
-        aria-invalid={invalid || undefined} aria-describedby={describedBy(issueIds, hint !== undefined && hintId)}
+        aria-invalid={invalid || undefined} aria-describedby={describedBy(issueIds, hint !== undefined && hintId, about)}
         onChange={(event) => {
           const picked = options.find((option) => option === event.target.value);
-          form.set(path, picked ?? empty?.value);
+          if (picked !== undefined && onPick !== undefined) {
+            onPick(picked);
+          } else {
+            form.set(path, picked ?? empty?.value);
+          }
         }}>
         {empty !== undefined && <option value="">{empty.label}</option>}
         {options.map((option) => <option key={option} value={option}>{optionLabel(option)}</option>)}

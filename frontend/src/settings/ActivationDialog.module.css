@@ -5,6 +5,11 @@
   gap: var(--space-4);
 }
 
+.checking {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
 .preview {
   display: grid;
   gap: var(--space-3);
@@ -62,4 +67,11 @@
 
 .problemTitle {
   color: var(--color-critical);
+}
+
+/* A model id is one word: it breaks between ids, never at its own hyphens. */
+.problem code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-2);
+  white-space: nowrap;
 }

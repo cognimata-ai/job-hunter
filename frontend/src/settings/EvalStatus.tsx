@@ -3,8 +3,9 @@
 // - "Last eval: passed, ρ = 0.71": the newest golden run's gate (passed, failed or not calibrated) once it has
 //   completed and been gated, else its status (running, completed but not gated, did not finish), and ρ to two
 //   decimals when it has one; "No golden run yet" without a run;
-// - the eval gate: the active configuration's (the read's `active_gate`, with the golden cases it counts), and
-//   while the draft changes a gated class, the gate its save would check (the dry-run's `eval_gate`);
+// - the eval gate: the active configuration's (the read's `active_gate`, with the golden cases it counts; read
+//   again for each base settings version and after an activation), and while the draft changes a gated class,
+//   the gate its save would check (the dry-run's `eval_gate`);
 // - that golden runs start from the command line (RUNBOOK): the page only reads them.
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
@@ -25,11 +26,13 @@ type EvalRunsPageOut = components["schemas"]["EvalRunsPageOut"];
 type EvalRunOut = components["schemas"]["EvalRunOut"];
 type ServerText = ReturnType<typeof useServerText>;
 
+/** The golden runs' reads, one under each base settings version (a gated save or an activation changes the active
+ * configuration, so its gate); an activation invalidates them all. */
 export const GOLDEN_RUNS_KEY = ["eval-runs", "golden"] as const;
 
-function useGoldenRuns(): UseQueryResult<EvalRunsPageOut> {
+function useGoldenRuns(base: number): UseQueryResult<EvalRunsPageOut> {
   return useQuery({
-    queryKey: GOLDEN_RUNS_KEY,
+    queryKey: [...GOLDEN_RUNS_KEY, base],
     queryFn: ({ signal }) => apiSend<EvalRunsPageOut>("/api/eval-runs?kind=golden&limit=1", { signal }),
   });
 }
@@ -61,7 +64,7 @@ export function EvalStatus() {
   const serverText = useServerText();
   const format = useFormat();
   const form = useSettingsForm();
-  const runs = useGoldenRuns();
+  const runs = useGoldenRuns(form.base.version.id);
   const result = useEvalResult();
   const headingId = useId();
   const draftGate = form.dryRun?.projections?.eval_gate;

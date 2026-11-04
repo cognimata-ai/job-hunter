@@ -35,6 +35,15 @@ async function notice(): Promise<HTMLElement> {
   return within(await waitFor(versions)).findByRole("group", { name: "New rubric v2 available" });
 }
 
+/** Presses the dialog's Activate once its fresh preview is in (the button is no longer busy). */
+async function confirmWhenRead(dialog: HTMLElement): Promise<void> {
+  const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: en["activation.confirm"] });
+  await waitFor(() => {
+    expect(confirm.disabled).toBe(false);
+  });
+  await userEvent.setup().click(confirm);
+}
+
 describe("VersionsPanel", () => {
   it("a newer version shows the available notice with eval and cost", async () => {
     const api = fakeApi({ signedIn: true });
@@ -88,14 +97,16 @@ describe("VersionsPanel", () => {
     const user = userEvent.setup();
     await user.click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
+    await waitFor(() => {
+      expect(dialog.textContent).toContain("1,180 ads, about $41.30 online or $20.65 in batches; bulk budget $22.44");
+    });
     expect(dialog.textContent).toContain(en["eval_gate.passed"]);
     expect(dialog.textContent).toContain("#7 · passed, ρ = 0.71");
     expect(dialog.textContent).toContain(en["activation.schema_verified"]);
-    expect(dialog.textContent).toContain("1,180 ads, about $41.30 online or $20.65 in batches; bulk budget $22.44");
     expect(within(dialog).queryByRole("checkbox")).toBeNull(); // no override for a passed gate
-    expect(requestsTo(api, PREVIEW_2)).toHaveLength(1); // the notice's read, not a second one
+    expect(requestsTo(api, PREVIEW_2)).toHaveLength(2); // the notice's read, and the dialog's own on open
     const reads = requestsTo(api, "GET /api/settings").length;
-    await user.click(within(dialog).getByRole("button", { name: en["activation.confirm"] }));
+    await confirmWhenRead(dialog);
     await waitFor(() => {
       expect(requestsTo(api, ACTIVATE_2)).toHaveLength(1);
     });
@@ -119,10 +130,12 @@ describe("VersionsPanel", () => {
     const user = userEvent.setup();
     await user.click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
+    const tick = await within(dialog).findByRole("checkbox", { name: en["activation.override"] });
     expect(dialog.textContent).toContain(en["eval_gate.failed"]);
     const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: en["activation.confirm"] });
     expect(confirm.disabled).toBe(true);
-    await user.click(within(dialog).getByRole("checkbox", { name: en["activation.override"] }));
+    expect(confirm.getAttribute("aria-busy")).toBe("false"); // waiting for the tick, not busy
+    await user.click(tick);
     expect(confirm.disabled).toBe(false);
     await user.click(confirm);
     await waitFor(() => {
@@ -140,7 +153,7 @@ describe("VersionsPanel", () => {
     const user = userEvent.setup();
     await user.click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
-    await user.click(within(dialog).getByRole("button", { name: en["activation.confirm"] }));
+    await confirmWhenRead(dialog);
     const tick = await within(dialog).findByRole("checkbox", { name: en["activation.override"] });
     expect(within(dialog).getByRole<HTMLButtonElement>("button", { name: en["activation.confirm"] }).disabled).toBe(true);
     await user.click(tick);
@@ -179,11 +192,35 @@ describe("VersionsPanel", () => {
     const user = userEvent.setup();
     await user.click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
-    await user.click(within(dialog).getByRole("button", { name: en["activation.confirm"] }));
+    await confirmWhenRead(dialog);
     const alert = await within(dialog).findByRole("alert");
     expect(alert.textContent).toContain(en["activation.schema_required"]);
+    // the preview names no model: the server's title is the fallback (D39)
     expect(alert.textContent).toContain("generator on claude-haiku-5-5");
     expect(within(dialog).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("schema_dry_run_required names the preview's unverified models as codes", async () => {
+    const api = fakeApi({ signedIn: true });
+    newerRubric(api, activationPreview({ schema_verified: false, unverified_models: ["claude-fable-5-1", "claude-haiku-5-5"] }));
+    api.routes.set(ACTIVATE_2, () =>
+      problem(409, "conflict_state", {
+        title: "The model policy has no passed live schema dry-run for generator on claude-haiku-5-5",
+        detail: "schema_dry_run_required",
+      }),
+    );
+    renderSettings(["scoring"]);
+    await userEvent.setup().click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
+    await confirmWhenRead(dialog);
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toContain(en["activation.schema_required"]);
+    expect(within(alert).getAllByText(/^claude-/, { selector: "code" }).map((code) => code.textContent)).toEqual([
+      "claude-fable-5-1",
+      "claude-haiku-5-5",
+    ]);
+    expect(alert.textContent).toContain(en["activation.schema_required_models"].split("<models")[0].trim());
+    expect(alert.textContent).not.toContain("The model policy has no passed"); // the server's English title is no longer shown
   });
 
   it("another refusal is a problem in the dialog", async () => {
@@ -194,7 +231,7 @@ describe("VersionsPanel", () => {
     const user = userEvent.setup();
     await user.click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
-    await user.click(within(dialog).getByRole("button", { name: en["activation.confirm"] }));
+    await confirmWhenRead(dialog);
     expect((await within(dialog).findByRole("alert")).textContent).toContain(en["problem.idempotency_in_progress"]);
   });
 
@@ -204,7 +241,109 @@ describe("VersionsPanel", () => {
     renderSettings(["scoring"]);
     await userEvent.setup().click(within(await notice()).getByRole("button", { name: "Activate rubric v2" }));
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
-    expect(dialog.textContent).toContain("Not verified for claude-fable-5-1, claude-haiku-5-5");
+    await waitFor(() => {
+      expect(dialog.textContent).toContain("Not verified for claude-fable-5-1, claude-haiku-5-5");
+    });
+  });
+
+  it("the activation dialog reads its preview again on open", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.rubricVersions = [rubricVersion(), rubricVersion({ id: 2, version: "v2", active: false })];
+    let preview = activationPreview();
+    let hold: Promise<void> | null = null;
+    api.routes.set(PREVIEW_2, async () => {
+      if (hold !== null) {
+        await hold;
+      }
+      return json(preview);
+    });
+    renderSettings(["scoring"]);
+    const user = userEvent.setup();
+    const box = await notice();
+    await waitFor(() => {
+      expect(box.textContent).toContain("Re-scores 1,180 ads");
+    });
+    await user.click(within(box).getByRole("button", { name: "Activate rubric v2" }));
+    let dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
+    await waitFor(() => {
+      expect(dialog.textContent).toContain("1,180 ads, about $41.30 online");
+    });
+    await user.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
+    // meanwhile a golden run failed the candidate's gate and the cost moved
+    preview = activationPreview({ gate_state: "failed", targets: 99, est_usd_online: "3.100000" });
+    let release: () => void = () => undefined;
+    hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await user.click(within(box).getByRole("button", { name: "Activate rubric v2" }));
+    dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
+    await waitFor(() => {
+      expect(requestsTo(api, PREVIEW_2)).toHaveLength(3); // the notice's, then one on each open
+    });
+    // while the fresh read is in flight: none of the old figures, no decision on the tick, Activate waits
+    expect(dialog.textContent).not.toContain("1,180 ads");
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: en["activation.confirm"] });
+    expect(confirm.disabled).toBe(true);
+    expect(confirm.getAttribute("aria-busy")).toBe("true");
+    release();
+    await waitFor(() => {
+      expect(dialog.textContent).toContain("99 ads, about $3.10 online");
+    });
+    expect(dialog.textContent).toContain(en["eval_gate.failed"]);
+    expect(within(dialog).getByRole("checkbox", { name: en["activation.override"] })).toBeTruthy();
+    expect(confirm.disabled).toBe(true);
+  });
+
+  it("a save changes the preview key", async () => {
+    const api = fakeApi({ signedIn: true });
+    newerRubric(api);
+    const base = settingsRead();
+    let saved = false;
+    api.routes.set("GET /api/settings", () =>
+      json(saved ? { ...base, version: { ...base.version, id: 42, version_no: 13, effect_classes: ["evaluation_policy"] } } : base),
+    );
+    api.routes.set("POST /api/settings", () => {
+      saved = true;
+      return json({ version: { id: 42, version_no: 13, effect_classes: ["evaluation_policy"] }, apply_scope_operation_id: null }, 201);
+    });
+    const { probe } = renderSettings(["scoring"]);
+    const box = await notice();
+    await waitFor(() => {
+      expect(box.textContent).toContain("Re-scores 1,180 ads");
+    });
+    expect(requestsTo(api, PREVIEW_2)).toHaveLength(1);
+    fireEvent.change(screen.getByRole("spinbutton", { name: en["settings_scoring.relevance_threshold"] }), { target: { value: "65" } });
+    const save = within(document.getElementById("scoring") ?? document.body).getByRole<HTMLButtonElement>("button", {
+      name: en["settings_form.save"],
+    });
+    await waitFor(() => {
+      expect(save.disabled).toBe(false);
+    });
+    await userEvent.setup().click(save);
+    await waitFor(() => {
+      expect(probe.form?.base.version.id).toBe(42);
+    });
+    // the preview of the new base: read again
+    await waitFor(() => {
+      expect(requestsTo(api, PREVIEW_2)).toHaveLength(2);
+    });
+  });
+
+  it("a failed preview disables Activate without a spinner", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.rubricVersions = [rubricVersion({ active: false }), rubricVersion({ id: 2, version: "v2", active: true })];
+    api.routes.set("GET /api/settings/rubric-versions/1/activation-preview", () => problem(404, "not_found"));
+    renderSettings(["scoring"]);
+    const list = await within(await waitFor(versions)).findByRole("list", { name: en["settings_scoring.rubric_versions"] });
+    await userEvent.setup().click(within(list).getByRole("button", { name: "Activate rubric v1" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v1?" });
+    const problemBox = await within(dialog).findByRole("alert");
+    expect(problemBox.textContent).toContain(en["problem.not_found"]);
+    expect(within(problemBox).getByRole("button", { name: en["action.retry"] })).toBeTruthy();
+    const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: en["activation.confirm"] });
+    expect(confirm.disabled).toBe(true);
+    expect(confirm.getAttribute("aria-busy")).toBe("false");
   });
 
   it("activation invalidates the versions, status and jobs", async () => {
@@ -219,13 +358,18 @@ describe("VersionsPanel", () => {
     const dialog = await screen.findByRole("alertdialog", { name: "Activate rubric v2?" });
     const lists = requestsTo(api, "GET /api/settings/rubric-versions").length;
     const schemas = requestsTo(api, "GET /api/settings/prompt-schema-versions").length;
-    await user.click(within(dialog).getByRole("button", { name: en["activation.confirm"] }));
+    const golden = requestsTo(api, "GET /api/eval-runs").length;
+    await confirmWhenRead(dialog);
     await waitFor(() => {
       expect(requestsTo(api, "GET /api/settings/rubric-versions").length).toBeGreaterThan(lists);
     });
     expect(requestsTo(api, "GET /api/settings/prompt-schema-versions").length).toBeGreaterThan(schemas);
     expect(app.queryClient.getQueryState(["system", "status"])?.isInvalidated).toBe(true);
     expect(app.queryClient.getQueryState(["jobs", "list", "probe"])?.isInvalidated).toBe(true);
+    // the eval gate row: the active configuration changed
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/eval-runs").length).toBeGreaterThan(golden);
+    });
   });
 
   it("after the activation the form's base is the version it saved", async () => {
@@ -246,7 +390,7 @@ describe("VersionsPanel", () => {
     // an unsaved change: the rebase keeps it on the new base, with no "changed elsewhere" offer
     fireEvent.change(screen.getByRole("spinbutton", { name: en["settings_scoring.relevance_threshold"] }), { target: { value: "65" } });
     await user.click(within(box).getByRole("button", { name: "Activate rubric v2" }));
-    await user.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: en["activation.confirm"] }));
+    await confirmWhenRead(await screen.findByRole("alertdialog"));
     await waitFor(() => {
       expect(probe.form?.base.version.id).toBe(42);
     });
