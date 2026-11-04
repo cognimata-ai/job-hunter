@@ -30,6 +30,7 @@ import { useTranslation } from "react-i18next";
 import { apiFetch, type ProblemError, toProblem } from "../api/client";
 import type { components } from "../api/schema";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { useToast } from "../components/Toaster";
 import { intlLocale, useServerText } from "../i18n/index";
@@ -38,6 +39,7 @@ import { JOBS_KEY } from "./api";
 import { detailKey, type JobDetailOut } from "./detailApi";
 import { availabilityText, type ServerText } from "./format";
 import styles from "./GroupMembers.module.css";
+import refStyles from "./JobRef.module.css";
 import { focusDropped } from "./useListKeyboard";
 
 export type GroupOut = components["schemas"]["GroupOut"];
@@ -146,7 +148,7 @@ function Member({ member, electionReason, thisJob, busy, onOpen, onWrite }: Memb
     <li aria-labelledby={name} className={styles.member}>
       <p className={styles.head}>
         {onOpen !== undefined && !thisJob ? (
-          <button id={titleId} type="button" className={styles.ref} onClick={() => { onOpen(jobId); }}>
+          <button id={titleId} type="button" className={cx(refStyles.ref, styles.ref)} onClick={() => { onOpen(jobId); }}>
             {member.title}
           </button>
         ) : (
