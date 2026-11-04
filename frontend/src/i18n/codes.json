@@ -570,7 +570,59 @@
     "eu",
     "global"
   ],
+  "llm_node": [
+    "critic",
+    "extract_profile",
+    "generate",
+    "propose_queries",
+    "revise"
+  ],
+  "model_preset": [
+    "A",
+    "B",
+    "C",
+    "custom"
+  ],
+  "eval_run_status": [
+    "completed",
+    "failed",
+    "running"
+  ],
+  "schema_transport": [
+    "fake",
+    "live"
+  ],
   "order": {
+    "effort": {
+      "claude-opus-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-sonnet-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-haiku-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-fable-5-1": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
     "seniority": [
       "intern",
       "working_student",

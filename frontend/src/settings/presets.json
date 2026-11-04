@@ -1,0 +1,77 @@
+{
+  "A": {
+    "critic_light_effort": "low",
+    "nodes": {
+      "critic": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "extract_profile": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "generate": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "propose_queries": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "revise": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      }
+    }
+  },
+  "B": {
+    "critic_light_effort": "low",
+    "nodes": {
+      "critic": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "extract_profile": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "generate": {
+        "effort": "medium",
+        "model": "claude-sonnet-5-5"
+      },
+      "propose_queries": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "revise": {
+        "effort": "medium",
+        "model": "claude-sonnet-5-5"
+      }
+    }
+  },
+  "C": {
+    "critic_light_effort": "low",
+    "nodes": {
+      "critic": {
+        "effort": "medium",
+        "model": "claude-sonnet-5-5"
+      },
+      "extract_profile": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "generate": {
+        "effort": "medium",
+        "model": "claude-haiku-5-5"
+      },
+      "propose_queries": {
+        "effort": "medium",
+        "model": "claude-opus-5-5"
+      },
+      "revise": {
+        "effort": "medium",
+        "model": "claude-haiku-5-5"
+      }
+    }
+  }
+}

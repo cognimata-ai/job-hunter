@@ -11,10 +11,15 @@
 //   section's anchor from any other), its warnings (amber with "I understand", or one compact line with its tick
 //   for a standing one), the projections as compact rows, the effect chips, and Save. While the current draft's
 //   dry-run is not in, the panel says "Checking…" over the last answer, and Save is disabled.
+// - **The re-score confirmation** (spec §13.3, E15; plan M4 Task 30, Ruling T30-a): a Save whose dry-run effects
+//   include `llm_tuple` first asks in a `ConfirmDialog`, with the re-score's ads and cost from the `llm_rescore`
+//   warning's detail. It is the Save of every section: the document is one, and any section's Save sends it.
+//   Cancel (or Esc) sends nothing; Confirm saves as Save does.
 import type { TFunction } from "i18next";
-import { type MouseEvent, type ReactNode, useId } from "react";
+import { type MouseEvent, type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NETWORK_CODE, toProblem } from "../api/client";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import i18n, { intlLocale, type TranslationKey, useServerText } from "../i18n/index";
@@ -364,8 +369,11 @@ export function DryRunPanel() {
   }
   const rescore = warnings.find((warning) => warning.code === "llm_rescore");
   const rescoreUsd = rescore === undefined ? null : str(rescore.detail.est_usd);
+  const rescoreTargets = rescore === undefined ? null : num(rescore.detail.targets);
   const effects = dirty ? (result?.effects ?? []).filter((effect) => effect !== "none") : [];
   const reason = blockedReason(form, t);
+  const [asking, setAsking] = useState(false);
+  const asks = effects.includes("llm_tuple");
   return (
     <div className={cx(styles.panel, form.checking && styles.checking)}>
       <p className={styles.status} role={alert ? "status" : undefined}>{status}</p>
@@ -433,11 +441,33 @@ export function DryRunPanel() {
       <div className={styles.actions}>
         <button type="button" className={fields.primary} disabled={!form.canSave} aria-busy={form.saving || undefined}
           aria-describedby={reason === null ? undefined : reasonId}
-          onClick={() => { form.save(section); }}>
+          onClick={() => {
+            if (asks) {
+              setAsking(true);
+            } else {
+              form.save(section);
+            }
+          }}>
           {t("settings_form.save")}
         </button>
         {reason !== null && <p id={reasonId} className={styles.reason}>{reason}</p>}
       </div>
+      <ConfirmDialog open={asking} title={t("settings_form.rescore_title")} confirmLabel={t("settings_form.rescore_confirm")}
+        onCancel={() => { setAsking(false); }}
+        onConfirm={() => {
+          setAsking(false);
+          form.save(section);
+        }}>
+        <p>
+          {rescoreTargets !== null && rescoreUsd !== null
+            ? t("settings_form.rescore_body", {
+                count: rescoreTargets,
+                value: format.number(rescoreTargets),
+                est_usd: format.usd(rescoreUsd),
+              })
+            : t("settings_form.rescore_body_unknown")}
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }

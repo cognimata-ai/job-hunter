@@ -5,7 +5,9 @@ arguments (`typing.get_args`), a mapping's keys, or an AST walk of the calls tha
 the missing and the extra codes. The catalogue's own form is pinned too: exactly these namespaces, each a
 sorted list of distinct strings (the frontend's `i18n.test.ts` checks that both languages have a key for each
 code), and beside them `order`: the namespaces whose codes the UI lists in their backend's own order (the
-seniority ladder, plan M4 Task 23, Ruling T23-c), each equal to that order.
+seniority ladder, plan M4 Task 23, Ruling T23-c), each equal to that order, and `order.effort`, each model's
+supported efforts in `Effort`'s order (`llm.pricing.SUPPORTED_EFFORTS`, plan M4 Task 30, resolution c): the
+effort options of the model grid, shown as their codes, so they are no namespace.
 
 The alert codes are the `code` of every `raise_alert` and `open_alert` call in `backend/src`, with a module
 constant resolved by importing its module, and the codes of a module's wrapper that forwards its own `code`
@@ -36,7 +38,7 @@ from jobhunter.graphs.profile.nodes import propose_queries as propose_node
 from jobhunter.jobs.cards import Badge, ScoreOut
 from jobhunter.jobs.detail import DET_CRITERIA, DetailScoreOut
 from jobhunter.jobs.query import EMPLOYMENT_VALUES, SENIORITY_VALUES
-from jobhunter.llm import gateway
+from jobhunter.llm import gateway, pricing, schema_dry_run
 from jobhunter.llm.schemas import generator
 from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.critic import CriticOut
@@ -52,7 +54,7 @@ from jobhunter.profile.review import Repair
 from jobhunter.queries import authoring
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
-from jobhunter.scoring import aggregate, validator
+from jobhunter.scoring import aggregate, eval_runs, validator
 from jobhunter.scoring.cycles import PauseReason
 from jobhunter.scoring.det_criteria import DetCriterion
 from jobhunter.scoring.filters import FilterCode
@@ -485,6 +487,13 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "watchlist_validation": lambda: literal_values(watchlist_listing.ValidationStatus),
     "watchlist_unsupported": lambda: literal_values(get_type_hints(watchlist_patterns.Unsupported)["reason"]),
     "lever_region": lambda: literal_values(watchlist_patterns.LeverRegion),
+    # Scoring & models (plan M4 Task 30, resolutions c, e and f): the graph nodes of the model and execution
+    # grids, the preset labels, a golden run's status, and the transport of a prompt-schema version's schema
+    # dry-run; the gate states are `eval_gate`'s
+    "llm_node": lambda: literal_values(settings_model.Node),
+    "model_preset": lambda: literal_values(settings_model.PolicyLabel),
+    "eval_run_status": lambda: literal_values(eval_runs.EvalStatus),
+    "schema_transport": lambda: literal_values(schema_dry_run.Transport),
 }
 
 # The profile form's closed sets that an existing namespace covers (plan M4 Task 27, resolution g): each
@@ -522,6 +531,8 @@ SETTINGS_FORM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
         (set(settings_model.SourceSwitches.model_fields) - {ATS_SWITCH})
         | literal_values(watchlist_patterns.AtsType)
     ),
+    # the critic's light-effort triggers (Scoring & models, plan M4 Task 30)
+    "critic_trigger": lambda: literal_values(settings_model.LightTrigger),
 }
 
 
@@ -530,6 +541,16 @@ ORDERS: Final[dict[str, Callable[[], list[str]]]] = {
     "seniority": lambda: list(SENIORITY_LADDER),
 }
 ORDER_KEY: Final = "order"
+# Each model's supported efforts in `Effort`'s order (module docstring): `order.effort.<model>`.
+EFFORT_ORDER: Final = "effort"
+
+
+def model_efforts() -> dict[str, list[str]]:
+    """Each model of §10.3 with the efforts `llm.pricing` lists it as supporting, in `Effort`'s order."""
+    return {
+        model: [effort for effort in get_args(pricing.Effort) if effort in pricing.SUPPORTED_EFFORTS[model]]
+        for model in pricing.MODELS
+    }
 
 
 @pytest.fixture(scope="module")
@@ -545,10 +566,16 @@ def test_the_catalogue_has_exactly_the_namespaces(catalogue: dict[str, Any]) -> 
 
 def test_each_order_is_its_backend_order_of_its_namespace(catalogue: dict[str, Any]) -> None:
     orders = catalogue.get(ORDER_KEY)
-    assert isinstance(orders, dict) and sorted(orders) == sorted(ORDERS), orders
+    assert isinstance(orders, dict) and sorted(orders) == sorted([*ORDERS, EFFORT_ORDER]), orders
     for namespace, expected in ORDERS.items():
         assert orders[namespace] == expected(), f"codes.json[order][{namespace}]"
         assert sorted(orders[namespace]) == catalogue[namespace], f"order[{namespace}] is not its namespace"
+
+
+def test_each_model_s_efforts_are_its_supported_efforts_in_order(catalogue: dict[str, Any]) -> None:
+    efforts = catalogue[ORDER_KEY].get(EFFORT_ORDER)
+    assert efforts == model_efforts(), f"codes.json[order][{EFFORT_ORDER}]"
+    assert all(efforts[model] for model in pricing.MODELS), "a model without an effort"
 
 
 @pytest.mark.parametrize("namespace", sorted(NAMESPACES))

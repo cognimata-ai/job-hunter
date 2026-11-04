@@ -468,7 +468,9 @@ function changed(state: State, draft: Settings, path: string, candidates: readon
   };
 }
 
-function isEvalGate(error: ProblemError): boolean {
+/** Whether `error` is the eval gate's refusal (409 `eval_gate_failed`): the override is offered. The save and a
+ * shipped version's activation (Task 30's `ActivationDialog`) refuse a failed gate alike. */
+export function isEvalGate(error: ProblemError): boolean {
   return error.code === "eval_gate_failed" || (error.code === "conflict_state" && error.detail === "eval_gate_failed");
 }
 

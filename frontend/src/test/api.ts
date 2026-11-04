@@ -1,8 +1,8 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
-// stats and watchlist reads, the settings dry-run, the logout, the login's answers in the order a test gives
-// them, and any other route a test answers itself (`routes`). A route is matched by its path alone; the query
-// string is the request's `search`.
+// stats, watchlist, golden-run and shipped-version reads, the settings dry-run, the logout, the login's answers
+// in the order a test gives them, and any other route a test answers itself (`routes`). A route is matched by
+// its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -23,6 +23,11 @@ type QuotaDetailOut = components["schemas"]["QuotaDetailOut"];
 type QueryListOut = components["schemas"]["QueryListOut"];
 type CellStatsOut = components["schemas"]["CellStatsOut"];
 type WatchlistCompanyOut = components["schemas"]["WatchlistCompanyOut"];
+type EvalRunOut = components["schemas"]["EvalRunOut"];
+type EvalRunsPageOut = components["schemas"]["EvalRunsPageOut"];
+type RubricVersionOut = components["schemas"]["RubricVersionOut"];
+type PromptSchemaVersionOut = components["schemas"]["PromptSchemaVersionOut"];
+type ActivationPreviewOut = components["schemas"]["ActivationPreviewOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -705,6 +710,75 @@ export function spendOut(overrides: Partial<SpendOut> = {}): SpendOut {
   };
 }
 
+/** A golden run (`GET /api/eval-runs?kind=golden`): run 7, completed and passed, ρ 0.712. */
+export function goldenRun(overrides: Partial<EvalRunOut> = {}): EvalRunOut {
+  return {
+    id: 7,
+    kind: "golden",
+    route: "production",
+    status: "completed",
+    passed: true,
+    gate: "passed",
+    spearman_rho: "0.712",
+    pairwise: "0.801",
+    contested_rate: "0.040",
+    failed_gates: [],
+    cost_usd: "1.240000",
+    started_at: "2026-11-02T08:00:00Z",
+    finished_at: "2026-11-02T08:40:00Z",
+    rubric_version_id: 1,
+    prompt_schema_version_id: 1,
+    ...overrides,
+  };
+}
+
+/** The golden runs' page: `items` newest first, and the active configuration's gate. */
+export function evalRunsPage(items: EvalRunOut[] = [], activeGate: EvalRunsPageOut["active_gate"] = { state: "uncalibrated", cases: 12 }): EvalRunsPageOut {
+  return { items, next_cursor: null, active_gate: activeGate };
+}
+
+/** A shipped rubric version: v1 (id 1), active. */
+export function rubricVersion(overrides: Partial<RubricVersionOut> = {}): RubricVersionOut {
+  return {
+    id: 1,
+    version: "v1",
+    content_hash: "3f9a0c2d4b6e8f1a2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d",
+    created_at: "2026-10-20T09:00:00Z",
+    active: true,
+    ...overrides,
+  };
+}
+
+/** A shipped prompt-schema version: id 1, active, with no schema dry-run. */
+export function promptSchemaVersion(overrides: Partial<PromptSchemaVersionOut> = {}): PromptSchemaVersionOut {
+  return {
+    id: 1,
+    prompt_schema_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d3f9a0c2d4b6e8f",
+    created_at: "2026-10-20T09:00:00Z",
+    active: true,
+    dry_run: null,
+    ...overrides,
+  };
+}
+
+/** An activation preview of version 2: the gate passed by run 7 (ρ 0.712), the schema verified, and 1,180 ads
+ * re-scored at about $41.30 online. */
+export function activationPreview(overrides: Partial<ActivationPreviewOut> = {}): ActivationPreviewOut {
+  return {
+    version_id: 2,
+    active: false,
+    gate_state: "passed",
+    latest_golden_run: { eval_run_id: 7, passed: true, spearman_rho: "0.712", finished_at: "2026-11-02T08:40:00Z" },
+    schema_verified: true,
+    unverified_models: [],
+    targets: 1180,
+    est_usd_online: "41.300000",
+    est_usd_batch: "20.650000",
+    bulk_budget_usd: "22.440000",
+    ...overrides,
+  };
+}
+
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -766,6 +840,12 @@ export interface FakeApi {
   queryStats: CellStatsOut[];
   /** What `GET /api/watchlist` answers (none by default). */
   watchlist: WatchlistCompanyOut[];
+  /** What `GET /api/eval-runs` answers (no run, an uncalibrated gate, by default). */
+  evalRuns: EvalRunsPageOut;
+  /** What `GET /api/settings/rubric-versions` answers (v1, active, by default). */
+  rubricVersions: RubricVersionOut[];
+  /** What `GET /api/settings/prompt-schema-versions` answers (id 1, active, by default). */
+  promptSchemaVersions: PromptSchemaVersionOut[];
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -796,6 +876,9 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     queries: [],
     queryStats: [],
     watchlist: [],
+    evalRuns: evalRunsPage(),
+    rubricVersions: [rubricVersion()],
+    promptSchemaVersions: [promptSchemaVersion()],
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -865,6 +948,15 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/watchlist") {
       return Promise.resolve(json(api.watchlist));
+    }
+    if (method === "GET" && path === "/api/eval-runs") {
+      return Promise.resolve(json(api.evalRuns));
+    }
+    if (method === "GET" && path === "/api/settings/rubric-versions") {
+      return Promise.resolve(json(api.rubricVersions));
+    }
+    if (method === "GET" && path === "/api/settings/prompt-schema-versions") {
+      return Promise.resolve(json(api.promptSchemaVersions));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

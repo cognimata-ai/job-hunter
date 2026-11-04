@@ -67,6 +67,15 @@
   opacity: 0.8;
 }
 
+/* Disabled without being busy (`confirmDisabled`): the form's disabled look. */
+.primary:disabled[aria-busy="false"] {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
 .busy {
   width: 14px;
   height: 14px;

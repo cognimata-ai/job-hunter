@@ -15,6 +15,7 @@ import type { SettingsSection } from "../pages/ProfileSettingsPage";
 import { QueriesSection } from "../settings/QueriesSection";
 import { ScheduleSection } from "../settings/ScheduleSection";
 import { ScopeSection } from "../settings/ScopeSection";
+import { ScoringSection } from "../settings/ScoringSection";
 import { SectionFrame } from "../settings/SectionFrame";
 import { WatchlistSection } from "../settings/WatchlistSection";
 import { type SettingsForm, SettingsFormProvider, useSettingsForm } from "../settings/useSettingsForm";
@@ -27,6 +28,7 @@ const BODIES: Partial<Record<SettingsSection, ReactNode>> = {
   queries: <QueriesSection />,
   watchlist: <WatchlistSection />,
   schedule: <ScheduleSection />,
+  scoring: <ScoringSection />,
 };
 
 /** Hands the form to the test on every render (`probe.form`), as a section of a later task holds it. */
