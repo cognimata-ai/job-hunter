@@ -3,12 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../../api/schema";
 import en from "../../i18n/en.json";
-import { type FakeApi, fakeApi, json, profileList, requestsTo } from "../../test/api";
+import { type FakeApi, fakeApi, json, problem, profileList, requestsTo } from "../../test/api";
 import { renderApp, settled } from "../../test/app";
-import { draftOut, failedDraft, readyDraft, reviewDraft } from "../../test/fixtures/drafts";
+import { draftOut, failedDraft, profile, readyDraft, reviewDraft } from "../../test/fixtures/drafts";
 
 type DraftOut = components["schemas"]["DraftOut"];
 type OpenDraftOut = components["schemas"]["OpenDraftOut"];
+type SpanEditIn = components["schemas"]["SpanEditIn"];
 
 const CV_TEXT = "Max Mustermann\nSenior Backend Engineer\n" + "Python, PostgreSQL, FastAPI. ".repeat(12);
 
@@ -172,7 +173,14 @@ describe("CvSection", () => {
       en["draft_repair.retry_llm"],
       en["cv.failure.start_again"],
     ]);
-    await user.click(within(failure).getByRole("button", { name: en["draft_repair.native_pdf"] }));
+    const native = within(failure).getByRole("button", { name: en["draft_repair.native_pdf"] });
+    expect(native.getAttribute("aria-expanded")).toBe("false");
+    await user.click(native);
+    expect(native.getAttribute("aria-expanded")).toBe("true");
+    await user.click(native); // a second press closes it again
+    expect(native.getAttribute("aria-expanded")).toBe("false");
+    expect(within(failure).queryByRole("button", { name: en["cv.failure.native_send"] })).toBeNull();
+    await user.click(native);
     const send = within(failure).getByRole<HTMLButtonElement>("button", { name: en["cv.failure.native_send"] });
     expect(within(failure).getByText(/will be sent to Anthropic\. Contact stripping cannot be applied\.$/)).toBeTruthy();
     expect(send.disabled).toBe(true);
@@ -224,6 +232,14 @@ describe("CvSection", () => {
     const failure = await within(section()).findByRole("group", { name: en["cv.failure.title"] });
     expect(within(section()).queryByRole("textbox", { name: en["cv.paste.label"] })).toBeNull();
     await user.click(within(failure).getByRole("button", { name: en["draft_repair.paste_text"] }));
+    expect(within(section()).getByRole("textbox", { name: en["cv.paste.label"] })).toBe(document.activeElement);
+    // closed by its own toggle (the disclosure button beside the upload), the repair opens it again
+    const toggle = within(section())
+      .getAllByRole("button", { name: en["cv.paste.open"] })
+      .find((button) => button.hasAttribute("aria-expanded"));
+    await user.click(toggle ?? section());
+    expect(within(section()).queryByRole("textbox", { name: en["cv.paste.label"] })).toBeNull();
+    await user.click(within(failure).getByRole("button", { name: en["draft_repair.paste_text"] }));
     expect(within(section()).getByRole("textbox", { name: en["cv.paste.label"] })).toBeTruthy();
     await user.click(within(failure).getByRole("button", { name: en["cv.failure.start_again"] }));
     expect(within(section()).queryByRole("group", { name: en["cv.failure.title"] })).toBeNull();
@@ -249,5 +265,74 @@ describe("CvSection", () => {
       expect(requestsTo(api, "GET /api/profile")).toHaveLength(2);
     });
     expect(await within(section()).findByText("Active profile v3, confirmed 30 Oct 2026, 10:00")).toBeTruthy();
+  });
+
+  it("a draft found through open_draft keeps its repairs once it has failed", async () => {
+    const api = fakeApi({ signedIn: true });
+    let open: OpenDraftOut | null = { id: 7, status: "extracting_profile" };
+    let draft: DraftOut = draftOut({ status: "extracting_profile" });
+    api.routes.set("GET /api/profile", () => json({ ...profileList(), open_draft: open }));
+    api.routes.set("GET /api/profile/drafts/7", () => json(draft));
+    const app = renderApp("/settings#cv");
+    await waitFor(() => {
+      expect(current()).toEqual([en["cv.step.extracting_profile"].replace("{{model}}", "claude-opus-5-5")]);
+    });
+    // failed: no longer open, so the next profile read names no draft
+    draft = failedDraft("invalid_output", ["retry_llm"]);
+    open = null;
+    await act(() => app.queryClient.refetchQueries({ queryKey: ["profile"] }));
+    const failure = await within(section()).findByRole("group", { name: en["cv.failure.title"] });
+    expect(within(failure).getByRole("button", { name: en["draft_repair.retry_llm"] })).toBeTruthy();
+  });
+
+  it("a stale set in ready is not re-sent on load", async () => {
+    const api = fakeApi({ signedIn: true });
+    withOpenDraft(api, { id: 7, status: "ready" });
+    api.routes.set("GET /api/profile/drafts/7", () => json(reviewDraft("stale", 0, { status: "ready", draft: profile() })));
+    renderApp("/settings#cv");
+    const note = await within(await screen.findByRole("region", { name: en["cv.profile.title"] })).findByText(en["cv.text.reapplying_ready"]);
+    expect(note.closest("details")).toBeNull(); // beside the strip report, not inside the collapsed text
+    await settled(300);
+    expect(requestsTo(api, "PUT /api/profile/drafts/7/text")).toHaveLength(0);
+    expect(within(section()).getByRole<HTMLButtonElement>("button", { name: en["cv.text.mark"] }).disabled).toBe(true);
+  });
+
+  it("re-applying a stale set in ready asks first", async () => {
+    const api = fakeApi({ signedIn: true });
+    let reapplied = false;
+    withOpenDraft(api, { id: 7, status: "ready" });
+    api.routes.set("GET /api/profile/drafts/7", () =>
+      json(reapplied ? reviewDraft("stale", 1) : reviewDraft("stale", 0, { status: "ready", draft: profile() })),
+    );
+    api.routes.set("PUT /api/profile/drafts/7/text", (request) => {
+      const { span_edits: edits } = JSON.parse(request.body ?? "{}") as { span_edits: SpanEditIn[] };
+      if (edits.some((edit) => edit.op === "restore")) {
+        return problem(422, "validation_failed", {
+          errors: [{ field: "body.span_edits.0.start", code: "no_replacement", message: "The span names no replacement." }],
+        });
+      }
+      reapplied = true;
+      return json({ stripped_text_preview: reviewDraft("stale", 1).stripped_text_preview });
+    });
+    renderApp("/settings#cv");
+    const user = userEvent.setup();
+    const reapply = await screen.findByRole("button", { name: en["cv.text.reapply"] });
+    await user.click(reapply);
+    const dialog = screen.getByRole("alertdialog", { name: en["cv.reapply.title"] });
+    expect(within(dialog).getByText(en["cv.reapply.body"])).toBeTruthy();
+    await user.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(requestsTo(api, "PUT /api/profile/drafts/7/text")).toHaveLength(0);
+    await user.click(reapply);
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["cv.reapply.confirm"] }));
+    // the same once-only re-send: the stored set, then without the refused restore; the text review reopens
+    expect(await within(section()).findByRole("region", { name: en["cv.text.title"] })).toBeTruthy();
+    const puts = requestsTo(api, "PUT /api/profile/drafts/7/text");
+    expect(puts.map((r) => (JSON.parse(r.body ?? "{}") as { span_edits: SpanEditIn[] }).span_edits)).toEqual([
+      [{ op: "restore", start: 39, end: 54 }, { op: "remove", start: 67, end: 77 }],
+      [{ op: "remove", start: 67, end: 77 }],
+    ]);
+    // `PUT …/text` is not a keyed route (§14.1; the route takes no Idempotency-Key)
+    expect(puts.every((r) => !r.headers.has("Idempotency-Key"))).toBe(true);
   });
 });

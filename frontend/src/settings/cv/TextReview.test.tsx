@@ -272,6 +272,64 @@ describe("TextReview", () => {
     expect(screen.queryByText(en["cv.text.reapplying"])).toBeNull();
   });
 
+  it("a failed re-send offers Try again, and shows its problem", async () => {
+    const api = fakeApi({ signedIn: true });
+    let down = true;
+    let reapplied = false;
+    api.routes.set("GET /api/profile/drafts/7", () => json(reviewDraft("stale", reapplied ? 1 : 0)));
+    api.routes.set("PUT /api/profile/drafts/7/text", (request) => {
+      if (down) {
+        return problem(503, "internal");
+      }
+      const { span_edits: edits } = JSON.parse(request.body ?? "{}") as { span_edits: SpanEditIn[] };
+      if (edits.some((edit) => edit.op === "restore")) {
+        return problem(422, "validation_failed", {
+          errors: [{ field: "body.span_edits.0.start", code: "no_replacement", message: "The span names no replacement." }],
+        });
+      }
+      reapplied = true;
+      return json({ stripped_text_preview: reviewDraft("stale", 1).stripped_text_preview });
+    });
+    renderInProviders(<Harness />);
+    const retry = await screen.findByRole("button", { name: en["cv.text.reapply_again"] });
+    expect((await screen.findByRole("alert")).textContent).toContain(en["problem.internal"]);
+    expect(requestsTo(api, "PUT /api/profile/drafts/7/text")).toHaveLength(1);
+    expect(markButton().disabled).toBe(true); // still stale: no edit on a set that does not apply
+    down = false;
+    fireEvent.click(retry);
+    await shows(reviewDraft("stale", 1).stripped_text_preview ?? "");
+    expect(requestsTo(api, "PUT /api/profile/drafts/7/text")).toHaveLength(3); // the set, then without the refused entry
+    expect(screen.queryByText(en["cv.text.reapplying"])).toBeNull();
+  });
+
+  it("a re-send refused for another reason shows its problem", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/profile/drafts/7", () => json(reviewDraft("stale", 0)));
+    api.routes.set("PUT /api/profile/drafts/7/text", () =>
+      problem(422, "validation_failed", {
+        errors: [{ field: "body.span_edits.1.start", code: "overlap", message: "Removed spans may not overlap each other." }],
+      }),
+    );
+    renderInProviders(<Harness />);
+    expect((await screen.findByRole("alert")).textContent).toContain(en["problem.validation_failed"]);
+    expect(screen.getByRole("button", { name: en["cv.text.reapply_again"] })).toBeTruthy();
+    expect(requestsTo(api, "PUT /api/profile/drafts/7/text")).toHaveLength(1); // nothing named no_replacement
+  });
+
+  it("each mark names its category for assistive technology, outside the preview's text", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/profile/drafts/7", () => json(reviewDraft("hyphen_phone", 1)));
+    renderInProviders(<Harness />);
+    await shows("[NAME]\nSenior Backend Engineer\nMobil: [REMOVED]\nE-Mail: [EMAIL]");
+    const marks = [...text().querySelectorAll("mark")].map((mark) => mark.textContent);
+    expect(marks).toEqual([
+      `${en["cv.text.mark_sr"].replace("{{category}}", en["contact_category.name"])} [NAME]`,
+      `${en["cv.text.removed_sr"]} [REMOVED]`,
+      `${en["cv.text.mark_sr"].replace("{{category}}", en["contact_category.email"])} [EMAIL]`,
+    ]);
+    expect(text().querySelector("mark .visually-hidden")?.closest("[data-preview]")).toBeNull();
+  });
+
   it("Approve sends a keyed text-review", async () => {
     const api = fakeApi({ signedIn: true });
     api.routes.set("GET /api/profile/drafts/7", () => json(reviewDraft("hyphen_phone")));

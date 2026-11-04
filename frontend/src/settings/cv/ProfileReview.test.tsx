@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import codes from "../../i18n/codes.json";
+import de from "../../i18n/de.json";
 import en from "../../i18n/en.json";
 import { fakeApi, json, problem, requestsTo } from "../../test/api";
 import { renderInProviders, settled } from "../../test/app";
@@ -113,6 +114,7 @@ describe("ProfileReview", () => {
     const issues = [
       { path: "skills[0].evidence", code: "ungrounded" as const, message: "The quote is not in the CV text.", proposal: null },
       { path: "roles[7].title", code: "limit" as const, message: "At most 200 characters allowed.", proposal: null },
+      { path: "target_titles[0].title", code: "contact_removed" as const, message: "Contact data (email) was found in this value and removed.", proposal: null },
     ];
     const api = draftRoute(() => readyDraft(issues));
     api.routes.set("PUT /api/profile/drafts/7", () =>
@@ -120,6 +122,7 @@ describe("ProfileReview", () => {
         errors: [
           { field: "body.draft.languages.1.evidence", code: "invalid", message: "Not a string the profile can hold" },
           { field: "body.draft.roles[0].highlights[0]", code: "invalid", message: "Holds a NUL character" },
+          { field: "body.draft.target_titles[1].title", code: "invalid", message: "Holds a NUL in the title" },
         ],
       }),
     );
@@ -128,8 +131,14 @@ describe("ProfileReview", () => {
     const evidence = within(skill).getByRole("textbox", { name: en["cv.profile.evidence"] });
     expect(describedBy(evidence)).toContain(en["issue.ungrounded"]);
     expect(describedBy(evidence)).toContain("The quote is not in the CV text.");
+    // a target title's text: at its chip
+    const chip = (title: string) =>
+      screen.getByRole("button", { name: en["cv.profile.remove_title"].replace("{{title}}", title) }).closest("li") as HTMLElement;
+    expect(describedBy(chip("Backend Engineer"))).toContain(en["issue.contact_removed"]);
+    expect(describedBy(chip("Backend Engineer"))).toContain("Contact data (email) was found in this value and removed.");
     // a path no field shows: in the summary, with the count
-    const summary = screen.getByRole("region", { name: "⚠ 2 validation issues" });
+    const summary = screen.getByRole("region", { name: "⚠ 3 validation issues" });
+    expect(within(summary).queryByText(/Contact data \(email\)/)).toBeNull(); // shown at its chip, not twice
     expect(within(summary).getByText(/At most 200 characters allowed\./)).toBeTruthy();
     expect(within(summary).getByText("roles[7].title")).toBeTruthy();
     await userEvent.setup().click(screen.getByRole("button", { name: en["cv.profile.save"] }));
@@ -143,6 +152,36 @@ describe("ProfileReview", () => {
     expect((role.closest("details") as HTMLDetailsElement).open).toBe(true); // a role with an issue opens
     const highlight = within(role).getByRole("textbox", { name: en["cv.profile.highlight_n"].replace("{{n}}", "1") });
     expect(describedBy(highlight)).toContain("Holds a NUL character");
+    expect(describedBy(chip("Softwareentwickler Backend"))).toContain("Holds a NUL in the title");
+  });
+
+  it("a confirm's 422 closes the modal and shows its errors at their fields", async () => {
+    const api = draftRoute(() => readyDraft());
+    api.routes.set("GET /api/profile/drafts/7/rescore-estimate", () => json(rescoreEstimate()));
+    api.routes.set("POST /api/profile/drafts/7/confirm", () =>
+      problem(422, "validation_failed", {
+        errors: [
+          { field: "skills[0].evidence", code: "ungrounded", message: "The quote is not in the CV text." },
+          { field: "body.expected_rescore_ack", code: "ack_required", message: "Acknowledge the estimate." },
+        ],
+      }),
+    );
+    renderInProviders(<Harness />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: en["cv.profile.confirm"] }));
+    const modal = await screen.findByRole("alertdialog", { name: en["cv.confirm.title"] });
+    await within(modal).findByText(/^Creates profile v5/);
+    await user.click(within(modal).getByRole("button", { name: en["cv.confirm.confirm"] }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    const skill = group(en["cv.profile.skill_n"].replace("{{n}}", "1"));
+    const evidence = within(skill).getByRole("textbox", { name: en["cv.profile.evidence"] });
+    expect(describedBy(evidence)).toContain("The quote is not in the CV text.");
+    expect(evidence.getAttribute("aria-invalid")).toBe("true");
+    // the acknowledgement has no field: in the summary, with its path
+    expect(within(screen.getByRole("region", { name: "⚠ 2 validation issues" })).getByText("body.expected_rescore_ack")).toBeTruthy();
+    expect(requestsTo(api, "POST /api/profile/drafts/7/confirm")[0].headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it("a proposal is shown as text and applied", async () => {
@@ -220,6 +259,15 @@ describe("ProfileReview", () => {
     await settled();
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(describedBy(screen.getByRole("textbox", { name: en["cv.profile.summary"] }))).toContain("Holds a NUL character");
+  });
+
+  it("a role's seniority reads as the profile's, in both languages", () => {
+    for (const [lang, table] of [["en", en], ["de", de]] as const) {
+      const strings = table as Record<string, string>;
+      for (const level of codes.seniority) {
+        expect(strings[`role_seniority.${level}`], `${lang}: ${level}`).toBe(strings[`seniority.${level}`]);
+      }
+    }
   });
 
   it("each closed set lists exactly its catalogue namespace", () => {

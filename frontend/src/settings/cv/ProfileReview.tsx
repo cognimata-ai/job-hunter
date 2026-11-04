@@ -80,6 +80,8 @@ export const WORK_AUTHORIZATIONS = valuesOf({ authorized: true, requires_sponsor
   true
 >);
 const TITLE_LANGS = valuesOf({ en: true, de: true } satisfies Record<TargetTitle["lang"], true>);
+// A target title's members, whose issues its chip shows (`paths.renderedPaths` lists them).
+const TITLE_MEMBERS = valuesOf({ title: true, lang: true } satisfies Record<keyof TargetTitle, true>);
 
 /** `items` with item `i` patched. */
 function replaced<T>(items: readonly T[], i: number, patch: Partial<T>): T[] {
@@ -162,14 +164,15 @@ function IssueItem({ problem, showPath = false }: { problem: Problem; showPath?:
   );
 }
 
-/** The issues at `path`, and what its control carries for them. */
-function useFieldIssues(path: string): { invalid: boolean; describedBy: string | undefined; node: ReactNode } {
+/** The issues at `path` (or at each of `path`'s paths, in order), and what its control carries for them. */
+function useFieldIssues(path: string | readonly string[]): { invalid: boolean; describedBy: string | undefined; node: ReactNode } {
   const issues = useIssues();
-  const list = issues.at(path);
+  const paths = typeof path === "string" ? [path] : path;
+  const list = paths.flatMap((p) => issues.at(p));
   if (list.length === 0) {
     return { invalid: false, describedBy: undefined, node: null };
   }
-  const id = issues.idOf(path);
+  const id = issues.idOf(paths[0] ?? "");
   return {
     invalid: true,
     describedBy: id,
@@ -285,9 +288,11 @@ function Item({ legend, onRemove, removeLabel, children }:
   );
 }
 
-/** A list shown as chips with ×, and a field to add one (`extra`: a control beside it, such as a language). */
-function Chips({ path, labels, onRemove, onAdd, addLabel, removeLabel, extra }: {
+/** A list shown as chips with ×, and a field to add one (`extra`: a control beside it, such as a language). A
+ * chip shows the issues at its item and at its `members` (a target title's `title` and `lang`). */
+function Chips({ path, members = [], labels, onRemove, onAdd, addLabel, removeLabel, extra }: {
   path: string;
+  members?: readonly string[];
   labels: readonly string[];
   onRemove: (index: number) => void;
   onAdd: (text: string) => void;
@@ -309,7 +314,7 @@ function Chips({ path, labels, onRemove, onAdd, addLabel, removeLabel, extra }: 
     <>
       <ul role="list" className={styles.chips}>
         {labels.map((label, i) => (
-          <ChipItem key={`${String(i)}-${label}`} path={`${path}[${String(i)}]`} text={label}
+          <ChipItem key={`${String(i)}-${label}`} path={`${path}[${String(i)}]`} members={members} text={label}
             removeLabel={removeLabel(i)} onRemove={() => { onRemove(i); }} />
         ))}
       </ul>
@@ -325,8 +330,9 @@ function Chips({ path, labels, onRemove, onAdd, addLabel, removeLabel, extra }: 
   );
 }
 
-function ChipItem({ path, text, removeLabel, onRemove }: { path: string; text: string; removeLabel: string; onRemove: () => void }) {
-  const issues = useFieldIssues(path);
+function ChipItem({ path, members, text, removeLabel, onRemove }:
+  { path: string; members: readonly string[]; text: string; removeLabel: string; onRemove: () => void }) {
+  const issues = useFieldIssues([path, ...members.map((member) => `${path}.${member}`)]);
   return (
     <li className={cx(styles.chip, issues.invalid && styles.chipInvalid)} aria-describedby={issues.describedBy}>
       <span>{text}</span>
@@ -559,7 +565,7 @@ function ProfileForm({ draftId, draft, profile }: { draftId: number; draft: Draf
         <TextField path="summary" label={t("cv.profile.summary")} value={form.summary} multiline className={styles.wide}
           onChange={(v) => { update({ summary: v ?? "" }); }} />
         <Section title={t("cv.profile.target_titles")} path="target_titles">
-          <Chips path="target_titles" addLabel={t("cv.profile.new_title")}
+          <Chips path="target_titles" members={TITLE_MEMBERS} addLabel={t("cv.profile.new_title")}
             labels={form.target_titles.map((title) =>
               t("cv.profile.title_chip", { title: title.title, lang: serverText("language_code", title.lang) }),
             )}

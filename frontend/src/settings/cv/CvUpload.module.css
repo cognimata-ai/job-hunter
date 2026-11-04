@@ -106,8 +106,20 @@
   max-width: var(--measure);
 }
 
+.meter {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
 .size {
-  justify-self: end;
+  margin-left: auto;
   color: var(--color-text-muted);
   font-size: var(--font-size-1);
 }

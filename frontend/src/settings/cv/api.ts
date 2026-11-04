@@ -45,8 +45,17 @@ export type StrippedTextOut = components["schemas"]["StrippedTextOut"];
 export const DRAFT_POLL_MS = 3000;
 /** The upload's and the paste's mutation key: the section shows "Uploading" while one runs. */
 export const CV_UPLOAD_KEY = [...PROFILE_KEY, "cv"] as const;
-/** The paste's cap: its JSON body, in UTF-8 bytes (`upload.PASTE_BODY_MAX_BYTES`). */
+/** A pasted CV's length, in code points with NUL characters dropped, as `profile.upload.check_paste` counts it
+ * (`PASTE_MIN`, `PASTE_MAX`; tests/unit/test_paste_limits.py holds these equal to the server's: Ruling T27-g). */
+export const PASTE_MIN = 300;
+export const PASTE_MAX = 50_000;
+/** The paste's JSON body cap, in UTF-8 bytes (`upload.PASTE_BODY_MAX_BYTES`): a guard under the length limits. */
 export const PASTE_MAX_BYTES = 2 ** 20;
+
+/** A pasted text's length as the server counts it: its code points, without NUL characters. */
+export function pasteLength(text: string): number {
+  return Array.from(text.replaceAll("\u0000", "")).length;
+}
 
 export const draftKey = (id: number) => [...PROFILE_KEY, "draft", id] as const;
 export const estimateKey = (id: number) => [...PROFILE_KEY, "rescore-estimate", id] as const;

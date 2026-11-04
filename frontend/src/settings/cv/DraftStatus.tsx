@@ -108,7 +108,7 @@ export function DraftFailure({ draftId, draft, onPaste, onStartAgain }: DraftFai
     if (repair === "paste_text") {
       onPaste();
     } else if (repair === "native_pdf") {
-      setNative(true);
+      setNative((shown) => !shown);
     } else if (!retry.isPending) {
       retry.mutate({ mode: "llm" });
     }

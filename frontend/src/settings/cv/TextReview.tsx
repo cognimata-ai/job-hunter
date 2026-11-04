@@ -11,8 +11,14 @@
 //   Marking uses the native selection, which keyboard users reach with caret browsing; restoring is a button
 //   (Ruling T27-e).
 // - Every edit sends the complete set (`PUT …/text`) and reads the draft again; a 422 says "This edit could not
-//   be applied" and the stored set stays. A stored set the rules no longer apply (`segments` empty, `edits` not)
-//   is sent again once per draft load, without the entries a 422 `no_replacement` names.
+//   be applied" and the stored set stays.
+// - A stored set the rules no longer apply (`segments` empty, `edits` not) is sent again (`useReapply`), without
+//   the entries a 422 `no_replacement` names. In `text_review` that happens once per draft load by itself; in
+//   `ready` only when the user asks (the section's [Re-apply the removals], behind a confirmation: re-sending
+//   reopens the review and discards the extracted profile, Ruling T27-f). Until then marking and restoring are
+//   disabled. A re-send that fails otherwise shows its problem and [Try again].
+// - Each mark carries its category as a visually hidden prefix, outside the preview's text, so the offsets do not
+//   count it (ARIA gives a <mark> no name of its own).
 // - In `text_review`, [Approve text & extract profile (~$…)] sends the keyed approval, which starts the paid
 //   extraction; in `ready` a text edit reopens the review (the server discards the extracted profile).
 import { Fragment, type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
@@ -128,6 +134,57 @@ function paragraphs(preview: string, segments: readonly SegmentOut[]): Piece[][]
   return found.filter((paragraph, i) => paragraph.length > 0 || i < found.length - 1);
 }
 
+export interface Reapply {
+  /** The stored set no longer applies: no map, and edits to send again. */
+  stale: boolean;
+  running: boolean;
+  /** The last re-send failed otherwise than by naming refused entries (no answer, a 5xx, another refusal). */
+  failure: ProblemError | null;
+  run: () => void;
+}
+
+/**
+ * The re-send of a stored set the rules no longer apply (`api/routes/profile_review.py`'s last paragraph): the
+ * stored set, then, after a 422 that names entries `no_replacement`, the set without them. One at a time; the
+ * draft is read again after the one that succeeds.
+ */
+export function useReapply(draftId: number, draft: DraftOut): Reapply {
+  const { mutateAsync } = useEditText(draftId);
+  const [running, setRunning] = useState(false);
+  const [failure, setFailure] = useState<ProblemError | null>(null);
+  const inFlight = useRef(false);
+  const { segments, edits } = draft;
+  const stale = segments.length === 0 && edits.restored.length + edits.removed.length > 0;
+  const run = useCallback(() => {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setRunning(true);
+    setFailure(null);
+    const set = editSetOf(edits);
+    void (async () => {
+      try {
+        await mutateAsync(set);
+      } catch (error) {
+        const problem = toProblem(error);
+        const refused = refusedEntries(problem, "no_replacement");
+        if (refused.size === 0) {
+          setFailure(problem);
+        } else {
+          await mutateAsync(set.filter((_, i) => !refused.has(i))).catch((again: unknown) => {
+            setFailure(toProblem(again));
+          });
+        }
+      } finally {
+        inFlight.current = false;
+        setRunning(false);
+      }
+    })();
+  }, [edits, mutateAsync]);
+  return { stale, running, failure, run };
+}
+
 /** "Removed: 1 name · 1 e-mail …", from the strip counts. */
 export function StripReport({ report }: { report: DraftOut["strip_report"] }) {
   const { t } = useTranslation();
@@ -158,10 +215,10 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
   const { segments, edits } = draft;
   const [selected, setSelected] = useState<RawSpan | null>(null);
   const [notice, setNotice] = useState<"refused" | "too_many" | null>(null);
-  const stale = segments.length === 0 && edits.restored.length + edits.removed.length > 0;
-  const [reapplying, setReapplying] = useState(false);
+  const reapply = useReapply(draftId, draft);
+  const { stale, run: reapplyNow } = reapply;
   const reapplied = useRef<number | null>(null);
-  const { mutateAsync } = edit;
+  const inReview = draft.status === "text_review";
 
   const readSelection = useCallback(() => {
     setSelected(selectedSpan(container.current, preview, segments));
@@ -172,27 +229,13 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
     return () => { document.removeEventListener("selectionchange", readSelection); };
   }, [readSelection]);
 
-  // A stored set the rules no longer apply: sent again once, without the entries it names as refused.
+  // In text review, a stored set the rules no longer apply is sent again by itself, once per draft load.
   useEffect(() => {
-    if (!stale || reapplied.current === draftId) {
-      return;
+    if (inReview && stale && reapplied.current !== draftId) {
+      reapplied.current = draftId;
+      reapplyNow();
     }
-    reapplied.current = draftId;
-    setReapplying(true);
-    const set = editSetOf(edits);
-    void (async () => {
-      try {
-        await mutateAsync(set);
-      } catch (error) {
-        const refused = refusedEntries(toProblem(error), "no_replacement");
-        if (refused.size > 0) {
-          await mutateAsync(set.filter((_, i) => !refused.has(i))).catch(() => undefined); // shown below
-        }
-      } finally {
-        setReapplying(false);
-      }
-    })();
-  }, [stale, draftId, edits, mutateAsync]);
+  }, [inReview, stale, draftId, reapplyNow]);
 
   const send = (set: SpanEdit[]) => {
     if (edit.isPending) {
@@ -226,7 +269,10 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
     if (s.kind === "removed") {
       return (
         <Fragment key={key}>
-          <mark data-preview="" className={styles.removed} title={t("cv.text.removed_mark")}>{p.text}</mark>
+          <mark className={styles.removed} title={t("cv.text.removed_mark")}>
+            <span className="visually-hidden">{t("cv.text.removed_sr")}{" "}</span>
+            <span data-preview="">{p.text}</span>
+          </mark>
           <button type="button" className={styles.restore} aria-label={t("cv.text.restore_removed")}
             disabled={edit.isPending || stale} onClick={() => { restore(s); }}>
             <span aria-hidden="true">↺</span>
@@ -237,9 +283,10 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
     const category = t(`contact_category.${s.category ?? "personal"}`);
     return (
       <Fragment key={key}>
-        <mark data-preview="" className={styles.replacement}
+        <mark className={styles.replacement}
           title={s.restorable ? t("cv.text.replaced", { category }) : t("cv.text.not_restorable", { category })}>
-          {p.text}
+          <span className="visually-hidden">{t("cv.text.mark_sr", { category })}{" "}</span>
+          <span data-preview="">{p.text}</span>
         </mark>
         {s.restorable && (
           <button type="button" className={styles.restore} aria-label={t("cv.text.restore", { category })}
@@ -256,7 +303,17 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
   return (
     <div className={styles.review}>
       {report && <StripReport report={draft.strip_report} />}
-      {(stale || reapplying) && <p role="status" className={styles.note}>{t("cv.text.reapplying")}</p>}
+      {inReview && (stale || reapply.running) && (
+        <div className={styles.stale}>
+          <p role="status" className={styles.note}>{t("cv.text.reapplying")}</p>
+          {reapply.failure !== null && (
+            <button type="button" className={controls.secondary} disabled={reapply.running} onClick={reapplyNow}>
+              {t("cv.text.reapply_again")}
+            </button>
+          )}
+        </div>
+      )}
+      {inReview && reapply.failure !== null && <ProblemBox error={reapply.failure} />}
       <div ref={container} className={styles.text} data-testid="cv-text">
         {paragraphs(preview, segments).map((paragraph, i) => (
           <p key={i} className={cx(styles.line, paragraph.every((p) => p.text.trim() === "") && styles.blank)}>
@@ -270,7 +327,9 @@ export function TextReview({ draftId, draft, extractUsd, report = true }: TextRe
           onMouseDown={(event) => { event.preventDefault(); }} onClick={markSelection}>
           {t("cv.text.mark")}
         </button>
-        <p id={hintId} className={styles.hint}>{selected === null ? t("cv.text.select_first") : t("cv.text.mark_hint")}</p>
+        <p id={hintId} className={styles.hint}>
+          {stale ? t("cv.text.stale_hint") : selected === null ? t("cv.text.select_first") : t("cv.text.mark_hint")}
+        </p>
       </div>
       {notice === "refused" && <p role="alert" className={controls.error}>{t("cv.text.refused")}</p>}
       {notice === "too_many" && (

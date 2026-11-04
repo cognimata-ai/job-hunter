@@ -109,7 +109,7 @@ describe("CvUpload", () => {
     await user.click(toggle);
     const area = screen.getByRole<HTMLTextAreaElement>("textbox", { name: en["cv.paste.label"] });
     fireEvent.change(area, { target: { value: CV_TEXT } });
-    expect(describedBy(area)).toContain(`${String(new TextEncoder().encode(CV_TEXT).length)} / 1,048,576`);
+    expect(describedBy(area)).toContain(`${String(CV_TEXT.length)} / 50,000 characters`);
     await user.click(screen.getByRole("button", { name: en["cv.paste.submit"] }));
     await waitFor(() => {
       expect(onCreated).toHaveBeenCalledWith(43);
@@ -119,19 +119,45 @@ describe("CvUpload", () => {
     expect(request.headers.has("Idempotency-Key")).toBe(false);
   });
 
-  it("the paste refuses over 1 MiB before sending, and an empty text", async () => {
-    const api = fakeApi({ signedIn: true });
+  it("the paste counts characters as the server does: an emoji is one, a NUL none", () => {
+    fakeApi({ signedIn: true });
     renderInProviders(<CvUpload openStatus={null} onCreated={vi.fn()} pasteOpen />);
     const area = screen.getByRole<HTMLTextAreaElement>("textbox", { name: en["cv.paste.label"] });
-    const submit = screen.getByRole("button", { name: en["cv.paste.submit"] });
+    fireEvent.change(area, { target: { value: "😀\u0000a" } }); // 4 UTF-16 units, 3 code points, 1 NUL
+    expect(describedBy(area)).toContain("2 / 50,000 characters");
+  });
+
+  it("the paste refuses fewer than 300 characters and more than 50,000 before sending", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("POST /api/profile/cv-text", () => json({ draft_id: 46 }, 202));
+    renderInProviders(<CvUpload openStatus={null} onCreated={vi.fn()} pasteOpen />);
+    const area = screen.getByRole<HTMLTextAreaElement>("textbox", { name: en["cv.paste.label"] });
+    const submit = screen.getByRole<HTMLButtonElement>("button", { name: en["cv.paste.submit"] });
+    expect(submit.disabled).toBe(true); // nothing pasted yet
+    fireEvent.change(area, { target: { value: "a".repeat(299) } });
+    expect(submit.disabled).toBe(true);
+    expect(describedBy(area)).toContain("At least 300 characters");
     fireEvent.click(submit);
-    expect((await screen.findByRole("alert")).textContent).toBe(en["cv.paste.empty"]);
-    // 2^20 − 1 bytes of "ä" (2 bytes each) and one more "ä": over the cap by one byte
-    fireEvent.change(area, { target: { value: "a" + "ä".repeat(2 ** 19) } });
-    expect(area.getAttribute("aria-invalid")).toBe("true");
-    fireEvent.click(submit);
-    expect((await screen.findByRole("alert")).textContent).toBe(en["cv.paste.too_large"].replace("{{max}}", "1,048,576"));
     expect(requestsTo(api, "POST /api/profile/cv-text")).toHaveLength(0);
+    fireEvent.change(area, { target: { value: "a".repeat(50_001) } });
+    expect(submit.disabled).toBe(true);
+    expect(area.getAttribute("aria-invalid")).toBe("true");
+    expect(describedBy(area)).toContain("At most 50,000 characters");
+    // 50,000 emoji are 100,000 UTF-16 units but 50,000 characters: allowed
+    fireEvent.change(area, { target: { value: "😀".repeat(50_000) } });
+    expect(submit.disabled).toBe(false);
+    expect(area.getAttribute("aria-invalid")).toBe("false");
+    // the body's 1 MiB cap stays a silent guard: 300 characters behind a megabyte of NULs
+    fireEvent.change(area, { target: { value: "\u0000".repeat(2 ** 20) + "a".repeat(300) } });
+    expect(submit.disabled).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.change(area, { target: { value: "a".repeat(300) } });
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(requestsTo(api, "POST /api/profile/cv-text")).toHaveLength(1);
+    });
+    expect(JSON.parse(requestsTo(api, "POST /api/profile/cv-text")[0].body ?? "null")).toEqual({ text: "a".repeat(300) });
   });
 
   it("asks before replacing an open draft", async () => {
@@ -202,7 +228,7 @@ describe("CvUpload", () => {
     const answers = [
       () =>
         problem(422, "validation_failed", {
-          errors: [{ field: "native_pdf_opt_in", code: "native_pdf_disabled", message: "Sending the original PDF is not enabled" }],
+          errors: [{ field: "native_pdf_opt_in", code: "native_pdf_disabled", message: "native path off (server text)" }],
         }),
       () => problem(409, "conflict_state"),
     ];
@@ -215,7 +241,9 @@ describe("CvUpload", () => {
     await waitFor(() => {
       expect(nativeBox().getAttribute("aria-invalid")).toBe("true");
     });
-    expect(describedBy(nativeBox())).toContain("Sending the original PDF is not enabled");
+    // the refusal's code through the catalogue, the server's text only as the fallback (D39)
+    expect(describedBy(nativeBox())).toContain(en["draft_failure.native_pdf_disabled"]);
+    expect(describedBy(nativeBox())).not.toContain("server text");
     await user.click(uploadButton());
     expect((await screen.findByRole("alert")).textContent).toBe(en["cv.upload.conflict"]);
   });

@@ -4,13 +4,14 @@
 //   but one file is ignored, with a text. A picked file is sent with [Upload CV].
 // - "Send original PDF to Claude" is enabled for a PDF only. Its disclosure is the checkbox's description
 //   (`aria-describedby`), always in the accessibility tree; ⓘ only shows it or hides it from view.
-// - [Paste text instead] discloses a text area; its size is shown against the 1 MiB cap in UTF-8 bytes, and an
-//   empty or over-cap text is refused before anything is sent.
+// - [Paste text instead] discloses a text area. Its length is counted as the server counts it (code points, NUL
+//   characters dropped) and shown against the 50,000 the server takes; under 300 or over 50,000 it cannot be sent
+//   (Ruling T27-g), nor over the body's 1 MiB, a silent guard. The paste repair opens it with the focus in it.
 // - With a draft in review (`text_review`, `ready`) an upload or a paste asks first: the server discards that
 //   draft (D18). While one is being processed both controls are disabled.
 // - Neither request is keyed (Ruling T27-c). A refused file or text shows each `errors[].code` through the
 //   `upload_reason` namespace; a refused opt-in shows at the checkbox; a 409 says a CV is being processed.
-import { type DragEvent, type SyntheticEvent, useId, useState } from "react";
+import { type DragEvent, type SyntheticEvent, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isProblem, type ProblemError } from "../../api/client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -18,7 +19,17 @@ import { cx } from "../../components/cx";
 import { ProblemBox } from "../../components/ProblemBox";
 import { useServerText } from "../../i18n/index";
 import { useFormat } from "../../system/format";
-import { type DraftStatusCode, isInReview, isProcessing, PASTE_MAX_BYTES, usePasteCv, useUploadCv } from "./api";
+import {
+  type DraftStatusCode,
+  isInReview,
+  isProcessing,
+  PASTE_MAX,
+  PASTE_MAX_BYTES,
+  PASTE_MIN,
+  pasteLength,
+  usePasteCv,
+  useUploadCv,
+} from "./api";
 import controls from "./controls.module.css";
 import styles from "./CvUpload.module.css";
 
@@ -69,7 +80,6 @@ export function CvUpload({ openStatus, pasteOpen = false, onCreated }: CvUploadP
   const [infoShown, setInfoShown] = useState(false);
   const [pasting, setPasting] = useState(pasteOpen);
   const [text, setText] = useState("");
-  const [pasteRefusal, setPasteRefusal] = useState<"empty" | "too_large" | null>(null);
   const [asking, setAsking] = useState<"upload" | "paste" | null>(null);
   const inputId = useId();
   const nativeId = useId();
@@ -77,13 +87,22 @@ export function CvUpload({ openStatus, pasteOpen = false, onCreated }: CvUploadP
   const nativeErrorId = useId();
   const pasteId = useId();
   const sizeId = useId();
-  const pasteErrorId = useId();
+  const limitId = useId();
+  const pasteArea = useRef<HTMLTextAreaElement>(null);
   const processing = isProcessing(openStatus ?? undefined);
   const busy = processing || upload.isPending || paste.isPending;
   const pdf = isPdf(file);
-  const bytes = new TextEncoder().encode(text).length;
-  const overCap = bytes > PASTE_MAX_BYTES;
+  const chars = pasteLength(text);
+  const tooShort = chars < PASTE_MIN;
+  const tooLong = chars > PASTE_MAX;
+  const pastable = !tooShort && !tooLong && new TextEncoder().encode(text).length <= PASTE_MAX_BYTES;
   const nativeError = upload.error?.errors.find((e) => e.field === NATIVE_FIELD);
+  const serverText = useServerText();
+  useEffect(() => {
+    if (pasteOpen) {
+      pasteArea.current?.focus();
+    }
+  }, [pasteOpen]);
 
   const pick = (picked: File | null) => {
     setFile(picked);
@@ -130,19 +149,11 @@ export function CvUpload({ openStatus, pasteOpen = false, onCreated }: CvUploadP
   };
   const submitPaste = (event: SyntheticEvent) => {
     event.preventDefault();
-    if (busy) {
-      return;
-    }
-    if (text.trim() === "") {
-      setPasteRefusal("empty");
-    } else if (overCap) {
-      setPasteRefusal("too_large");
-    } else {
-      setPasteRefusal(null);
+    if (pastable && !busy) {
       askOr("paste");
     }
   };
-  const max = format.number(PASTE_MAX_BYTES);
+  const max = format.number(PASTE_MAX);
   return (
     <div className={styles.upload}>
       {processing && <p className={styles.processing}>{t("cv.upload.processing")}</p>}
@@ -172,7 +183,11 @@ export function CvUpload({ openStatus, pasteOpen = false, onCreated }: CvUploadP
             </button>
           </div>
           <p id={disclosureId} className={infoShown ? styles.disclosure : "visually-hidden"}>{t("cv.native.disclosure")}</p>
-          {nativeError !== undefined && <p id={nativeErrorId} className={controls.error}>{nativeError.message}</p>}
+          {nativeError !== undefined && (
+            <p id={nativeErrorId} className={controls.error}>
+              {serverText("draft_failure", nativeError.code, nativeError.message)}
+            </p>
+          )}
         </div>
       </form>
       {upload.error !== null && nativeError === undefined && <Refusal error={upload.error} />}
@@ -183,20 +198,21 @@ export function CvUpload({ openStatus, pasteOpen = false, onCreated }: CvUploadP
       {pasting && (
         <form className={styles.paste} onSubmit={submitPaste} noValidate aria-label={t("cv.paste.form")}>
           <label htmlFor={pasteId} className={controls.label}>{t("cv.paste.label")}</label>
-          <textarea id={pasteId} className={controls.textarea} rows={10} value={text} disabled={busy}
-            aria-invalid={overCap || pasteRefusal !== null}
-            aria-describedby={pasteRefusal === null ? sizeId : `${sizeId} ${pasteErrorId}`}
-            onChange={(event) => { setText(event.target.value); setPasteRefusal(null); }} />
-          <p id={sizeId} className={cx(styles.size, overCap && styles.over)}>
-            {t("cv.paste.size", { size: format.number(bytes), max })}
-          </p>
-          {pasteRefusal !== null && (
-            <p id={pasteErrorId} role="alert" className={controls.error}>
-              {pasteRefusal === "empty" ? t("cv.paste.empty") : t("cv.paste.too_large", { max })}
+          <textarea ref={pasteArea} id={pasteId} className={controls.textarea} rows={10} value={text} disabled={busy}
+            aria-invalid={tooLong} aria-describedby={tooShort || tooLong ? `${sizeId} ${limitId}` : sizeId}
+            onChange={(event) => { setText(event.target.value); }} />
+          <div className={styles.meter}>
+            {(tooShort || tooLong) && (
+              <p id={limitId} className={tooLong ? controls.error : styles.hint}>
+                {tooLong ? t("cv.paste.too_long", { max }) : t("cv.paste.too_short", { min: format.number(PASTE_MIN) })}
+              </p>
+            )}
+            <p id={sizeId} className={cx(styles.size, tooLong && styles.over)}>
+              {t("cv.paste.count", { count: chars, n: format.number(chars), max })}
             </p>
-          )}
+          </div>
           {paste.error !== null && <Refusal error={paste.error} />}
-          <button type="submit" className={controls.primary} disabled={busy} aria-busy={paste.isPending}>
+          <button type="submit" className={controls.primary} disabled={busy || !pastable} aria-busy={paste.isPending}>
             {t("cv.paste.submit")}
           </button>
         </form>
