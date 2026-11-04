@@ -17,9 +17,10 @@ The sorts are namespaced by their list (D35): `GOLDEN_CASES_SORT` is `golden_cas
   (`None` on the last page) (M4 Task 10).
 - A job cursor (`JobCursor`, `encode_job_cursor` / `decode_job_cursor`) is `desc`, in the `scored` or
   `unscored` section of a score sort or the `all` section of a date sort, with the last row's sort value, its
-  job id, the ranking generation `gen` of the first page and `posted_after`, the absolute cut-off of the
-  request's relative date filter, fixed by the first page. The filters' hash is computed with that cut-off,
-  never with the time of the next request (B31).
+  job id, the ranking generation `gen` of the first page, and `posted_after` and `posted_before`, the absolute
+  bounds of the request's date filter, fixed by the first page: a relative window's cut-off, and a `custom`
+  window's midnights in `display.timezone`. The filters' hash is computed with those bounds, never with the
+  time of the next request nor the zone it would read (B31).
 
 A decoder refuses with 400 `invalid_cursor` anything but a cursor this server signed for that list and those
 filters: a malformed one, a bad signature, another cursor version, sort, direction, section or
@@ -37,7 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Final, Literal, TypeIs
 
 from jobhunter.api.errors import Problem
 from jobhunter.config import AppConfig
@@ -231,8 +232,9 @@ class JobCursor:
     (`"71.50"`); in the `unscored` section its similarity (a number in [-1, 1]) or `None`; under the date
     sorts (section `all`) its time as an ISO-8601 UTC string with microseconds, or `None` for `posted` (an
     unknown posting date sorts last). `job_id` is that row's job id (at least 1), `gen` the ranking generation
-    of the first page (at least 0), `posted_after` the cut-off the filters' hash is computed with: `None`, or
-    an ISO-8601 UTC time as `last_value` is under the date sorts.
+    of the first page (at least 0), `posted_after` and `posted_before` the bounds of the posted window that
+    the filters' hash is computed with: each `None` (no bound), or an ISO-8601 UTC time as `last_value` is
+    under the date sorts.
 
     A cursor that breaks these rules (a section its sort lacks, a value of the wrong shape, a `bool` for a
     number) cannot be made: `ValueError`.
@@ -244,6 +246,7 @@ class JobCursor:
     job_id: int
     gen: int
     posted_after: str | None
+    posted_before: str | None = None
 
     def __post_init__(self) -> None:
         if not _holds(self):
@@ -269,7 +272,7 @@ def _holds(c: JobCursor) -> bool:
         return False
     if not (_count(c.job_id, 1) and _count(c.gen, 0)):
         return False
-    if not (c.posted_after is None or _utc_time(c.posted_after)):
+    if not all(bound is None or _utc_time(bound) for bound in (c.posted_after, c.posted_before)):
         return False
     value = c.last_value
     match c.section:
@@ -285,7 +288,7 @@ def _holds(c: JobCursor) -> bool:
 
 def encode_job_cursor(c: JobCursor, *, filters_hash: str, key: bytes) -> str:
     """The signed cursor of a Jobs list page that ends at `c`; `filters_hash` is the hash of the request's
-    filters with `c.posted_after` as the cut-off."""
+    filters with `c.posted_after` and `c.posted_before` as the window's bounds."""
     return _encode(
         {
             "v": CURSOR_VERSION,
@@ -296,19 +299,27 @@ def encode_job_cursor(c: JobCursor, *, filters_hash: str, key: bytes) -> str:
             "job_id": c.job_id,
             "gen": c.gen,
             "posted_after": c.posted_after,
+            "posted_before": c.posted_before,
             "filters_hash": filters_hash,
         },
         key=key,
     )
 
 
+def _bound(value: object) -> TypeIs[str | None]:
+    """Whether `value` is a window bound of a cursor body: `None` or a UTC time."""
+    return value is None or (isinstance(value, str) and _utc_time(value))
+
+
 def decode_job_cursor(
-    cursor: str, *, key: bytes, sort: JobSort, filters_hash: Callable[[str | None], str]
+    cursor: str, *, key: bytes, sort: JobSort, filters_hash: Callable[[str | None, str | None], str]
 ) -> JobCursor:
     """The position of a cursor `encode_job_cursor` made for this sort and the request's filters, whose hash
-    `filters_hash` computes from the cursor's own `posted_after` (B31); else 400 `invalid_cursor`."""
+    `filters_hash` computes from the cursor's own `posted_after` and `posted_before` (B31); else 400
+    `invalid_cursor`."""
     body = _decode(cursor, key=key)
     section, last_key, posted_after = body.get("section"), body.get("last_key"), body.get("posted_after")
+    posted_before = body.get("posted_before")
     job_id, gen = body.get("job_id"), body.get("gen")
     if (
         body.get("sort") != f"jobs.{sort}"
@@ -319,8 +330,8 @@ def decode_job_cursor(
         or len(last_key) != 1
         or not isinstance(job_id, int)
         or not isinstance(gen, int)
-        or not (posted_after is None or (isinstance(posted_after, str) and _utc_time(posted_after)))
-        or body.get("filters_hash") != filters_hash(posted_after)  # asked only with a valid cut-off
+        or not (_bound(posted_after) and _bound(posted_before))
+        or body.get("filters_hash") != filters_hash(posted_after, posted_before)  # asked with valid bounds
     ):
         raise invalid_cursor()
     last_value = last_key[0]
@@ -334,6 +345,7 @@ def decode_job_cursor(
             job_id=job_id,
             gen=gen,
             posted_after=posted_after,
+            posted_before=posted_before,
         )
     except ValueError:
         raise invalid_cursor() from None

@@ -70,7 +70,7 @@ inside a savepoint that a `NotPrepared` rolls back, so nothing of a batch that i
    a `BudgetExhausted` there is a bug and fails the operation), each item's `llm_call_id`, and the
    submission's `request_count`, `request_hash` (SHA-256 over its items sorted by `custom_id`, each
    `custom_id ‖ SHA-256(canonical params)`), `reserved_usd` and `followup_held_usd = m x hold`;
-10. `bulk.add_hold(m x hold)`; 11. `ranking.bump`.
+10. `bulk.add_hold(m x hold)`; no ranking bump (below, the ranking generation).
 `hold` is `bulk.hold_per_item` of the active evaluation policy and model policy; the ledger's
 `prompt_template_version` is the rendered prompt's own.
 
@@ -85,7 +85,7 @@ charged and its target's `charged_attempts + 1`, R6, Deviation 13; the target ro
 **The recording transactions** (steps 4a-4c) share one shape in the schedule's order (Codex r2 B7, B13):
 `active_config FOR SHARE`, the operation owner, the submission `FOR UPDATE` under `state = 'submit_started'`
 and its claim, then the month row and the ledger entries, the bulk row, the targets, then the attempts (the
-order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c), and `ranking_state`.
+order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c); no ranking bump (below).
 Attempts move only while `running` (`transition_where`, zero rows is fine), so an attempt a supersession ended
 keeps its outcome and no accounting of an item depends on it. The handler runs the recording in a transaction
 of its own, retried on a retryable database error (`graphs.sanitize.is_retryable_db_error`: a deadlock, a
@@ -115,7 +115,7 @@ callers are the recovery of a lost execution and `submit_start`, which holds it)
 each entry released (`release_never_dispatched`: the calls `cancelled`, the counters and the bulk debit
 credited); the items' holds released; the submission's `in_batch` targets → `pending`; the attempts still
 `running` → `cancelled('batch_abandoned')` (A2 B10, Deviation 12; the targets first, T16-c); the follow-on;
-`ranking.bump`.
+no ranking bump (below).
 
 **The recovery of a lost execution** (`recover_lost`, Codex r1 #23, r2 B12, r3 B2, B3): every `preparing` or
 `submit_started` submission (of `operation_id`, when given) whose operation is not `running` under the claim
@@ -173,8 +173,14 @@ the batch pin (a cancelled one untouched; their bulk rows first, P52) before the
 `released` (a superseded one keeps `cancelled`; T16-c's order); the alerts of the locked state resolved
 (`batch.submit_ambiguous_unresolved` for a quarantine; `batch.retrieve_failing`, and the 25 h alert should
 one be open, for a lost batch); the follow-on (it fires for a release, and never again when the submission is
-reconciled later); `ranking.bump` last. A released quarantine stays the ambiguous reconciliation's to find
-for 29 days (`batch_adoption`), a released lost batch the poll's (`batch_results`), by its provider id.
+reconciled later); no ranking bump (below). A released quarantine stays the ambiguous reconciliation's to
+find for 29 days (`batch_adoption`), a released lost batch the poll's (`batch_results`), by its provider id.
+
+**The ranking generation** (spec §7.1, B30): the preparation, a rejection, an abandon and a
+release move their targets `pending → in_batch` or `in_batch → pending` only (a cancelled target is left as
+it is), within the unscored bucket of the Jobs list (`ranking.crosses_bucket`), so none of them changes what a
+page shows and none bumps. `rerequest`'s exhaustion sweep (`pending → failed_attempts_exhausted`) crosses into
+the failed bucket and bumps, last.
 
 **The quarantined spend** (`quarantined_usd`, S:L1199, Ruling P31): Σ `reserved_usd` of the `submit_ambiguous`
 submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_batch_usd`, and the context of
@@ -865,8 +871,7 @@ async def _fill(
             "s": submission_id,
         },
     )
-    await bulk.add_hold(conn, bulk_operation_id, held)  # 10.
-    await ranking.bump(conn)  # 11. step 11, last
+    await bulk.add_hold(conn, bulk_operation_id, held)  # 10. (no bump: within the unscored bucket)
     log.info(
         "batch_prepared",
         submission_id=submission_id,
@@ -1079,7 +1084,6 @@ async def record_rejected(
         await raise_auth_failed(conn, http_status=rejected.status)
     # a not-sent rejection's follow-on is the reconciler's (Ruling T16-f): the provider asked for time
     requested = await follow_on(conn, submission_id=submission_id, defer=defer, request=not rejected.not_sent)
-    await ranking.bump(conn)  # step 11, last
     log.warning(
         "batch_submit_rejected",
         submission_id=submission_id,
@@ -1137,7 +1141,6 @@ async def abandon(
     moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "cancelled", ABANDONED_DETAIL)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
-    await ranking.bump(conn)  # step 11, last
     log.warning(
         "batch_abandoned",
         submission_id=submission_id,
@@ -1350,7 +1353,6 @@ async def release(
         if await resolve_alert(conn, code=code, subject=str(submission_id)):
             resolved.append(code)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
-    await ranking.bump(conn)  # step 11, last
     reserved = Decimal(locked.reserved_usd)
     log.warning(
         "batch_released",

@@ -72,10 +72,9 @@ most `_LOCK_ROUNDS`, then `CoMemberChanged`). Every decision reads its rows afte
 relies on the member rows its caller locked in the ordered statement (`held`; `InvariantViolation` for a
 member that is not held, before anything is written). So no transaction ever waits for a company lock while
 it holds job rows, and a merge and a regroup of one company cannot deadlock: the second waits on the job
-rows. `split_member` and `confirm_group` (user actions) take no advisory lock either: their job rows (the
-group's members), then the group row; `confirm_group` takes `active_config` `FOR SHARE` before them. They
-lock in one round: a group whose members changed between the read and the lock is `CoMemberChanged`,
-and the user's request is sent again.
+rows. `split_member` and `confirm_group` (user actions) take no advisory lock either: `active_config` `FOR
+SHARE`, then their job rows (the group's members), then the group row. They lock in one round: a group whose
+members changed between the read and the lock is `CoMemberChanged`, and the user's request is sent again.
 
 **`group_representatives`** (cadence `heavy`, §17.4): the active groups that break §7.17 #4, read with §8.7's
 eligibility (A1 issue 27: a representative that is not an eligible member, a failed, refused, expired,
@@ -877,11 +876,14 @@ async def _lock_group(
 async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> None:
     """The user splits the member off the group (§8.7): `dedup_decisions(different, user_split)` against every
     other member, the member leaves, and a group left with one member is `dissolved` (`split`); a group whose
-    representative left re-elects (`split`) and revalidates. Its last statement bumps the ranking.
+    representative left re-elects (`split`) and revalidates. `active_config FOR SHARE` is its first lock (the
+    schedule's step 2, as `confirm_group`'s), before any job or target row: the deferred targets it settles
+    move under the configuration they were read with. Its last statement bumps the ranking.
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for a group that is not
     active or a job that is not its member, and `CoMemberChanged` for a group whose members changed
     while they were locked, having written nothing."""
+    await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
     group, member_ids, _ = await _lock_group(conn, group_id, (job_id,))
     if job_id not in member_ids:
         raise InvariantViolation(f"job {job_id} is not a member of duplicate group {group_id}")

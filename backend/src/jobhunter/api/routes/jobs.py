@@ -13,9 +13,10 @@ order, a location id that is no gazetteer id, a NUL), is 422 `validation_failed`
   (`db.snapshot.read_snapshot`) holds the generation, the page (`jobs.listing.select_page`) and its cards
   (`jobs.cards.build_cards`), so `ranking_generation`, the snapshot's, describes exactly the rows of the
   page. A first page resolves the posted window at `utcnow()` (a `custom` one in `display.timezone`), stamps
-  its cursor with that generation (`gen`) and the window's lower bound (`posted_after`), and has the capped
-  `counts`; a later page takes `gen` and `posted_after` from its cursor, so its filters' hash, its cut-off
-  and its banner refer to the first page (B31), and has no counts. `ranking_changed` is whether the
+  its cursor with that generation (`gen`) and the window's bounds (`posted_after`, `posted_before`), and has
+  the capped `counts`; a later page takes `gen` and both bounds from its cursor, so its filters' hash, its
+  window and its banner refer to the first page whatever the clock or the zone then (B31), and has no
+  counts. `ranking_changed` is whether the
   snapshot's generation is above the cursor's `gen` (§14.3: the "Ranking changed" banner); `next_cursor`
   keeps the first page's `gen`. A cursor this list did not sign for this sort and these filters, or whose
   position no page of the sort ends at, is 400 `invalid_cursor`.
@@ -228,6 +229,11 @@ def _position(cursor: JobCursor) -> Position:
             )
 
 
+def _moment(bound: str | None) -> datetime | None:
+    """A window bound a cursor carries, as an instant."""
+    return None if bound is None else datetime.fromisoformat(bound)
+
+
 def _cursor_value(position: Position) -> str | float | None:
     match position.value:
         case Decimal():
@@ -278,14 +284,11 @@ async def list_jobs(
         gen, after = current, None
         if cursor is not None:
 
-            def hashed(cut_off: str | None) -> str:
-                moment = None if cut_off is None else datetime.fromisoformat(cut_off)
-                return jobs_filters_hash(query, posted_after=moment)
+            def hashed(lower: str | None, upper: str | None) -> str:
+                return jobs_filters_hash(query, posted_after=_moment(lower), posted_before=_moment(upper))
 
             decoded = decode_job_cursor(cursor, key=key, sort=query.sort, filters_hash=hashed)
-            posted_after = (
-                None if decoded.posted_after is None else datetime.fromisoformat(decoded.posted_after)
-            )
+            posted_after, posted_before = _moment(decoded.posted_after), _moment(decoded.posted_before)
             gen, after = decoded.gen, _position(decoded)
         try:
             selection = await select_page(
@@ -305,9 +308,12 @@ async def list_jobs(
             job_id=selection.next.job_id,
             gen=gen,
             posted_after=None if posted_after is None else _utc_iso(posted_after),
+            posted_before=None if posted_before is None else _utc_iso(posted_before),
         )
         next_cursor = encode_job_cursor(
-            position, filters_hash=jobs_filters_hash(query, posted_after=posted_after), key=key
+            position,
+            filters_hash=jobs_filters_hash(query, posted_after=posted_after, posted_before=posted_before),
+            key=key,
         )
     return JobsPageOut(
         items=items,

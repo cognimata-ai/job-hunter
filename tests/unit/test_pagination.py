@@ -3,7 +3,8 @@
 
 A list cursor (`encode_list_cursor`) carries its list's namespaced sort, so one list never accepts another's
 cursor; a job cursor (`encode_job_cursor`) carries its section, the sort value of its last row, the job id,
-the ranking generation and the `posted_after` cut-off the filters' hash is computed with.
+the ranking generation and the posted window's bounds, `posted_after` and `posted_before`, the filters' hash
+is computed with.
 """
 
 import base64
@@ -183,12 +184,12 @@ def test_a_list_cursor_needs_the_all_section_and_a_list_key(change: dict[str, An
 )
 def test_malformed_cursors_are_refused(cursor: str) -> None:
     refused(lambda: decode_list(cursor))
-    refused(lambda: decode_job_cursor(cursor, key=KEY, sort="score_mid", filters_hash=lambda _: "h"))
+    refused(lambda: decode_job_cursor(cursor, key=KEY, sort="score_mid", filters_hash=lambda *_: "h"))
 
 
 def test_a_signed_body_that_is_no_object_is_refused() -> None:
     refused(lambda: decode_list(sign([2])))
-    refused(lambda: decode_job_cursor(sign([2]), key=KEY, sort="posted", filters_hash=lambda _: "h"))
+    refused(lambda: decode_job_cursor(sign([2]), key=KEY, sort="posted", filters_hash=lambda *_: "h"))
 
 
 def test_filters_hash_is_the_canonical_json_digest() -> None:
@@ -304,19 +305,20 @@ def test_cursor_key_is_hkdf_of_the_session_secret() -> None:
 # ---- the job cursors ---------------------------------------------------------------------------------------
 
 POSTED_AFTER = "2026-10-19T12:00:00.000000+00:00"
+POSTED_BEFORE = "2026-10-31T23:00:00.000000+00:00"
 
 
-def job_filters_hash(posted_after: str | None) -> str:
-    """The jobs list's filters with the cut-off the cursor carries (B31)."""
-    return filters_hash({"remote": True, "posted_after": posted_after})
+def job_filters_hash(posted_after: str | None, posted_before: str | None = None) -> str:
+    """The jobs list's filters with the window's bounds the cursor carries (B31)."""
+    return filters_hash({"remote": True, "posted_after": posted_after, "posted_before": posted_before})
 
 
 def job_cursor(c: JobCursor) -> str:
-    return encode_job_cursor(c, filters_hash=job_filters_hash(c.posted_after), key=KEY)
+    return encode_job_cursor(c, filters_hash=job_filters_hash(c.posted_after, c.posted_before), key=KEY)
 
 
 def decode_job(
-    cursor: str, sort: JobSort, hash_of: Callable[[str | None], str] = job_filters_hash
+    cursor: str, sort: JobSort, hash_of: Callable[[str | None, str | None], str] = job_filters_hash
 ) -> JobCursor:
     return decode_job_cursor(cursor, key=KEY, sort=sort, filters_hash=hash_of)
 
@@ -332,6 +334,8 @@ ROUND_TRIPS = [
     JobCursor("posted", "all", None, 5, 2, None),
     JobCursor("first_seen", "all", "2026-10-26T12:00:00.000001+00:00", 8, 9, None),
     JobCursor("first_seen", "all", "2026-10-26T12:00:00Z", 8, 9, POSTED_AFTER),
+    JobCursor("score_mid", "scored", "71.50", 4711, 1834, POSTED_AFTER, POSTED_BEFORE),  # a custom window
+    JobCursor("posted", "all", "2026-10-26T12:00:00.123456+00:00", 5, 2, POSTED_AFTER, POSTED_BEFORE),
 ]
 
 
@@ -348,7 +352,8 @@ def test_job_cursor_round_trips_per_sort_and_section(c: JobCursor) -> None:
         "job_id": c.job_id,
         "gen": c.gen,
         "posted_after": c.posted_after,
-        "filters_hash": job_filters_hash(c.posted_after),
+        "posted_before": c.posted_before,
+        "filters_hash": job_filters_hash(c.posted_after, c.posted_before),
     }
     for other in get_args(JobSort):
         if other != c.sort:
@@ -443,7 +448,7 @@ def test_job_cursor_refuses_a_posted_after_that_is_no_utc_time(posted_after: JSO
     template = body_of(job_cursor(ROUND_TRIPS[6]))
     asked: list[str | None] = []
 
-    def any_cut_off(cut_off: str | None) -> str:
+    def any_cut_off(cut_off: str | None, upper: str | None) -> str:
         asked.append(cut_off)
         return cast(str, template["filters_hash"])
 
@@ -487,16 +492,40 @@ def test_job_cursor_hash_is_checked_with_its_own_posted_after() -> None:
     hash is computed from the cursor's `posted_after`, never from the time the next page is requested."""
     c = ROUND_TRIPS[6]
     cursor = job_cursor(c)
-    asked: list[str | None] = []
+    asked: list[tuple[str | None, str | None]] = []
 
-    def recording(posted_after: str | None) -> str:
-        asked.append(posted_after)
-        return job_filters_hash(posted_after)
+    def recording(posted_after: str | None, posted_before: str | None) -> str:
+        asked.append((posted_after, posted_before))
+        return job_filters_hash(posted_after, posted_before)
 
     assert decode_job(cursor, "posted", recording) == c
-    assert asked == [POSTED_AFTER]
+    assert asked == [(POSTED_AFTER, None)]
     moved = sign({**body_of(cursor), "posted_after": "2026-10-20T12:00:00.000000+00:00"})
     refused(lambda: decode_job(moved, "posted"))  # another cut-off than the hash was made with
-    other_filters = lambda pa: filters_hash({"remote": False, "posted_after": pa})  # noqa: E731
+    other_filters = lambda pa, pb: filters_hash({"remote": False, "posted_after": pa, "posted_before": pb})  # noqa: E731
     refused(lambda: decode_job(cursor, "posted", other_filters))
     refused(lambda: decode_job(sign({**body_of(cursor), "posted_after": None}), "posted"))
+
+
+def test_job_cursor_hash_is_checked_with_its_own_posted_before() -> None:
+    """B31: a `custom` window's upper bound (midnight after `posted_to` in `display.timezone`) is fixed by the
+    first page and travels in the cursor too, so a later change of the zone never moves a continued page's
+    window: the hash is computed from the cursor's `posted_before`, and a cursor whose upper bound moved, or
+    that lost it, is refused."""
+    c = ROUND_TRIPS[-1]
+    cursor = job_cursor(c)
+    asked: list[tuple[str | None, str | None]] = []
+
+    def recording(posted_after: str | None, posted_before: str | None) -> str:
+        asked.append((posted_after, posted_before))
+        return job_filters_hash(posted_after, posted_before)
+
+    assert decode_job(cursor, "posted", recording) == c
+    assert asked == [(POSTED_AFTER, POSTED_BEFORE)]
+    moved: JSONValue
+    for moved in ("2026-11-01T00:00:00.000000+00:00", None, 5, "2026-10-31T23:00:00.000000", "tomorrow"):
+        forged = sign({**body_of(cursor), "posted_before": moved})
+        refused(partial(decode_job, forged, "posted"))  # moved, lost, or no UTC time
+    for malformed in (5, "2026-10-31T23:00:00.000000", "2026-11-01T00:00:00.000000+01:00", "tomorrow"):
+        with pytest.raises(ValueError):
+            JobCursor("posted", "all", None, 5, 2, POSTED_AFTER, cast(Any, malformed))

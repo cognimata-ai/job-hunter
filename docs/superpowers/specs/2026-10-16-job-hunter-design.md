@@ -5097,10 +5097,10 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
   ```json
   {"v": 2, "sort": "jobs.score_mid", "dir": "desc", "section": "scored",
    "last_key": ["71.50"], "job_id": 4711, "gen": 1834,
-   "posted_after": "2026-10-05T09:12:00.000000+00:00", "filters_hash": "…"}
+   "posted_after": "2026-10-05T09:12:00.000000+00:00", "posted_before": null, "filters_hash": "…"}
   ```
 
-  `section` is `scored` or `unscored` for the score sorts and `all` for the date sorts. The cursor's `sort` is namespaced (`"jobs.score_mid"`, and `"<list>.<key>"` for the other lists). `last_key` holds the sort value of the last row: a score as a fixed-point string (`"71.50"`), a similarity as a number or `null`, a time as ISO-8601 (`null` for an unknown posting date). The cursor carries `posted_after`, the absolute cutoff the first page resolved, and `filters_hash` covers it and the normalised filters (defaults applied, sets sorted and de-duplicated).
+  `section` is `scored` or `unscored` for the score sorts and `all` for the date sorts. The cursor's `sort` is namespaced (`"jobs.score_mid"`, and `"<list>.<key>"` for the other lists). `last_key` holds the sort value of the last row: a score as a fixed-point string (`"71.50"`), a similarity as a number or `null`, a time as ISO-8601 (`null` for an unknown posting date). The cursor carries `posted_after` and `posted_before`, the absolute bounds the first page resolved (a relative window's cutoff and no upper bound; a custom window's midnights in `display.timezone`, so a later change of the zone never moves a continued page's window), and `filters_hash` covers them and the normalised filters (defaults applied, sets sorted and de-duplicated).
 - The server rejects a cursor whose signature is invalid, or whose `filters_hash` differs from the request's filters: 400 `invalid_cursor`.
 - **Ordering and section predicates**:
 

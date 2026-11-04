@@ -65,22 +65,33 @@ def test_equivalent_queries_hash_equal() -> None:
         jobs_filters_hash(bare, posted_after=after),
         jobs_filters_hash(bare, posted_after=after + timedelta(microseconds=1)),
         jobs_filters_hash(bare, posted_after=None),
+        jobs_filters_hash(bare, posted_after=after, posted_before=NOW),
         jobs_filters_hash(JobsQuery(status=["unseen"]), posted_after=after),
         jobs_filters_hash(JobsQuery(loc=BERLIN), posted_after=after),
         jobs_filters_hash(JobsQuery(q="python"), posted_after=after),
     }
-    assert len(hashes) == 6
+    assert len(hashes) == 7
+    # a custom window's upper bound: the same instant in any zone, another instant another hash
+    custom = JobsQuery(posted="custom", posted_from=date(2026, 10, 1), posted_to=date(2026, 10, 31))
+    upper = datetime(2026, 10, 31, 23, 0, tzinfo=UTC)
+    assert jobs_filters_hash(custom, posted_after=after, posted_before=upper) == jobs_filters_hash(
+        custom, posted_after=after, posted_before=upper.astimezone(ZoneInfo("Europe/Berlin"))
+    )
+    assert jobs_filters_hash(custom, posted_after=after, posted_before=upper) != jobs_filters_hash(
+        custom, posted_after=after, posted_before=upper + timedelta(hours=1)
+    )
 
 
 def test_normalized_filters_list_every_filter_but_the_sort() -> None:
     after = NOW - timedelta(days=30)
     filters = normalized_filters(JobsQuery(work_mode=["remote", "hybrid"], loc=BERLIN), posted_after=after)
     assert "sort" not in filters
-    assert set(filters) == (set(JobsQuery.model_fields) - {"sort"}) | {"posted_after"}
+    assert set(filters) == (set(JobsQuery.model_fields) - {"sort"}) | {"posted_after", "posted_before"}
     assert filters["work_mode"] == ["hybrid", "remote"]
     assert filters["status"] == ["applied", "saved", "seen", "unseen"]
     assert filters["company"] == []
     assert filters["posted_after"] == "2026-10-03T09:30:00.000000+00:00"
+    assert filters["posted_before"] is None  # a relative window has no upper bound
     assert filters["loc"] == BERLIN
     assert filters["posted_from"] is None
 

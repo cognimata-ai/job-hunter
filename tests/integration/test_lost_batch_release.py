@@ -291,10 +291,11 @@ async def test_a_lost_batch_release_frees_targets_and_keeps_the_spend_ambiguous(
     """The release of a lost batch is the quarantined release's (L5045): `submitted → released` with its
     provider id kept, every entry `dispatched → ambiguous` (the call `batch_released`) at the amount Needs
     attention showed and the 202 states, the holds released, the targets `pending`, the attempts `released`,
-    `batch.retrieve_failing` resolved, the follow-on requested once, the ranking bumped; the singleton is
-    free: the follow-on submits a new batch of the same targets. The money: the month row's counters and the
-    bulk operation's `spent_usd` are what the entries count at before and after, the release changes neither
-    (the reservation stays counted), and the bulk's follow-up hold drops from the submission's to 0."""
+    `batch.retrieve_failing` resolved, the follow-on requested once, the ranking not bumped (the targets stay
+    in the unscored bucket, B30); the singleton is free: the follow-on submits a new batch of the same
+    targets. The money: the month row's counters and the bulk operation's `spent_usd` are what the entries
+    count at before and after, the release changes neither (the reservation stays counted), and the bulk's
+    follow-up hold drops from the submission's to 0."""
     s = lost.submission_id
     setup = lost.batch.setup
     await lost_and_alerted(engine, fake_llm, lost)
@@ -330,7 +331,7 @@ async def test_a_lost_batch_release_frees_targets_and_keeps_the_spend_ambiguous(
     assert all(i.hold_released_at is not None for i in (await item_rows(engine)).values())
     assert await open_alert_codes(engine) == []  # the alert resolved
     assert await retrieve_failing_at(logged_in_client, monkeypatch, lost.after) == EMPTY
-    assert await generation(engine) > before  # the ranking bumped
+    assert await generation(engine) == before  # `in_batch → pending`: no bump (B30)
     (follow_on,) = follow_ons_of(await operations_of(engine, "batch_submit"), s)
 
     fake_llm.batches(BatchScript(create="ok", polls_until_ended=5))

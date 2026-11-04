@@ -10,8 +10,9 @@ key that holds one; a location number that is out of range, NaN or infinite. No 
 
 `resolve_window` turns the posted window into absolute UTC bounds, fixed once per first page: a relative
 window ends at the request's `now`; a `custom` one runs from midnight of `posted_from` to midnight after
-`posted_to` in `display.timezone` (B31). `normalized_filters` is every filter but the sort with its defaults
-applied, each set as a sorted list without repeats, and `posted_after` as an ISO-8601 UTC time with
+`posted_to` in `display.timezone` (B31). The cursor carries both bounds, so a later page keeps them whatever
+the clock or the zone then. `normalized_filters` is every filter but the sort with its defaults applied, each
+set as a sorted list without repeats, and `posted_after` and `posted_before` as ISO-8601 UTC times with
 microseconds, so equivalent requests hash equal (`jobs_filters_hash`, B7). `score_filter_active` is whether
 any score filter is off its default: then only scored cards are listed (B15).
 """
@@ -170,10 +171,12 @@ def resolve_window(q: JobsQuery, *, now: datetime, tz: str) -> tuple[datetime | 
             return now.astimezone(UTC) - _WINDOWS[window], None
 
 
-def _iso_utc(moment: datetime) -> str:
-    """The one spelling of an instant in the hash: UTC, microseconds, `+00:00`."""
+def _iso_utc(moment: datetime | None) -> str | None:
+    """The one spelling of a window bound in the hash: UTC, microseconds, `+00:00`; `None` for no bound."""
+    if moment is None:
+        return None
     if moment.utcoffset() is None:
-        raise ValueError("posted_after must be timezone-aware")
+        raise ValueError("a window bound must be timezone-aware")
     return moment.astimezone(UTC).isoformat(timespec="microseconds")
 
 
@@ -191,17 +194,26 @@ def _normalized(value: object) -> JSONValue:
     raise TypeError(f"not a filter value: {type(value).__name__}")
 
 
-def normalized_filters(q: JobsQuery, *, posted_after: datetime | None) -> dict[str, JSONValue]:
-    """Every filter of `q` but `sort`, defaults applied, each set a sorted list without repeats, and
-    `posted_after` as an ISO-8601 UTC time with microseconds (`None` when the window has no lower bound)."""
+def normalized_filters(
+    q: JobsQuery, *, posted_after: datetime | None, posted_before: datetime | None = None
+) -> dict[str, JSONValue]:
+    """Every filter of `q` but `sort`, defaults applied, each set a sorted list without repeats, and the
+    window's bounds `posted_after` and `posted_before` as ISO-8601 UTC times with microseconds (`None` for a
+    bound the window lacks: every window but `custom` has no upper one)."""
     filters = {name: _normalized(getattr(q, name)) for name in type(q).model_fields if name != "sort"}
-    filters["posted_after"] = None if posted_after is None else _iso_utc(posted_after)
+    filters["posted_after"] = _iso_utc(posted_after)
+    filters["posted_before"] = _iso_utc(posted_before)
     return filters
 
 
-def jobs_filters_hash(q: JobsQuery, *, posted_after: datetime | None) -> str:
-    """The cursor's `filters_hash` of `q` with the cut-off `posted_after` (B7, B31)."""
-    filters: dict[str, JSONValue | Decimal] = dict(normalized_filters(q, posted_after=posted_after))
+def jobs_filters_hash(
+    q: JobsQuery, *, posted_after: datetime | None, posted_before: datetime | None = None
+) -> str:
+    """The cursor's `filters_hash` of `q` with the window's bounds `posted_after` and `posted_before` (B7,
+    B31)."""
+    filters: dict[str, JSONValue | Decimal] = dict(
+        normalized_filters(q, posted_after=posted_after, posted_before=posted_before)
+    )
     return filters_hash(filters)
 
 

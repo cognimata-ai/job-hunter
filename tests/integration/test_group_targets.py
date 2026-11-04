@@ -10,17 +10,19 @@ r1 #36, r3 B14, A1 issue 27).
 - **Deferral**: `groups.deferrable` (entering deferral: not the representative, `override = 'none'`, not
   `score_individually`, no conflicting fact, the target `pending` or `budget_deferred`) and the persistent
   `groups.deferral_eligible` (staying deferred) agree with the regroup sweep's SQL.
-- **Group events**: a split member's deferred target returns to `pending`; a representative change keeps a
-  deferred member deferred while `deferral_eligible` holds against the new representative and returns it to
-  `pending` otherwise; a full-text twin is elected (also one without a target yet) and is an always-include
-  candidate; a representative whose new revision has no target yet is not re-elected; a member that leaves on
-  a revalidation has its deferred target returned to `pending`, and one merged away has it cancelled
-  `job_merged` (merge step 4, before it leaves the group in step 5; M3 Task 22).
+- **Group events**: a split member's deferred target returns to `pending`, the split holding `active_config`
+  `FOR SHARE` before any job row (the lock schedule's step 2, as `confirm_group`); a representative change
+  keeps a deferred member deferred while `deferral_eligible` holds against the new representative and returns
+  it to `pending` otherwise; a full-text twin is elected (also one without a target yet) and is an
+  always-include candidate; a representative whose new revision has no target yet is not re-elected; a member
+  that leaves on a revalidation has its deferred target returned to `pending`, and one merged away has it
+  cancelled `job_merged` (merge step 4, before it leaves the group in step 5; M3 Task 22).
 
 Groups of canonical jobs (`tests.support.groups.canonical_job`) pass G1-G5 with one another; the others are
 `tests.support.m3` jobs with membership rows written directly. Every datum is invented.
 """
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import timedelta
@@ -48,6 +50,8 @@ from tests.support.m3 import (
     insert_published,
     insert_submission,
 )
+from tests.support.pg import PgServer, lock_wait_details
+from tests.support.procs import await_until
 from tests.support.scoring import (
     activate_score_tuple,
     member_group,
@@ -66,6 +70,8 @@ _GROUP: Final = sa.text(
 _CURRENT_REVISION: Final = sa.text("SELECT current_revision_id FROM jobs WHERE id = :j")
 _FLAG: Final = sa.text("UPDATE duplicate_group_members SET score_individually = true WHERE job_id = :j")
 _LOCK_JOBS: Final = sa.text("SELECT id FROM jobs WHERE id = ANY(:ids) ORDER BY id FOR UPDATE")
+_LOCK_JOB: Final = sa.text("SELECT id FROM jobs WHERE id = :j FOR UPDATE")
+_LOCK_ACTIVE_CONFIG: Final = sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
 _ELIGIBLE: Final = sa.text(
     "SELECT j.id FROM jobs j JOIN active_config ac ON ac.id = 1 "  # noqa: S608 (the module's constant)
     f"WHERE j.id = ANY(:ids) AND {ELIGIBLE_SQL} ORDER BY j.id"
@@ -605,6 +611,51 @@ async def test_a_split_member_s_deferred_target_returns_to_pending(engine, job_w
     assert (await group_row(engine, group))[0] == "dissolved"
     released = await swept_of(engine, target_q)
     assert (released.state, released.deferred_group_id) == ("pending", None)
+
+
+async def test_a_split_takes_active_config_before_any_job_row(
+    engine: AsyncEngine, job_with_postings: Any, migrated: PgServer
+) -> None:
+    """`split_member` holds `active_config FOR SHARE` (§3.3.3 step 2) before its job rows, as `confirm_group`
+    and `score_individually` do: while it waits on a member's job row that another transaction holds, a
+    configuration writer (`active_config FOR UPDATE`, a tuple activation's step 2) already queues behind it,
+    so the split's target moves are written under the configuration they were read with."""
+    make = jobs_maker(engine, job_with_postings)
+    p, s = [await make("jsearch", description_text=FULL_TEXT) for _ in "ps"]
+    group = (await regroup(engine, p)).group_id  # p and s, its only candidate
+    assert group is not None
+
+    async def split() -> None:
+        async with engine.begin() as conn:
+            await groups.split_member(conn, group, s)
+
+    def waits_on(relation: str) -> list[Any]:
+        return [w for w in lock_wait_details(migrated) if w.relation == relation]
+
+    async with engine.connect() as blocker, engine.connect() as writer:
+        await blocker.begin()
+        await blocker.execute(_LOCK_JOB, {"j": s})
+        splitting = asyncio.create_task(split())
+
+        async def on_job() -> bool:
+            return bool(waits_on("jobs")) or splitting.done()
+
+        await await_until(on_job, 10, 0.02)
+        assert not splitting.done()
+        (job_wait,) = waits_on("jobs")
+        await writer.begin()
+        writing = asyncio.create_task(writer.execute(_LOCK_ACTIVE_CONFIG))
+
+        async def writer_queued() -> bool:
+            return any(job_wait.pid in w.blocking_pids for w in waits_on("active_config")) or writing.done()
+
+        await await_until(writer_queued, 10, 0.02)
+        assert not writing.done(), "the configuration writer was not queued behind the split"
+        await blocker.rollback()
+        await asyncio.wait_for(splitting, 10)
+        await asyncio.wait_for(writing, 10)
+        await writer.rollback()
+    assert (await group_row(engine, group))[0] == "dissolved"
 
 
 async def test_a_representative_change_keeps_an_eligible_member_deferred(

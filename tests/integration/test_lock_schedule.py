@@ -768,15 +768,18 @@ async def test_abandon_and_node_9_s_cancellation_take_the_target_rows_before_the
         return await batches.abandon(conn, submission, now=utcnow())
 
     if first == "abandon":
-        async with holding(engine, _LOCK_RANKING) as blocker:  # abandon's last lock
-            abandoning = background(_in_transaction(engine, abandon))
-            assert blocker in one_wait(await waits(migrated, abandoning), "ranking_state").blocking_pids
-            assert not await free(engine, "score_targets", target.target_id)
-            cancelling = background(node_9_cancel(engine, target.job_id, target.job_revision_id))
-            wait = one_wait(await waits(migrated, abandoning, cancelling, count=2), "score_targets")
-            assert wait.key == str(target.target_id)
-            assert await free(engine, "score_attempts", attempt) is False  # abandon ended it; held
-        abandoned, cancelled = await settle(abandoning, cancelling)
+        # abandon takes no `ranking_state` (B30: `in_batch → pending` stays in the unscored bucket), so its
+        # transaction is held open once it returned, every lock taken
+        abandoned_held = Held(engine, abandon)
+        await abandoned_held.holding()
+        assert not await free(engine, "score_targets", target.target_id)
+        cancelling = background(node_9_cancel(engine, target.job_id, target.job_revision_id))
+        wait = one_wait(await waits(migrated, cancelling), "score_targets")
+        assert wait.key == str(target.target_id) and wait.blocking_pids == (abandoned_held.pid,)
+        assert await free(engine, "score_attempts", attempt) is False  # abandon ended it; held
+        assert await free(engine, "ranking_state", 1)
+        abandoned = await abandoned_held.commit()
+        (cancelled,) = await settle(cancelling)
         assert abandoned is True and (cancelled.targets, cancelled.attempts) == (1, 0)
     else:
         held = Held(

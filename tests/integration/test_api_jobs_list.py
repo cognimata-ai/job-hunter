@@ -5,11 +5,13 @@ A first page carries the snapshot's ranking generation, the capped counts and a 
 generation and the window's cut-off; a later page continues from its cursor under the same filters in any
 order of their repeated parameters, is refused as `invalid_cursor` under other filters, raises
 `ranking_changed` after a bump while its next cursor keeps the first page's generation, and keeps the first
-page's posted cut-off an hour later. The limit is bounded, both routes need a session, the facets count the
+page's posted cut-off an hour later, and both bounds of a `custom` window after a settings save that changes
+`display.timezone` alone. The limit is bounded, both routes need a session, the facets count the
 listed cards' companies and sources, and a place of `GET /api/geo/places` filters the list as it is. The
 clock is injected (`jobhunter.api.routes.jobs.utcnow`). Every datum is invented.
 """
 
+import copy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -25,6 +27,7 @@ from jobhunter.jobs.query import JobsQuery, jobs_filters_hash
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.jobs_list import BERLIN, MUNICH, Card, add_posting, place, seed_cards
+from tests.support.settings import save, settings_body
 
 pytestmark = pytest.mark.integration
 
@@ -63,9 +66,11 @@ async def get(client: httpx.AsyncClient, url: str = URL, **params: Any) -> dict[
 def decoded(api_app: JobHunterApp, cursor: str, query: JobsQuery) -> JobCursor:
     """The position of a cursor the list issued for `query`."""
 
-    def hashed(cut_off: str | None) -> str:
+    def hashed(cut_off: str | None, upper: str | None) -> str:
         return jobs_filters_hash(
-            query, posted_after=None if cut_off is None else datetime.fromisoformat(cut_off)
+            query,
+            posted_after=None if cut_off is None else datetime.fromisoformat(cut_off),
+            posted_before=None if upper is None else datetime.fromisoformat(upper),
         )
 
     return decode_job_cursor(
@@ -209,6 +214,50 @@ async def test_posted_after_is_carried_by_the_cursor(
     assert ids(two) == [edge]
     fresh = await get(logged_in_client, sort="posted", posted="24h", limit=10)
     assert ids(fresh) == [newest]  # a first page an hour later cuts it off
+
+
+async def test_a_custom_window_keeps_both_bounds_across_a_display_timezone_change(
+    logged_in_client: httpx.AsyncClient,
+    api_app: JobHunterApp,
+    engine: AsyncEngine,
+    active_tuple: int,
+    clock: list[datetime],
+) -> None:
+    """B31: a `custom` window runs from midnight to midnight in `display.timezone`; the first page resolves
+    both bounds and the cursor carries both. Page 1 under Europe/Berlin (1 to 4 November: 31 October 23:00 to
+    4 November 23:00 UTC), then a settings save that changes the zone alone, to UTC, then page 2: Berlin's
+    bounds still, so the card posted at 23:30 UTC on 4 November (inside UTC's window only) is on no page of
+    that list, and the one posted at 23:30 UTC on 31 October (inside Berlin's only) is. A first page after
+    the save resolves UTC's bounds."""
+    window = {"posted": "custom", "posted_from": "2026-11-01", "posted_to": "2026-11-04"}
+    posted = [
+        datetime(2026, 11, 3, 12, 0, tzinfo=UTC),
+        datetime(2026, 11, 4, 23, 30, tzinfo=UTC),  # inside UTC's window only
+        datetime(2026, 10, 31, 23, 30, tzinfo=UTC),  # inside Berlin's window only
+    ]
+    inside, late, early = await seed_cards(
+        engine,
+        [
+            scored(high - 20, high, posted_at=at, first_seen_at=at + timedelta(hours=1))
+            for high, at in zip((90, 70, 50), posted, strict=True)
+        ],
+    )
+    one = await get(logged_in_client, limit=1, **window)
+    assert ids(one) == [inside]
+    position = decoded(api_app, one["next_cursor"], JobsQuery.model_validate(window))
+    assert (position.posted_after, position.posted_before) == (
+        "2026-10-31T23:00:00.000000+00:00",
+        "2026-11-04T23:00:00.000000+00:00",
+    )
+    active = await settings_body(logged_in_client)
+    payload = copy.deepcopy(active["payload"])
+    assert payload["display"]["timezone"] == "Europe/Berlin"
+    payload["display"]["timezone"] = "UTC"
+    await save(logged_in_client, payload, base=int(active["version"]["id"]))
+    two = await get(logged_in_client, limit=10, cursor=one["next_cursor"], **window)
+    assert (ids(two), two["ranking_changed"]) == ([early], False)
+    fresh = await get(logged_in_client, limit=10, **window)
+    assert ids(fresh) == [inside, late]
 
 
 async def test_limit_bounds_and_401_without_session(
