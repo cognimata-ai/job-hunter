@@ -11,7 +11,7 @@
 // to the card's drawer (`href`, the Jobs URL with `job=<id>`, Ruling T24-f), a tab stop like the quick actions:
 // a plain primary click (or Enter on the link) opens it through `onOpen`, as Enter on the card does, and a
 // modifier or middle click is the browser's (a new tab).
-import { type ReactNode, useId } from "react";
+import { type ReactNode, type Ref, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { useDisplay } from "../app/display";
 import { cx } from "../components/cx";
@@ -43,6 +43,8 @@ export interface JobCardProps {
   header?: ReactNode;
   /** Shown below the card's actions, across the card (a group card's members). */
   footer?: ReactNode;
+  /** The card's <article> (a group card focuses it when a write takes its members away). */
+  ref?: Ref<HTMLElement>;
 }
 
 function Unscored({ card }: { card: JobCardOut }) {
@@ -58,7 +60,7 @@ function Unscored({ card }: { card: JobCardOut }) {
   );
 }
 
-export function JobCard({ card, focused, onOpen, href, header, footer }: JobCardProps) {
+export function JobCard({ card, focused, onOpen, href, header, footer, ref }: JobCardProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
   const { timezone } = useDisplay();
@@ -69,7 +71,8 @@ export function JobCard({ card, focused, onOpen, href, header, footer }: JobCard
   const unseen = card.user === null || card.user.seen_at === null;
   const framed = header !== undefined || footer !== undefined;
   return (
-    <article className={cx(styles.card, framed && styles.framed)} aria-labelledby={headingId} tabIndex={focused ? 0 : -1}
+    <article ref={ref} className={cx(styles.card, framed && styles.framed)} aria-labelledby={headingId}
+      tabIndex={focused ? 0 : -1}
       onKeyDown={(event) => {
         if (event.key === "Enter" && event.target === event.currentTarget) {
           event.preventDefault();

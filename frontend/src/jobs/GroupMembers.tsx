@@ -6,16 +6,19 @@
 //   no closed set to translate it from), then by job id as the api lists them. Each shows its sources, title,
 //   company and places, its completeness, availability and own state (its active-tuple target's), and "Scored
 //   individually" once the user asked for that; the drawer marks the opened job "This job". With `onOpen`, the
-//   title of every other member is a button that shows that member's detail.
+//   title of every other member is a button that shows that member's detail. A member, and the group of its
+//   actions, is named by its title and its sources, company and places, since duplicates often share a title.
 // - Split is on every member: it needs no confirmation, since a group is never formed again behind the user's
 //   back (§8.7). Score individually is on a member other than the representative not scored individually yet.
 //   Confirm as one job, once below the list while the group is active and has a representative, asks first.
 // - Split and Score individually answer the group after the write: it goes into the cached detail of each
-//   member (the representative's is the group card's), so the list changes at once, and every job query is read
-//   again (`JOBS_KEY`). Confirm answers 202: the jobs are read again, and "Merged into one job". A dissolved
-//   group (a split that left one member, or a confirmation) says "The group was dissolved" or the merge, its
-//   cached members carry the dissolved group, which the group card and the tab show as gone, and `onGone` is
-//   called first (the group card then knows the list is being read again already).
+//   member that stays (the representative's is the group card's), and a split member's says it is in no group,
+//   so the list changes at once; every job query is read again (`JOBS_KEY`), and after Score individually and
+//   Confirm the header's status too (a member becomes pending, or the merged members' targets are cancelled).
+//   Confirm answers 202: "Merged into one job". A dissolved group (a split that left one member, or a
+//   confirmation) says "The group was dissolved" or the merge, and its cached members carry the dissolved
+//   group, which the group card and the tab show as gone. `onGone` names, before the caches change, the members
+//   whose group a write ended (the group card then knows the list is being read again already).
 // - None of these routes takes an `Idempotency-Key` (§14.1). While a write runs every action of the group is
 //   disabled (`aria-busy` on the list), so writes never overlap. A retryable 409 (a concurrent change, the
 //   route's three tries spent) offers Try again, which sends the same request; any other failure is the problem
@@ -30,6 +33,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ProblemBox } from "../components/ProblemBox";
 import { useToast } from "../components/Toaster";
 import { intlLocale, useServerText } from "../i18n/index";
+import { STATUS_KEY } from "../system/api";
 import { JOBS_KEY } from "./api";
 import { detailKey, type JobDetailOut } from "./detailApi";
 import { availabilityText, type ServerText } from "./format";
@@ -63,7 +67,10 @@ function dissolved(group: GroupOut): GroupOut {
   return { ...group, status: "dissolved", representative_job_id: null, unscorable_reason: null, members: [] };
 }
 
-function useGroupWrite(group: GroupOut, onGone?: () => void): UseMutationResult<Written, ProblemError, GroupWrite> {
+function useGroupWrite(
+  group: GroupOut,
+  onGone?: (jobIds: readonly number[]) => void,
+): UseMutationResult<Written, ProblemError, GroupWrite> {
   const { t } = useTranslation();
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -82,14 +89,17 @@ function useGroupWrite(group: GroupOut, onGone?: () => void): UseMutationResult<
     },
     retry: false,
     meta: { ownToast: true }, // its failure is shown under the members
-    onSuccess: (written) => {
+    onSuccess: (written, write) => {
       const after = "group" in written ? written.group : dissolved(group);
-      if (after.status === "dissolved") {
-        onGone?.();
+      const split = write.action === "split" ? write.jobId : null; // in no group from now on
+      const members = group.members.map((member) => member.job_id);
+      const ended = after.status === "dissolved" ? members : members.filter((jobId) => jobId === split);
+      if (ended.length > 0) {
+        onGone?.(ended);
       }
-      for (const member of group.members) {
-        queryClient.setQueryData<JobDetailOut>(detailKey(member.job_id), (detail) =>
-          detail === undefined ? detail : { ...detail, group: after },
+      for (const jobId of members) {
+        queryClient.setQueryData<JobDetailOut>(detailKey(jobId), (detail) =>
+          detail === undefined ? detail : { ...detail, group: jobId === split ? null : after },
         );
       }
       if ("mergedInto" in written) {
@@ -98,6 +108,9 @@ function useGroupWrite(group: GroupOut, onGone?: () => void): UseMutationResult<
         toast({ message: t("group.dissolved") });
       }
       void queryClient.invalidateQueries({ queryKey: JOBS_KEY });
+      if (write.action !== "split") {
+        void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
+      }
     },
   });
 }
@@ -120,6 +133,8 @@ function Member({ member, electionReason, thisJob, busy, onOpen, onWrite }: Memb
   const { t, i18n } = useTranslation();
   const serverText = useServerText();
   const titleId = useId();
+  const whereId = useId();
+  const name = `${titleId} ${whereId}`; // the title, then its sources, company and places
   const { job_id: jobId } = member;
   const where = [sourceNames(member.source_ids, i18n.language, serverText), member.company, ...member.locations];
   const state = [
@@ -128,7 +143,7 @@ function Member({ member, electionReason, thisJob, busy, onOpen, onWrite }: Memb
     memberStateText(member.target_state, t, serverText),
   ];
   return (
-    <li aria-labelledby={titleId} className={styles.member}>
+    <li aria-labelledby={name} className={styles.member}>
       <p className={styles.head}>
         {onOpen !== undefined && !thisJob ? (
           <button id={titleId} type="button" className={styles.ref} onClick={() => { onOpen(jobId); }}>
@@ -149,9 +164,9 @@ function Member({ member, electionReason, thisJob, busy, onOpen, onWrite }: Memb
         {thisJob && <> <span className={styles.marker}>{t("group.this_job")}</span></>}
         {member.score_individually && <> <span className={styles.marker}>{t("group.individual")}</span></>}
       </p>
-      <p className={styles.facts}>{where.filter((part) => part !== "").join(" · ")}</p>
+      <p id={whereId} className={styles.facts}>{where.filter((part) => part !== "").join(" · ")}</p>
       <p className={styles.facts}>{state.join(" · ")}</p>
-      <div role="group" aria-labelledby={titleId} className={styles.actions}>
+      <div role="group" aria-labelledby={name} className={styles.actions}>
         <button type="button" className={styles.button} disabled={busy}
           onClick={() => { onWrite({ action: "split", jobId }); }}>
           {t("group.split")}
@@ -173,8 +188,9 @@ export interface GroupMembersProps {
   thisJobId?: number;
   /** Shows a member's detail (a click on its title). */
   onOpen?: (jobId: number) => void;
-  /** A write of this list ended the group (a dissolving split, Confirm); called before the caches change. */
-  onGone?: () => void;
+  /** The members whose group a write of this list ended (a split member; every member of a dissolved or
+   * confirmed group), named before the caches change. */
+  onGone?: (jobIds: readonly number[]) => void;
 }
 
 export function GroupMembers({ group, thisJobId, onOpen, onGone }: GroupMembersProps) {

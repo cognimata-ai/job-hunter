@@ -41,23 +41,11 @@
   overflow-wrap: anywhere;
 }
 
-/* A member's title that shows its detail: it reads as a link. */
+/* A member's title that shows its detail: `JobRef`'s button that reads as a link, as heavy as a title. */
 .ref {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--color-accent);
-  font: inherit;
+  composes: ref from "./JobRef.module.css";
   font-weight: var(--font-weight-medium);
-  text-align: left;
-  text-decoration: underline;
-  text-underline-offset: 0.18em;
   overflow-wrap: anywhere;
-  cursor: pointer;
-}
-
-.ref:hover {
-  color: var(--color-accent-hover);
 }
 
 .marker {

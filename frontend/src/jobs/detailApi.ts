@@ -47,7 +47,8 @@ export function historyKey(jobId: number): readonly [string, "history", number] 
   return [...JOBS_KEY, "history", jobId];
 }
 
-const LISTS_KEY = [...JOBS_KEY, "list"] as const;
+/** The prefix of every loaded list's key (`useJobsList`'s `listKey`). */
+export const LISTS_KEY = [...JOBS_KEY, "list"] as const;
 
 /** Why a failed detail read has no detail (B28): `{survivor}` for a merged job (a 404 with its survivor), `{}`
  * for one that no longer exists (a 404 without one), `null` for any other failure. */

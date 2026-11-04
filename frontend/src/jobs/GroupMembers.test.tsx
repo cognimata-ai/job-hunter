@@ -70,15 +70,26 @@ async function expanded() {
   return { card, members, user };
 }
 
-/** A member's item in the members' list (named by the member's title). */
+/** A member's title: the first part of its item's name (`aria-labelledby`, the title then the facts). */
+function titleOf(item: HTMLElement): string | undefined {
+  return document.getElementById((item.getAttribute("aria-labelledby") ?? "").split(" ")[0])?.textContent;
+}
+
+/** A member's item in the members' list, by its title. */
 function member(members: HTMLElement, title: string): HTMLElement {
-  return within(members).getByRole("listitem", { name: title });
+  const item = within(members).getAllByRole("listitem").find((li) => titleOf(li) === title);
+  if (item === undefined) {
+    throw new Error(`no member titled ${title}`);
+  }
+  return item;
 }
 
 function names(members: HTMLElement): (string | undefined)[] {
-  return within(members)
-    .getAllByRole("listitem")
-    .map((item) => document.getElementById(item.getAttribute("aria-labelledby") ?? "")?.textContent);
+  return within(members).getAllByRole("listitem").map(titleOf);
+}
+
+function statusReads(api: FakeApi): number {
+  return requestsTo(api, "GET /api/system/status").length;
 }
 
 function bodies(api: FakeApi, call: string): unknown[] {
@@ -132,6 +143,8 @@ describe("GroupMembers", () => {
     await waitFor(() => {
       expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1);
     });
+    await settled();
+    expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1); // read again once
     expect(screen.queryByText(en["group.dissolved"])).toBeNull();
   });
 
@@ -143,6 +156,7 @@ describe("GroupMembers", () => {
     s.api.routes.set(INDIVIDUALLY, () => answers(s, after));
     const { members, user } = await expanded();
     const reads = requestsTo(s.api, "GET /api/jobs").length;
+    const statuses = statusReads(s.api);
     await user.click(within(member(members, "Senior Backend Engineer")).getByRole("button", { name: en["group.score_individually"] }));
     await waitFor(() => {
       expect(bodies(s.api, INDIVIDUALLY)).toEqual([{ job_id: 5 }]);
@@ -156,6 +170,9 @@ describe("GroupMembers", () => {
     await waitFor(() => {
       expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1);
     });
+    await settled();
+    expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1); // read again once
+    expect(statusReads(s.api)).toBe(statuses + 1); // the header's pending count moves too
   });
 
   it("Score individually is not offered to the representative or an already individual member", async () => {
@@ -186,6 +203,7 @@ describe("GroupMembers", () => {
     });
     const { card, user } = await expanded();
     const reads = requestsTo(s.api, "GET /api/jobs").length;
+    const statuses = statusReads(s.api);
     await user.click(within(card).getByRole("button", { name: en["group.confirm"] }));
     const dialog = await screen.findByRole("alertdialog", { name: en["group.confirm_title"] });
     expect(dialog.textContent).toContain(en["group.confirm_body"].replace("{{title}}", "Backend Engineer"));
@@ -204,6 +222,15 @@ describe("GroupMembers", () => {
       expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1);
     });
     expect(screen.queryByRole("alertdialog")).toBeNull();
+    // the members (and Confirm) have gone with the group: focus is on the card, never on <body>
+    expect(await within(card).findByText(en["group.gone"])).toBeTruthy();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(card);
+    });
+    await settled();
+    expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1); // read again once
+    expect(statusReads(s.api)).toBe(statuses + 1); // the members' targets were cancelled
+    expect(document.activeElement).toBe(card);
   });
 
   it("Confirm is not offered without a representative", async () => {
@@ -268,6 +295,22 @@ describe("GroupMembers", () => {
     expect(screen.queryByRole("button", { name: /^Show members/ })).toBeNull(); // no group card any more
     await settled();
     expect(requestsTo(s.api, "GET /api/jobs").length).toBe(reads + 1); // read again once
+    // the focused Split went with the group, and the card stopped being a group card: focus stays on its article
+    expect(document.activeElement).toBe(screen.getByRole("article", { name: "Backend Engineer" }));
+  });
+
+  it("two members with the same title get different accessible names", async () => {
+    const twin = groupOut().members.map((m) => (m.job_id === 6 ? { ...m, title: "Senior Backend Engineer" } : m));
+    stack(groupOut({ members: twin }));
+    const { members } = await expanded();
+    // the title, then the member's sources, company and places
+    const adzuna = "Senior Backend Engineer Adzuna · Acme GmbH · Berlin";
+    const arbeitnow = "Senior Backend Engineer Arbeitnow · Acme GmbH · Berlin · Potsdam";
+    expect(within(members).getByRole("listitem", { name: adzuna })).toBeTruthy();
+    expect(within(members).getByRole("listitem", { name: arbeitnow })).toBeTruthy();
+    // and so are the groups of their actions: each Split says whose it is
+    expect(within(within(members).getByRole("group", { name: adzuna })).getByRole("button", { name: en["group.split"] })).toBeTruthy();
+    expect(within(within(members).getByRole("group", { name: arbeitnow })).getByRole("button", { name: en["group.split"] })).toBeTruthy();
   });
 
   it("actions are disabled while a write runs", async () => {

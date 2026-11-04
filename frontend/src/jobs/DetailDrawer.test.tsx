@@ -548,7 +548,8 @@ describe("DetailDrawer: the Duplicates tab", () => {
     api.routes.set("GET /api/jobs/9", () => json(representativeDetail()));
     const { app, members, user } = await duplicatesTab();
     const items = within(members).getAllByRole("listitem");
-    expect(items.map((item) => document.getElementById(item.getAttribute("aria-labelledby") ?? "")?.textContent)).toEqual([
+    // each item is named by the member's title, then its facts
+    expect(items.map((item) => document.getElementById((item.getAttribute("aria-labelledby") ?? "").split(" ")[0])?.textContent)).toEqual([
       "Backend Engineer",
       TITLE,
       "Backend Engineer (m/w/d)",
@@ -569,6 +570,20 @@ describe("DetailDrawer: the Duplicates tab", () => {
     expect(await screen.findByRole("dialog", { name: "Backend Engineer" })).toBeTruthy();
     expect(app.router.state.location.search).toEqual({ job: "9" });
     expect(app.router.history.length).toBe(1); // replaced
+  });
+
+  it("a split of this job from its own tab says at once that it is in no group", async () => {
+    const api = stack(deferredDetail());
+    const after = { ...groupOut(), members: groupOut().members.filter((m) => m.job_id !== 5) };
+    api.routes.set("POST /api/duplicate-groups/3/split", () => json(after));
+    const { members, panel, user } = await duplicatesTab();
+    // the refetch that follows is held: what the tab shows comes from the write's answer
+    api.routes.set("GET /api/jobs/5", () => new Promise<Response>(() => undefined));
+    const own = within(members).getAllByRole("listitem")[1];
+    await user.click(within(own).getByRole("button", { name: en["group.split"] }));
+    expect(await within(panel).findByText(en["group.none"])).toBeTruthy(); // not the group without "This job"
+    expect(within(panel).queryByRole("list", { name: en["group.members"] })).toBeNull();
+    expect(JSON.parse(requestsTo(api, "POST /api/duplicate-groups/3/split")[0].body ?? "null")).toEqual({ job_id: 5 });
   });
 
   it("confirm from the drawer reopens on the survivor", async () => {

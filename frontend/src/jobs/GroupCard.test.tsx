@@ -1,6 +1,8 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { createMemoryHistory } from "@tanstack/react-router";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { App, createApp } from "../app/App";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
 import i18n from "../i18n/index";
@@ -8,9 +10,12 @@ import {
   type FakeApi,
   fakeApi,
   groupCard,
+  groupOut,
   jobCard,
+  jobDetail,
   jobsPage,
   json,
+  problem,
   representativeDetail,
   requestsTo,
   userActions,
@@ -165,6 +170,58 @@ describe("GroupCard", () => {
     });
     await settled();
     expect(requestsTo(api, "GET /api/jobs").length).toBe(reads + 1); // once, not in a loop
+  });
+
+  it("a failed read of the members offers Retry", async () => {
+    const api = stack();
+    let hold: (response: Response) => void = () => undefined;
+    let healthy = false;
+    api.routes.set("GET /api/jobs/9", () =>
+      healthy
+        ? json(representativeDetail())
+        : requestsTo(api, "GET /api/jobs/9").length === 1
+          ? new Promise<Response>((resolve) => { hold = resolve; })
+          : problem(500, "internal"),
+    );
+    // queries retry a 5xx three times: here without the 1-2-4 s waits
+    const app = createApp({ history: createMemoryHistory({ initialEntries: ["/"] }) });
+    app.queryClient.setDefaultOptions({ queries: { ...app.queryClient.getDefaultOptions().queries, retryDelay: 0 } });
+    render(<App app={app} />);
+    const card = await groupCardOf();
+    const user = userEvent.setup();
+    await user.click(within(card).getByRole("button", { name: en["group.show_members"].replace("{{size}}", "3") }));
+    const loading = within(card).getByRole("status");
+    expect(loading.getAttribute("aria-busy")).toBe("true"); // the skeleton while the detail is read
+    hold(problem(500, "internal"));
+    const box = await within(card).findByRole("alert");
+    expect(box.textContent).toContain(en["problem.internal"]);
+    expect(within(card).queryByRole("list", { name: en["group.members"] })).toBeNull();
+    healthy = true;
+    await user.click(within(box).getByRole("button", { name: en["action.retry"] }));
+    const members = await within(card).findByRole("list", { name: en["group.members"] });
+    expect(within(members).getAllByRole("listitem")).toHaveLength(3);
+    expect(within(card).queryByRole("alert")).toBeNull();
+  });
+
+  it("a member's title pushes its job, and Back closes the drawer", async () => {
+    const api = stack();
+    api.routes.set("GET /api/jobs/5", () => json(jobDetail({ group: groupOut(), user: userActions(5, { seen_at: NOW.toISOString() }) })));
+    const app = renderApp("/?sort=posted");
+    const card = await groupCardOf();
+    const user = userEvent.setup();
+    await user.click(within(card).getByRole("button", { name: en["group.show_members"].replace("{{size}}", "3") }));
+    const members = await within(card).findByRole("list", { name: en["group.members"] });
+    const before = app.router.history.length;
+    await user.click(within(members).getByRole("button", { name: "Senior Backend Engineer" }));
+    expect(await screen.findByRole("dialog", { name: "Senior Backend Engineer" })).toBeTruthy();
+    expect(app.router.state.location.search).toEqual({ sort: "posted", job: "5" });
+    expect(app.router.history.length).toBe(before + 1); // pushed, as a card's own title does
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(app.router.state.location.search).toEqual({ sort: "posted" });
+    expect(app.router.history.canGoBack()).toBe(false); // closed by Back: no entry left behind
   });
 
   it("j and k treat the group card as one card", async () => {
