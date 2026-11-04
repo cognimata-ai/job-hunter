@@ -4,9 +4,9 @@
 // `deferred_duplicate` in the group again. Then the group's card: "scored via" its representative; Split of the
 // member, after which the member is a card of its own, "Pending — queued", with Score now.
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { answerTo, apiContext, getJson } from "../support/api";
+import { answerTo, apiContext } from "../support/api";
 import { en, expect, filled, templateMatch, test } from "../support/fixtures";
-import { cardOf, type JobDetailOut, SCORE_NOW, searchFor } from "../support/jobs";
+import { cardOf, jobDetail, SCORE_NOW, searchFor } from "../support/jobs";
 import { reingestPair } from "../support/stack";
 
 // The Split is one-shot per stack: a retry could only fail on the split pair (Ruling T33-b).
@@ -20,9 +20,9 @@ test("E10: the re-ingest pair is a group card scored via its representative, and
   expect(pair.problem, said).toBeNull();
   const api = await apiContext(page);
   try {
-    const member = await getJson<JobDetailOut>(api, `/api/jobs/${String(pair.member)}`);
+    const member = await jobDetail(api, pair.member);
     expect([member.target?.state, member.group?.id], said).toEqual(["deferred_duplicate", pair.groupId]);
-    const representative = await getJson<JobDetailOut>(api, `/api/jobs/${String(pair.representative)}`);
+    const representative = await jobDetail(api, pair.representative);
     const title = representative.job.title;
 
     await page.goto("/");
@@ -56,7 +56,7 @@ test("E10: the re-ingest pair is a group card scored via its representative, and
     await expect(own).toBeVisible();
     await expect(own.getByText(en["chip.pending"], { exact: true })).toBeVisible();
     await expect(own.getByRole("button", { name: SCORE_NOW })).toBeEnabled();
-    const after = await getJson<JobDetailOut>(api, `/api/jobs/${String(pair.member)}`);
+    const after = await jobDetail(api, pair.member);
     expect([after.target?.state, after.group]).toEqual(["pending", null]);
     await expectNoSeriousA11yViolations(page);
   } finally {

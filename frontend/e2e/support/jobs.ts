@@ -1,15 +1,18 @@
-// The Jobs page from a spec (plan M4 Task 34): its cards, the list's answers as the SPA reads them, a search by
-// title, the state chips of an unscored card, a pending job scored now through the API, and the labelling
-// queue's labelled jobs. Every text is the app's own (`en`).
+// The Jobs page from a spec (plan M4 Task 34): its cards, the list's answers as the SPA reads them, the whole
+// list through the API, a search by title, the state chips of an unscored card, a job's detail, a pending job
+// scored now through the API, and Label mode (its batch, its precondition and each card's job). Every text is the
+// app's own (`en`).
 import type { Locator, Page, Response } from "@playwright/test";
 import type { components } from "../../src/api/schema";
-import { type ApiContext, getJson, ORIGIN } from "./api";
+import { answerTo, type ApiContext, getJson, ORIGIN } from "./api";
 import { en, expect, templateMatch } from "./fixtures";
 import { psql, waitFor } from "./stack";
 
 export type JobsPageOut = components["schemas"]["JobsPageOut"];
 export type JobCardOut = components["schemas"]["JobCardOut"];
 export type JobDetailOut = components["schemas"]["JobDetailOut"];
+export type LabellingQueueOut = components["schemas"]["LabellingQueueOut"];
+type LabelItemOut = components["schemas"]["LabelItemOut"];
 
 /** How long a score-now's target may take to be published (the setup's `PUBLISH_WITHIN_S`). */
 export const PUBLISH_WITHIN_MS = 180_000;
@@ -121,10 +124,9 @@ export async function labelledJobs(jobIds: readonly number[]): Promise<number[]>
   return found === "" ? [] : found.split(",").map(Number);
 }
 
-/** The cards of every page of the list under the filters of `first` (a first page's answer to `read`), read on
- * through the API from its `next_cursor`. */
-export async function wholeList(api: ApiContext, read: Response, first: JobsPageOut): Promise<JobCardOut[]> {
-  const filters = filtersOf(new URL(read.url()).searchParams);
+/** `first`'s cards and those of every page after it under `filters` (`filtersOf`), read through the API from its
+ * `next_cursor`. */
+async function onFrom(api: ApiContext, filters: string, first: JobsPageOut): Promise<JobCardOut[]> {
   const items = [...first.items];
   let cursor = first.next_cursor;
   while (cursor !== null) {
@@ -136,6 +138,24 @@ export async function wholeList(api: ApiContext, read: Response, first: JobsPage
     cursor = answer.next_cursor;
   }
   return items;
+}
+
+/** The cards of every page of the list under the filters of `first` (a first page's answer to `read`), read on
+ * through the API from its `next_cursor`. */
+export function wholeList(api: ApiContext, read: Response, first: JobsPageOut): Promise<JobCardOut[]> {
+  return onFrom(api, filtersOf(new URL(read.url()).searchParams), first);
+}
+
+/** The cards of every page of the list under `filters` (a query string, none: the defaults), through the API. */
+export async function listedThroughApi(api: ApiContext, filters = ""): Promise<JobCardOut[]> {
+  const first = new URLSearchParams(filters);
+  first.set("limit", "100");
+  return onFrom(api, filters, await getJson<JobsPageOut>(api, `/api/jobs?${first.toString()}`));
+}
+
+/** `GET /api/jobs/{id}`: the job's detail. */
+export function jobDetail(api: ApiContext, jobId: number): Promise<JobDetailOut> {
+  return getJson<JobDetailOut>(api, `/api/jobs/${String(jobId)}`);
 }
 
 /** Types `title` into the filter panel's Search (every other filter at its default): the first page of the list
@@ -162,7 +182,7 @@ export async function pendingJob(api: ApiContext): Promise<JobCardOut> {
 export async function publishedDetail(api: ApiContext, jobId: number, what: string, timeoutMs = PUBLISH_WITHIN_MS): Promise<JobDetailOut> {
   return waitFor(
     async () => {
-      const detail = await getJson<JobDetailOut>(api, `/api/jobs/${String(jobId)}`);
+      const detail = await jobDetail(api, jobId);
       const state = detail.target?.state ?? "none";
       if (state.startsWith("published_")) {
         return detail;
@@ -189,4 +209,70 @@ export async function scoreNowPublished(api: ApiContext, jobId: number, what: st
     throw new Error(`${what}: score-now of job ${String(jobId)} answered ${String(response.status())} (${String(code)}), not 202`);
   }
   return publishedDetail(api, jobId, what);
+}
+
+/** Label mode's keys and the labels they give (`LabelCard`: `1` Good, `2` OK, `3` Poor). */
+export const LABEL_KEYS = [
+  ["1", "good"],
+  ["2", "ok"],
+  ["3", "poor"],
+] as const;
+
+export interface LabelBatch {
+  /** The labelling queue's answer that the batch was taken from. */
+  queue: LabellingQueueOut;
+  /** Label mode's section. */
+  mode: Locator;
+  /** The batch's cards, in the page's (shuffled) order. */
+  cards: Locator;
+  /** The labelling progress bar (`aria-valuenow`: the labels counted). */
+  progress: Locator;
+}
+
+/** Label mode entered by `enter` (the toggle, by a click or a key): the queue's answer, which must hold at least
+ * three ads and no labelled one (else `spec` fails naming that precondition: the queue gives labelled ads only
+ * once the unlabelled ones run out), and the batch shown. */
+export async function enterLabelMode(page: Page, enter: () => Promise<unknown>, spec: string): Promise<LabelBatch> {
+  const read = answerTo(page, "GET", "/api/labelling/queue");
+  await enter();
+  const queue = (await (await read).json()) as LabellingQueueOut;
+  const ids = queue.items.map((item) => item.job_id);
+  expect(ids.length, "ads in the labelling queue's batch").toBeGreaterThanOrEqual(LABEL_KEYS.length);
+  expect(await labelledJobs(ids), `labelled ads in the batch: ${spec} needs a batch of unlabelled ads`).toEqual([]);
+  const mode = page.getByRole("region", { name: en["label_mode.title"] });
+  const batch = mode.getByRole("list", { name: en["label_mode.queue"] }).getByRole("article");
+  await expect(batch).toHaveCount(ids.length);
+  return { queue, mode, cards: batch, progress: mode.getByRole("progressbar", { name: en["label_mode.progress_label"] }) };
+}
+
+/** The job of a Label mode card: the queue's item with the card's title and company (a card carries no id). Two
+ * items alike would leave the card's job unknown, which fails. */
+export async function labelCardJob(card: Locator, items: readonly LabelItemOut[]): Promise<number> {
+  const title = await card.getByRole("heading", { level: 3 }).textContent();
+  const found: number[] = [];
+  for (const item of items.filter((candidate) => candidate.title === title)) {
+    if ((await card.getByText(item.company, { exact: true }).count()) > 0) {
+      found.push(item.job_id);
+    }
+  }
+  expect(found.length, `the batch's ads titled "${String(title)}" at the card's company`).toBe(1);
+  return found[0];
+}
+
+/** Presses `key` (`press`) on the card of job `jobId` and checks the label it saves: `POST /api/jobs/{jobId}/
+ * feedback` answers 201 with `label`, and the card reads "Labelled: <label>". */
+export async function labelWith(
+  page: Page,
+  card: Locator,
+  jobId: number,
+  [key, label]: (typeof LABEL_KEYS)[number],
+  press: () => Promise<unknown>,
+): Promise<void> {
+  const saved = answerTo(page, "POST", `/api/jobs/${String(jobId)}/feedback`);
+  await press();
+  const response = await saved;
+  expect(response.status(), `the label of key ${key} on job ${String(jobId)}`).toBe(201);
+  expect(response.request().postDataJSON()).toMatchObject({ kind: "label", label });
+  const given = templateMatch(en["label_mode.labelled"], { label: en[`feedback_label.${label}`] });
+  await expect(card.getByText(given)).toBeVisible();
 }

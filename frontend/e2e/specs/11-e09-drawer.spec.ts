@@ -8,9 +8,9 @@
 // pair (setup step 5): Unmerge of its merge event, after which both jobs are listed again.
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { answerTo, type ApiContext, apiContext, getJson } from "../support/api";
+import { answerTo, type ApiContext, apiContext } from "../support/api";
 import { en, expect, filled, templateMatch, test } from "../support/fixtures";
-import { type JobDetailOut, type JobsPageOut, scoreNowPublished } from "../support/jobs";
+import { jobDetail, type JobDetailOut, listedThroughApi, scoreNowPublished } from "../support/jobs";
 import { groundedJobId, psql } from "../support/stack";
 
 type DetailScoreOut = components["schemas"]["DetailScoreOut"];
@@ -75,20 +75,9 @@ function groundedProblem(detail: JobDetailOut): string | null {
   return wanted ? null : `no rejected draft with ${DISPUTED_CRITERION} ${String(GENERATED_LEVEL)} → ${String(DISPUTED_LEVEL)}`;
 }
 
-function detailOf(api: ApiContext, jobId: number): Promise<JobDetailOut> {
-  return getJson<JobDetailOut>(api, `/api/jobs/${String(jobId)}`);
-}
-
 /** The jobs of the whole default list (what the Jobs page lists), through the API. */
 async function listedJobs(api: ApiContext): Promise<Set<number>> {
-  const ids = new Set<number>();
-  let path: string | null = "/api/jobs?limit=100";
-  while (path !== null) {
-    const answer: JobsPageOut = await getJson<JobsPageOut>(api, path);
-    answer.items.forEach((card) => ids.add(card.job_id));
-    path = answer.next_cursor === null ? null : `/api/jobs?limit=100&cursor=${encodeURIComponent(answer.next_cursor)}`;
-  }
-  return ids;
+  return new Set((await listedThroughApi(api)).map((card) => card.job_id));
 }
 
 test("E9: the grounded job's drawer under profile v2, and Unmerge of the merged pair", async ({ page }) => {
@@ -97,7 +86,7 @@ test("E9: the grounded job's drawer under profile v2, and Unmerge of the merged 
   try {
     const jobId = await groundedJobId();
     const grounded = await test.step("the grounded job published under the active tuple", async () => {
-      let detail = await detailOf(api, jobId);
+      let detail = await jobDetail(api, jobId);
       const state = detail.target?.state ?? "none";
       if (TO_SCORE.includes(state)) {
         detail = await scoreNowPublished(api, jobId, "setup step 7's grounded job under profile v2");
@@ -153,7 +142,7 @@ test("E9: the grounded job's drawer under profile v2, and Unmerge of the merged 
       expect(open, "an unreversed user-confirmed merge (setup step 5): E9's Unmerge needs a fresh stack").not.toBe("");
       const [eventId, from, into] = open.split("|").map(Number);
       expect([...(await listedJobs(api))].filter((id) => id === from), `merged job ${String(from)} listed`).toEqual([]);
-      const survivor = await detailOf(api, into);
+      const survivor = await jobDetail(api, into);
       await page.goto(`/?job=${String(into)}`);
       const pairDrawer = page.getByRole("dialog", { name: survivor.job.title, exact: true });
       await pairDrawer.getByRole("tab", { name: en["drawer.tab.provenance"] }).click();

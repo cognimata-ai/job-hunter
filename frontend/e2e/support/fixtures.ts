@@ -16,7 +16,8 @@ export const LOW_TEXT_PDF = fileURLToPath(new URL("../fixtures/low-text.pdf", im
 /** The phone number of `cv.docx` that the contact stripper misses (`scripts/e2e_fixtures.PLANTED_PHONE`). */
 export const PLANTED_PHONE = "+49 30 123";
 
-function escapeRegExp(text: string): string {
+/** `text` with every RegExp metacharacter escaped, to match it as written. */
+export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 

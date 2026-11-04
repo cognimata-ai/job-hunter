@@ -1,20 +1,13 @@
 // E20 (spec §18.7, §15.9; plan M4 Task 34): the Jobs page by the keyboard alone. `j` and `k` move focus between
 // the cards, Enter opens the focused card's drawer, Tab cycles inside the drawer (focus never leaves it, and comes
-// round to where it started), Esc closes it with focus back on the same card; in Label mode `j` reaches the
-// batch and `1`, `2` and `3` label three ads, focus moving on to the next ad to label after each.
-import type { components } from "../../src/api/schema";
+// round to where it started), Esc closes it with focus back on the same card; Shift+Tab reaches the Label mode
+// toggle and Enter turns it on; there `j` reaches the batch and `1`, `2` and `3` label three ads (each card's own
+// job answering), focus moving on to the next ad to label after each.
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { en, expect, filled, test } from "../support/fixtures";
-import { cardJobId, cards, firstPageRead, labelledJobs, shownPage } from "../support/jobs";
+import { en, expect, test } from "../support/fixtures";
+import { cardJobId, cards, enterLabelMode, firstPageRead, LABEL_KEYS, labelCardJob, labelWith, shownPage } from "../support/jobs";
 
-type LabellingQueueOut = components["schemas"]["LabellingQueueOut"];
-
-const TAB_CAP = 400; // more stops than any drawer has: a trap that leaks or never comes round fails
-const KEYS = [
-  ["1", "good"],
-  ["2", "ok"],
-  ["3", "poor"],
-] as const;
+const TAB_CAP = 400; // more stops than any drawer (or the way back to the filters) has: a leak or no end fails
 
 // Labels are written once per job: a retry would label other ads, hiding the first failure (Ruling T33-b).
 test.describe.configure({ retries: 0 });
@@ -73,34 +66,36 @@ test("E20: j/k, Enter, Tab, Esc and 1/2/3 work the list, the drawer and Label mo
   await expect(drawer).toBeHidden();
   await expect(two).toBeFocused();
 
-  const queueRead = page.waitForResponse(
-    (response) => response.request().method() === "GET" && new URL(response.url()).pathname === "/api/labelling/queue",
+  // Label mode by the keyboard: Shift+Tab from the card back to the filter panel's toggle (the panel is before
+  // the list), then Enter.
+  const toggle = page.getByRole("button", { name: en["filters.label_mode"], exact: true });
+  const { queue, mode, cards: batch, progress } = await enterLabelMode(
+    page,
+    async () => {
+      let stops = 0;
+      for (; stops < TAB_CAP && !(await toggle.evaluate((element) => element === document.activeElement)); stops++) {
+        await page.keyboard.press("Shift+Tab");
+      }
+      expect(stops, `Shift+Tab reaches Label mode within ${String(TAB_CAP)} presses`).toBeLessThan(TAB_CAP);
+      await page.keyboard.press("Enter");
+    },
+    "E20",
   );
-  await page.getByRole("button", { name: en["filters.label_mode"], exact: true }).press("Enter");
-  const queue = (await (await queueRead).json()) as LabellingQueueOut;
-  const ids = queue.items.map((item) => item.job_id);
-  expect(ids.length, "ads in the labelling queue's batch").toBeGreaterThanOrEqual(KEYS.length);
-  expect(await labelledJobs(ids), "labelled ads in the batch: E20 needs a batch of unlabelled ads").toEqual([]);
-  const mode = page.getByRole("region", { name: en["label_mode.title"] });
-  const batch = mode.getByRole("list", { name: en["label_mode.queue"] }).getByRole("article");
-  await expect(batch).toHaveCount(ids.length);
-  const progress = mode.getByRole("progressbar", { name: en["label_mode.progress_label"] });
   await expectNoSeriousA11yViolations(page);
 
   await page.keyboard.press("j");
   await expect(batch.nth(0)).toBeFocused();
-  for (const [i, [key, label]] of KEYS.entries()) {
-    await expect(batch.nth(i), `the ad to label next (${key})`).toBeFocused();
-    const saved = page.waitForResponse(
-      (response) => response.request().method() === "POST" && /^\/api\/jobs\/\d+\/feedback$/.test(new URL(response.url()).pathname),
-    );
-    await page.keyboard.press(key);
-    expect((await saved).status(), `the label of key ${key}`).toBe(201);
-    await expect(batch.nth(i).getByText(filled(en["label_mode.labelled"], { label: en[`feedback_label.${label}`] }), { exact: true })).toBeVisible();
+  for (const [i, keyed] of LABEL_KEYS.entries()) {
+    const card = batch.nth(i);
+    await expect(card, `the ad to label next (${keyed[0]})`).toBeFocused();
+    await labelWith(page, card, await labelCardJob(card, queue.items), keyed, () => page.keyboard.press(keyed[0]));
   }
   // focus moves on to the next ad to label, else (a batch of three) to Next batch
-  const next = ids.length > KEYS.length ? batch.nth(KEYS.length) : mode.getByRole("button", { name: en["label_mode.next_batch"] });
+  const next =
+    queue.items.length > LABEL_KEYS.length
+      ? batch.nth(LABEL_KEYS.length)
+      : mode.getByRole("button", { name: en["label_mode.next_batch"] });
   await expect(next).toBeFocused();
-  await expect(progress).toHaveAttribute("aria-valuenow", String(queue.progress.labelled + KEYS.length));
+  await expect(progress).toHaveAttribute("aria-valuenow", String(queue.progress.labelled + LABEL_KEYS.length));
   await expectNoSeriousA11yViolations(page);
 });

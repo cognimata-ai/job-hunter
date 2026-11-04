@@ -5,12 +5,22 @@
 import { expectNoSeriousA11yViolations } from "../support/a11y";
 import { apiContext } from "../support/api";
 import { en, expect, test } from "../support/fixtures";
-import { cards, firstPageRead, type JobsPageOut, PAGE_LIMIT, pendingJob, scoreNowPublished, shownPage } from "../support/jobs";
+import {
+  cards,
+  firstPageRead,
+  type JobsPageOut,
+  PAGE_LIMIT,
+  pendingJob,
+  PUBLISH_WITHIN_MS,
+  scoreNowPublished,
+  shownPage,
+} from "../support/jobs";
 
 // The publish must land between page 1 and page 2: a retry would only re-time that race (Ruling T33-b).
 test.describe.configure({ retries: 0 });
 
 test("E8: a publish between two pages raises Ranking changed, and Refresh starts again from page 1", async ({ page }) => {
+  test.setTimeout(PUBLISH_WITHIN_MS + 120_000); // the publish's own bound, and the pages and checks around it
   const api = await apiContext(page);
   try {
     const first = firstPageRead(page);

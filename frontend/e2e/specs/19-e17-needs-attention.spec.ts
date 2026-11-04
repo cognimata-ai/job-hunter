@@ -8,13 +8,13 @@
 // (`overrunBufferBound`; the dry-run refuses less): an `llm_tuple` re-score, whose batch is sent and ends
 // `submit_ambiguous`; the script is removed then, so no later batch is quarantined. The quarantined block shows
 // its reserved amount; Release & re-score asks first, stating that amount, and the batch is `released`, its
-// targets requeued (`pending`, or already in the batch the re-score sends). At the end the script is removed
-// (again: after a failure it may still be there) and the four settings restored.
+// targets requeued (each out of it, none cancelled, whatever the scorer does next). At the end the script is
+// removed (again: after a failure it may still be there) and the four settings restored.
 import type { Locator, Page } from "@playwright/test";
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
 import { answerTo, type ApiContext, apiContext, getJson } from "../support/api";
-import { en, expect, filled, templateMatch, test } from "../support/fixtures";
+import { en, escapeRegExp, expect, filled, templateMatch, test } from "../support/fixtures";
 import { pageUsd, readSettings, type SaveOut, saveSettings, type Settings, withRestore } from "../support/settings";
 import { overrunBufferBound, psql, seededRejectedItem, waitFor, writeBatchScript } from "../support/stack";
 
@@ -24,6 +24,7 @@ type QuarantinedBatchOut = components["schemas"]["QuarantinedBatchOut"];
 const REPLAYED_WITHIN_MS = 60_000;
 const ATTENTION_POLL_MS = 90_000; // Needs attention is read again every 60 s
 const QUARANTINED_WITHIN_MS = 300_000;
+const REQUEUED_WITHIN_MS = 30_000;
 const BATCH_MIN_TARGETS = 20;
 const GRID_A = { model: "claude-opus-5-5", effort: "medium" } as const; // `settings/presets.json`'s A
 const GRID_NODES = ["generate", "revise", "critic"] as const;
@@ -39,7 +40,7 @@ function attention(api: ApiContext): Promise<AttentionOut> {
 
 /** A block of Needs attention, by its section's name (its heading also holds its count). */
 function block(page: Page, section: string): Locator {
-  const named = new RegExp(`^${section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} [\\d,]+$`);
+  const named = new RegExp(`^${escapeRegExp(section)} [\\d,]+$`);
   return page.getByRole("region", { name: en["attention.title"] }).getByRole("region", { name: named });
 }
 
@@ -104,16 +105,29 @@ test("E17: Replay of the seeded rejected item, and Release & re-score of a quara
       model_policy: active.scoring.model_policy,
       overrun_buffer_usd: active.llm.overrun_buffer_usd,
     };
+    // Both parts of the restore run, each whatever the other did; their failures are named together.
     const restore = async () => {
-      await writeBatchScript(null);
-      const what = "the batch settings, the grid and the overrun buffer read at the start";
-      const restored = await saveSettings(api, what, (p) => {
-        p.scoring.batch_bulk_rescore = before.batch_bulk_rescore;
-        p.scoring.batch_min_targets = before.batch_min_targets;
-        p.scoring.model_policy = before.model_policy;
-        p.llm.overrun_buffer_usd = before.overrun_buffer_usd;
-      });
-      expect(restored.response.status(), what).toBe(201);
+      const failures: string[] = [];
+      try {
+        await writeBatchScript(null);
+      } catch (error) {
+        failures.push(`the batch script's removal: ${String(error)}`);
+      }
+      try {
+        const what = "the batch settings, the grid and the overrun buffer read at the start";
+        const restored = await saveSettings(api, what, (p) => {
+          p.scoring.batch_bulk_rescore = before.batch_bulk_rescore;
+          p.scoring.batch_min_targets = before.batch_min_targets;
+          p.scoring.model_policy = before.model_policy;
+          p.llm.overrun_buffer_usd = before.overrun_buffer_usd;
+        });
+        expect(restored.response.status(), what).toBe(201);
+      } catch (error) {
+        failures.push(`the settings' restore: ${String(error)}`);
+      }
+      if (failures.length > 0) {
+        throw new Error(failures.join("\n… and "));
+      }
     };
     const newest = Number(await psql("SELECT coalesce(max(id), 0) FROM batch_submissions"));
     await withRestore(async () => {
@@ -162,18 +176,28 @@ test("E17: Replay of the seeded rejected item, and Release & re-score of a quara
       const answer = await released;
       expect(answer.status(), `the release of batch ${String(batch.submission_id)}`).toBe(202);
       expect(await answer.json()).toMatchObject({ submission_id: batch.submission_id, state: "released" });
-      // Release requeues the batch's targets as `pending`, and the re-score it starts may send them in a new
-      // batch at once: each target is out of the released batch, `pending` or `in_batch` in a later one.
-      const requeued = await psql(
-        "SELECT s.state || '|' || count(DISTINCT t.id) FILTER (WHERE t.state = 'pending' OR (t.state = 'in_batch' " +
-          "AND t.batch_submission_id > s.id)) || '|' || count(DISTINCT t.id) FROM batch_submissions s " +
-          "JOIN batch_items i ON i.submission_id = s.id JOIN score_targets t ON t.id = i.target_id " +
-          `WHERE s.id = ${String(batch.submission_id)} GROUP BY s.state`,
-      );
-      const targets = String(batch.request_count);
-      expect(requeued, `batch ${String(batch.submission_id)}'s state | its targets requeued | its targets`).toBe(
-        `released|${targets}|${targets}`,
-      );
+      // Release requeues the batch's targets as `pending`, and the re-score it starts may send them in a new batch
+      // at once, or a cycle claim one: each target has left the released batch (none still `in_batch` in it) and
+      // none ended `cancelled`. Polled, so a scorer's move in between never decides it.
+      const expected = `released|0|0|${String(batch.request_count)}`;
+      let read = "";
+      try {
+        await waitFor(
+          async () => {
+            read = await psql(
+              "SELECT s.state || '|' || count(DISTINCT t.id) FILTER (WHERE t.state = 'in_batch' AND " +
+                "t.batch_submission_id = s.id) || '|' || count(DISTINCT t.id) FILTER (WHERE t.state = 'cancelled') " +
+                "|| '|' || count(DISTINCT t.id) FROM batch_submissions s JOIN batch_items i ON i.submission_id = s.id " +
+                `JOIN score_targets t ON t.id = i.target_id WHERE s.id = ${String(batch.submission_id)} GROUP BY s.state`,
+            );
+            return read === expected ? true : null;
+          },
+          REQUEUED_WITHIN_MS,
+          `batch ${String(batch.submission_id)} released with every target out of it`,
+        );
+      } catch (error) {
+        throw new Error(`${String(error)}: state|still in it|cancelled|targets = ${read}, not ${expected}`, { cause: error });
+      }
       await expect(page.getByText(en["attention.released"], { exact: true })).toBeVisible();
       await expectNoSeriousA11yViolations(page);
     }, restore);

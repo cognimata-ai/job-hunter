@@ -16,13 +16,13 @@
 // A list read once is the query cache's afterwards (Reset, a box ticked again): the page shows it unread.
 import type { Locator, Page } from "@playwright/test";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { apiContext, getJson } from "../support/api";
+import { apiContext } from "../support/api";
 import { en, expect, test } from "../support/fixtures";
 import {
   cardOf,
   cards,
   firstPageRead,
-  type JobDetailOut,
+  jobDetail,
   SCORE_LABEL,
   shownPage,
   UNSCORED_CHIP,
@@ -159,7 +159,7 @@ test("E7: the filters list and drop named cards, and a reload keeps them", async
       for (const card of listed.filter((c) => postedOrSeen(c) < since)) {
         // a group card is listed when its representative or one of its deferred members matches (§8.7)
         const members = await Promise.all(
-          (card.group?.members ?? []).map((member) => getJson<JobDetailOut>(api, `/api/jobs/${String(member.job_id)}`)),
+          (card.group?.members ?? []).map((member) => jobDetail(api, member.job_id)),
         );
         if (!members.some((member) => postedOrSeen(member.job) >= since)) {
           older.push(`${String(card.job_id)} ${card.posted_at ?? card.first_seen_at}`);
