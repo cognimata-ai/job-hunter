@@ -13,11 +13,13 @@ import {
   detailScore,
   type FakeApi,
   fakeApi,
+  groupOut,
   jobCard,
   jobDetail,
   jobsPage,
   json,
   problem,
+  representativeDetail,
   requestsTo,
   userActions,
 } from "../test/api";
@@ -498,7 +500,7 @@ describe("DetailDrawer: the description", () => {
 });
 
 describe("DetailDrawer: the tabs", () => {
-  it("has the same five tabs for every job, and an empty one says so", async () => {
+  it("has the same six tabs for every job, and an empty one says so", async () => {
     stack(jobDetail({ history: { items: [], next_cursor: null }, user: userActions(5, { seen_at: NOW.toISOString() }) }));
     const { dialog, user } = await openPasted();
     const tabs = within(within(dialog).getByRole("tablist", { name: en["drawer.tabs"] })).getAllByRole("tab");
@@ -506,14 +508,88 @@ describe("DetailDrawer: the tabs", () => {
       en["drawer.tab.description"],
       en["drawer.tab.contested"],
       en["drawer.tab.provenance"],
+      en["drawer.tab.duplicates"],
       en["drawer.tab.history"],
       en["drawer.tab.feedback"],
     ]);
     await user.click(tabs[1]);
     expect(within(within(dialog).getByRole("tabpanel")).getByText(en["contested.none"])).toBeTruthy();
     await user.click(tabs[3]);
-    expect(within(within(dialog).getByRole("tabpanel")).getByText(en["history.none"])).toBeTruthy();
+    expect(within(within(dialog).getByRole("tabpanel")).getByText(en["group.none"])).toBeTruthy();
     await user.click(tabs[4]);
+    expect(within(within(dialog).getByRole("tabpanel")).getByText(en["history.none"])).toBeTruthy();
+    await user.click(tabs[5]);
     expect(within(within(dialog).getByRole("tabpanel")).getByRole("form", { name: en["feedback.title"] })).toBeTruthy();
+  });
+});
+
+describe("DetailDrawer: the Duplicates tab", () => {
+  /** Job 5's detail as a deferred member of `groupOut()`, scored via its representative, job 9. */
+  function deferredDetail(): JobDetailOut {
+    return jobDetail({
+      description: { ...jobDetail().description, from_job_id: 9 },
+      score: detailScore({ scored_via_job_id: 9 }),
+      target: { id: 50, state: "deferred_duplicate", state_reason: null, refusal_category: null, similarity: 0.7, override: "none" },
+      group: groupOut(),
+      user: userActions(5, { seen_at: NOW.toISOString() }),
+    });
+  }
+
+  async function duplicatesTab() {
+    const opened = await openPasted();
+    await opened.user.click(within(opened.dialog).getByRole("tab", { name: en["drawer.tab.duplicates"] }));
+    const panel = within(opened.dialog).getByRole("tabpanel", { name: en["drawer.tab.duplicates"] });
+    const members = within(panel).getByRole("list", { name: en["group.members"] });
+    return { ...opened, panel, members };
+  }
+
+  it("the Duplicates tab marks this job and the representative", async () => {
+    const api = stack(deferredDetail());
+    api.routes.set("GET /api/jobs/9", () => json(representativeDetail()));
+    const { app, members, user } = await duplicatesTab();
+    const items = within(members).getAllByRole("listitem");
+    expect(items.map((item) => document.getElementById(item.getAttribute("aria-labelledby") ?? "")?.textContent)).toEqual([
+      "Backend Engineer",
+      TITLE,
+      "Backend Engineer (m/w/d)",
+    ]);
+    const [representative, own, other] = items;
+    expect(within(representative).getByText(en["group.representative"])).toBeTruthy();
+    expect(within(representative).queryByText(en["group.this_job"])).toBeNull();
+    expect(within(own).getByText(en["group.this_job"])).toBeTruthy();
+    expect(within(own).queryByText(en["group.representative"])).toBeNull();
+    expect(within(other).queryByText(en["group.this_job"])).toBeNull();
+    // this job's title is no way to itself; another member's shows that member in the drawer (a replace)
+    expect(within(own).queryByRole("button", { name: TITLE })).toBeNull();
+    // the same actions as on the group card
+    expect(within(members).getAllByRole("button", { name: en["group.split"] })).toHaveLength(3);
+    expect(within(own).getByRole("button", { name: en["group.score_individually"] })).toBeTruthy();
+    expect(within(representative).queryByRole("button", { name: en["group.score_individually"] })).toBeNull();
+    await user.click(within(representative).getByRole("button", { name: "Backend Engineer" }));
+    expect(await screen.findByRole("dialog", { name: "Backend Engineer" })).toBeTruthy();
+    expect(app.router.state.location.search).toEqual({ job: "9" });
+    expect(app.router.history.length).toBe(1); // replaced
+  });
+
+  it("confirm from the drawer reopens on the survivor", async () => {
+    const api = stack(deferredDetail());
+    let merged = false;
+    api.routes.set("GET /api/jobs/5", () => (merged ? problem(404, "not_found", { merged_into_job_id: 9 }) : json(deferredDetail())));
+    api.routes.set("GET /api/jobs/9", () => json(representativeDetail(null)));
+    api.routes.set("POST /api/duplicate-groups/3/confirm", () => {
+      merged = true;
+      return json({ job_id: 9 }, 202);
+    });
+    const { app, panel, user } = await duplicatesTab();
+    await user.click(within(panel).getByRole("button", { name: en["group.confirm"] }));
+    const confirm = await screen.findByRole("alertdialog", { name: en["group.confirm_title"] });
+    expect(screen.getByRole("dialog", { name: TITLE })).toBeTruthy(); // the drawer stays open under it
+    await user.click(within(confirm).getByRole("button", { name: en["group.confirm"] }));
+    expect(await screen.findByRole("dialog", { name: "Backend Engineer" })).toBeTruthy();
+    expect(app.router.state.location.search).toEqual({ job: "9" });
+    expect(requestsTo(api, "POST /api/duplicate-groups/3/confirm")).toHaveLength(1);
+    expect(await screen.findByText(en["drawer.merged"])).toBeTruthy();
+    expect(screen.getByText(en["group.merged"])).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });

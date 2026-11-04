@@ -4,15 +4,17 @@
 // ★ saved and ✓ applied markers; the badges and the knockouts; then either the score badge or, for a card
 // without a score, its state chip with the preliminary similarity and Score now; and the quick actions.
 //
-// Every server string is rendered as text. A group card (`kind: "group"`) is its representative's card here
-// (Task 25 frames it). The card takes part in the list's roving focus: `tabIndex` 0 when `focused`, else -1;
-// Enter on the card itself (not on one of its controls) opens it. The title is a link to the card's drawer
-// (`href`, the Jobs URL with `job=<id>`, Ruling T24-f), a tab stop like the quick actions: a plain primary click
-// (or Enter on the link) opens it through `onOpen`, as Enter on the card does, and a modifier or middle click is
-// the browser's (a new tab).
-import { useId } from "react";
+// Every server string is rendered as text. A group card (`kind: "group"`) is its representative's card here;
+// `GroupCard` (Task 25) frames it with a `header` above the card's facts and a `footer` below its actions, inside
+// the same <article>, so the group stays one card. The card takes part in the list's roving focus: `tabIndex` 0
+// when `focused`, else -1; Enter on the card itself (not on one of its controls) opens it. The title is a link
+// to the card's drawer (`href`, the Jobs URL with `job=<id>`, Ruling T24-f), a tab stop like the quick actions:
+// a plain primary click (or Enter on the link) opens it through `onOpen`, as Enter on the card does, and a
+// modifier or middle click is the browser's (a new tab).
+import { type ReactNode, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { useDisplay } from "../app/display";
+import { cx } from "../components/cx";
 import { RelativeTime } from "../components/RelativeTime";
 import { useServerText } from "../i18n/index";
 import type { JobCardOut } from "./api";
@@ -37,6 +39,10 @@ export interface JobCardProps {
   onOpen: (jobId: number) => void;
   /** The URL of the card's detail: the Jobs page's with `job=<id>`. */
   href: string;
+  /** Shown above the card's facts, across the card (a group card's header). */
+  header?: ReactNode;
+  /** Shown below the card's actions, across the card (a group card's members). */
+  footer?: ReactNode;
 }
 
 function Unscored({ card }: { card: JobCardOut }) {
@@ -52,7 +58,7 @@ function Unscored({ card }: { card: JobCardOut }) {
   );
 }
 
-export function JobCard({ card, focused, onOpen, href }: JobCardProps) {
+export function JobCard({ card, focused, onOpen, href, header, footer }: JobCardProps) {
   const { t } = useTranslation();
   const serverText = useServerText();
   const { timezone } = useDisplay();
@@ -61,14 +67,16 @@ export function JobCard({ card, focused, onOpen, href }: JobCardProps) {
   const modes = workModesText(card.work_modes, card.work_mode_known, t);
   const where = [...card.locations, modes].filter((part) => part !== "").join(" · ");
   const unseen = card.user === null || card.user.seen_at === null;
+  const framed = header !== undefined || footer !== undefined;
   return (
-    <article className={styles.card} aria-labelledby={headingId} tabIndex={focused ? 0 : -1}
+    <article className={cx(styles.card, framed && styles.framed)} aria-labelledby={headingId} tabIndex={focused ? 0 : -1}
       onKeyDown={(event) => {
         if (event.key === "Enter" && event.target === event.currentTarget) {
           event.preventDefault();
           onOpen(card.job_id);
         }
       }}>
+      {header !== undefined && <div className={styles.header}>{header}</div>}
       <div className={styles.main}>
         <h2 id={headingId} className={styles.title}>
           <a href={href} className={styles.titleLink}
@@ -123,6 +131,7 @@ export function JobCard({ card, focused, onOpen, href }: JobCardProps) {
       <div className={styles.actions}>
         <QuickActions card={card} />
       </div>
+      {footer !== undefined && <div className={styles.footer}>{footer}</div>}
     </article>
   );
 }

@@ -184,10 +184,11 @@
   border-bottom: 1px solid var(--color-border);
 }
 
+/* Six tabs fit one row of the 50 % drawer at 1280 px in both languages; narrower, the list wraps. */
 .tab {
   min-height: 36px;
   margin-bottom: -1px;
-  padding: 0 var(--space-3);
+  padding: 0 var(--space-2);
   border: 1px solid transparent;
   border-radius: var(--radius-2) var(--radius-2) 0 0;
   background: transparent;

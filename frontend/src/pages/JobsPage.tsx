@@ -12,7 +12,8 @@
 // - Without an active profile, "Upload your CV to start ranking" (a link to the CV section) above the cards,
 //   which are still listed, unscored (§15.8).
 // - The list's keyboard is `useListKeyboard`'s; Enter on a card, or a click on its title (a link to the same
-//   URL, Ruling T24-f), pushes `job=<id>`.
+//   URL, Ruling T24-f), pushes `job=<id>`. A duplicate group's card (`kind: "group"`) is `GroupCard`, one card
+//   under its representative's id (Task 25).
 // - The detail drawer (Task 24, resolution e) is open while the search has `job`. Closing it goes Back when this
 //   page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL without `job`; showing
 //   another job in it (a survivor, a representative) replaces `job`. The drawer gives focus back to what held it
@@ -28,6 +29,7 @@ import { Skeleton } from "../components/Skeleton";
 import type { TranslationKey } from "../i18n/index";
 import { DetailDrawer } from "../jobs/DetailDrawer";
 import { FilterPanel } from "../jobs/FilterPanel";
+import { GroupCard } from "../jobs/GroupCard";
 import { JobCard } from "../jobs/JobCard";
 import { DEFAULT_SEARCH, type JobSort, resetSearch, SORTS, toApiParams } from "../jobs/search";
 import { type CountsOut, useJobsList } from "../jobs/useJobsList";
@@ -171,7 +173,11 @@ export function JobsPage() {
         <ol role="list" className={styles.list} aria-labelledby={headingId}>
           {list.items.map((card) => (
             <li key={card.job_id} {...keyboard.itemProps(card.job_id)}>
-              <JobCard card={card} {...keyboard.cardProps(card.job_id)} href={jobHref(card.job_id)} />
+              {card.kind === "group" ? (
+                <GroupCard card={card} {...keyboard.cardProps(card.job_id)} href={jobHref(card.job_id)} />
+              ) : (
+                <JobCard card={card} {...keyboard.cardProps(card.job_id)} href={jobHref(card.job_id)} />
+              )}
             </li>
           ))}
         </ol>

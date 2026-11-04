@@ -279,6 +279,96 @@ export function jobDetail(overrides: Partial<JobDetailOut> = {}): JobDetailOut {
   };
 }
 
+type GroupOut = components["schemas"]["GroupOut"];
+type GroupMemberOut = components["schemas"]["GroupMemberOut"];
+
+/** A member of a duplicate group as the detail's `group` lists it: job 5, an Adzuna ad at Acme in Berlin with a
+ * partial description, deferred to the group's representative. */
+export function groupMember(overrides: Partial<GroupMemberOut> = {}): GroupMemberOut {
+  return {
+    job_id: 5,
+    title: "Senior Backend Engineer",
+    company: "Acme GmbH",
+    source_ids: ["adzuna"],
+    locations: ["Berlin"],
+    completeness: "partial",
+    availability: "active",
+    target_state: "deferred_duplicate",
+    score_individually: false,
+    is_representative: false,
+    ...overrides,
+  };
+}
+
+/** Duplicate group 3 as `GET /api/jobs/{id}` answers its `group`: the representative job 9 (JSearch and
+ * Greenhouse, scored), elected `initial`, and its deferred members 5 (Adzuna) and 6 (Arbeitnow, not
+ * re-confirmed), by job id as the api lists them. */
+export function groupOut(overrides: Partial<GroupOut> = {}): GroupOut {
+  return {
+    id: 3,
+    status: "active",
+    representative_job_id: 9,
+    unscorable_reason: null,
+    election_reason: "initial",
+    members: [
+      groupMember(),
+      groupMember({
+        job_id: 6,
+        title: "Backend Engineer (m/w/d)",
+        source_ids: ["arbeitnow"],
+        locations: ["Berlin", "Potsdam"],
+        completeness: "full",
+        availability: "stale",
+      }),
+      groupMember({
+        job_id: 9,
+        title: "Backend Engineer",
+        source_ids: ["jsearch", "greenhouse"],
+        completeness: "full",
+        target_state: "published_accepted",
+        is_representative: true,
+      }),
+    ],
+    ...overrides,
+  };
+}
+
+/** The list's card of `groupOut()`: its representative job 9 (kind `group`), scored 82, with the group's three
+ * members and its two deferred ones, 5 and 6. */
+export function groupCard(overrides: Partial<JobCardOut> = {}): JobCardOut {
+  return jobCard({
+    job_id: 9,
+    kind: "group",
+    title: "Backend Engineer",
+    source_ids: ["jsearch", "greenhouse"],
+    score: { mid: "82.40", low: "74.00", high: "89.50", coverage: "0.850", confidence: "high", result_status: "accepted" },
+    target: { id: 90, state: "published_accepted", state_reason: null, refusal_category: null, similarity: 0.7, override: "none" },
+    bucket: "scored",
+    group: {
+      group_id: 3,
+      size: 3,
+      representative: { job_id: 9, title: "Backend Engineer", source_ids: ["jsearch", "greenhouse"] },
+      members: [
+        { job_id: 5, title: "Senior Backend Engineer", source_ids: ["adzuna"], availability: "active", completeness: "partial", target_state: "deferred_duplicate" },
+        { job_id: 6, title: "Backend Engineer (m/w/d)", source_ids: ["arbeitnow"], availability: "stale", completeness: "full", target_state: "deferred_duplicate" },
+      ],
+    },
+    links: { open_ad: "https://boards.example.com/acme/jobs/9", adzuna: null },
+    ...overrides,
+  });
+}
+
+/** The detail of `groupCard()`'s representative, job 9, already seen, in `group` (`groupOut()` by default). */
+export function representativeDetail(group: GroupOut | null = groupOut()): JobDetailOut {
+  const detail = jobDetail();
+  return jobDetail({
+    job: { ...detail.job, job_id: 9, title: "Backend Engineer", source_ids: ["jsearch", "greenhouse"] },
+    description: { ...detail.description, from_job_id: 9 },
+    group,
+    user: userActions(9, { seen_at: "2026-11-02T08:00:00Z" }),
+  });
+}
+
 /** A first page of the Jobs list holding `items`, with no further page. */
 export function jobsPage(items: JobCardOut[] = []): JobsPageOut {
   return {

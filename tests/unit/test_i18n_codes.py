@@ -374,6 +374,10 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "profile_section": lambda: set(validator.PROFILE_SECTIONS),
     "merge_kind": lambda: table_check_values(COLLECTION_MIGRATION, "merge_events", "kind"),
     "feedback_label": lambda: literal_values(FeedbackLabel),
+    # a duplicate group's members (plan M4 Task 25): a job's completeness (the `jobs.completeness` CHECK); the
+    # representative's `election_reason` has no closed set to derive from (a free `text` column whose writers
+    # pass the constants of `dedup.groups`), so the UI shows it verbatim
+    "completeness": lambda: table_check_values(COLLECTION_MIGRATION, "jobs", "completeness"),
 }
 
 

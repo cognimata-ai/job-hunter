@@ -124,6 +124,26 @@
   border-top: 1px solid var(--color-border);
 }
 
+/* A framed card (a duplicate group's, Task 25): its header above the facts and its footer below the actions,
+ * each across the card. */
+.framed {
+  grid-template-areas:
+    "header header"
+    "main side"
+    "actions actions"
+    "footer footer";
+}
+
+.header {
+  grid-area: header;
+  min-width: 0;
+}
+
+.footer {
+  grid-area: footer;
+  min-width: 0;
+}
+
 @media (max-width: 640px) {
   .card {
     grid-template-columns: minmax(0, 1fr);
@@ -132,6 +152,15 @@
       "side"
       "actions";
     padding: var(--space-3);
+  }
+
+  .framed {
+    grid-template-areas:
+      "header"
+      "main"
+      "side"
+      "actions"
+      "footer";
   }
 }
 

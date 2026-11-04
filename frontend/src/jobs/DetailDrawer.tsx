@@ -9,8 +9,8 @@
 //   outcome, "scored via <representative>" for a deferred member (B26), the versions line (the model ids are data,
 //   shown as served), the summary in the UI language, the criteria and "Knockouts · Caps · Industry". Without a
 //   score, the state chip's text (Task 22's).
-// - The tabs: Description, Contested, Provenance, History and Feedback, the same for every job, back at
-//   Description for each new job.
+// - The tabs: Description, Contested, Provenance, Duplicates, History and Feedback (the spec's mock order), the
+//   same for every job, back at Description for each new job.
 //
 // Opening a job decides `seen_on_open` once per open of that job, on its first loaded detail: sent when that
 // detail says unseen, and never on a later read (a refetch after Seen was cleared must not mark it seen again).
@@ -40,6 +40,7 @@ import { CriteriaTable } from "./CriteriaTable";
 import { DescriptionTab } from "./DescriptionTab";
 import styles from "./DetailDrawer.module.css";
 import { type DetailScoreOut, goneOf, type JobDetailOut, type JobOut, useJobDetail, useSeenOnOpen } from "./detailApi";
+import { DuplicatesTab } from "./DuplicatesTab";
 import { FeedbackTab } from "./FeedbackTab";
 import {
   availabilityText,
@@ -66,11 +67,12 @@ export interface DetailDrawerProps {
 
 // The precisions a posted label already states ("date unknown", "(ingest date)").
 const PRECISION_IN_LABEL: ReadonlySet<string> = new Set(["unknown", "ingest"]);
-const TABS = ["description", "contested", "provenance", "history", "feedback"] as const;
+const TABS = ["description", "contested", "provenance", "duplicates", "history", "feedback"] as const;
 const TAB_LABELS = {
   description: "drawer.tab.description",
   contested: "drawer.tab.contested",
   provenance: "drawer.tab.provenance",
+  duplicates: "drawer.tab.duplicates",
   history: "drawer.tab.history",
   feedback: "drawer.tab.feedback",
 } as const satisfies Record<(typeof TABS)[number], TranslationKey>;
@@ -296,6 +298,7 @@ function DetailTabs({ detail, onNavigate }: { detail: JobDetailOut; onNavigate: 
     description: <DescriptionTab detail={detail} onNavigate={onNavigate} />,
     contested: <ContestedTab contested={detail.contested} />,
     provenance: <ProvenanceTab detail={detail} />,
+    duplicates: <DuplicatesTab detail={detail} onNavigate={onNavigate} />,
     history: <HistoryTab jobId={jobId} first={detail.history} />,
     feedback: <FeedbackTab jobId={jobId} feedback={detail.feedback} />,
   };

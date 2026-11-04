@@ -343,6 +343,27 @@ describe("JobsPage", () => {
       expect(requestsTo(api, "GET /api/jobs").at(-1)?.search.get("sort")).toBe("first_seen");
     });
   });
+
+  it("an unscorable group's members are plain cards with the badge", async () => {
+    // B27: a group without a representative has no group card; each member is its own card with the badge
+    const api = fakeApi({ signedIn: true });
+    const failed = { id: 0, state: "failed_transient", state_reason: "timeout", refusal_category: null, similarity: 0.5, override: "none" };
+    const badge = { group_id: 4, unscorable_reason: "all_failed" };
+    api.jobs = jobsPage([
+      jobCard({ job_id: 1, title: "Job 1", target: { ...failed, id: 11 }, bucket: "failed", group_badge: badge }),
+      jobCard({ job_id: 2, title: "Job 2", target: { ...failed, id: 12 }, bucket: "failed", group_badge: badge }),
+    ]);
+    renderApp("/");
+    await screen.findByRole("article", { name: "Job 1" });
+    expect(articles()).toHaveLength(2);
+    for (const card of articles()) {
+      const badges = within(card).getByRole("list", { name: en["card.badges"] });
+      expect(badges.textContent).toContain(en["card.not_scorable"].replace("{{reason}}", en["group_unscorable.all_failed"]));
+      expect(within(card).getByRole("button", { name: en["action.retry"] })).toBeTruthy();
+    }
+    expect(screen.queryByText(new RegExp(en["group.possible_duplicates"].replace("({{size}})", "")))).toBeNull();
+    expect(screen.queryByRole("button", { name: new RegExp(en["group.show_members"].replace(" ({{size}})", "")) })).toBeNull();
+  });
 });
 
 function cleanupAndRender(api: FakeApi, counts: components["schemas"]["CountsOut"], language: "en" | "de"): void {
