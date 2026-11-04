@@ -1,7 +1,7 @@
 // The E2E stack from a spec (plan M4 Task 32): the four-file dev stack's compose command, psql as the bootstrap
-// role, the score lane's bucket, polling, the fake Batches API's script, and the smoke user's credentials. It
-// only runs `exec`, `run` and `cp` against the running stack, never `up`, so a local override layered at `up`
-// (the SPA served from the host's build) survives. A command's stdout is returned, never printed; a failure
+// role, the score lane's bucket, polling, the fake Batches API's script, the smoke user's credentials and E9's
+// grounded job. It only runs `exec` and `run` against the running stack, never `up`, so a local override
+// layered at `up` (the SPA served from the host's build) survives. A command's stdout is returned, never printed; a failure
 // names the command's first words, its exit status and the tail of its stderr.
 import { spawn } from "node:child_process";
 import { REPO_ROOT } from "./paths";
@@ -87,14 +87,31 @@ export async function psql(sql: string): Promise<string> {
   return out.trimEnd();
 }
 
-/** A constant of a smoke script (`scripts/<module>.py`), read with `uv run python -c` and never printed. */
-async function scriptConstant(module: string, name: string): Promise<string> {
-  const code = `import sys; sys.path.insert(0, "scripts"); import ${module}; sys.stdout.write(str(${module}.${name}))`;
+/** `expression` (over `module`, a script of scripts/) evaluated with `uv run python -c`: its text, never
+ * printed. */
+async function scriptValue(module: string, expression: string): Promise<string> {
+  const code = `import sys; sys.path.insert(0, "scripts"); import ${module}; sys.stdout.write(str(${expression}))`;
   const ran = await run(["uv", "run", "python", "-c", code]);
   if (ran.code !== 0) {
-    throw new Error(`reading ${module}.${name} exited ${String(ran.code)}: ${tail(ran.stderr)}`);
+    throw new Error(`reading ${expression} exited ${String(ran.code)}: ${tail(ran.stderr)}`);
   }
   return ran.stdout;
+}
+
+/** A constant of a smoke script (`scripts/<module>.py`). */
+function scriptConstant(module: string, name: string): Promise<string> {
+  return scriptValue(module, `${module}.${name}`);
+}
+
+/** E9's grounded job (`m4_seeds.grounded_job_id`): the lowest `getyourguide` candidate whose current
+ * revision has its six grounded answer files on the worker and a published result, of any tuple, whose
+ * description evidence is the grounded quotes. It reads no target state, so it holds after profile v2. */
+export async function groundedJobId(): Promise<number> {
+  const found = Number(await scriptValue("m4_seeds", "m4_seeds.grounded_job_id()"));
+  if (!Number.isInteger(found) || found < 1) {
+    throw new Error("m4_seeds.grounded_job_id() answered no job id");
+  }
+  return found;
 }
 
 /** The score lane's bucket refilled (`smoke_m3.ADVANCE_BUCKET`, Ruling T28-f): the month row's clock a month

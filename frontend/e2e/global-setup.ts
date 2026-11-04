@@ -4,7 +4,7 @@
 // and the visual checks share that user. The password is read in process and never printed.
 import { request } from "@playwright/test";
 import { ORIGIN, saveAuthState } from "./support/api";
-import { compose, smokeUser, waitFor } from "./support/stack";
+import { DC, run, smokeUser, waitFor } from "./support/stack";
 
 const READY_WITHIN_MS = 300_000;
 
@@ -22,13 +22,12 @@ async function ready(): Promise<true | null> {
 export default async function globalSetup(): Promise<void> {
   await waitFor(ready, READY_WITHIN_MS, "GET /readyz 200");
   const user = await smokeUser();
-  try {
-    await compose(["run", "--rm", "-T", "api", ...user.create], { input: `${user.password}\n` });
-  } catch (error) {
-    if (!(error instanceof Error) || !error.message.includes(user.exists)) {
-      throw error;
-    }
-    // the user exists already: the login below proves it is the smoke user
+  const created = await run([...DC, "run", "--rm", "-T", "api", ...user.create], { input: `${user.password}\n` });
+  // A user that exists already is the smoke user when the login below works (`smoke_m0` reads the whole stderr
+  // for the message, as here).
+  if (created.code !== 0 && !created.stderr.includes(user.exists)) {
+    const tail = created.stderr.trim().split("\n").slice(-3).join(" | ").slice(0, 400);
+    throw new Error(`jobhunter user create exited ${String(created.code)}: ${tail}`);
   }
   await saveAuthState(user);
 }

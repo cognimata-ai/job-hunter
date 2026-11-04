@@ -14,6 +14,25 @@ export default defineConfig(
     },
   },
   {
+    // The E2E specs and the setup project take `test` from support/fixtures, which carries the CSP guard (R1);
+    // `test` of @playwright/test has none (plan M4 Task 32). Its types and `expect` may come from either.
+    files: ["e2e/specs/**/*.ts", "e2e/setup/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@playwright/test",
+              importNames: ["test"],
+              message: "Import `test` from support/fixtures: it carries the CSP guard (R1).",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     // The build's Node scripts (plain ESM): the Node globals they use, without @types/node.
     files: ["scripts/**/*.mjs"],
     languageOptions: { globals: { process: "readonly", console: "readonly", URL: "readonly" } },

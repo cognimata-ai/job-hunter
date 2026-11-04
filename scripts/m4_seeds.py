@@ -41,6 +41,12 @@ integers. A text that may hold a line break or a `|` (a description) is read as 
   of answers: a tar unpacked into a staging directory of the keyed directory, then each file renamed into
   place, so a try reads the old answer or the new one, never a partial file). A file that is there with the
   same bytes is not written again (`grounded_files_present`).
+- `grounded_job_id(run_sql=…) -> int` (E9's job, for the scenarios): the lowest grounded candidate
+  (`GROUNDED_JOB_SQL`: a retained Greenhouse `getyourguide` job of completeness `full` whose description has
+  three quotes) whose current revision has all six grounded answer files in the worker's keyed directory and
+  a published result, of any tuple, whose description evidence is a non-empty subset of its grounded quotes.
+  No target state is read, so the rule holds after a profile v2 changed the tuple; `find_grounded_job` is the
+  same, `None` for none.
 - `seed_rejected_item(run_sql=…) -> (raw_response_id, raw_item_id)` (E17: the fixtures reject no item): the
   ids of the seed when a fetch request with `spec ? 'm4_seed'` exists; else, in one transaction with
   `SET LOCAL session_replication_role = replica` (this seed only: it inserts a fetch request and its
@@ -48,8 +54,9 @@ integers. A text that may hold a line break or a `|` (a description) is read as 
   (`attempt_seq = 8`, `spec || {"m4_seed": true}`) that succeeded with a new `raw_responses` row referencing
   the original's body (`body_ref_id`, the same `body_sha256` and `item_count`, `fetched_at = now()`,
   `expires_at = now() + 30 days`, parsed), and one `raw_items` row for item 0 (the original item 0's
-  `item_sha256`, `rejected` with `identity_error`). The current parser reads that body, so a replay moves the
-  item `rejected -> pending` and the replay's resolution links it.
+  `item_sha256`, `rejected` with `identity_error`). The three inserts are made only for a page with an item 0:
+  when the newest page has none, nothing is written and the seed fails naming that page. The current parser
+  reads that body, so a replay moves the item `rejected -> pending` and the replay's resolution links it.
 
 Nothing here prints. A failure raises `smoke_m0.CheckFailed` naming ids, states and counts, never ad text, a
 key or a secret.
@@ -70,6 +77,7 @@ from typing import Any, Final
 
 import smoke_m0  # scripts/ is the script's directory, the first entry of sys.path
 from smoke_m0 import DOCKER_TIMEOUT_S, CheckFailed, stderr_tail
+from smoke_m3 import RETAINED_JOB_SQL  # a current revision of a retained job (`jobs j`)
 
 REPO: Final = Path(__file__).resolve().parents[1]
 # The E2E stack (plan M4 Global Constraints): the dev stack, both fakes and the E2E overlay, one project.
@@ -87,11 +95,6 @@ DC: Final = [
     "-f",
     str(REPO / "deploy/compose.e2e.yaml"),
 ]
-# A current revision of a retained job (`jobs j`), as `smoke_m3.RETAINED_JOB_SQL` (and
-# `scoring.targets.RETAINED_JOB_SQL`) states it.
-RETAINED_JOB_SQL: Final = (
-    "j.merged_into_job_id IS NULL AND j.current_revision_id IS NOT NULL AND NOT j.synthetic_eval"
-)
 # The command tags `psql -At` prints for a statement of a transaction script that returns no rows.
 _COMMAND_TAGS: Final = frozenset({"BEGIN", "SET", "COMMIT", "ROLLBACK"})
 
@@ -379,6 +382,65 @@ def _missing(answers: Mapping[str, bytes], digests: Mapping[str, str]) -> dict[s
     }
 
 
+GROUNDED_BOARD: Final = ("greenhouse", "getyourguide")
+# A grounded candidate (`jobs j`, its revision `r`): a retained Greenhouse `getyourguide` job of completeness
+# `full` (the description's sentences are checked in Python, `grounded_quotes`). Constants only.
+GROUNDED_JOB_SQL: Final = f"""\
+{RETAINED_JOB_SQL} AND j.completeness = 'full' AND EXISTS (SELECT 1 FROM postings p
+  JOIN source_instances s ON s.id = p.source_instance_id WHERE p.job_id = j.id
+  AND s.source_id = '{GROUNDED_BOARD[0]}' AND s.instance_key = '{GROUNDED_BOARD[1]}')"""  # noqa: S608
+# Every candidate with its current revision, its description and, per published result of that revision (any
+# tuple), the distinct quotes of its description evidence; one JSON array, by job id.
+GROUNDED_JOBS: Final = f"""\
+/* m4_seeds.grounded_jobs */ SELECT coalesce(json_agg(json_build_object('job_id', j.id,
+  'revision_id', j.current_revision_id, 'description', r.description_text,
+  'evidence', (SELECT coalesce(json_agg(q.quotes), '[]') FROM (SELECT json_agg(DISTINCT e.quote) AS quotes
+    FROM llm_results l JOIN result_evidence e ON e.llm_result_id = l.id AND e.source_kind = 'description'
+    WHERE l.job_revision_id = j.current_revision_id GROUP BY l.id) q)) ORDER BY j.id), '[]')::text
+FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id WHERE {GROUNDED_JOB_SQL}"""  # noqa: S608
+
+
+def grounded_file_names(job_revision_id: int) -> frozenset[str]:
+    """The file names of the six grounded answers of a revision (`grounded_answers` with the critic)."""
+    from jobhunter.llm.fake import answer_key, keyed_answer_filename
+
+    refs = {"job_revision_id": job_revision_id}
+    keys = [
+        answer_key("generate", refs, 0),
+        *(answer_key("critic", refs, n) for n in CRITIC_ROUNDS),
+        *(answer_key("revise", refs, n) for n in REVISIONS),
+    ]
+    return frozenset(keyed_answer_filename(key) for key in keys)
+
+
+def find_grounded_job(run_sql: SqlRunner = stack_sql) -> int | None:
+    """E9's job (module docstring), or `None` when no candidate is grounded yet."""
+    jobs = json_line(run_sql(GROUNDED_JOBS), what="the grounded candidates")
+    present = set(keyed_digests(keyed_dir()))
+    for job in jobs if isinstance(jobs, list) else []:
+        try:
+            quotes = set(grounded_quotes(str(job["description"])))
+        except ValueError:
+            continue
+        if not grounded_file_names(int(job["revision_id"])) <= present:
+            continue
+        if any(isinstance(found, list) and found and set(found) <= quotes for found in job["evidence"]):
+            return int(job["job_id"])
+    return None
+
+
+def grounded_job_id(run_sql: SqlRunner = stack_sql) -> int:
+    """E9's job (module docstring); none fails loudly."""
+    found = find_grounded_job(run_sql)
+    if found is None:
+        raise CheckFailed(
+            f"no {GROUNDED_BOARD[0]} {GROUNDED_BOARD[1]} job of completeness full with three quotes has its "
+            "grounded answer files and a published result with the grounded quotes as its description "
+            "evidence"
+        )
+    return found
+
+
 def grounded_files_present(job_id: int, *, run_sql: SqlRunner = stack_sql) -> bool:
     """Whether every answer of the job's grounded scoring is in the worker's keyed directory, unchanged."""
     revision, description, skill = grounded_inputs(job_id, run_sql)
@@ -431,7 +493,7 @@ WHERE f.spec ? 'm4_seed' ORDER BY f.id LIMIT 1"""
 SEED_REJECTED_ITEM: Final = """\
 BEGIN;
 SET LOCAL session_replication_role = replica;
-/* m4_seeds.rejected_item */ WITH src AS (
+/* m4_seeds.rejected_item */ WITH page AS (
   SELECT f.run_id, f.run_attempt_no, f.cell_id, f.source_instance_id, f.phase, f.operation,
     f.detail_native_id, f.parent_fetch_request_id, f.request_key, f.page_no, f.request_class, f.spec,
     f.http_status, f.continuation, f.next_cursor, f.items, f.new_native_ids, f.new_postings,
@@ -442,6 +504,9 @@ SET LOCAL session_replication_role = replica;
   WHERE s.source_id = 'arbeitnow' AND f.status = 'succeeded' AND f.operation = 'list' AND f.page_no = 1
     AND NOT f.spec ? 'm4_seed'
   ORDER BY r.fetched_at DESC, f.id DESC LIMIT 1
+), src AS (  -- the page with its item 0: no item 0, no row, so none of the three inserts writes
+  SELECT page.*, i.item_sha256 FROM page
+  JOIN raw_items i ON i.raw_response_id = page.response_id AND i.item_index = 0
 ), ids AS (
   SELECT nextval(pg_get_serial_sequence('fetch_requests', 'id')) AS request_id,
     nextval(pg_get_serial_sequence('raw_responses', 'id')) AS response_id
@@ -463,12 +528,11 @@ SET LOCAL session_replication_role = replica;
   FROM src CROSS JOIN ids RETURNING id
 ), ri AS (
   INSERT INTO raw_items (raw_response_id, item_index, item_sha256, disposition, reason_code, disposed_at)
-  SELECT ids.response_id, 0, i.item_sha256, 'rejected', 'identity_error', now()
-  FROM src CROSS JOIN ids JOIN raw_items i ON i.raw_response_id = src.response_id AND i.item_index = 0
-  RETURNING id
+  SELECT ids.response_id, 0, src.item_sha256, 'rejected', 'identity_error', now()
+  FROM src CROSS JOIN ids RETURNING id
 )
-SELECT coalesce((SELECT id FROM rr), 0), coalesce((SELECT id FROM ri), 0),
-  (SELECT count(*) FROM fr);
+SELECT coalesce((SELECT id FROM rr), 0), coalesce((SELECT id FROM ri), 0), (SELECT count(*) FROM fr),
+  coalesce((SELECT response_id FROM page), 0);
 COMMIT;"""
 
 
@@ -480,8 +544,12 @@ def seed_rejected_item(run_sql: SqlRunner = stack_sql) -> tuple[int, int]:
         if not item:
             raise CheckFailed(f"the seeded response {response} has no raw item")
         return response, item
-    made = one_row(run_sql(SEED_REJECTED_ITEM), 3, what="the rejected item")
-    response, item, requests = ints(made or ["0", "0", "0"], what="the rejected item")
+    made = one_row(run_sql(SEED_REJECTED_ITEM), 4, what="the rejected item")
+    response, item, requests, original = ints(made or ["0", "0", "0", "0"], what="the rejected item")
+    if not original:
+        raise CheckFailed("no succeeded Arbeitnow page-1 response to copy: nothing seeded")
     if not (response and item and requests == 1):
-        raise CheckFailed("no succeeded Arbeitnow page-1 response with an item 0 to copy")
+        raise CheckFailed(
+            f"the newest succeeded Arbeitnow page-1 response {original} has no item 0: nothing seeded"
+        )
     return response, item

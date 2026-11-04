@@ -165,18 +165,79 @@ async def test_seed_rejected_item_is_replayable_and_idempotent(
     assert disposition == "linked" and observation is not None
 
 
+async def test_seed_rejected_item_inserts_nothing_without_an_item_0(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps, migrated, seeds
+) -> None:
+    """The newest Arbeitnow page-1 response without an item 0 (moved to another index, as a page whose first
+    element was never stored): the seed writes no fetch request, response or item, and fails naming that
+    page."""
+    await run_to_the_end(engine, collect_deps, companies=(), enabled=("arbeitnow",))
+    run_sql = superuser_sql(migrated)
+    newest = await scalar(
+        engine,
+        "SELECT r.id FROM fetch_requests f JOIN raw_responses r ON r.id = f.raw_response_id "
+        "JOIN source_instances s ON s.id = f.source_instance_id WHERE s.source_id = 'arbeitnow' "
+        "AND f.status = 'succeeded' AND f.operation = 'list' AND f.page_no = 1 "
+        "ORDER BY r.fetched_at DESC, f.id DESC LIMIT 1",
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE raw_items SET item_index = 999 WHERE raw_response_id = :r AND item_index = 0"),
+            {"r": newest},
+        )
+    counted = (
+        "SELECT (SELECT count(*) FROM fetch_requests), (SELECT count(*) FROM raw_responses), "
+        "(SELECT count(*) FROM raw_items)"
+    )
+    before = await one(engine, counted)
+    with pytest.raises(sys.modules["smoke_m0"].CheckFailed, match=f"response {newest} has no item 0"):
+        seeds.seed_rejected_item(run_sql)
+    assert await one(engine, counted) == before
+    assert await scalar(engine, "SELECT count(*) FROM fetch_requests WHERE spec ? 'm4_seed'") == 0
+
+
 # ---- the merge pair ----------------------------------------------------------------------------------------
+
+
+# A company key that sorts before every collected one, given to an Adzuna job and another job below.
+ADZUNA_FIRST: Final = "0000-e2e-adzuna-first"
+_ELIGIBLE_COMPANIES: Final = (
+    "SELECT j.company_key FROM jobs j WHERE j.merged_into_job_id IS NULL "
+    "AND j.current_revision_id IS NOT NULL AND NOT j.synthetic_eval AND j.duplicate_group_id IS NULL "
+    "GROUP BY 1 HAVING count(*) >= 2 ORDER BY 1 LIMIT 1"
+)
 
 
 async def test_seed_merge_pair_is_idempotent_and_confirmable(
     engine, current_epoch, fake_http, fake_embedder, collect_deps, migrated, seeds
 ) -> None:
-    await run_to_the_end(engine, collect_deps, companies=(GETYOURGUIDE,), enabled=("arbeitnow", "ats"))
+    # Adzuna is read on the fixtures (a quota source: a free run reads it too); one of its ungrouped jobs and
+    # an Arbeitnow job are given the company key that sorts first, which the seed must pass over.
+    await run_to_the_end(
+        engine,
+        collect_deps,
+        queries=("software engineer",),
+        companies=(GETYOURGUIDE,),
+        enabled=("adzuna", "arbeitnow", "ats"),
+    )
     run_sql = superuser_sql(migrated)
+    adzuna_job, other_job = await one(
+        engine,
+        "SELECT (SELECT min(id) FROM jobs WHERE 'adzuna' = ANY(source_ids) AND duplicate_group_id IS NULL), "
+        "(SELECT min(id) FROM jobs WHERE 'arbeitnow' = ANY(source_ids) AND NOT 'adzuna' = ANY(source_ids))",
+    )
+    assert adzuna_job is not None and other_job is not None
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE jobs SET company_key = :k WHERE id IN (:a, :b)"),
+            {"k": ADZUNA_FIRST, "a": adzuna_job, "b": other_job},
+        )
+    assert await scalar(engine, _ELIGIBLE_COMPANIES) == ADZUNA_FIRST  # it would be chosen but for Adzuna
     before = await scalar(engine, "SELECT count(*) FROM duplicate_groups")
     seeded = seeds.seed_merge_pair(run_sql)
     assert seeded is not None and seeds.seed_merge_pair(run_sql) == seeded
     group, representative, member = seeded
+    assert not {representative, member} & {adzuna_job, other_job}
     assert await scalar(engine, "SELECT count(*) FROM duplicate_groups") == before + 1
     (made,) = await rows(
         engine,

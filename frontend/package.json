@@ -4,11 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "build": "vite build && node scripts/check-dist-csp.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p e2e/tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "e2e": "playwright test -c e2e/playwright.config.ts",

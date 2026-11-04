@@ -2,14 +2,14 @@
 // scenarios. It runs `uv run python scripts/e2e_setup.py` in the repository, shows its JSON lines (one per step:
 // ids, states, counts and codes, never a secret), fails with them when it exits non-zero, and then signs the
 // smoke user in through the API again and rewrites `AUTH_STATE`, so `scenarios` start on a fresh, valid session
-// whatever `first-use` did.
-import { expect, test as setup } from "@playwright/test";
+// whatever `first-use` did. Its `test` is the fixtures' (the CSP guard, as for every spec; no page opens).
 import process from "node:process";
 import { saveAuthState } from "../support/api";
+import { expect, test as setup } from "../support/fixtures";
 import { REPO_ROOT } from "../support/paths";
 import { run, smokeUser } from "../support/stack";
 
-// The collection (600 s), a quiet moment of the score lane (600 s), the grounded publish (180 s) and the polls.
+// The collection (600 s), the grounded publish (180 s), the score lane's settle wait (600 s) and the polls.
 const SETUP_WITHIN_MS = 40 * 60_000;
 
 setup("the deterministic E2E setup", async () => {

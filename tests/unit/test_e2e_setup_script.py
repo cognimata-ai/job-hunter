@@ -168,7 +168,23 @@ class FakeStack:
             self.m3.APPLY_STATE.format(operation=77): f"succeeded|{SCOPE + 1}|0",
             setup.PERIODIC_DONE: "1",
             self.m3.LANE_STATE: "0|0|2",
+            setup.PENDING_APPLY: f"77|{SCOPE}",
+            self.m4.GROUNDED_JOBS: json.dumps(
+                [
+                    {
+                        "job_id": JOB,
+                        "revision_id": REVISION,
+                        "description": DESCRIPTION,
+                        "evidence": [self.quotes],
+                    }
+                ]
+            ),
         }
+        # answers that change once a statement was read: {statement read: {statement: its new answer}}
+        self.then: dict[str, dict[str, str]] = {}
+        # what `POST /api/jobs/{JOB}/score-now` answers, and a non-JSON body for `GET /api/settings`
+        self.score_now = httpx.Response(202, json={"target_id": 9, "state": "pending"})
+        self.settings_text: str | None = None
         self.settings: dict[str, Any] = {
             "version": {"id": 41, "version_no": 3},
             "payload": {
@@ -192,6 +208,7 @@ class FakeStack:
             statement = args[-1]
             if statement in self.answers:
                 out = self.answers[statement] + "\n"
+                self.answers.update(self.then.pop(statement, {}))
             else:
                 self.writes.append(f"sql: {statement.splitlines()[0][:60]}")
         elif args[-2:-1] == ["printenv"]:
@@ -211,6 +228,8 @@ class FakeStack:
         if (method, path) == ("POST", "/api/auth/login"):
             cookie = f"__Host-jh_session={TOKEN}; HttpOnly; Path=/; SameSite=strict; Secure"
             return httpx.Response(204, headers={"set-cookie": cookie})
+        if (method, path) == ("GET", "/api/settings") and self.settings_text is not None:
+            return httpx.Response(200, text=self.settings_text)
         if method == "GET":
             body = {
                 "/api/settings": self.settings,
@@ -230,6 +249,8 @@ class FakeStack:
             saved["version"] = {"id": 42, "version_no": 4}
             self.settings = saved
             return httpx.Response(201, json={**saved, "apply_scope_operation_id": 77})
+        if (method, path) == ("POST", f"/api/jobs/{JOB}/score-now"):
+            return self.score_now
         return httpx.Response(500)
 
 
@@ -289,7 +310,10 @@ def test_each_step_checks_before_it_writes(
     by_step = {p["step"]: p.get("detail") for p in printed}
     assert by_step["inputs"] == "already there"
     assert by_step["merge"] == "a user-confirmed merge stands: nothing seeded"
-    assert by_step["grounded"] == f"job {JOB} published with its grounded answers already; files present"
+    assert by_step["grounded"] == (
+        f"job {JOB} published with its grounded answers already; files present; "
+        "m4_seeds.grounded_job_id() finds it"
+    )
     assert by_step["rejected_item"] == f"raw response {RESPONSE}, raw item 66"
 
 
@@ -304,7 +328,7 @@ def test_the_grounded_answers_are_written_before_the_confirm(
     profiles: Iterator[dict[str, Any]] = iter([{"active": None}, {"active": {"id": 5, "version_no": 1}}])
     smoke_m2.STATE.draft_id = 17
     other = {"job_id": JOB + 1, "revision_id": REVISION + 1, "description": "Kurz. Zu kurz."}
-    stack.answers[setup.GROUNDED_JOBS] = json.dumps(
+    stack.answers[m4.GROUNDED_JOBS] = json.dumps(
         [{"job_id": JOB, "revision_id": REVISION, "description": DESCRIPTION}, other]
     )
 
@@ -362,3 +386,109 @@ def test_it_never_prints_a_cookie_a_key_or_the_password(
     failed = lines(out)[-1]
     assert failed["ok"] is False and failed["detail"].count("[redacted]") == 3
     assert TOKEN not in out and password not in out
+
+
+def pending_candidate(stack: FakeStack, setup: ModuleType) -> None:
+    """The grounded job's target `pending` until it is read once, then published (as a cycle publishes it)."""
+    candidates = json.loads(stack.answers[setup.GROUNDED_CANDIDATES])
+    candidates[0]["state"], candidates[0]["result_id"] = "pending", None
+    stack.answers[setup.GROUNDED_CANDIDATES] = json.dumps(candidates)
+    stack.answers[setup.TARGET_OF_JOB.format(job=JOB)] = "published_contested|score_now"
+
+
+def test_score_now_accepts_only_the_conflict_of_a_claimed_target(
+    setup: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Step 7 on a pending job: a 409 `conflict_state` (a cycle claimed it since) is awaited as a 202 is;
+    any other 409 fails the step, naming its code."""
+    stack = FakeStack(setup)
+    pending_candidate(stack, setup)
+    stack.score_now = httpx.Response(409, json={"code": "conflict_state", "status": 409})
+    assert run_on(setup, stack, monkeypatch) == 0
+    grounded = {p["step"]: p for p in lines(capsys.readouterr().out)}["grounded"]
+    assert grounded["ok"] and "published_contested" in grounded["detail"]
+    assert stack.writes == [f"POST /api/jobs/{JOB}/score-now"]
+
+    stack = FakeStack(setup)
+    pending_candidate(stack, setup)
+    stack.score_now = httpx.Response(409, json={"code": "budget_exhausted", "status": 409})
+    assert run_on(setup, stack, monkeypatch) == 1
+    failed = lines(capsys.readouterr().out)[-1]
+    assert (failed["step"], failed["ok"]) == ("grounded", False)
+    assert failed["detail"] == f"score-now of job {JOB}: expected 202, got 409 (code 'budget_exhausted')"
+
+
+def test_a_data_error_names_the_last_answer(
+    setup: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An answer that is no JSON fails its step with the class and the method, path and status of the last
+    answer, never with the class alone or the answer's text."""
+    stack = FakeStack(setup)
+    stack.settings_text = "<html>not json, an invented page</html>"
+    assert run_on(setup, stack, monkeypatch) == 1
+    out = capsys.readouterr().out
+    failed = lines(out)[-1]
+    assert (failed["step"], failed["ok"]) == ("settings", False)
+    assert failed["detail"] == "JSONDecodeError after GET /api/settings answered 200"
+    assert "invented page" not in out
+    assert setup.data_error(KeyError("job_id"), []) == "KeyError 'job_id' before any API answer"
+
+
+def test_a_pending_scope_apply_is_awaited_not_saved_again(
+    setup: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Step 3 when the E2E scope is saved but its apply is pending (an interrupted run): it polls that apply's
+    flip and saves nothing."""
+    stack = FakeStack(setup)
+    stack.answers[setup.PENDING_SCOPE] = str(SCOPE + 1)
+    stack.then[stack.m3.APPLY_STATE.format(operation=77)] = {setup.PENDING_SCOPE: "0"}
+    assert run_on(setup, stack, monkeypatch) == 0
+    settings = {p["step"]: p for p in lines(capsys.readouterr().out)}["settings"]
+    assert settings == {
+        "step": "settings",
+        "ok": True,
+        "detail": "already saved: version_no 3; the pending apply operation 77 succeeded: "
+        f"scope {SCOPE} -> {SCOPE + 1}",
+    }
+    assert stack.writes == [] and stack.keys == []
+
+
+def test_the_grounded_job_is_found_by_its_files_and_its_evidence(
+    setup: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`m4_seeds.grounded_job_id`: the lowest candidate whose revision has all six grounded files and a
+    published result (any tuple) with the grounded quotes as its description evidence; a candidate without
+    three quotes, without the files or without such a result is passed over; none fails loudly."""
+    m4 = sys.modules["m4_seeds"]
+    stack = FakeStack(setup)
+    no_files = {
+        "job_id": JOB - 2,
+        "revision_id": REVISION - 2,
+        "description": DESCRIPTION,
+        "evidence": [stack.quotes],
+    }
+    other_evidence = {
+        "job_id": JOB - 1,
+        "revision_id": REVISION,
+        "description": DESCRIPTION,
+        "evidence": [["Kurz."]],
+    }
+    short = {"job_id": JOB - 3, "revision_id": REVISION, "description": "Kurz.", "evidence": [["Kurz."]]}
+    grounded = {
+        "job_id": JOB,
+        "revision_id": REVISION,
+        "description": DESCRIPTION,
+        "evidence": [[], stack.quotes[:2]],
+    }
+    monkeypatch.setattr(subprocess, "run", stack.run)
+    stack.answers[m4.GROUNDED_JOBS] = json.dumps([short, no_files, other_evidence, grounded])
+    assert m4.grounded_job_id(m4.stack_sql) == JOB
+    assert m4.grounded_file_names(REVISION) == {
+        f"{purpose}_{REVISION}_{n}.sse"
+        for purpose, rounds in (("generate", (0,)), ("critic", (1, 2, 3)), ("revise", (1, 2)))
+        for n in rounds
+    }
+    stack.answers[m4.GROUNDED_JOBS] = json.dumps([short, no_files, other_evidence])
+    assert m4.find_grounded_job(m4.stack_sql) is None
+    with pytest.raises(m4.CheckFailed, match="no greenhouse getyourguide job"):
+        m4.grounded_job_id(m4.stack_sql)

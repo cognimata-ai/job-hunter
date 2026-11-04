@@ -80,7 +80,7 @@ COLLECT_WITHIN_S: Final = 600
 APPLY_WITHIN_S: Final = 120
 TARGETS_WITHIN_S: Final = 120
 PUBLISH_WITHIN_S: Final = 180
-GROUNDED_BOARD: Final = ("greenhouse", "getyourguide")
+GROUNDED_BOARD: Final = m4_seeds.GROUNDED_BOARD
 # E10: the fixtures' Adzuna re-ingest pair (`adzuna_reingest_pair`, tests/contract/README.md): one ad under
 # two ids, which every fresh collection groups (tests/integration/test_collect_end_to_end.py).
 REINGEST_IDS: Final = ("5933514068", "5933514069")
@@ -92,6 +92,7 @@ E7_ADZUNA_TITLE: Final = normalize_title(E7_ADZUNA_AD_TITLE).title
 E7_ASHBY_BOARD: Final = ("ashby", "n8n")
 SETTLE_WITHIN_S: Final = 600
 PUBLISHED: Final = ("published_accepted", "published_contested")
+CLAIMED: Final = "conflict_state"  # score-now's 409 for a target a cycle is scoring
 ENDED_UNPUBLISHED: Final = ("refused", "cancelled", "expired_unscored")
 
 _BOARD_SLUGS: Final = ", ".join(f"'{slug}'" for _, slug, _ in smoke_m3.BOARDS)
@@ -109,8 +110,14 @@ PAID_RUN_DONE: Final = (
     "WHERE include_paid AND status = 'succeeded'"
 )
 JOB_COUNT: Final = "/* e2e.job_count */ SELECT count(*) FROM jobs"
-# The grounded job's candidates (step 7): every retained Greenhouse `getyourguide` job of completeness
-# `full` with its active-tuple target, as one JSON array (their descriptions included: never printed).
+# The newest scope apply and the active scope (step 3, while a saved scope is pending).
+PENDING_APPLY: Final = (
+    "/* e2e.pending_apply */ SELECT coalesce((SELECT max(id) FROM operations "
+    "WHERE kind = 'apply_scope'), 0), scope_version_id FROM active_config WHERE id = 1"
+)
+# The grounded job's candidates (step 7, `m4_seeds.GROUNDED_JOB_SQL`) with their active-tuple targets, as one
+# JSON array (their descriptions included: never printed). Step 6 reads them before any target exists through
+# `m4_seeds.GROUNDED_JOBS`.
 GROUNDED_CANDIDATES: Final = f"""\
 /* e2e.grounded_candidates */ SELECT coalesce(json_agg(json_build_object('job_id', j.id,
   'state', t.state, 'result_id', t.published_result_id, 'description', r.description_text)
@@ -118,17 +125,7 @@ GROUNDED_CANDIDATES: Final = f"""\
 FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id
 JOIN active_config a ON a.id = 1
 JOIN score_targets t ON t.job_revision_id = j.current_revision_id AND t.llm_tuple_id = a.llm_tuple_id
-WHERE {m4_seeds.RETAINED_JOB_SQL} AND j.completeness = 'full' AND EXISTS (SELECT 1 FROM postings p
-  JOIN source_instances s ON s.id = p.source_instance_id WHERE p.job_id = j.id
-  AND s.source_id = '{GROUNDED_BOARD[0]}' AND s.instance_key = '{GROUNDED_BOARD[1]}')"""  # noqa: S608
-# The same jobs before any target exists (step 6, before the confirm): their current revision and description.
-GROUNDED_JOBS: Final = f"""\
-/* e2e.grounded_jobs */ SELECT coalesce(json_agg(json_build_object('job_id', j.id,
-  'revision_id', j.current_revision_id, 'description', r.description_text) ORDER BY j.id), '[]')::text
-FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id
-WHERE {m4_seeds.RETAINED_JOB_SQL} AND j.completeness = 'full' AND EXISTS (SELECT 1 FROM postings p
-  JOIN source_instances s ON s.id = p.source_instance_id WHERE p.job_id = j.id
-  AND s.source_id = '{GROUNDED_BOARD[0]}' AND s.instance_key = '{GROUNDED_BOARD[1]}')"""  # noqa: S608
+WHERE {m4_seeds.GROUNDED_JOB_SQL}"""  # noqa: S608
 # The completed periodic cycles (step 9 waits for the first).
 PERIODIC_DONE: Final = (
     "/* e2e.periodic_done */ SELECT count(*) FROM score_cycles "
@@ -144,7 +141,7 @@ TARGET_OF_JOB: Final = (
     "JOIN score_targets t ON t.job_revision_id = j.current_revision_id AND t.llm_tuple_id = a.llm_tuple_id "
     "WHERE j.id = {job}"
 )
-RETAINED_COUNT: Final = f"/* e2e.retained */ SELECT count(*) FROM jobs j WHERE {m4_seeds.RETAINED_JOB_SQL}"  # noqa: S608
+RETAINED_COUNT: Final = f"/* e2e.retained */ SELECT count(*) FROM jobs j WHERE {smoke_m3.RETAINED_JOB_SQL}"  # noqa: S608
 _REINGEST_IN: Final = ", ".join(f"'{native}'" for native in REINGEST_IDS)
 # E10's pair: each posting with its job, group, structured sets, active-tuple target and active-scope filter.
 REINGEST_PAIR: Final = f"""\
@@ -163,10 +160,10 @@ LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = a.sc
 WHERE p.native_id IN ({_REINGEST_IN})"""  # noqa: S608 (constants only)
 E7_JOBS: Final = f"""\
 /* e2e.e7_jobs */ SELECT
-  (SELECT count(*) FROM jobs j WHERE {m4_seeds.RETAINED_JOB_SQL} AND j.availability = 'active'
+  (SELECT count(*) FROM jobs j WHERE {smoke_m3.RETAINED_JOB_SQL} AND j.availability = 'active'
     AND j.title = '{E7_ADZUNA_TITLE}' AND j.work_mode_source = 'none' AND EXISTS (SELECT 1 FROM postings p
     JOIN source_instances s ON s.id = p.source_instance_id WHERE p.job_id = j.id AND s.source_id = 'adzuna')),
-  (SELECT count(*) FROM jobs j WHERE {m4_seeds.RETAINED_JOB_SQL} AND j.availability = 'active'
+  (SELECT count(*) FROM jobs j WHERE {smoke_m3.RETAINED_JOB_SQL} AND j.availability = 'active'
     AND j.work_mode_source = 'structured' AND 'remote' = ANY(j.work_mode_possible) AND EXISTS (SELECT 1
     FROM postings p JOIN source_instances s ON s.id = p.source_instance_id WHERE p.job_id = j.id
     AND s.source_id = '{E7_ASHBY_BOARD[0]}' AND s.instance_key = '{E7_ASHBY_BOARD[1]}'))"""  # noqa: S608
@@ -298,8 +295,20 @@ def step_settings(ctx: Context) -> str | None:
     ):
         raise CheckFailed("the active settings have no scoring group or version id")
     pending = number(PENDING_SCOPE, what="the pending scope")
-    if scope_is_wanted(payload) and payload["scoring"].get("batch_bulk_rescore") is False and not pending:
-        return f"already saved: version_no {pick(active, 'version', 'version_no')!r}"
+    saved_already = f"already saved: version_no {pick(active, 'version', 'version_no')!r}"
+    bulk_off = payload["scoring"].get("batch_bulk_rescore") is False
+    if scope_is_wanted(payload) and pending:  # an earlier save's apply in flight: its flip, not a new save
+        operation, active_scope = m4_seeds.ints(
+            row(PENDING_APPLY, 2, what="the pending apply"), what="the apply"
+        )
+        if not operation:
+            raise CheckFailed(f"scope {pending} is pending without a scope apply")
+        flipped = await_flip(operation, active_scope)
+        if bulk_off:
+            return f"{saved_already}; the pending {flipped}"
+        pending = 0
+    if scope_is_wanted(payload) and bulk_off and not pending:
+        return saved_already
     (old_scope,) = m4_seeds.ints(
         row(smoke_m3.ACTIVE, 2, what="the active tuple")[1:], what="the active scope"
     )
@@ -371,7 +380,7 @@ def ground_candidates(ctx: Context) -> str:
     skill = pick(skills[0], "name") if isinstance(skills, list) and skills else None
     if not isinstance(skill, str) or not skill:
         raise CheckFailed(f"draft {smoke_m2.STATE.draft_id} has no skill")
-    jobs = m4_seeds.json_line(sql(GROUNDED_JOBS), what="the grounded candidates")
+    jobs = m4_seeds.json_line(sql(m4_seeds.GROUNDED_JOBS), what="the grounded candidates")
     answers: dict[str, bytes] = {}
     grounded = 0
     for job in jobs if isinstance(jobs, list) else []:
@@ -463,15 +472,36 @@ def step_grounded(ctx: Context) -> str | None:
     files = "files present" if present else "files written"
     state = pick(chosen, "state")
     if state in PUBLISHED:
-        return f"job {job_id} published with its grounded answers already; {files}"
+        return f"job {job_id} published with its grounded answers already; {files}; {handed_on(job_id)}"
     if state == "pending":
         response = ctx.client.post(
             f"{ORIGIN}/api/jobs/{job_id}/score-now", json={}, headers=smoke_m2.mutating(ctx, fresh_key())
         )
-        # 409: a cycle claimed it since (it scores it on the same answers)
-        if response.status_code not in (202, 409):
-            raise CheckFailed(f"score-now of job {job_id}: expected 202, got {response.status_code}")
-    return f"job {job_id} ({state}): {files}; {await_publish(job_id)}"
+        code = problem_code(response) if response.status_code == 409 else None
+        # 409 `conflict_state`: a cycle claimed it since, and scores it on the same answers
+        if response.status_code != 202 and code != CLAIMED:
+            raise CheckFailed(
+                f"score-now of job {job_id}: expected 202, got {response.status_code} (code {code!r})"
+            )
+    published = await_publish(job_id)
+    return f"job {job_id} ({state}): {files}; {published}; {handed_on(job_id)}"
+
+
+def problem_code(response: httpx.Response) -> str | None:
+    """The `code` of a problem answer, `None` when it has none."""
+    try:
+        code = pick(response.json(), "code")
+    except ValueError:
+        return None
+    return code if isinstance(code, str) else None
+
+
+def handed_on(job_id: int) -> str:
+    """`m4_seeds.grounded_job_id`, the scenarios' way to E9's job, must find the job this step chose."""
+    found = m4_seeds.grounded_job_id()
+    if found != job_id:
+        raise CheckFailed(f"the grounded job is {job_id}, but m4_seeds.grounded_job_id() finds {found}")
+    return "m4_seeds.grounded_job_id() finds it"
 
 
 def step_rejected_item(ctx: Context) -> str | None:
@@ -691,9 +721,25 @@ STEPS: Final[list[tuple[str, Callable[[Context], str | None]]]] = [
 ]
 
 
+def data_error(exc: Exception, last: list[str]) -> str:
+    """A data error's detail: its class (a missing key with its name) and the last API answer, never a
+    value it holds."""
+    what = (
+        f"{type(exc).__name__} {str(exc.args[0])[:60]!r}" if isinstance(exc, KeyError) else type(exc).__name__
+    )
+    return f"{what} after {last[0]}" if last else f"{what} before any API answer"
+
+
 def run(client: httpx.Client) -> int:
-    """Every step in order on `client` (module docstring); the exit status."""
+    """Every step in order on `client` (module docstring); the exit status. A data error (an answer that is
+    no JSON, a missing key, a wrong type) names the last answer the API gave: its method, path and status."""
     ctx = Context(client)
+    last: list[str] = []
+
+    def note(response: httpx.Response) -> None:
+        last[:] = [f"{response.request.method} {response.request.url.path} answered {response.status_code}"]
+
+    client.event_hooks = {**client.event_hooks, "response": [*client.event_hooks["response"], note]}
     for name, step in STEPS:
         try:
             detail = step(ctx)
@@ -703,8 +749,11 @@ def run(client: httpx.Client) -> int:
         except subprocess.TimeoutExpired as exc:
             emit(ctx, name, False, f"{Path(str(exc.cmd[0])).name} timed out after {exc.timeout:g} s")
             return 1
-        except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError) as exc:  # transport, docker, data
+        except (httpx.HTTPError, OSError) as exc:  # transport, a missing docker
             emit(ctx, name, False, type(exc).__name__)
+            return 1
+        except (ValueError, KeyError, TypeError) as exc:  # data: no JSON, a missing key, a wrong type
+            emit(ctx, name, False, data_error(exc, last))
             return 1
         emit(ctx, name, True, detail)
     return 0
