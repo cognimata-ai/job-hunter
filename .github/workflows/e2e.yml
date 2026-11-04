@@ -1,0 +1,73 @@
+# The E2E suite (spec §18.7; plan M4 Task 32, U2, R3): the Playwright specs of frontend/e2e against the E2E stack,
+# the dev stack with the fixture sources, the fake LLM and the fake embedder (deploy/compose.e2e.yaml), so no
+# provider and no model is ever called. On pull requests to main and by hand.
+#
+# The order: the configuration loads and every project discovers exactly the files frontend/e2e/support/specs.ts
+# names (`e2e:check`), before a browser is installed or the stack built; then the browser (a CI runner installs
+# its own; a dev container uses its pre-installed one), the dev secrets (dev-secrets.sh without a key: the fake LLM
+# needs none), the stack (the embedder's `fake` target: no model download) and the suite. The report and the
+# traces are uploaded when the suite fails; the stack and its volumes go in every case.
+#
+# Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment), uv
+# and Node to exact versions, the images to the digests of deploy/images.lock. No secret is referenced: the token
+# is read-only and the checkout does not keep it.
+name: E2E
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      DC: >-
+        docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml
+        -f deploy/compose.fakellm.yaml -f deploy/compose.e2e.yaml
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      # The global setup reads the smoke password and the stack setup runs scripts/e2e_setup.py with uv.
+      - run: uv sync --frozen
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --prefix frontend
+      - name: The configuration loads and every project discovers exactly its specs
+        run: npm --prefix frontend run e2e:check
+      - name: Chromium for Playwright
+        run: npx --prefix frontend playwright install --with-deps chromium
+      - name: The dev secrets (the fake LLM needs no key)
+        run: sudo scripts/dev-secrets.sh
+      - name: The E2E stack
+        run: $DC up -d --build --wait
+      - name: The E2E suite
+        run: npm --prefix frontend run e2e
+      - name: Upload the report and the traces
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: e2e-report
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove the stack and its volumes
+        if: always()
+        run: $DC down -v

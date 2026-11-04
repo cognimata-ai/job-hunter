@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "e2e": "playwright test -c e2e/playwright.config.ts",
+    "e2e:check": "node e2e/check-list.mjs",
     "gen:api": "openapi-typescript openapi.json -o src/api/schema.d.ts"
   },
   "dependencies": {
