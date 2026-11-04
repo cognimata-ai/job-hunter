@@ -683,8 +683,15 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
   const toast = useToast();
   const queryClient = useQueryClient();
   const [frames, setFrames] = useState<readonly SettingsSection[]>([]);
-  // the shell's own query (the same key and read); a second observer reads nothing more on mount
-  const settings = useQuery({ queryKey: SETTINGS_KEY, queryFn: ({ signal }) => readSettings({ signal }), refetchOnMount: false });
+  // the shell's own query (the same key and read); a second observer reads nothing more on mount, also not after a
+  // failed read (`retryOnMount: false`: a read on mount would put the query back to pending, and the shell would
+  // swap the page for its spinner and mount it again, in a loop); its Retry reads again
+  const settings = useQuery({
+    queryKey: SETTINGS_KEY,
+    queryFn: ({ signal }) => readSettings({ signal }),
+    refetchOnMount: false,
+    retryOnMount: false,
+  });
   const data = settings.data;
   const [state, dispatch] = useReducer(
     (current: State | null, action: Action | { type: "load"; data: SettingsOut }) => {

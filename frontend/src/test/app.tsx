@@ -11,8 +11,13 @@ import { Toaster } from "../components/Toaster";
 /** 07:00 UTC on 3 Nov 2026: the moment `statusOut()` describes. */
 export const NOW = new Date("2026-11-03T07:00:00Z");
 
-export function renderApp(path: string): AppParts {
+/** Renders the app at `path`; `retryDelay` replaces the queries' backoff (a read that fails past its retries). */
+export function renderApp(path: string, { retryDelay }: { retryDelay?: number } = {}): AppParts {
   const app = createApp({ history: createMemoryHistory({ initialEntries: [path] }) });
+  if (retryDelay !== undefined) {
+    const queries = app.queryClient.getDefaultOptions().queries;
+    app.queryClient.setDefaultOptions({ queries: { ...queries, retryDelay } });
+  }
   render(<App app={app} />);
   return app;
 }

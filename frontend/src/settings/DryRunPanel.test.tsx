@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
 import { type FakeApi, dryRunOut, fakeApi, json, problem, requestsTo, settingsRead } from "../test/api";
+import { renderApp, settled } from "../test/app";
 import { dryRunPayloads, renderSettings } from "../test/settings";
 
 type Settings = components["schemas"]["Settings"];
@@ -247,5 +248,21 @@ describe("DryRunPanel", () => {
     await userEvent.setup().click(within(section("schedule")).getByRole("button", { name: en["action.retry"] }));
     expect(await screen.findByRole("spinbutton", { name: en["settings_schedule.interval"] })).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("on the page, a settings load failure is read once and shows the sections with one alert", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/settings", () => problem(503, "internal"));
+    renderApp("/settings", { retryDelay: 0 });
+    expect(await screen.findByRole("heading", { level: 1, name: en["settings.title"] })).toBeTruthy();
+    await waitFor(() => {
+      expect(within(section("scope")).getByRole("alert").textContent).toContain(en["problem.internal"]);
+    });
+    await settled(300);
+    // the shell's read and its three retries; the form's own observer does not read again on mount
+    expect(requestsTo(api, "GET /api/settings")).toHaveLength(4);
+    expect(within(section("schedule")).queryByRole("alert")).toBeNull();
+    expect(within(section("budget")).queryByRole("alert")).toBeNull();
+    expect(within(section("budget")).getByRole("button", { name: en["action.retry"] })).toBeTruthy();
   });
 });
