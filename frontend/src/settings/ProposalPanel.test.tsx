@@ -199,13 +199,9 @@ describe("ProposalPanel", () => {
     const api = fakeApi({ signedIn: true });
     profileWith(api, { id: 5, status: "ready", failure_code: null });
     api.routes.set("GET /api/profile/query-proposals/5", () => json({ status: "ready", items: [PYTHON, BACKEND], failure_code: null }));
-    // the first item was added before (its text in another case); a query of the second's text is in another
-    // language
-    api.queries = [
-      queryRow({ id: 12, text: "senior python developer", lang: "en", origin: "llm_proposal" }),
-      queryRow({ id: 13, text: "Backend Entwickler", lang: "en" }),
-    ];
-    settingsWith(api, { queries: [{ query_id: 12, enabled: true }, { query_id: 13, enabled: true }] });
+    // the first item was added before (its text in another case); the second has no query yet
+    api.queries = [queryRow({ id: 12, text: "senior python developer", lang: "en", origin: "llm_proposal" })];
+    settingsWith(api, { queries: [{ query_id: 12, enabled: true }] });
     renderSettings(["queries"]);
     const added = await itemOf(PYTHON.text);
     await waitFor(() => {
@@ -213,6 +209,49 @@ describe("ProposalPanel", () => {
     });
     expect(within(added).queryByRole("button")).toBeNull();
     expect(within(await itemOf(BACKEND.text)).getByRole("button", { name: "Add “Backend Entwickler”" })).toBeTruthy();
+  });
+
+  it("an item whose text is a query in the other language says so, with no Add", async () => {
+    const api = fakeApi({ signedIn: true });
+    profileWith(api, { id: 5, status: "ready", failure_code: null });
+    api.routes.set("GET /api/profile/query-proposals/5", () => json({ status: "ready", items: [PYTHON, BACKEND], failure_code: null }));
+    // the server's uniqueness is `lower(text)` whatever the language: "backend entwickler" is an English query
+    api.queries = [queryRow({ id: 13, text: "backend entwickler", lang: "en", enabled: false })];
+    renderSettings(["queries"]);
+    const other = await itemOf(BACKEND.text);
+    await waitFor(() => {
+      expect(within(other).getByText("Already a query (English)")).toBeTruthy();
+    });
+    expect(within(other).queryByRole("button")).toBeNull();
+    expect(within(other).queryByText(en["settings_proposal.added"])).toBeNull();
+    // the other item is offered as before
+    expect(within(await itemOf(PYTHON.text)).getByRole("button", { name: "Add “Senior Python Developer”" })).toBeTruthy();
+  });
+
+  it("a refused request shows the server's detail", async () => {
+    const api = fakeApi({ signedIn: true });
+    profileWith(api, null);
+    api.routes.set("POST /api/profile/query-proposals", () =>
+      problem(409, "conflict_state", { detail: "The active profile was purged; confirm a new one first." }),
+    );
+    renderSettings(["queries"]);
+    const user = userEvent.setup();
+    await user.click(await within(await findPanel()).findByRole("button", { name: "Propose queries (~$0.02)" }));
+    const alert = await within(panel()).findByRole("alert");
+    expect(alert.textContent).toContain(en["problem.conflict_state"]);
+    expect(alert.textContent).toContain("The active profile was purged; confirm a new one first.");
+    expect(requestsTo(api, "GET /api/profile/query-proposals/5")).toHaveLength(0);
+  });
+
+  it("a purged proposal says so", async () => {
+    const api = fakeApi({ signedIn: true });
+    profileWith(api, { id: 5, status: "purged", failure_code: null });
+    api.routes.set("GET /api/profile/query-proposals/5", () => json({ status: "purged", items: null, failure_code: null }));
+    renderSettings(["queries"]);
+    expect(await within(await findPanel()).findByText(en["settings_proposal.purged"])).toBeTruthy();
+    expect(within(panel()).queryByRole("list")).toBeNull();
+    // a new proposal can be asked for
+    expect(within(panel()).getByRole<HTMLButtonElement>("button", { name: "Propose queries (~$0.02)" }).disabled).toBe(false);
   });
 
   it("an item whose query exists is enabled in the draft", async () => {

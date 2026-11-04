@@ -11,6 +11,8 @@
 //   writes each marked toggle onto the entry of the same id, appends an added entry the new base lacks, and drops
 //   a mark whose entry the new base no longer has. An added entry can be taken back (`removeEntry`, Task 29); an
 //   entry of the base is toggled, never removed (the routes of Queries & sources and the watchlist remove one).
+//   An added entry taken back while its save was in flight stays out once the saved version holds it: its mark
+//   is dirty against that version, and the adopt takes it out.
 // - **The dry-run** (Ruling T28-c) runs 500 ms after the last change, on the whole draft, and never while the
 //   draft is the base. The latest answer wins: a change aborts the request in flight, and an answer for an older
 //   draft is never taken. Until the current draft's answer is in, the form is `checking` and Save is disabled.
@@ -254,7 +256,8 @@ function isDirty(base: Settings, draft: Settings, path: string): boolean {
   const mine = findEntry(draft, list, Number(id));
   const theirs = findEntry(base, list, Number(id));
   if (mine === undefined) {
-    return false;
+    // an entry `base` holds and the draft took out (an added entry taken back while its save was in flight)
+    return toggle === undefined && theirs !== undefined;
   }
   return toggle === undefined ? !deepEqual(mine, theirs) : theirs?.enabled !== mine.enabled;
 }
@@ -298,6 +301,11 @@ export function overlay(base: Settings, draft: Settings, dirty: ReadonlySet<stri
     const id = Number(idText);
     const mine = findEntry(draft, list, id);
     if (mine === undefined) {
+      // an entry the draft took out (`isDirty`): out of the new base too
+      if (toggle === undefined && findEntry(next, list, id) !== undefined) {
+        next = withEntries(next, list, entriesOf(next, list).filter((entry) => entry[ID_KEY[list]] !== id));
+        kept.push(path);
+      }
       continue;
     }
     if (findEntry(next, list, id) !== undefined) {
@@ -639,10 +647,11 @@ export interface SettingsForm {
   setEvalOverride: (on: boolean) => void;
   /** Saves the draft; `from` is the section whose Save was pressed. */
   save: (from?: SettingsSection) => void;
-  /** After an internal save of another route: reads the settings, then writes the dirty paths onto them. */
-  rebase: () => Promise<void>;
+  /** After an internal save of another route: reads the settings, then writes the dirty paths onto them.
+   * Resolves `true` once that version is the base, `false` when the read failed (the base stays). */
+  rebase: () => Promise<boolean>;
   /** The offer's Reload and reapply: as `rebase`, and the ticks are cleared. */
-  reapply: () => Promise<void>;
+  reapply: () => Promise<boolean>;
   retryDryRun: () => void;
   /** Reads the saved version again after a failed re-read. */
   retryReread: () => void;
@@ -842,19 +851,22 @@ export function SettingsFormProvider({ children }: { children: ReactNode }) {
     }
   }, [queryClient]);
 
-  // Reads the settings for a rebase, then writes the dirty paths onto them.
-  const rebase = useCallback(async (clearTicks: boolean) => {
+  // Reads the settings for a rebase, then writes the dirty paths onto them; whether that version is now the base.
+  const rebase = useCallback(async (clearTicks: boolean): Promise<boolean> => {
     dispatch({ type: "adopting", adopting: { mode: "reapply", clearTicks } });
     try {
       await queryClient.refetchQueries({ queryKey: SETTINGS_KEY, exact: true }, { throwOnError: true });
     } catch {
       dispatch({ type: "adoptFailed" });
-      return;
+      return false;
     }
     const read = queryClient.getQueryData<SettingsOut>(SETTINGS_KEY);
-    if (read !== undefined) {
-      dispatch({ type: "settings", data: read, settled: true });
+    if (read === undefined) {
+      dispatch({ type: "adoptFailed" });
+      return false;
     }
+    dispatch({ type: "settings", data: read, settled: true });
+    return true;
   }, [queryClient]);
 
   const form = useMemo((): SettingsForm | null => {

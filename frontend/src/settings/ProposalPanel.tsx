@@ -7,10 +7,14 @@
 //   shows it again and never asks for a second paid one. It is read every 3 s while running (`useProposal`).
 // - `ready`: its queries, each with its text (in its language), its language, its target title, its exploration
 //   flag and the model's rationale, all as text, and [Add] (`POST /api/queries` with the proposal and the flag;
-//   the query enters the draft enabled). An item reads "Added" while the draft holds a query of its text (case
-//   folded) and language, or the query its own Add answered.
+//   the query enters the draft enabled). An item is matched against the live queries by its text alone (case
+//   folded), as the server's `lower(text)` uniqueness is blind to the language: a match in its own language
+//   that the draft holds (or the query its own Add answered) reads "Added"; a match in the other language reads
+//   "Already a query (<language>)", with no [Add], since an add could only meet that query. While an item's Add
+//   is out, [Propose queries] waits, so a new proposal never replaces the item under it.
 // - `failed`: why, through `proposal_failure`; a code without a text of its own reads "The proposal failed"
 //   with the code. `purged`: the proposal went with its profile.
+import { useIsMutating } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProblemBox } from "../components/ProblemBox";
@@ -21,7 +25,16 @@ import { useProfile } from "../profile/api";
 import { useFormat } from "../system/format";
 import fields from "./fields.module.css";
 import styles from "./ProposalPanel.module.css";
-import { type ProposalOut, type ProposedQueryOut, type QueryListOut, useAddQuery, useProposal, useQueries, useRequestProposal } from "./queriesApi";
+import {
+  ADD_PROPOSED_KEY,
+  type ProposalOut,
+  type ProposedQueryOut,
+  type QueryListOut,
+  useAddQuery,
+  useProposal,
+  useQueries,
+  useRequestProposal,
+} from "./queriesApi";
 import { useSettingsForm } from "./useSettingsForm";
 
 /** The newer of two proposal ids (ids are serial). */
@@ -36,26 +49,33 @@ function Item({ item, proposalId, queries }: { item: ProposedQueryOut; proposalI
   const { t } = useTranslation();
   const serverText = useServerText();
   const form = useSettingsForm();
-  const adding = useAddQuery();
+  const adding = useAddQuery({ proposed: true });
   const textId = useId();
   const held = (id: number) => form.draft.queries.some((entry) => entry.query_id === id);
   const key = item.text.trim().toLowerCase();
-  const matched = queries?.some((query) => query.text.trim().toLowerCase() === key && query.lang === item.lang && held(query.id)) ?? false;
-  const added = matched || (adding.outcome !== null && held(adding.outcome.id));
+  const match = queries?.find((query) => query.text.trim().toLowerCase() === key);
+  const other = match !== undefined && match.lang !== item.lang ? match : undefined;
+  const added = (match !== undefined && other === undefined && held(match.id)) || (adding.outcome !== null && held(adding.outcome.id));
   const outcome = adding.outcome?.kind;
+  let state;
+  if (added) {
+    state = <span className={styles.added}>{t("settings_proposal.added")}</span>;
+  } else if (other !== undefined) {
+    state = <span className={styles.exists}>{t("settings_proposal.exists_other", { language: serverText("language_code", other.lang) })}</span>;
+  } else {
+    state = (
+      <button type="button" className={fields.button} disabled={adding.pending} aria-busy={adding.pending || undefined}
+        aria-label={t("settings_proposal.add_label", { text: item.text })}
+        onClick={() => { adding.add({ text: item.text, lang: item.lang, proposal_id: proposalId, exploration: item.exploration }); }}>
+        {t("settings_proposal.add")}
+      </button>
+    );
+  }
   return (
     <li className={styles.item}>
       <div className={styles.itemHead}>
         <span id={textId} lang={item.lang} className={styles.itemText}>{item.text}</span>
-        {added ? (
-          <span className={styles.added}>{t("settings_proposal.added")}</span>
-        ) : (
-          <button type="button" className={fields.button} disabled={adding.pending} aria-busy={adding.pending || undefined}
-            aria-label={t("settings_proposal.add_label", { text: item.text })}
-            onClick={() => { adding.add({ text: item.text, lang: item.lang, proposal_id: proposalId, exploration: item.exploration }); }}>
-            {t("settings_proposal.add")}
-          </button>
-        )}
+        {state}
       </div>
       <p className={styles.meta}>
         <span>{serverText("language_code", item.lang)}</span>
@@ -134,6 +154,7 @@ export function ProposalPanel() {
   const latest = profile.data?.latest_proposal ?? null;
   const shownId = newest(requested, latest?.id ?? null);
   const proposal = useProposal(shownId);
+  const adding = useIsMutating({ mutationKey: ADD_PROPOSED_KEY }) > 0;
   let body;
   if (profile.isPending) {
     body = <Skeleton variant="line" count={2} />;
@@ -148,7 +169,7 @@ export function ProposalPanel() {
     body = (
       <>
         <div className={styles.action}>
-          <button type="button" className={fields.primary} disabled={!active || running || request.isPending}
+          <button type="button" className={fields.primary} disabled={!active || running || adding || request.isPending}
             aria-busy={request.isPending || undefined} aria-describedby={active ? undefined : reasonId}
             onClick={() => { request.mutate(undefined, { onSuccess: (out) => { setRequested(out.proposal_id); } }); }}>
             {t("settings_proposal.propose", { usd: format.usd(profile.data.estimates.propose_queries_usd) })}

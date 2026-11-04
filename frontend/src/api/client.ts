@@ -175,3 +175,13 @@ export async function apiFetch<T>(path: string, init: ApiInit = {}): Promise<T> 
     });
   }
 }
+
+/** `apiFetch` with every failure a `ProblemError` (`toProblem`: no answer is the `"network"` problem), for a
+ * caller that shows or branches on the problem. */
+export async function apiSend<T>(path: string, init: ApiInit = {}): Promise<T> {
+  try {
+    return await apiFetch<T>(path, init);
+  } catch (error) {
+    throw toProblem(error);
+  }
+}

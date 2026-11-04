@@ -62,6 +62,15 @@
   font-weight: var(--font-weight-medium);
 }
 
+.exists {
+  flex: none;
+  max-width: 50%;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  text-align: right;
+}
+
 .meta {
   display: flex;
   flex-wrap: wrap;

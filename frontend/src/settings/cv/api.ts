@@ -16,7 +16,7 @@ import {
 } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
-import { apiFetch, type ProblemError, toProblem } from "../../api/client";
+import { apiFetch, apiSend as send, type ProblemError } from "../../api/client";
 import { useKeyedMutation } from "../../api/idempotency";
 import type { components } from "../../api/schema";
 import { SETTINGS_KEY, type SettingsOut } from "../../app/AppShell";
@@ -76,14 +76,6 @@ export function isInReview(status: DraftStatusCode | undefined): boolean {
 /** Whether a draft in `status` is over: confirmed or discarded. */
 export function isOver(status: DraftStatusCode | undefined): boolean {
   return status === "confirmed" || status === "discarded";
-}
-
-async function send<T>(path: string, init: Parameters<typeof apiFetch>[1]): Promise<T> {
-  try {
-    return await apiFetch<T>(path, init);
-  } catch (error) {
-    throw toProblem(error);
-  }
 }
 
 /**

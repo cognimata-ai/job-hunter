@@ -1,10 +1,11 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
 import { type FakeApi, cellStats, fakeApi, json, problem, queryRow, requestsTo, settingsRead } from "../test/api";
 import { dryRunPayloads, formOf, renderSettings, saves } from "../test/settings";
+import { QUERIES_KEY } from "./queriesApi";
 
 type Settings = components["schemas"]["Settings"];
 type SettingsOut = components["schemas"]["SettingsOut"];
@@ -108,7 +109,7 @@ describe("QueriesSection", () => {
     expect(cellOf(second, en["settings_queries.col.cadence"]).textContent).toBe("10 days");
     expect(cellOf(second, en["settings_queries.col.hint"]).textContent).toBe("");
     expect(checkbox(second).checked).toBe(false);
-    expect(within(second).queryByText(en["settings_queries.not_in_settings"])).toBeNull();
+    expect(within(second).queryByText(en["settings_entries.not_in_settings"])).toBeNull();
   });
 
   it("shows a row's cells from one read of the stats", async () => {
@@ -339,6 +340,142 @@ describe("QueriesSection", () => {
     expect(checkbox(await rowOf("Data Engineers")).checked).toBe(true);
   });
 
+  it("an edit's follow-up runs after the editor closes mid-flight", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.queries = [queryRow({ id: 3, text: "Data Engineer", enabled: false })];
+    served(api, version(41, 12)); // the settings list no query: the edit saves no settings
+    let answer: (() => void) | null = null;
+    api.routes.set("PATCH /api/queries/3", () =>
+      new Promise<Response>((resolve) => {
+        answer = () => {
+          resolve(json({ id: 8, text: "Data Engineers", lang: "en", origin: "user", exploration: false, proposal_id: null }));
+        };
+      }),
+    );
+    const { probe, queryClient } = renderSettings(["queries"]);
+    const user = userEvent.setup();
+    await user.click(checkbox(await rowOf("Data Engineer")));
+    await user.click(within(await rowOf("Data Engineer")).getByRole("button", { name: en["settings_queries.edit"] }));
+    const editor = within(section()).getByRole("group", { name: "Edit “Data Engineer”" });
+    await user.type(within(editor).getByRole("textbox", { name: en["settings_queries.edit_text"] }), "s");
+    await user.click(within(editor).getByRole("button", { name: en["settings_queries.edit_save"] }));
+    await waitFor(() => {
+      expect(answer).not.toBeNull();
+    });
+    // while the PATCH is out, the editor cannot be closed by its own buttons
+    expect(within(editor).getByRole<HTMLButtonElement>("button", { name: en["action.cancel"] }).disabled).toBe(true);
+    expect(within(await rowOf("Data Engineer")).getByRole<HTMLButtonElement>("button", { name: en["settings_queries.edit"] }).disabled).toBe(true);
+    // a list read drops the retired row, and its editor with it
+    api.queries = [queryRow({ id: 8, text: "Data Engineers", enabled: false })];
+    await act(() => queryClient.invalidateQueries({ queryKey: QUERIES_KEY }));
+    await waitFor(() => {
+      expect(within(section()).queryByRole("group", { name: "Edit “Data Engineer”" })).toBeNull();
+    });
+    await act(async () => {
+      answer?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(formOf(probe).draft.queries).toEqual([{ query_id: 8, enabled: true }]);
+    });
+    expect([...formOf(probe).dirty]).toEqual(["queries[id=8]"]);
+    expect(checkbox(await rowOf("Data Engineers")).checked).toBe(true);
+  });
+
+  it("an edit carries the row's own toggle to the new query", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.queries = [queryRow({ id: 1 })];
+    const settings = served(api, version(41, 12, { queries: [{ query_id: 1, enabled: true }] }));
+    api.routes.set("PATCH /api/queries/1", () => {
+      // the internal save moved the entry, its saved flag kept
+      settings.current = version(42, 13, { queries: [{ query_id: 7, enabled: true }] });
+      api.queries = [queryRow({ id: 7, text: "Backend Developer" })];
+      return json({ id: 7, text: "Backend Developer", lang: "en", origin: "user", exploration: false, proposal_id: null });
+    });
+    const { probe } = renderSettings(["queries"]);
+    const user = userEvent.setup();
+    await user.click(checkbox(await rowOf("Backend Engineer"))); // disabled in the draft
+    await user.click(within(await rowOf("Backend Engineer")).getByRole("button", { name: en["settings_queries.edit"] }));
+    const editor = within(section()).getByRole("group", { name: "Edit “Backend Engineer”" });
+    const text = within(editor).getByRole("textbox", { name: en["settings_queries.edit_text"] });
+    await user.clear(text);
+    await user.type(text, "Backend Developer");
+    await user.click(within(editor).getByRole("button", { name: en["settings_queries.edit_save"] }));
+    await waitFor(() => {
+      expect(formOf(probe).base.version.id).toBe(42);
+    });
+    await waitFor(() => {
+      expect(formOf(probe).draft.queries).toEqual([{ query_id: 7, enabled: false }]);
+    });
+    expect([...formOf(probe).dirty]).toEqual(["queries[id=7].enabled"]);
+    expect(checkbox(await rowOf("Backend Developer")).checked).toBe(false);
+  });
+
+  it("a toggle of the row made while its edit is out wins", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.queries = [queryRow({ id: 1 })];
+    const settings = served(api, version(41, 12, { queries: [{ query_id: 1, enabled: true }] }));
+    let answer: (() => void) | null = null;
+    api.routes.set("PATCH /api/queries/1", () =>
+      new Promise<Response>((resolve) => {
+        answer = () => {
+          settings.current = version(42, 13, { queries: [{ query_id: 7, enabled: true }] });
+          api.queries = [queryRow({ id: 7, text: "Backend Developer" })];
+          resolve(json({ id: 7, text: "Backend Developer", lang: "en", origin: "user", exploration: false, proposal_id: null }));
+        };
+      }),
+    );
+    const { probe } = renderSettings(["queries"]);
+    const user = userEvent.setup();
+    await user.click(within(await rowOf("Backend Engineer")).getByRole("button", { name: en["settings_queries.edit"] }));
+    const editor = within(section()).getByRole("group", { name: "Edit “Backend Engineer”" });
+    const text = within(editor).getByRole("textbox", { name: en["settings_queries.edit_text"] });
+    await user.clear(text);
+    await user.type(text, "Backend Developer");
+    await user.click(within(editor).getByRole("button", { name: en["settings_queries.edit_save"] }));
+    await waitFor(() => {
+      expect(answer).not.toBeNull();
+    });
+    await user.click(checkbox(await rowOf("Backend Engineer"))); // disabled while the PATCH is out
+    await act(async () => {
+      answer?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(formOf(probe).base.version.id).toBe(42);
+    });
+    await waitFor(() => {
+      expect(formOf(probe).draft.queries).toEqual([{ query_id: 7, enabled: false }]);
+    });
+  });
+
+  it("an edit whose rebase fails moves no entry", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.queries = [queryRow({ id: 1 })];
+    served(api, version(41, 12, { queries: [{ query_id: 1, enabled: true }] }));
+    api.routes.set("PATCH /api/queries/1", () => {
+      // the route saved version 42 with query 7, which the form cannot read
+      api.routes.set("GET /api/settings", () => problem(503, "internal"));
+      api.queries = [queryRow({ id: 7, text: "Backend Developer" })];
+      return json({ id: 7, text: "Backend Developer", lang: "en", origin: "user", exploration: false, proposal_id: null });
+    });
+    const { probe } = renderSettings(["queries"], { retryDelay: 1 });
+    const user = userEvent.setup();
+    await user.click(checkbox(await rowOf("Backend Engineer")));
+    await user.click(checkbox(await rowOf("Backend Engineer"))); // toggled and back: the row's entry is the base's
+    await user.click(within(await rowOf("Backend Engineer")).getByRole("button", { name: en["settings_queries.edit"] }));
+    const editor = within(section()).getByRole("group", { name: "Edit “Backend Engineer”" });
+    const text = within(editor).getByRole("textbox", { name: en["settings_queries.edit_text"] });
+    await user.clear(text);
+    await user.type(text, "Backend Developer");
+    await user.click(within(editor).getByRole("button", { name: en["settings_queries.edit_save"] }));
+    // the follow-up ended: the list was read again
+    expect(await within(section()).findByText("Backend Developer", {}, { timeout: 3000 })).toBeTruthy();
+    expect(formOf(probe).base.version.id).toBe(41);
+    expect(formOf(probe).draft.queries).toEqual([{ query_id: 1, enabled: true }]);
+    expect(formOf(probe).dirty.size).toBe(0);
+  });
+
   it("Disable changes the draft", async () => {
     const api = fakeApi({ signedIn: true });
     api.queries = [queryRow({ id: 1 })];
@@ -364,20 +501,78 @@ describe("QueriesSection", () => {
     const { probe } = renderSettings(["queries"]);
     const user = userEvent.setup();
     const row = await rowOf("Data Engineer");
-    expect(within(row).getByText(en["settings_queries.not_in_settings"])).toBeTruthy();
+    expect(within(row).getByText(en["settings_entries.not_in_settings"])).toBeTruthy();
     expect(checkbox(row).checked).toBe(false);
-    expect(within(await rowOf("Backend Engineer")).queryByText(en["settings_queries.not_in_settings"])).toBeNull();
+    expect(within(await rowOf("Backend Engineer")).queryByText(en["settings_entries.not_in_settings"])).toBeNull();
     await user.click(checkbox(row));
     expect(checkbox(row).checked).toBe(true);
-    expect(within(row).queryByText(en["settings_queries.not_in_settings"])).toBeNull();
+    expect(within(row).queryByText(en["settings_entries.not_in_settings"])).toBeNull();
     expect(formOf(probe).draft.queries).toEqual([{ query_id: 1, enabled: true }, { query_id: 3, enabled: true }]);
     expect([...formOf(probe).dirty]).toEqual(["queries[id=3]"]);
     // unticked again, the draft is the saved settings
     await user.click(checkbox(row));
     expect(formOf(probe).draft.queries).toEqual([{ query_id: 1, enabled: true }]);
     expect(formOf(probe).dirty.size).toBe(0);
-    expect(within(row).getByText(en["settings_queries.not_in_settings"])).toBeTruthy();
+    expect(within(row).getByText(en["settings_entries.not_in_settings"])).toBeTruthy();
     expect(writes(api)).toEqual([]);
+  });
+
+  it("an emptied stale period ticks its box again when it loses the focus", async () => {
+    const api = fakeApi({ signedIn: true });
+    const base = settingsRead().payload;
+    served(api, version(41, 12, { collection: { ...base.collection, stale_ttl_days: 45 } }));
+    const { probe } = renderSettings(["queries"]);
+    const user = userEvent.setup();
+    const follow = await within(section()).findByRole<HTMLInputElement>("checkbox", { name: "Same as the maximum ad age (30 days)" });
+    expect(follow.checked).toBe(false);
+    const ttl = within(section()).getByRole<HTMLInputElement>("spinbutton", { name: en["settings_queries.stale_ttl"] });
+    expect(ttl.value).toBe("45");
+    await user.clear(ttl);
+    // emptied, the number stays while it has the focus; the draft follows the maximum ad age
+    expect(within(section()).getByRole("spinbutton", { name: en["settings_queries.stale_ttl"] })).toBe(ttl);
+    expect(follow.checked).toBe(false);
+    expect(formOf(probe).draft.collection.stale_ttl_days).toBeNull();
+    await user.tab();
+    expect(follow.checked).toBe(true);
+    expect(within(section()).queryByRole("spinbutton", { name: en["settings_queries.stale_ttl"] })).toBeNull();
+    expect([...formOf(probe).dirty]).toEqual(["collection.stale_ttl_days"]);
+  });
+
+  it("an emptied stale period that is the saved one is clean and ticked", async () => {
+    const api = fakeApi({ signedIn: true });
+    served(api, version(41, 12)); // stale_ttl_days null: the maximum ad age
+    const { probe } = renderSettings(["queries"]);
+    const user = userEvent.setup();
+    const follow = await within(section()).findByRole<HTMLInputElement>("checkbox", { name: "Same as the maximum ad age (30 days)" });
+    await user.click(follow);
+    const ttl = within(section()).getByRole<HTMLInputElement>("spinbutton", { name: en["settings_queries.stale_ttl"] });
+    expect(ttl.value).toBe("30");
+    await user.click(ttl);
+    await user.clear(ttl);
+    expect(formOf(probe).dirty.size).toBe(0);
+    await user.tab();
+    expect(follow.checked).toBe(true);
+    expect(within(section()).queryByRole("spinbutton", { name: en["settings_queries.stale_ttl"] })).toBeNull();
+    expect(await within(section()).findByText(en["settings_form.no_changes"])).toBeTruthy();
+  });
+
+  it("the table keeps its roles in every layout", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.queries = [queryRow({ id: 1 })];
+    served(api, version(41, 12, { queries: [{ query_id: 1, enabled: true }] }));
+    renderSettings(["queries"]);
+    const grid = await table();
+    // explicit roles: a card layout's `display: block` keeps them in every engine
+    expect(grid.getAttribute("role")).toBe("table");
+    expect(within(grid).getAllByRole("rowgroup").map((group) => group.getAttribute("role"))).toEqual(["rowgroup", "rowgroup"]);
+    const heads = within(grid).getAllByRole("columnheader");
+    expect(heads).toHaveLength(11);
+    expect(heads.every((head) => head.getAttribute("role") === "columnheader")).toBe(true);
+    const row = await rowOf("Backend Engineer");
+    expect(row.getAttribute("role")).toBe("row");
+    const cells = within(row).getAllByRole("cell");
+    expect(cells).toHaveLength(11);
+    expect(cells.every((cell) => cell.getAttribute("role") === "cell")).toBe(true);
   });
 
   it("binds the source switches, the quota limits and the stale period to the draft", async () => {

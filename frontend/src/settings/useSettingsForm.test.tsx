@@ -511,6 +511,75 @@ describe("useSettingsForm", () => {
     expect(screen.getByText(en["settings_form.unsaved"])).toBeTruthy();
   });
 
+  it("an added entry taken back while its save is in flight stays out after the adopt", async () => {
+    const api = fakeApi({ signedIn: true });
+    const settings = served(api);
+    let answer: (() => void) | null = null;
+    api.routes.set("POST /api/settings", (request) =>
+      new Promise<Response>((resolve) => {
+        answer = () => {
+          settings.current = version(42, 13, saveBody(request).payload);
+          resolve(saved(42, 13));
+        };
+      }),
+    );
+    const { probe } = renderSettings(["schedule"]);
+    await intervalField();
+    act(() => {
+      formOf(probe).addEntry("queries", 3);
+    });
+    await waitFor(() => {
+      expect(saveButton().disabled).toBe(false);
+    });
+    await userEvent.setup().click(saveButton());
+    await waitFor(() => {
+      expect(answer).not.toBeNull();
+    });
+    // while the save is in flight, the entry is taken back
+    act(() => {
+      formOf(probe).removeEntry("queries", 3);
+    });
+    expect(formOf(probe).draft.queries).toEqual([]);
+    await act(async () => {
+      answer?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(formOf(probe).base.version.id).toBe(42);
+    });
+    expect(formOf(probe).base.payload.queries).toEqual([{ query_id: 3, enabled: true }]);
+    expect(formOf(probe).draft.queries).toEqual([]);
+    expect([...formOf(probe).dirty]).toEqual(["queries[id=3]"]);
+    await waitFor(() => {
+      expect(dryRunPayloads(api).at(-1)?.queries).toEqual([]);
+    });
+    // added again, it is the saved entry: clean
+    act(() => {
+      formOf(probe).addEntry("queries", 3);
+    });
+    expect(formOf(probe).dirty.size).toBe(0);
+  });
+
+  it("rebase resolves whether it took the read", async () => {
+    const api = fakeApi({ signedIn: true });
+    const settings = served(api);
+    const { probe } = renderSettings(["schedule"], { retryDelay: 1 });
+    await intervalField();
+    settings.current = version(42, 13, settingsRead().payload);
+    let taken: boolean | null = null;
+    await act(async () => {
+      taken = await formOf(probe).rebase();
+    });
+    expect(taken).toBe(true);
+    expect(formOf(probe).base.version.id).toBe(42);
+    api.routes.set("GET /api/settings", () => problem(503, "internal"));
+    await act(async () => {
+      taken = await formOf(probe).rebase();
+    });
+    expect(taken).toBe(false);
+    expect(formOf(probe).base.version.id).toBe(42);
+  });
+
   it("an out-of-order older answer is ignored", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = fakeApi({ signedIn: true });

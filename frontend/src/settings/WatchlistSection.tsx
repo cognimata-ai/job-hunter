@@ -13,11 +13,12 @@
 //   `unvalidated` until its validation ends; a 409 says the board is on the list; a refusal shows its errors.
 // - **The list** (`GET /api/watchlist`): each company's name and board, validation, last complete snapshot (in
 //   the display time zone, or "Never"), its board's health and its postings; [Remove] asks first, then
-//   `DELETE /api/watchlist/{id}` (204) rebases. Neither write takes an `Idempotency-Key`.
+//   `DELETE /api/watchlist/{id}` (204) rebases. Neither write takes an `Idempotency-Key`; each write's follow-up
+//   (the rebase, the list read again) is its mutation's own, so it runs also once its form or dialog is gone.
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { type SyntheticEvent, type ReactNode, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { apiFetch, type ProblemError, toProblem } from "../api/client";
+import { apiSend, type ProblemError, toProblem } from "../api/client";
 import type { components } from "../api/schema";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
@@ -28,7 +29,8 @@ import { useServerText } from "../i18n/index";
 import { useFormat } from "../system/format";
 import { closedSet } from "./fields";
 import fields from "./fields.module.css";
-import { conflictId } from "./queriesApi";
+import { EntryToggle } from "./EntryToggle";
+import { conflictId, useLatestForm } from "./queriesApi";
 import tables from "./tables.module.css";
 import { useSettingsForm } from "./useSettingsForm";
 import styles from "./WatchlistSection.module.css";
@@ -59,14 +61,6 @@ const ATS_TYPES = closedSet<AtsType>({
 });
 const LEVER_REGIONS = closedSet<LeverRegion>({ global: true, eu: true });
 
-async function send<T>(path: string, init: Parameters<typeof apiFetch>[1]): Promise<T> {
-  try {
-    return await apiFetch<T>(path, init);
-  } catch (error) {
-    throw toProblem(error);
-  }
-}
-
 function nameValid(name: string): boolean {
   const length = Array.from(name.trim()).length;
   return length >= NAME_CHARS[0] && length <= NAME_CHARS[1];
@@ -76,43 +70,53 @@ function nameValid(name: string): boolean {
 export function useWatchlist(): UseQueryResult<WatchlistCompanyOut[], ProblemError> {
   return useQuery<WatchlistCompanyOut[], ProblemError>({
     queryKey: WATCHLIST_KEY,
-    queryFn: ({ signal }) => send<WatchlistCompanyOut[]>("/api/watchlist", { signal }),
+    queryFn: ({ signal }) => apiSend<WatchlistCompanyOut[]>("/api/watchlist", { signal }),
   });
 }
 
 type AddOutcome = { kind: "added"; name: string } | { kind: "exists" };
 
-/** `POST /api/watchlist`, then the rebase (the route saved the settings with the new entry) and the list read
- * again. `onAdded` clears the form at once. */
+/** `POST /api/watchlist`, then, in the mutation's own `onSuccess` (it runs also once the form is gone): the
+ * rebase (the route saved the settings with the new entry) and the list read again. A 409 with the company's
+ * id is an outcome, not a failure. `onAdded` clears the form while it is there. */
 function useAddCompany() {
   const form = useSettingsForm();
+  const latest = useLatestForm();
   const queryClient = useQueryClient();
-  const [outcome, setOutcome] = useState<AddOutcome | null>(null);
-  const mutation = useMutation<WatchlistCreatedOut, ProblemError, WatchlistIn>({
-    mutationFn: (body) => send<WatchlistCreatedOut>("/api/watchlist", { method: "POST", body: JSON.stringify(body) }),
+  const mutation = useMutation<AddOutcome, ProblemError, WatchlistIn>({
+    mutationFn: async (body) => {
+      try {
+        await apiSend<WatchlistCreatedOut>("/api/watchlist", { method: "POST", body: JSON.stringify(body) });
+        return { kind: "added", name: body.display_name };
+      } catch (error) {
+        const problem = toProblem(error);
+        if (conflictId(problem, "watchlist_company_id") === null) {
+          throw problem;
+        }
+        return { kind: "exists" };
+      }
+    },
     retry: false,
+    onSuccess: async (outcome) => {
+      if (outcome.kind === "added") {
+        await (latest.current ?? form).rebase();
+        await queryClient.invalidateQueries({ queryKey: WATCHLIST_KEY, exact: true });
+      }
+    },
   });
   return {
     add: (body: WatchlistIn, onAdded: () => void) => {
-      setOutcome(null);
-      const added = async () => {
-        setOutcome({ kind: "added", name: body.display_name });
-        onAdded();
-        await form.rebase(); // the route saved the settings with the new entry
-        await queryClient.invalidateQueries({ queryKey: WATCHLIST_KEY, exact: true });
-      };
       mutation.mutate(body, {
-        onSuccess: () => { void added(); },
-        onError: (error) => {
-          if (conflictId(error, "watchlist_company_id") !== null) {
-            setOutcome({ kind: "exists" });
+        onSuccess: (outcome) => {
+          if (outcome.kind === "added") {
+            onAdded();
           }
         },
       });
     },
     pending: mutation.isPending,
-    outcome,
-    error: mutation.error !== null && conflictId(mutation.error, "watchlist_company_id") === null ? mutation.error : null,
+    outcome: mutation.data ?? null,
+    error: mutation.error,
   };
 }
 
@@ -232,7 +236,7 @@ function AddByUrl() {
   const parse = useQuery<ParsedUrlOut | UnsupportedUrlOut, ProblemError>({
     queryKey: parseKey(target),
     queryFn: ({ signal }) =>
-      send<ParsedUrlOut | UnsupportedUrlOut>("/api/watchlist/parse-url", { method: "POST", body: JSON.stringify({ url: target }), signal }),
+      apiSend<ParsedUrlOut | UnsupportedUrlOut>("/api/watchlist/parse-url", { method: "POST", body: JSON.stringify({ url: target }), signal }),
     enabled: target !== "",
     staleTime: Infinity,
   });
@@ -355,21 +359,7 @@ function CompanyRow({ company, onRemove }: { company: WatchlistCompanyOut; onRem
   const { t } = useTranslation();
   const serverText = useServerText();
   const format = useFormat();
-  const form = useSettingsForm();
   const id = useId();
-  const entry = form.draft.watchlist.find((candidate) => candidate.watchlist_company_id === company.id);
-  const saved = form.base.payload.watchlist.some((candidate) => candidate.watchlist_company_id === company.id);
-  const toggle = (checked: boolean) => {
-    if (entry === undefined) {
-      if (checked) {
-        form.addEntry("watchlist", company.id);
-      }
-    } else if (!checked && !saved) {
-      form.removeEntry("watchlist", company.id);
-    } else {
-      form.setEntry("watchlist", company.id, checked);
-    }
-  };
   const ats = serverText("source", company.ats_type);
   const board = company.lever_region === null
     ? t("settings_watchlist.board", { ats, slug: company.board_slug })
@@ -377,27 +367,22 @@ function CompanyRow({ company, onRemove }: { company: WatchlistCompanyOut; onRem
   const snapshot = company.instance?.last_complete_snapshot_at ?? null;
   const { postings } = company;
   return (
-    <tr>
-      <td data-label={t("settings_watchlist.col.enabled")}>
-        <span className={tables.check}>
-          <input type="checkbox" checked={entry?.enabled === true} aria-label={t("settings_watchlist.enable", { name: company.display_name })}
-            aria-describedby={entry === undefined ? `${id}-missing` : undefined}
-            onChange={(event) => { toggle(event.target.checked); }} />
-          {entry === undefined && <span id={`${id}-missing`} className={tables.note}>{t("settings_watchlist.not_in_settings")}</span>}
-        </span>
+    <tr role="row">
+      <td role="cell" data-label={t("settings_watchlist.col.enabled")}>
+        <EntryToggle list="watchlist" id={company.id} label={t("settings_watchlist.enable", { name: company.display_name })} />
       </td>
-      <td data-label={t("settings_watchlist.col.company")} className={cx(tables.text, tables.wide)}>
+      <td role="cell" data-label={t("settings_watchlist.col.company")} className={cx(tables.text, tables.wide)}>
         <span id={`${id}-name`}>{company.display_name}</span>
         <span className={tables.meta}>{board}</span>
       </td>
-      <td data-label={t("settings_watchlist.col.validation")}>{serverText("watchlist_validation", company.validation_status)}</td>
-      <td data-label={t("settings_watchlist.col.snapshot")} className={tables.nowrap}>
+      <td role="cell" data-label={t("settings_watchlist.col.validation")}>{serverText("watchlist_validation", company.validation_status)}</td>
+      <td role="cell" data-label={t("settings_watchlist.col.snapshot")} className={tables.nowrap}>
         {snapshot === null ? t("settings_watchlist.never") : format.dayMonthTime(snapshot)}
       </td>
-      <td data-label={t("settings_watchlist.col.health")}>
+      <td role="cell" data-label={t("settings_watchlist.col.health")}>
         {company.instance === null ? t("value.none") : serverText("instance_health", company.instance.health)}
       </td>
-      <td data-label={t("settings_watchlist.col.postings")} className={tables.wide}>
+      <td role="cell" data-label={t("settings_watchlist.col.postings")} className={tables.wide}>
         {t("settings_watchlist.postings", {
           active: format.number(postings.active),
           stale: format.number(postings.stale),
@@ -405,7 +390,7 @@ function CompanyRow({ company, onRemove }: { company: WatchlistCompanyOut; onRem
           closed: format.number(postings.closed),
         })}
       </td>
-      <td className={tables.wide}>
+      <td role="cell" className={tables.wide}>
         <div className={tables.actions}>
           <button type="button" className={tables.action} aria-label={t("settings_watchlist.remove_label", { name: company.display_name })}
             onClick={onRemove}>
@@ -417,33 +402,46 @@ function CompanyRow({ company, onRemove }: { company: WatchlistCompanyOut; onRem
   );
 }
 
+/** `DELETE /api/watchlist/{id}` (204), then, in the mutation's own `onSuccess` (it runs also once the list is
+ * gone): the rebase (the route saved the settings without the entry), an entry the draft had added taken back
+ * (no settings version held it, so the route saved none), and the list read again. The take-back holds against
+ * either base, so it also follows a failed rebase: `removeEntry` acts only on an entry the base lacks, and a
+ * deleted company's id must not stay in the draft (the dry-run refuses it). */
+function useRemoveCompany() {
+  const form = useSettingsForm();
+  const latest = useLatestForm();
+  const queryClient = useQueryClient();
+  return useMutation<undefined, ProblemError, WatchlistCompanyOut>({
+    mutationFn: (company) => apiSend<undefined>(`/api/watchlist/${String(company.id)}`, { method: "DELETE" }),
+    retry: false,
+    onSuccess: async (_out, company) => {
+      const target = latest.current ?? form;
+      await target.rebase();
+      target.removeEntry("watchlist", company.id);
+      await queryClient.invalidateQueries({ queryKey: WATCHLIST_KEY, exact: true });
+    },
+  });
+}
+
 function CompanyList() {
   const { t } = useTranslation();
-  const form = useSettingsForm();
-  const queryClient = useQueryClient();
   const companies = useWatchlist();
   const [removing, setRemoving] = useState<WatchlistCompanyOut | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const headingId = useId();
-  const removal = useMutation<undefined, ProblemError, number>({
-    mutationFn: (id) => send<undefined>(`/api/watchlist/${String(id)}`, { method: "DELETE" }),
-    retry: false,
-  });
+  const removal = useRemoveCompany();
   const confirm = () => {
     if (removing === null || removal.isPending) {
       return;
     }
-    const company = removing;
-    const removed = async () => {
-      setRemoving(null);
-      setNotice(t("settings_watchlist.removed", { name: company.display_name }));
-      await form.rebase(); // the route saved the settings without the entry
-      form.removeEntry("watchlist", company.id); // an entry the draft had added: no settings version held it
-      await queryClient.invalidateQueries({ queryKey: WATCHLIST_KEY, exact: true });
-      heading.current?.focus(); // its row, and the Remove the dialog gave the focus back to, are gone
-    };
-    removal.mutate(company.id, { onSuccess: () => { void removed(); } });
+    removal.mutate(removing, {
+      onSuccess: (_out, company) => {
+        setRemoving(null);
+        setNotice(t("settings_watchlist.removed", { name: company.display_name }));
+        heading.current?.focus(); // its row, and the Remove the dialog gave the focus back to, are gone
+      },
+    });
   };
   let body: ReactNode;
   if (companies.isPending) {
@@ -455,19 +453,19 @@ function CompanyList() {
   } else {
     body = (
       <div className={tables.scroll}>
-        <table className={tables.table} aria-labelledby={headingId}>
-          <thead>
-            <tr>
-              <th scope="col">{t("settings_watchlist.col.enabled")}</th>
-              <th scope="col">{t("settings_watchlist.col.company")}</th>
-              <th scope="col">{t("settings_watchlist.col.validation")}</th>
-              <th scope="col">{t("settings_watchlist.col.snapshot")}</th>
-              <th scope="col">{t("settings_watchlist.col.health")}</th>
-              <th scope="col">{t("settings_watchlist.col.postings")}</th>
-              <th scope="col"><span className="visually-hidden">{t("settings_watchlist.col.actions")}</span></th>
+        <table role="table" className={tables.table} aria-labelledby={headingId}>
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.enabled")}</th>
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.company")}</th>
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.validation")}</th>
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.snapshot")}</th>
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.health")}</th>
+              <th role="columnheader" scope="col">{t("settings_watchlist.col.postings")}</th>
+              <th role="columnheader" scope="col"><span className="visually-hidden">{t("settings_watchlist.col.actions")}</span></th>
             </tr>
           </thead>
-          <tbody>
+          <tbody role="rowgroup">
             {companies.data.map((company) => (
               <CompanyRow key={company.id} company={company} onRemove={() => {
                 removal.reset();

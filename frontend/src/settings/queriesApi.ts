@@ -7,18 +7,21 @@
 // - `POST /api/queries` creates a query that is not enabled (its route's docstring): `useAddQuery` then adds it
 //   to the draft enabled (`addEntry`); the save is the section's panel's. A 409 `conflict_state` with a
 //   `query_id` is a live query of the same text: the draft gains it the same way when it lacks it.
+// - A committed write's follow-up (the draft, the rebase, the list read again) is its mutation's own
+//   `onSuccess`, which runs whether or not the component that sent it is still there (Task 28's save, M2). It
+//   reads the draft as it is when the answer comes (`useLatestForm`), so a change made in flight wins.
 // - The proposal shown is the profile's `latest_proposal` (so a reload shows it again, D18) or the one the keyed
 //   `POST /api/profile/query-proposals` answered; it is read under `PROFILE_KEY` and polled every 3 s with
 //   `X-JH-Background: 1` while `running`. Its end reads the profile again.
 // - Only the proposal's POST takes an `Idempotency-Key` (§14.1); none of the query writes does. No write is
 //   retried by itself, and every failure is a `ProblemError`.
 import { useMutation, useQuery, useQueryClient, type UseMutationResult, type UseQueryResult } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
-import { apiFetch, type ProblemError, toProblem } from "../api/client";
+import { useEffect, useRef } from "react";
+import { apiFetch, apiSend, type ProblemError, toProblem } from "../api/client";
 import { useKeyedMutation } from "../api/idempotency";
 import type { components } from "../api/schema";
 import { PROFILE_KEY } from "../profile/api";
-import { useSettingsForm } from "./useSettingsForm";
+import { type SettingsForm, useSettingsForm } from "./useSettingsForm";
 
 export type QueryListOut = components["schemas"]["QueryListOut"];
 export type CellStatsOut = components["schemas"]["CellStatsOut"];
@@ -38,12 +41,22 @@ export const QUERY_TEXT_CHARS = [2, 120] as const;
 /** The languages a query is in (`QueryIn.lang`), held to the schema both ways. */
 export const QUERY_LANGS = Object.keys({ de: true, en: true } satisfies Record<QueryLang, true>) as QueryLang[];
 
-async function send<T>(path: string, init: Parameters<typeof apiFetch>[1]): Promise<T> {
-  try {
-    return await apiFetch<T>(path, init);
-  } catch (error) {
-    throw toProblem(error);
-  }
+/** The mutation keys of a query added from a proposal's item, and of any other add. */
+export const ADD_PROPOSED_KEY = [...QUERIES_KEY, "add", "proposed"] as const;
+export const ADD_QUERY_KEY = [...QUERIES_KEY, "add"] as const;
+
+/** The form of the caller's last render while it is mounted, `null` once it is not: a write's follow-up reads
+ * the draft as it is when its answer comes. */
+export function useLatestForm(): { readonly current: SettingsForm | null } {
+  const form = useSettingsForm();
+  const latest = useRef<SettingsForm | null>(form);
+  useEffect(() => {
+    latest.current = form;
+  });
+  useEffect(() => () => {
+    latest.current = null;
+  }, []);
+  return latest;
 }
 
 /** A query's text as the server counts it: its code points once trimmed. */
@@ -66,7 +79,7 @@ export function conflictId(error: ProblemError, member: string): number | null {
 export function useQueries(): UseQueryResult<QueryListOut[], ProblemError> {
   return useQuery<QueryListOut[], ProblemError>({
     queryKey: QUERIES_KEY,
-    queryFn: ({ signal }) => send<QueryListOut[]>("/api/queries", { signal }),
+    queryFn: ({ signal }) => apiSend<QueryListOut[]>("/api/queries", { signal }),
   });
 }
 
@@ -74,7 +87,7 @@ export function useQueries(): UseQueryResult<QueryListOut[], ProblemError> {
 export function useQueryStats(enabled: boolean): UseQueryResult<CellStatsOut[], ProblemError> {
   return useQuery<CellStatsOut[], ProblemError>({
     queryKey: QUERY_STATS_KEY,
-    queryFn: ({ signal }) => send<CellStatsOut[]>("/api/queries/stats", { signal }),
+    queryFn: ({ signal }) => apiSend<CellStatsOut[]>("/api/queries/stats", { signal }),
     enabled,
   });
 }
@@ -92,6 +105,7 @@ export interface AddQueryVars {
 }
 
 export interface AddQuery {
+  /** Sends the add; `onDone` runs with its outcome while the caller is mounted (it clears a field). */
   add: (vars: AddQueryVars, onDone?: (outcome: AddOutcome) => void) => void;
   pending: boolean;
   /** The last outcome, until the next add. */
@@ -101,58 +115,89 @@ export interface AddQuery {
 }
 
 /**
- * `POST /api/queries`, then the query enters the draft enabled (module docstring); the queries are read again.
- * The draft is the form's when the answer arrives, so an entry the user added meanwhile counts.
+ * `POST /api/queries`, then the query enters the draft enabled (module docstring) and the queries are read
+ * again, in the mutation's own `onSuccess`. Whether the draft held a 409's query is read when the answer
+ * comes, so an entry the user added meanwhile counts. `proposed` keys an add from a proposal's item
+ * (`ADD_PROPOSED_KEY`), so the panel can wait for it.
  */
-export function useAddQuery(): AddQuery {
+export function useAddQuery({ proposed = false }: { proposed?: boolean } = {}): AddQuery {
   const form = useSettingsForm();
+  const latest = useLatestForm();
   const queryClient = useQueryClient();
-  const latest = useRef(form);
-  useEffect(() => {
-    latest.current = form;
-  });
-  const [outcome, setOutcome] = useState<AddOutcome | null>(null);
-  const mutation = useMutation<QueryOut, ProblemError, AddQueryVars>({
-    mutationFn: (vars) => send<QueryOut>("/api/queries", { method: "POST", body: JSON.stringify(vars) }),
+  const mutation = useMutation<AddOutcome, ProblemError, AddQueryVars>({
+    mutationKey: proposed ? ADD_PROPOSED_KEY : ADD_QUERY_KEY,
+    mutationFn: async (vars) => {
+      try {
+        const out = await apiSend<QueryOut>("/api/queries", { method: "POST", body: JSON.stringify(vars) });
+        return { kind: "added", id: out.id, text: out.text };
+      } catch (error) {
+        const problem = toProblem(error);
+        const id = conflictId(problem, "query_id");
+        if (id === null) {
+          throw problem;
+        }
+        const held = (latest.current ?? form).draft.queries.some((entry) => entry.query_id === id);
+        return { kind: held ? "exists" : "enabled", id, text: vars.text.trim() };
+      }
+    },
     retry: false,
+    onSuccess: async (outcome) => {
+      if (outcome.kind !== "exists") {
+        (latest.current ?? form).addEntry("queries", outcome.id);
+      }
+      await queryClient.invalidateQueries({ queryKey: QUERIES_KEY });
+    },
   });
-  const done = (next: AddOutcome, onDone?: (outcome: AddOutcome) => void) => {
-    setOutcome(next);
-    void queryClient.invalidateQueries({ queryKey: QUERIES_KEY });
-    onDone?.(next);
-  };
   return {
     add: (vars, onDone) => {
-      setOutcome(null);
-      mutation.mutate(vars, {
-        onSuccess: (out) => {
-          latest.current.addEntry("queries", out.id);
-          done({ kind: "added", id: out.id, text: out.text }, onDone);
-        },
-        onError: (error) => {
-          const id = conflictId(error, "query_id");
-          if (id === null) {
-            return;
-          }
-          const held = latest.current.draft.queries.some((entry) => entry.query_id === id);
-          if (!held) {
-            latest.current.addEntry("queries", id);
-          }
-          done({ kind: held ? "exists" : "enabled", id, text: vars.text.trim() }, onDone);
-        },
-      });
+      mutation.mutate(vars, { onSuccess: (outcome) => { onDone?.(outcome); } });
     },
     pending: mutation.isPending,
-    outcome,
-    error: mutation.error !== null && conflictId(mutation.error, "query_id") === null ? mutation.error : null,
+    outcome: mutation.data ?? null,
+    error: mutation.error,
   };
 }
 
-/** `PATCH /api/queries/{id} {text, lang}`: the query retired and its new row answered (its route's docstring). */
-export function useEditQuery(id: number): UseMutationResult<QueryOut, ProblemError, { text: string; lang: QueryLang }> {
-  return useMutation<QueryOut, ProblemError, { text: string; lang: QueryLang }>({
-    mutationFn: (vars) => send<QueryOut>(`/api/queries/${String(id)}`, { method: "PATCH", body: JSON.stringify(vars) }),
+/** An edit as sent (`PATCH /api/queries/{id} {text, lang}`), with the query's draft entry when it was sent. */
+export interface EditVars {
+  id: number;
+  text: string;
+  lang: QueryLang;
+  /** The draft's entry of the query at submit: the follow-up's fallback once the section is gone. */
+  entry: { enabled: boolean } | null;
+}
+
+/**
+ * `PATCH /api/queries/{id}`: the query retired and its new row answered (its route's docstring), then, in the
+ * mutation's own `onSuccess` (it runs also once the editor is closed): the rebase (the route saved the settings
+ * with the new id itself), the query's draft entry moved to the new id (Ruling T29-a's extension: a toggle, or
+ * an entry the draft had added, which no settings version names, so the server moved nothing), and the list
+ * read again. The entry is the draft's when the answer comes (a toggle made in flight wins), the one captured
+ * at submit once the section is gone. A failed rebase moves nothing (the moves need the version the route
+ * saved), but for an entry the draft had added: no settings version names it, so the route saved none and the
+ * base is current, and the retired id must not stay in the draft (the dry-run refuses it, Ruling T29-c).
+ */
+export function useEditQuery(): UseMutationResult<QueryOut, ProblemError, EditVars> {
+  const form = useSettingsForm();
+  const latest = useLatestForm();
+  const queryClient = useQueryClient();
+  return useMutation<QueryOut, ProblemError, EditVars>({
+    mutationFn: ({ id, text, lang }) =>
+      apiSend<QueryOut>(`/api/queries/${String(id)}`, { method: "PATCH", body: JSON.stringify({ text, lang }) }),
     retry: false,
+    onSuccess: async (out, vars) => {
+      const now = latest.current;
+      const target = now ?? form; // its methods dispatch to the page's form
+      const entry = now === null ? vars.entry : (now.draft.queries.find((candidate) => candidate.query_id === vars.id) ?? null);
+      const saved = target.base.payload.queries.some((candidate) => candidate.query_id === vars.id);
+      const rebased = await target.rebase();
+      if ((rebased || !saved) && out.id !== vars.id && entry !== null) {
+        target.removeEntry("queries", vars.id); // an entry the draft had added: no settings version moved it
+        target.addEntry("queries", out.id);
+        target.setEntry("queries", out.id, entry.enabled);
+      }
+      await queryClient.invalidateQueries({ queryKey: QUERIES_KEY });
+    },
   });
 }
 
@@ -164,7 +209,7 @@ export function useProposal(id: number | null): UseQueryResult<ProposalOut, Prob
     queryKey: proposalKey(id ?? 0),
     queryFn: ({ signal }) => {
       const known = queryClient.getQueryData<ProposalOut>(proposalKey(id ?? 0));
-      return send<ProposalOut>(`/api/profile/query-proposals/${String(id)}`, { signal, background: known?.status === "running" });
+      return apiSend<ProposalOut>(`/api/profile/query-proposals/${String(id)}`, { signal, background: known?.status === "running" });
     },
     enabled: id !== null,
     refetchInterval: (query) => (query.state.data?.status === "running" ? PROPOSAL_POLL_MS : false),

@@ -263,7 +263,7 @@ describe("WatchlistSection", () => {
     expect(beta.textContent).toContain(en["watchlist_validation.not_found"]);
     expect(beta.textContent).toContain(en["settings_watchlist.never"]);
     expect(beta.textContent).toContain(en["instance_health.breaker_open"]);
-    expect(beta.textContent).toContain(en["settings_queries.not_in_settings"]);
+    expect(beta.textContent).toContain(en["settings_entries.not_in_settings"]);
     const box = within(acme).getByRole<HTMLInputElement>("checkbox", { name: "Enable “Acme”" });
     await user.click(box);
     expect(formOf(probe).draft.watchlist).toEqual([{ watchlist_company_id: 4, enabled: false }]);
@@ -294,6 +294,33 @@ describe("WatchlistSection", () => {
     await user.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(requestsTo(api, "DELETE /api/watchlist/4")).toHaveLength(0);
+  });
+
+  it("a removal whose rebase fails still takes back the entry the draft added", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.watchlist = [watchlistCompany(), watchlistCompany({ id: 6, display_name: "Beta", board_slug: "beta", enabled: false })];
+    served(api, version(41, 12, { watchlist: [{ watchlist_company_id: 4, enabled: true }] }));
+    api.routes.set("DELETE /api/watchlist/6", () => {
+      // no settings version named company 6: the route saved none; the settings cannot be read now
+      api.routes.set("GET /api/settings", () => problem(503, "internal"));
+      api.watchlist = [watchlistCompany()];
+      return new Response(null, { status: 204 });
+    });
+    const { probe } = renderSettings(["watchlist"], { retryDelay: 1 });
+    const user = userEvent.setup();
+    await user.click(within(await rowOf("Beta")).getByRole("checkbox"));
+    expect(formOf(probe).draft.watchlist).toEqual([
+      { watchlist_company_id: 4, enabled: true },
+      { watchlist_company_id: 6, enabled: true },
+    ]);
+    await user.click(within(await rowOf("Beta")).getByRole("button", { name: "Remove “Beta”" }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["settings_watchlist.remove"] }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    }, { timeout: 3000 });
+    expect(formOf(probe).base.version.id).toBe(41);
+    expect(formOf(probe).draft.watchlist).toEqual([{ watchlist_company_id: 4, enabled: true }]);
+    expect(formOf(probe).dirty.size).toBe(0);
   });
 
   it("remove rebases", async () => {
