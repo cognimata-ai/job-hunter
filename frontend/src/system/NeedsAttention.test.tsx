@@ -1,6 +1,7 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
+import codes from "../i18n/codes.json";
 import en from "../i18n/en.json";
 import { attentionOut, type FakeApi, fakeApi, json, problem, requestsTo } from "../test/api";
 import { renderApp } from "../test/app";
@@ -9,19 +10,9 @@ type AttentionOut = components["schemas"]["AttentionOut"];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-// The blocks in `AttentionOut`'s order (observability/attention.py): no failed-purges block (U1).
-const ORDER = [
-  "raw_items",
-  "identity_conflicts",
-  "failed_targets",
-  "quarantined_batches",
-  "retrieve_failing",
-  "mass_disappearances",
-  "unscorable_groups",
-  "broken_sources",
-  "paused_lane",
-  "scope_apply_failed",
-] as const satisfies readonly (keyof AttentionOut)[];
+// The blocks in `AttentionOut`'s order (observability/attention.py; `codes.json`'s `order.attention_section`,
+// which test_i18n_codes.py holds to the model): no failed-purges block (U1).
+const ORDER = codes.order.attention_section as (keyof AttentionOut)[];
 
 // Needs attention's job links are the router's: these tests render the app at Profile & Settings.
 afterEach(() => {
@@ -37,7 +28,7 @@ function attention(): HTMLElement {
 }
 
 /** The block of the section `name` (its heading starts with the section's title). */
-async function block(name: (typeof ORDER)[number]): Promise<HTMLElement> {
+async function block(name: keyof AttentionOut): Promise<HTMLElement> {
   const title = en[`attention_section.${name}`];
   const part = await screen.findByRole("region", { name: en["attention.title"] });
   const heading = await within(part).findByRole("heading", { level: 4, name: new RegExp(`^${title.replace(/[()]/g, "\\$&")}`) });
@@ -292,7 +283,7 @@ describe("NeedsAttention", () => {
     api.routes.set("POST /api/ats-snapshots/11/acknowledge", () => json({ snapshot_id: 11, closed: 18 }));
     renderApp("/settings#system");
     const row = item(await block("mass_disappearances"), "Beispiel GmbH");
-    expect(row.textContent).toContain("18 of 20 postings missing");
+    expect(row.textContent).toContain("18 postings of 20 missing");
     fireEvent.click(within(row).getByRole("button", { name: en["attention.confirm_closure"] }));
     const dialog = screen.getByRole("alertdialog", { name: en["attention.closure_title"] });
     expect(dialog.textContent).toContain("Beispiel GmbH");
@@ -310,7 +301,8 @@ describe("NeedsAttention", () => {
     api.routes.set("POST /api/alerts/9/ack", () => json({ id: 9, acknowledged_at: "2026-11-03T07:00:00Z" }));
     renderApp("/settings#system");
     const paused = await block("paused_lane");
-    expect(paused.textContent).toContain(en["pause.reservation_bound_violated"]);
+    // the reason mid-sentence, lowercased in English
+    expect(paused.textContent).toContain("Scoring is paused: reservation bound violated");
     fireEvent.click(within(paused).getByRole("button", { name: en["attention.ack"] }));
     await waitFor(() => {
       expect(requestsTo(api, "POST /api/alerts/9/ack")).toHaveLength(1);
@@ -388,6 +380,14 @@ describe("NeedsAttention", () => {
   it("the release and a retry carry an Idempotency-Key; no other action does", async () => {
     const api = fakeApi({ signedIn: true });
     api.attention = attentionOut({
+      identity_conflicts: {
+        count: 1,
+        items: [{ conflict_id: 5, job_ids: [21, 22], reason: "pub:stepstone.de", opened_at: "2026-11-03T04:00:00Z" }],
+      },
+      mass_disappearances: {
+        count: 1,
+        items: [{ snapshot_id: 11, instance_label: "Beispiel GmbH", absent_count: 18, baseline_active_count: 20, taken_at: "2026-11-03T05:00:00Z" }],
+      },
       raw_items: rawItems(true),
       quarantined_batches: QUARANTINED,
       failed_targets: {
@@ -402,14 +402,28 @@ describe("NeedsAttention", () => {
     api.routes.set("POST /api/targets/51/retry", () => json({ target_id: 51, state: "pending" }, 202));
     api.routes.set("POST /api/alerts/9/ack", () => json({ id: 9, acknowledged_at: "2026-11-03T07:00:00Z" }));
     api.routes.set("POST /api/settings/scope/retry-apply", () => json({ operation_id: 77 }, 202));
+    api.routes.set("POST /api/identity-conflicts/5/resolve", () => json({ conflict_id: 5, status: "resolved_separate" }, 202));
+    api.routes.set("POST /api/ats-snapshots/11/acknowledge", () => json({ snapshot_id: 11, closed: 18 }));
     renderApp("/settings#system");
+    fireEvent.click(within(await block("identity_conflicts")).getByRole("button", { name: en["attention.separate"] }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.separate_confirm"] }));
+    fireEvent.click(within(await block("mass_disappearances")).getByRole("button", { name: en["attention.confirm_closure"] }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.confirm_closure"] }));
     fireEvent.click(within(item(await block("raw_items"), "Arbeitnow feed")).getByRole("button", { name: en["attention.replay"] }));
     fireEvent.click(within(await block("quarantined_batches")).getByRole("button", { name: en["attention.release"] }));
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.release_confirm"] }));
     fireEvent.click(within(await block("failed_targets")).getByRole("button", { name: en["attention.retry"] }));
     fireEvent.click(within(await block("paused_lane")).getByRole("button", { name: en["attention.ack"] }));
     fireEvent.click(within(await block("scope_apply_failed")).getByRole("button", { name: en["banner.retry_apply"] }));
-    const posts = ["POST /api/system/raw-items/replay", "POST /api/batches/3/release", "POST /api/targets/51/retry", "POST /api/alerts/9/ack", "POST /api/settings/scope/retry-apply"];
+    const posts = [
+      "POST /api/identity-conflicts/5/resolve",
+      "POST /api/ats-snapshots/11/acknowledge",
+      "POST /api/system/raw-items/replay",
+      "POST /api/batches/3/release",
+      "POST /api/targets/51/retry",
+      "POST /api/alerts/9/ack",
+      "POST /api/settings/scope/retry-apply",
+    ];
     await waitFor(() => {
       for (const call of posts) {
         expect(requestsTo(api, call), call).toHaveLength(1);
@@ -417,6 +431,43 @@ describe("NeedsAttention", () => {
     });
     const keyed = posts.filter((call) => requestsTo(api, call)[0]?.headers.get("Idempotency-Key") != null);
     expect(keyed).toEqual(["POST /api/batches/3/release", "POST /api/targets/51/retry"]);
+  });
+
+  it("a failed retry apply shows at its item, with no transient toast", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({ scope_apply_failed: { version_id: 14, alert_id: 4 } });
+    api.routes.set("POST /api/settings/scope/retry-apply", () => problem(503, "internal", { title: "Service unavailable" }));
+    renderApp("/settings#system");
+    const failed = await block("scope_apply_failed");
+    fireEvent.click(within(failed).getByRole("button", { name: en["banner.retry_apply"] }));
+    expect(await within(failed).findByRole("alert")).toBeTruthy();
+    expect(screen.queryByText(en["toast.transient"])).toBeNull();
+  });
+
+  it("reads needs attention again every 60 s in the background", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = fakeApi({ signedIn: true });
+      renderApp("/settings#system");
+      await block("raw_items");
+      const reads = () => requestsTo(api, "GET /api/system/needs-attention");
+      expect(reads()).toHaveLength(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(55_000);
+      });
+      expect(reads()).toHaveLength(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      await waitFor(() => {
+        expect(reads()).toHaveLength(2);
+      });
+      for (const read of reads()) {
+        expect(read.headers.get("X-JH-Background")).toBe("1");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("broken sources are information, a degraded one a warning; a job opens in the Jobs page's drawer", async () => {

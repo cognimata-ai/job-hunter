@@ -46,6 +46,7 @@ describe("GoldenSet", () => {
       expect(requestsTo(api, "PATCH /api/golden-cases/1")).toHaveLength(1);
     });
     expect(JSON.parse(requestsTo(api, "PATCH /api/golden-cases/1")[0]?.body ?? "")).toEqual({ active: false });
+    expect(requestsTo(api, "PATCH /api/golden-cases/1")[0]?.headers.get("Idempotency-Key")).toBeNull();
     expect(active.disabled).toBe(true);
     api.goldenCases = [goldenCase({ active: false }), api.goldenCases[1]];
     answer(json(goldenCase({ active: false })));
@@ -76,6 +77,7 @@ describe("GoldenSet", () => {
     await waitFor(() => {
       expect(requestsTo(api, "DELETE /api/golden-cases/2")).toHaveLength(1);
     });
+    expect(requestsTo(api, "DELETE /api/golden-cases/2")[0]?.headers.get("Idempotency-Key")).toBeNull();
     await waitFor(() => {
       expect(screen.queryByText("Softwareentwickler Java")).toBeNull();
     });

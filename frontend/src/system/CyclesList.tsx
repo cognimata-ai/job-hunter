@@ -9,9 +9,9 @@ import { useServerText } from "../i18n/index";
 import tables from "../settings/tables.module.css";
 import styles from "./CyclesList.module.css";
 import { useFormat } from "./format";
-import { LoadMore, useElapsed } from "./RunsList";
-import parts from "./SystemSection.module.css";
+import { LoadMore, useElapsed } from "./lists";
 import { type ScoreCycleOut, useCycles } from "./systemApi";
+import parts from "./SystemSection.module.css";
 
 function admitted(cycle: ScoreCycleOut): number {
   return Object.values(cycle.admitted).reduce((sum, n) => sum + n, 0);

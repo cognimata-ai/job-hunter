@@ -110,12 +110,14 @@ export function useRunNow(): UseMutationResult<RunNowOut, ProblemError, RunNowIn
 /**
  * The scope's retry-apply (`POST /api/settings/scope/retry-apply`, 202 `{operation_id}`). It takes no
  * `Idempotency-Key`: a repeated request finds the apply live and is refused (409 `conflict_state`). A 202
- * reads the status again.
+ * reads the status again. `ownToast`: the caller tells a failure itself, so no transient toast is raised beside
+ * it (Needs attention's item, plan M4 Task 31).
  */
-export function useRetryApply(): UseMutationResult<RetryApplyOut, unknown, undefined> {
+export function useRetryApply({ ownToast = false }: { ownToast?: boolean } = {}): UseMutationResult<RetryApplyOut, unknown, undefined> {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => apiFetch<RetryApplyOut>("/api/settings/scope/retry-apply", { method: "POST" }),
+    meta: ownToast ? { ownToast: true } : undefined,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
     },

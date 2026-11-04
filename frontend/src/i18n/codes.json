@@ -710,6 +710,26 @@
       "lead",
       "principal",
       "head"
+    ],
+    "attention_section": [
+      "raw_items",
+      "identity_conflicts",
+      "failed_targets",
+      "quarantined_batches",
+      "retrieve_failing",
+      "mass_disappearances",
+      "unscorable_groups",
+      "broken_sources",
+      "paused_lane",
+      "scope_apply_failed"
+    ],
+    "retryable_target_state": [
+      "refused",
+      "failed_max_tokens",
+      "failed_invalid_output",
+      "failed_request",
+      "failed_transient",
+      "failed_attempts_exhausted"
     ]
   }
 }

@@ -9,15 +9,14 @@ import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import { useServerText } from "../i18n/index";
-import fields from "../settings/fields.module.css";
 import tables from "../settings/tables.module.css";
 import { type RunOut, useRun } from "./api";
 import { useFormat } from "./format";
+import { LoadMore, useElapsed } from "./lists";
 import { RunReport } from "./RunReport";
 import styles from "./RunsList.module.css";
+import { useRuns } from "./systemApi";
 import parts from "./SystemSection.module.css";
-import { type PagedList, useRuns } from "./systemApi";
-import { useUnits } from "./units";
 
 const COLUMNS = 6;
 
@@ -31,38 +30,6 @@ function OpenReport({ runId }: { runId: number }) {
     return <ProblemBox error={run.error} onRetry={() => { void run.refetch(); }} />;
   }
   return <RunReport run={run.data.run} report={run.data.report} partialCauses={run.data.partial_causes} />;
-}
-
-/** How long a run or a cycle took: `null` before it started, `still` while it runs. */
-export function useElapsed(): (started: string | null, finished: string | null, still: string) => string {
-  const { t } = useTranslation();
-  const units = useUnits();
-  return (started, finished, still) => {
-    if (started === null) {
-      return t("value.none");
-    }
-    if (finished === null) {
-      return still;
-    }
-    return units.duration((Date.parse(finished) - Date.parse(started)) / 1000);
-  };
-}
-
-/** A list's Load more, or its failure with Retry. */
-export function LoadMore<T>({ list }: { list: PagedList<T> }) {
-  const { t } = useTranslation();
-  if (!list.hasMore && list.loadMoreError === null) {
-    return null;
-  }
-  return (
-    <div className={parts.more}>
-      {list.loadMoreError !== null && <ProblemBox error={list.loadMoreError} />}
-      <button type="button" className={fields.button} disabled={list.loadingMore} aria-busy={list.loadingMore || undefined}
-        onClick={list.loadMore}>
-        {t("jobs.load_more")}
-      </button>
-    </div>
-  );
 }
 
 function RunRow({ run, open, onToggle }: { run: RunOut; open: boolean; onToggle: () => void }) {

@@ -5,9 +5,11 @@ arguments (`typing.get_args`), a mapping's keys, or an AST walk of the calls tha
 the missing and the extra codes. The catalogue's own form is pinned too: exactly these namespaces, each a
 sorted list of distinct strings (the frontend's `i18n.test.ts` checks that both languages have a key for each
 code), and beside them `order`: the namespaces whose codes the UI lists in their backend's own order (the
-seniority ladder, plan M4 Task 23, Ruling T23-c), each equal to that order, and `order.effort`, each model's
-supported efforts in `Effort`'s order (`llm.pricing.SUPPORTED_EFFORTS`, plan M4 Task 30, resolution c): the
-effort options of the model grid, shown as their codes, so they are no namespace.
+seniority ladder, plan M4 Task 23, Ruling T23-c; Needs attention's sections, plan M4 Task 31), each equal to
+that order; `order.effort`, each model's supported efforts in `Effort`'s order
+(`llm.pricing.SUPPORTED_EFFORTS`, plan M4 Task 30, resolution c): the effort options of the model grid, shown
+as their codes, so they are no namespace; and `order.retryable_target_state`, the target states the retry
+route takes back (plan M4 Task 31).
 
 The alert codes are the `code` of every `raise_alert` and `open_alert` call in `backend/src`, with a module
 constant resolved by importing its module, and the codes of a module's wrapper that forwards its own `code`
@@ -56,7 +58,7 @@ from jobhunter.profile.review import Repair
 from jobhunter.queries import authoring
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
-from jobhunter.scoring import aggregate, eval_runs, validator
+from jobhunter.scoring import aggregate, eval_runs, targets, validator
 from jobhunter.scoring.cycles import CycleTrigger, PauseReason
 from jobhunter.scoring.det_criteria import DetCriterion
 from jobhunter.scoring.filters import FilterCode
@@ -579,10 +581,16 @@ SYSTEM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
 # The namespaces the UI lists in an order of their own, with that order from the backend.
 ORDERS: Final[dict[str, Callable[[], list[str]]]] = {
     "seniority": lambda: list(SENIORITY_LADDER),
+    # Needs attention's blocks, in `AttentionOut`'s order (plan M4 Task 31, review Minor 3)
+    "attention_section": lambda: list(attention.AttentionOut.model_fields),
 }
 ORDER_KEY: Final = "order"
 # Each model's supported efforts in `Effort`'s order (module docstring): `order.effort.<model>`.
 EFFORT_ORDER: Final = "effort"
+# The target states the retry route takes back (`scoring.targets.RETRYABLE_STATES`, in its order), a subset
+# of `target_state`: Needs attention offers Retry on an unscorable group's member in one of them (plan M4 Task
+# 31, review Minor 1). No namespace: the states are shown through `target_state`.
+RETRYABLE_ORDER: Final = "retryable_target_state"
 
 
 def model_efforts() -> dict[str, list[str]]:
@@ -606,10 +614,17 @@ def test_the_catalogue_has_exactly_the_namespaces(catalogue: dict[str, Any]) -> 
 
 def test_each_order_is_its_backend_order_of_its_namespace(catalogue: dict[str, Any]) -> None:
     orders = catalogue.get(ORDER_KEY)
-    assert isinstance(orders, dict) and sorted(orders) == sorted([*ORDERS, EFFORT_ORDER]), orders
+    keys = sorted([*ORDERS, EFFORT_ORDER, RETRYABLE_ORDER])
+    assert isinstance(orders, dict) and sorted(orders) == keys, orders
     for namespace, expected in ORDERS.items():
         assert orders[namespace] == expected(), f"codes.json[order][{namespace}]"
         assert sorted(orders[namespace]) == catalogue[namespace], f"order[{namespace}] is not its namespace"
+
+
+def test_the_retryable_states_are_the_retry_route_s(catalogue: dict[str, Any]) -> None:
+    retryable = catalogue[ORDER_KEY].get(RETRYABLE_ORDER)
+    assert retryable == list(targets.RETRYABLE_STATES), f"codes.json[order][{RETRYABLE_ORDER}]"
+    assert set(retryable) <= set(catalogue["target_state"]), "a retryable state that is no target state"
 
 
 def test_each_model_s_efforts_are_its_supported_efforts_in_order(catalogue: dict[str, Any]) -> None:
@@ -657,11 +672,11 @@ def test_the_system_section_s_reused_namespaces_cover_their_literals(
     assert not missing, f"codes.json[{namespace}] lacks {missing}"
 
 
-def test_the_attention_sections_are_the_module_s_in_its_order() -> None:
-    """Needs attention shows one block per section in `AttentionOut`'s order (plan M4 Task 31, resolution d),
-    and has no failed-purges section (U1)."""
+def test_the_attention_sections_have_no_failed_purges_section() -> None:
+    """Needs attention shows one block per section of `AttentionOut` (their order is
+    `order.attention_section`, held by `test_each_order_is_its_backend_order_of_its_namespace`), and none for
+    failed purges (U1)."""
     sections = list(attention.AttentionOut.model_fields)
-    assert sections[0] == "raw_items" and sections[-1] == "scope_apply_failed", sections
     assert not [name for name in sections if "purge" in name], sections
 
 

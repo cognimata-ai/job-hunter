@@ -8,18 +8,22 @@
 // - **Rejected raw items**: [Replay] (`{raw_response_id}`) on a replayable response; another says why, as text.
 // - **Identity conflicts**: [Keep apart] and [Merge], each behind a `ConfirmDialog` naming the jobs.
 // - **Refused and failed scores**, and the members of an unscorable group whose target is refused or failed
-//   (`scoring.targets.RETRYABLE_STATES`, the states the retry route takes): [Retry].
+//   (`scoring.targets.RETRYABLE_STATES`, the states the retry route takes, as `codes.json`'s
+//   `order.retryable_target_state`): [Retry].
 // - **Quarantined batches** (a `submit_ambiguous` one; a `released` one is listed while it is reconciled) and
 //   **batches that cannot be retrieved** (only when `releasable`, U3): [Release & re-score] opens a `ConfirmDialog`
 //   stating that item's `reserved_usd`, which stays counted as ambiguous spend; only its Confirm sends the keyed
 //   `{confirm: true}`. A retrieve-failing batch that is not releasable yet says from when it can be: its
-//   `expires_at` plus the hour the route waits (`releasable`: "more than 1 h past its expiry").
+//   `expires_at` plus the hour the route waits (`releasable`: "more than 1 h past its expiry";
+//   `tests/unit/test_attention_release_after.py` holds the constant to the backend's).
 // - **Mass disappearances**: [Confirm closure] behind a `ConfirmDialog`, since it closes postings.
 // - **Paused scoring**: [Acknowledge] sends the pausing alert's acknowledgement.
-// - **Failed scope apply**: [Retry apply] (`useRetryApply`).
+// - **Failed scope apply**: [Retry apply] (`useRetryApply`, telling its own failure at the item).
 // - **Broken sources** are information only; a `degraded` one shows as a warning.
 //
-// A job an item names is a `JobRef`, which opens the job in the Jobs page's drawer (`/?job=<id>`).
+// A job an item names is a `JobRef`, which opens the job in the Jobs page's drawer (`/?job=<id>`). The blocks are in
+// `codes.json`'s `order.attention_section` (`test_i18n_codes.py` holds it to `AttentionOut`); Needs attention is
+// read again every 60 s in the background while it shows, so a batch's "from" time turns into its Release.
 import { useNavigate } from "@tanstack/react-router";
 import type { TFunction } from "i18next";
 import { type ReactNode, useId, useState } from "react";
@@ -29,6 +33,7 @@ import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
 import { useToast } from "../components/Toaster";
+import codes from "../i18n/codes.json";
 import { intlLocale, useServerText } from "../i18n/index";
 import { JobRef } from "../jobs/JobRef";
 import { closedSet } from "../settings/fields";
@@ -53,8 +58,8 @@ import {
 type Section = keyof AttentionOut;
 type Item<S extends Section> = AttentionOut[S] extends { items: (infer I)[] } ? I : never;
 
-/** The sections in the module's order: `AttentionOut`'s every key, each once. */
-export const SECTIONS = closedSet<Section>({
+/** `AttentionOut`'s every key, each once (a section the schema adds and this list lacks fails to compile). */
+const KNOWN: ReadonlySet<string> = new Set(closedSet<Section>({
   raw_items: true,
   identity_conflicts: true,
   failed_targets: true,
@@ -65,17 +70,13 @@ export const SECTIONS = closedSet<Section>({
   broken_sources: true,
   paused_lane: true,
   scope_apply_failed: true,
-});
+}));
 
-/** The target states the retry route takes back (`scoring.targets.RETRYABLE_STATES`). */
-const RETRYABLE: ReadonlySet<string> = new Set([
-  "refused",
-  "failed_max_tokens",
-  "failed_invalid_output",
-  "failed_request",
-  "failed_transient",
-  "failed_attempts_exhausted",
-]);
+/** The sections in the module's order (`codes.json`'s `order.attention_section`). */
+export const SECTIONS = codes.order.attention_section.filter((name): name is Section => KNOWN.has(name));
+
+/** The target states the retry route takes back (`order.retryable_target_state`). */
+const RETRYABLE: ReadonlySet<string> = new Set(codes.order.retryable_target_state);
 
 /** How long after its expiry a lost batch can be released (`releasable`: "more than 1 h past its expiry";
  * `scoring.batches.RETRIEVE_FAILING_AFTER`). */
@@ -351,7 +352,12 @@ function MassItem({ item }: { item: Item<"mass_disappearances"> }) {
       <Meta>
         {item.absent_count === null || item.baseline_active_count === null
           ? t("attention.mass_meta_unknown", { time })
-          : t("attention.mass_meta", { absent: format.number(item.absent_count), baseline: format.number(item.baseline_active_count), time })}
+          : t("attention.mass_meta", {
+              count: item.absent_count,
+              absent: format.number(item.absent_count),
+              baseline: format.number(item.baseline_active_count),
+              time,
+            })}
       </Meta>
       <ConfirmDialog open={asking} title={t("attention.closure_title")} confirmLabel={t("attention.confirm_closure")}
         onCancel={() => { setAsking(false); }}
@@ -425,8 +431,14 @@ function BrokenItem({ item }: { item: Item<"broken_sources"> }) {
   );
 }
 
+/** A label inside a sentence: lowercased in English ("paused: reservation bound violated"); German keeps the
+ * capital of its nouns. */
+function midSentence(text: string, language: string): string {
+  return language === "en" ? text.charAt(0).toLocaleLowerCase("en") + text.slice(1) : text;
+}
+
 function PausedItem({ lane }: { lane: NonNullable<AttentionOut["paused_lane"]> }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const serverText = useServerText();
   const toast = useToast();
   const ack = useAckAlert();
@@ -439,7 +451,7 @@ function PausedItem({ lane }: { lane: NonNullable<AttentionOut["paused_lane"]> }
           {t("attention.ack")}
         </button>
       )}>
-      <p className={styles.title}>{t("attention.paused", { reason: serverText("pause", lane.reason) })}</p>
+      <p className={styles.title}>{t("attention.paused", { reason: midSentence(serverText("pause", lane.reason), i18n.language) })}</p>
     </ItemRow>
   );
 }
@@ -447,7 +459,7 @@ function PausedItem({ lane }: { lane: NonNullable<AttentionOut["paused_lane"]> }
 function ScopeItem({ failed }: { failed: NonNullable<AttentionOut["scope_apply_failed"]> }) {
   const { t } = useTranslation();
   const toast = useToast();
-  const retry = useRetryApply();
+  const retry = useRetryApply({ ownToast: true });
   const refresh = useAfterRetryApply();
   return (
     <ItemRow error={retry.error}

@@ -55,6 +55,8 @@ export const ALERTS_KEY = ["system", "alerts"] as const;
 export const GOLDEN_KEY = ["system", "golden-cases"] as const;
 export const HEALTH_KEY = ["system", "health"] as const;
 
+/** How often Needs attention is read again while it shows. */
+export const ATTENTION_POLL_MS = 60_000;
 /** The rows a page of the run, cycle and alert lists asks for. */
 export const PAGE_LIMIT = 20;
 /** The golden cases a page asks for (the route's default). */
@@ -119,11 +121,13 @@ function usePaged<T>(queryKey: QueryKey, path: string, params: Record<string, st
 
 // --- the reads ---
 
-/** Needs attention (`GET /api/system/needs-attention`). */
+/** Needs attention (`GET /api/system/needs-attention`), read again every 60 s in the background while it shows
+ * (`X-JH-Background: 1`: a poll never extends the session), so a time it shows ("can be released from") moves on. */
 export function useAttention(): UseQueryResult<AttentionOut, ProblemError> {
   return useQuery({
     queryKey: ATTENTION_KEY,
-    queryFn: ({ signal }) => apiSend<AttentionOut>("/api/system/needs-attention", { signal }),
+    queryFn: ({ signal }) => apiSend<AttentionOut>("/api/system/needs-attention", { signal, background: true }),
+    refetchInterval: ATTENTION_POLL_MS,
   });
 }
 

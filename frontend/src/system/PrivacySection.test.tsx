@@ -27,11 +27,24 @@ describe("PrivacySection", () => {
     expect(rows.map((row) => row.querySelector("th")?.textContent)).toEqual(
       RETENTION_ROWS.map((row) => en[`settings_privacy.row.${row}`]),
     );
-    expect(rows.length).toBeGreaterThanOrEqual(20);
     const fixed = rows.filter((row) => row.querySelector("input") === null);
     for (const row of fixed) {
       expect(row.querySelector("td")?.textContent.trim()).not.toBe("");
     }
+    // the rules a summary would leave out or understate (Ruling T31-c; test_privacy_retention_rows.py holds every
+    // row's periods to spec §20.1)
+    const kept = (what: string) =>
+      rows.find((row) => row.querySelector("th")?.textContent === what)?.querySelector("td")?.textContent ?? "";
+    expect(kept("Raw provider response bodies")).toBe("30 days, longer while a newer response refers to the same body");
+    expect(kept("Raw provider response records (metadata, body already removed)")).toBe("With their fetch request: 13 months");
+    expect(kept("Backups")).toBe("Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: indefinitely");
+    expect(kept("Backup set and backup run records")).toBe("13 months");
+    expect(kept("Closed or stale jobs (not saved, applied or in an active golden case)")).toBe(
+      "90 days after they closed, then tombstoned: their hashed keys and user-action timestamps are kept, their content deleted",
+    );
+    expect(kept("Superseded deterministic results (det_results instances)")).toBe(
+      "With the score history; the current instance follows its result",
+    );
 
     // the one editable row: the score history, with the model's bounds
     const field = within(table).getByRole<HTMLInputElement>("spinbutton", { name: en["settings_privacy.score_history_months"] });

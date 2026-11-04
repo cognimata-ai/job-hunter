@@ -15,9 +15,9 @@ import { closedSet } from "../settings/fields";
 import fields from "../settings/fields.module.css";
 import styles from "./AlertsList.module.css";
 import { useFormat } from "./format";
-import { LoadMore } from "./RunsList";
-import parts from "./SystemSection.module.css";
+import { LoadMore } from "./lists";
 import { type AlertOut, type AlertStatus, useAckAlert, useAlerts } from "./systemApi";
+import parts from "./SystemSection.module.css";
 
 /** The tabs, in the lifecycle's order (`observability.lists.AlertStatus`). */
 const STATUSES = closedSet<AlertStatus>({ open: true, acknowledged: true, resolved: true });

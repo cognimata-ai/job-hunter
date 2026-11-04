@@ -13,9 +13,9 @@ import { useToast } from "../components/Toaster";
 import { useServerText } from "../i18n/index";
 import tables from "../settings/tables.module.css";
 import styles from "./GoldenSet.module.css";
-import { LoadMore } from "./RunsList";
-import parts from "./SystemSection.module.css";
+import { LoadMore } from "./lists";
 import { type GoldenCaseOut, useDeleteGoldenCase, useGoldenCases, useSetGoldenFlags } from "./systemApi";
+import parts from "./SystemSection.module.css";
 
 const COLUMNS = 7;
 
