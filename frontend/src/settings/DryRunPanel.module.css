@@ -42,9 +42,12 @@
   font-weight: var(--font-weight-bold);
 }
 
+/* The same box as the ProblemBox (components/ProblemBox.module.css), without its alert role. */
 .quietProblem {
   display: grid;
+  justify-items: start;
   gap: var(--space-1);
+  max-width: var(--measure);
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--color-critical);
   border-left-width: 4px;
