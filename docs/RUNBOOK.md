@@ -4,8 +4,8 @@ The operations guide of spec §19.8. This file starts with the score lane's entr
 paused score lane and its acknowledgement, a quarantined batch and its release, a submitted batch that cannot
 be retrieved, the live schema dry-run before a prompt-schema version is activated, and the golden eval run on
 the installation before an activation. M4 adds the web UI's operator paths (below), which each entry names
-before its API route. M5 adds the host setup, start and stop, the health check, secret rotation, restore and
-the rest of the alert table (§19.8).
+before its API route, and, for development, the E2E suite (last). M5 adds the host setup, start and stop, the
+health check, secret rotation, restore and the rest of the alert table (§19.8).
 
 Every command below runs on the host in the compose directory. `docker compose run --rm --no-deps worker
 jobhunter …` starts a one-off container of the worker image with the worker's configuration and secrets; it
@@ -280,3 +280,21 @@ added, activated or deactivated while it runs never brings a run of fewer cases 
 The daily canary run (`canary_daily`, 06:41 UTC) re-scores the canary cases with the active configuration and
 raises `scoring.canary_drift` (warn) for a canary more than 8 points from its first score; it needs no action
 before an activation.
+
+## The E2E suite on a development stack
+
+The Playwright suite (spec §18.7) runs on a fresh dev stack of the four compose files `e2e.yml` uses:
+
+```
+DC="docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml \
+  -f deploy/compose.fakellm.yaml -f deploy/compose.e2e.yaml"
+sudo scripts/dev-secrets.sh && $DC up -d --build --wait
+npm --prefix frontend run e2e
+```
+
+A failed local run keeps the failed test's trace, screenshot and page snapshot in `frontend/test-results/`, and
+the HTML report with the trace in `frontend/playwright-report/` (both git-ignored). The trace holds the dev
+stack's session cookie and the smoke user's password, which every dev stack shares (`scripts/smoke_m0.py`):
+never attach these directories or a trace of them to an issue, and never share them. CI records no trace: after
+a failure it uploads the report and the test output with screenshots and page snapshots only, and `npm --prefix
+frontend run e2e:sentinel` checks that no credential is in them.
