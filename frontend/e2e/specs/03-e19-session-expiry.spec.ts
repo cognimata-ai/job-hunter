@@ -3,9 +3,9 @@
 // settings with their section in the hash. The spec signs in through the UI with its own user agent and expires
 // only its own session, by that agent's hash (the server stores `sha256(user_agent)`), so the saved session of
 // `AUTH_STATE` still answers afterwards.
-import { type Page, request } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
-import { ORIGIN } from "../support/api";
+import { newApiContext, ORIGIN } from "../support/api";
 import { en, expect, signInThroughUi, test } from "../support/fixtures";
 import { AUTH_STATE } from "../support/paths";
 import { psql, smokeUser } from "../support/stack";
@@ -77,7 +77,7 @@ test("E19: an expired session redirects to the login and back to the same URL", 
   await expectNoSeriousA11yViolations(page);
 
   // The saved session was never presented, so it still answers.
-  const saved = await request.newContext({ baseURL: ORIGIN, storageState: AUTH_STATE });
+  const saved = await newApiContext({ baseURL: ORIGIN, storageState: AUTH_STATE });
   try {
     expect((await saved.get("/api/auth/session")).status()).toBe(200);
   } finally {

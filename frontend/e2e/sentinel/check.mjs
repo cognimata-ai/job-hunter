@@ -1,12 +1,14 @@
-// `npm --prefix frontend run e2e:sentinel` (spec §16 L5486, Ruling F4-a): no retained or uploaded E2E artefact
-// holds a credential. It serves a login page and a stub of the session API on 127.0.0.1, invents a password, a
-// session cookie the login sets and one in a saved session, runs `artefacts.sentinel.ts` (which signs in with
-// them and fails on purpose) under the E2E configuration with `CI=1`, as e2e.yml runs it, and scans what the run
-// left in its test output and HTML report, the directories e2e.yml uploads after a failure: every file, every
-// zip entry (a trace) and the HTML report's embedded data. It exits 1 naming each file that holds a sentinel
-// (never the value), and also when the scan cannot be trusted: no failure screenshot, or a harmless canary the
-// spec put in a step title and an attachment that the scan does not find. The run's directory is removed when
-// the check passes and kept, holding invented values only, when it fails. No browser installs, no stack.
+// `npm --prefix frontend run e2e:sentinel` (spec §16 L5486, Rulings F4-a, F4-c): no retained or uploaded E2E
+// artefact, and no reporter output, holds a credential. It serves a login page and a stub of the session API on
+// 127.0.0.1, invents a password, a session cookie the login sets and one in a saved session, runs
+// `artefacts.sentinel.ts` (whose tests sign in with them and fail on purpose, one by an authenticated request to
+// a closed port) under the E2E configuration with `CI=1`, as e2e.yml runs it, and scans the run's list-reporter
+// output and what the run left in its test output and HTML report, the directories e2e.yml uploads after a
+// failure: every file, every zip entry (a trace) and the HTML report's embedded data. It exits 1 naming each
+// place that holds a sentinel (never the value), and also when the scan cannot be trusted: a test that did not
+// fail as it should, no failure screenshot, or a harmless canary the spec put in a step title and an attachment
+// that the scan does not find. The run's directory is removed when the check passes and kept, holding invented
+// values only, when it fails. No browser installs, no stack.
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -75,6 +77,11 @@ const server = createServer((request, response) => {
 });
 await new Promise((resolve) => { server.listen(0, "127.0.0.1", resolve); });
 const origin = `http://127.0.0.1:${String(server.address().port)}`;
+// a port that was free a moment ago and is closed now: a request to it fails in transport (ECONNREFUSED)
+const closed = createServer();
+await new Promise((resolve) => { closed.listen(0, "127.0.0.1", resolve); });
+const closedOrigin = `http://127.0.0.1:${String(closed.address().port)}`;
+await new Promise((resolve) => { closed.close(resolve); });
 
 const out = mkdtempSync(join(tmpdir(), "jh-e2e-sentinel-"));
 const results = join(out, "test-results");
@@ -93,6 +100,7 @@ const ran = await new Promise((resolve) => {
       CI: "1",
       PLAYWRIGHT_HTML_OUTPUT_DIR: report,
       JH_SENTINEL_ORIGIN: origin,
+      JH_SENTINEL_CLOSED_ORIGIN: closedOrigin,
       JH_SENTINEL_PASSWORD: SECRETS.password,
       JH_SENTINEL_STATE: state,
       JH_SENTINEL_CANARY: CANARY,
@@ -172,9 +180,10 @@ function files(dir) {
 const problems = [];
 if (ran.code !== 1) {
   problems.push(`the sentinel run exited ${String(ran.code)}, not 1 (its spec fails on purpose):\n${ran.output.slice(-2000)}`);
-} else if (!ran.output.includes("the sentinel spec fails on purpose")) {
-  problems.push(`the sentinel spec failed before its deliberate failure:\n${ran.output.slice(-2000)}`);
+} else if (!ran.output.includes("the sentinel spec fails on purpose") || !ran.output.includes("ECONNREFUSED")) {
+  problems.push(`a sentinel test failed before its deliberate failure:\n${ran.output.slice(-2000)}`);
 }
+scan("the run's reporter output", Buffer.from(ran.output), null);
 const scanned = [results, report].flatMap((top) => {
   try {
     return files(top).map((path) => ({ top, path }));

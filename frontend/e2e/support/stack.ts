@@ -7,6 +7,7 @@
 // status and the tail of its stderr.
 import { spawn } from "node:child_process";
 import { REPO_ROOT } from "./paths";
+import { rememberSecret } from "./redact";
 
 const COMPOSE_FILES = [
   "deploy/compose.dev.yaml",
@@ -245,7 +246,9 @@ export function smokeUser(): Promise<SmokeUser> {
     if (ran.code !== 0) {
       throw new Error(`reading the smoke user exited ${String(ran.code)}: ${tail(ran.stderr)}`);
     }
-    return JSON.parse(ran.stdout) as SmokeUser;
+    const user = JSON.parse(ran.stdout) as SmokeUser;
+    rememberSecret(user.password); // redacted from every error of the harness (`redact.ts`)
+    return user;
   })();
   return smoke;
 }

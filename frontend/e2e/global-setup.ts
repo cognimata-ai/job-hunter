@@ -1,15 +1,15 @@
 // Before every E2E run (plan M4 Task 32): the stack ready (`/readyz` 200 within 300 s), the user `smoke` with
 // `smoke_m0.PASSWORD` (`smoke_m0.USER_CREATE` in a one-off api container; a "user already exists" answer is
 // accepted when the login then works), and its session saved to `AUTH_STATE` through an API login. The E2E
-// and the visual checks share that user. The password is read in process and never printed.
-import { request } from "@playwright/test";
-import { ORIGIN, saveAuthState } from "./support/api";
+// and the visual checks share that user. The password is read in process and never printed; every request
+// context is `newApiContext`'s, whose failures are redacted (Ruling F4-c).
+import { newApiContext, ORIGIN, saveAuthState } from "./support/api";
 import { DC, run, smokeUser, waitFor } from "./support/stack";
 
 const READY_WITHIN_MS = 300_000;
 
 async function ready(): Promise<true | null> {
-  const context = await request.newContext({ baseURL: ORIGIN });
+  const context = await newApiContext({ baseURL: ORIGIN });
   try {
     return (await context.get("/readyz", { timeout: 5_000 })).status() === 200 ? true : null;
   } catch {

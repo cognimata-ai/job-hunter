@@ -6,6 +6,7 @@ import { expect, type Page, type Response } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 import en from "../../src/i18n/en.json" with { type: "json" };
 import { test as guarded } from "./csp";
+import { scrubbed } from "./redact";
 import type { SmokeUser } from "./stack";
 
 /** `csp.ts`'s `test` with one more automatic fixture (spec §16 L5486, Ruling F4-a): when a test's context closes,
@@ -95,5 +96,6 @@ export async function signInThroughUi(page: Page, user: SmokeUser, password = us
     (response) => new URL(response.url()).pathname === "/api/auth/login" && response.request().method() === "POST",
   );
   await page.getByRole("button", { name: en["login.submit"] }).click();
-  return answered;
+  // a browser wait's call log names no header, but its failure is redacted all the same (Ruling F4-c)
+  return scrubbed(() => answered);
 }
