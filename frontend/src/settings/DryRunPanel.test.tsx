@@ -92,6 +92,12 @@ describe("DryRunPanel", () => {
     const fallback = render(<Problem error={unknown} alert={false} />);
     expect(fallback.container.textContent).toContain("I'm a teapot");
     expect(fallback.container.textContent).toContain("Short and stout");
+    fallback.unmount();
+    const coded = new ProblemError({
+      status: 409, code: "conflict_state", title: "Conflict", detail: "purge_in_progress", requestId: null, errors: [],
+    });
+    const verbatim = render(<Problem error={coded} alert={false} />); // a code-shaped detail: verbatim, in German too
+    expect(verbatim.container.querySelector("code")?.textContent).toBe("purge_in_progress");
   });
 
   it("errors block Save and are linked to their fields", async () => {

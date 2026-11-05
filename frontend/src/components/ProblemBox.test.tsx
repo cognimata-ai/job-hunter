@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProblemError } from "../api/client";
@@ -56,6 +56,21 @@ describe("ProblemBox", () => {
     expect(box.textContent).not.toContain("server English");
     expect(box.textContent).not.toContain("the jobs changed");
     expect(box.textContent).toContain("req-5f2c"); // an id stays as it is
+  });
+
+  it("shows a code-shaped detail verbatim as code in every language, and hides a prose one in German", async () => {
+    const refused = (detail: string) =>
+      new ProblemError({ status: 409, code: "conflict_state", title: "Conflict", detail, requestId: null, errors: [] });
+    for (const language of ["en", "de"]) {
+      await i18n.changeLanguage(language);
+      const { unmount } = render(<ProblemBox error={refused("not_releasable")} />);
+      const box = screen.getByRole("alert");
+      expect(box.textContent).toContain(language === "de" ? de["problem.conflict_state"] : en["problem.conflict_state"]);
+      expect(within(box).getByText("not_releasable", { selector: "code" })).toBeTruthy();
+      unmount();
+    }
+    render(<ProblemBox error={refused("the batch was reconciled meanwhile")} />); // German, prose
+    expect(screen.getByRole("alert").textContent).not.toContain("reconciled");
   });
 
   it("in German falls back to the server's English title and detail for a code the catalogue lacks", async () => {
