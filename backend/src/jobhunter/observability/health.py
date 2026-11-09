@@ -24,11 +24,13 @@ error was raised; `reason` says what was wrong then: for the embedder `checksum_
 gave no usable answer, `unusable` for another model or dimension). Never an exception message.
 
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
-their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), the current quota
-window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16), the score lane
-(`scoring_health`, M3 Task 18), disk and database sizes, the versions and the embedder's health (with its
-model id) as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's
-view of a run row, shared with `POST /api/runs`.
+their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), each provider's quota
+window at `now` (`quota_health`, the header status's view), the LLM spend of the month (`llm_spend`, plan
+Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions and the
+embedder's health (with its model id) as the readiness check read it. Run ages are reported, never readiness
+gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs` and the run lists
+(`observability.lists`); every select of one either names `RUN_COLUMNS`, its fields, or fills a
+`worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks too.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
 save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
@@ -48,7 +50,7 @@ import asyncio
 import functools
 import platform
 import shutil
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -71,8 +73,10 @@ from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
+from jobhunter.quota.dryrun import live_windows
 from jobhunter.quota.ledger import used_units
-from jobhunter.quota.windows import Provider, WindowState, current_snapshot
+from jobhunter.quota.windows import Provider, Window, WindowState
+from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.cycles import PauseReason
 from jobhunter.worker.tasks import QUEUES
@@ -239,11 +243,8 @@ DISK_PATH: Final = "/"
 # The job statuses every known queue reports, 0 included; any other status is reported when it has jobs.
 DEPTH_STATUSES: Final = ("todo", "doing")
 
-# `runs_recent` serves it.
-_LAST_RUN: Final = q(
-    "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
-    "finished_at FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"
-)
+# `runs_last_success` serves both maxima (index-only, backwards), so the header status's 60 s poll, the system
+# health and the `stale_data` reconciler never scan `runs`.
 _RUN_FRESHNESS: Final = q(
     "SELECT EXISTS (SELECT 1 FROM runs) AS any_run, "
     "(SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
@@ -256,19 +257,37 @@ _QUEUE_DEPTHS: Final = q(
     "GROUP BY queue_name, status ORDER BY queue_name, status"
 )
 _DATABASE_BYTES: Final = q("SELECT pg_database_size(current_database())")
+_ACTIVE_VERSION: Final = q("SELECT settings_version_id FROM active_config WHERE id = 1")
 _ACTIVE_PAYLOAD: Final = q(
     "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
     "WHERE a.id = 1"
 )
 
 
+# The values of the `runs.status` CHECK (§7.6), in its order.
+RunStatus = Literal[
+    "queued",
+    "running",
+    "succeeded",
+    "partial",
+    "failed",
+    "failed_invariant",
+    "cancelled",
+    "missed",
+    "skipped_overlap",
+]
+
+
 class RunOut(BaseModel):
-    """A run as the api shows it (`runs` row, §7.6); its times in UTC."""
+    """A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
+    status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
+    `orphaned_queue`, …), null when it has none."""
 
     id: int
     kind: str
     trigger: str
-    status: str
+    status: RunStatus
+    status_reason: str | None
     scheduled_slot: datetime | None
     include_paid: bool
     attempt_no: int
@@ -285,6 +304,16 @@ class RunOut(BaseModel):
     def of(cls, run: object) -> "RunOut":
         """The `RunOut` of anything with the run's columns as attributes (a `RunRow`, a result row)."""
         return cls.model_validate(run, from_attributes=True)
+
+
+# The `runs` columns a `RunOut` is built from, `status_reason` included (D5): every select of one names them,
+# except those that fill a `worker.runs.RunRow`, whose required `status_reason` `RunOut` validates too.
+RUN_COLUMNS: Final = ", ".join(RunOut.model_fields)
+# The newest run, with its report (the header status reads its partial causes; a `RunOut` ignores it):
+# `runs_recent` serves it.
+LAST_RUN: Final = q(
+    f"SELECT {RUN_COLUMNS}, report FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"  # noqa: S608
+)
 
 
 class ReadyState(BaseModel):
@@ -324,7 +353,9 @@ class Versions(BaseModel):
 
 
 class QuotaOut(BaseModel):
-    """A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket."""
+    """A provider's quota window at the time of the request (§7.8): counted usage against its limit, and its
+    bucket. A stored window whose reset has passed shows its successor, which starts unspent; a provider with
+    no stored window shows the window its first request would open."""
 
     window_start: datetime
     window_end: datetime
@@ -339,20 +370,10 @@ class QuotaOut(BaseModel):
     def _in_utc(cls, value: datetime) -> datetime:
         return value.astimezone(UTC)
 
-
-QUOTA_PROVIDERS: Final[tuple[Provider, ...]] = ("jsearch", "serpapi", "adzuna")
-
-
-async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]:
-    """Each quota provider's current window with its counted usage, `None` when it has none yet."""
-    out: dict[Provider, QuotaOut | None] = {}
-    for provider in QUOTA_PROVIDERS:
-        w = await current_snapshot(conn, provider)
-        if w is None:
-            out[provider] = None
-            continue
-        used = await used_units(conn, provider, w.window_start)
-        out[provider] = QuotaOut(
+    @classmethod
+    def of(cls, w: Window, used: int) -> "QuotaOut":
+        """The view of window `w` with its counted usage `used`."""
+        return cls(
             window_start=w.window_start,
             window_end=w.window_end,
             state=w.state,
@@ -361,13 +382,43 @@ async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]
             remaining_units=max(0, w.limit_units - used),
             tokens=float(w.tokens),
         )
+
+
+QUOTA_PROVIDERS: Final[tuple[Provider, ...]] = ("jsearch", "serpapi", "adzuna")
+
+
+async def quota_views(
+    conn: AsyncConnection, windows: Mapping[Provider, Window | None]
+) -> dict[Provider, QuotaOut | None]:
+    """Each quota provider's view of its window in `windows` (`quota.dryrun.live_windows`: the windows at
+    `now`) with the window's counted usage in the ledger; `None` for a provider without one."""
+    out: dict[Provider, QuotaOut | None] = {}
+    for provider in QUOTA_PROVIDERS:
+        w = windows.get(provider)
+        out[provider] = (
+            None if w is None else QuotaOut.of(w, await used_units(conn, provider, w.window_start))
+        )
     return out
 
 
+async def quota_health(conn: AsyncConnection, *, now: datetime) -> dict[Provider, QuotaOut | None]:
+    """Each quota provider's window at `now` with its counted usage, the header status's own view (Ruling
+    T11-f): the stored current window rolled forward in memory under the active run settings
+    (`quota.dryrun.live_windows`), so a reset that has passed shows the successor before any ledger write
+    rolls it, and a provider without a stored window shows the one its first request would bootstrap. `None`
+    for SerpApi before its first account read, and for every provider when nothing is seeded."""
+    version = (await conn.execute(_ACTIVE_VERSION)).scalar_one_or_none()
+    if version is None:
+        return dict.fromkeys(QUOTA_PROVIDERS)
+    run = await load_run_settings(conn, int(version))
+    return await quota_views(conn, await live_windows(conn, run, now))
+
+
+# §17.5 "LLM spend" as M0 Deviation 6 reads it.
 class LlmSpendOut(BaseModel):
-    """The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
-    headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
-    without a row is the one a reservation would create, with the settings' cap and nothing counted."""
+    """The month's LLM spend (§17.5 "LLM spend"): the counted spend, the cap, the scoring headroom (§6.9.4)
+    and the USD bucket accrued to now, from the month row as `read_month` gives it; a month without a row is
+    the one a reservation would create, with the settings' cap and nothing counted."""
 
     month: date
     counted: DecimalOut
@@ -401,8 +452,11 @@ async def llm_spend(conn: AsyncConnection, *, now: datetime) -> LlmSpendOut | No
     return LlmSpendOut.of(await read_month_or_new(conn, budget.month_of(now), p, now=now), p)
 
 
+# What each figure reads: the module docstring, The score lane.
 class ScoringHealthOut(BaseModel):
-    """The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD."""
+    """The score lane: the running cycle, the pause reason, the oldest pending target's age, the pending and
+    batched targets and the quarantined batch spend. Ages are seconds at the caller's `now`, the amount in
+    USD."""
 
     running_cycle_id: int | None
     pause_reason: PauseReason | None
@@ -431,6 +485,8 @@ async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool
     )
 
 
+# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes` and the
+# caller's readiness report (`EmbedderOut`).
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -439,11 +495,12 @@ class SystemHealthOut(BaseModel):
       `last_fully_successful_run_age_s`: of a `succeeded` one only.
     - `run_age_state`: see `run_age_state`.
     - `queue_depths`: procrastinate jobs by queue and status.
-    - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
-    - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
-    - `scoring`: the score lane (`scoring_health`).
-    - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
-    - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
+    - `quota`: each quota provider's window at the time of the request, as the header status shows it;
+      `null` for SerpApi before its first account read.
+    - `llm`: the month's LLM spend, `null` when nothing is seeded.
+    - `scoring`: the score lane.
+    - `table_bytes`: the size of every table of the `public` schema, in bytes.
+    - `embedder`: the embedder's health as the readiness check read it.
     """
 
     ready: ReadyState
@@ -549,7 +606,7 @@ async def system_health(
     (readiness probes on a connection of its own), and the embedder is asked once, by that check. Read-only,
     apart from the gauges it refreshes: `ALERTS_OPEN` and `TABLE_BYTES`.
     """
-    last = (await conn.execute(_LAST_RUN)).first()
+    last = (await conn.execute(LAST_RUN)).first()
     freshness = await read_run_freshness(conn)
     alerts = await refresh_alert_gauge(conn)
     disk = shutil.disk_usage(DISK_PATH)
@@ -562,7 +619,7 @@ async def system_health(
         last_fully_successful_run_age_s=_age_s(now, freshness.last_full_success_at),
         run_age_state=run_age_state(now, freshness),
         queue_depths=await _queue_depths(conn),
-        quota=await quota_health(conn),
+        quota=await quota_health(conn, now=now),
         llm=await llm_spend(conn, now=now),
         scoring=await scoring_health(conn, now=now, fake_llm=fake_llm),
         alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),

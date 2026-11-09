@@ -254,13 +254,13 @@ def test_keys_left_out_take_their_defaults() -> None:
     assert classify_effects(Settings(), Settings.model_validate({"schedule": {"interval_hours": 6}})) == NONE
 
 
-def test_a_label_only_preset_change_is_an_llm_tuple_change() -> None:
-    """Ruling 2: §13.1 lists `preset` inside `scoring.model_policy` (effect `llm_tuple`), and the model
-    policy's hash covers the whole object, so a label-only change derives a new `model_policies` row."""
+def test_a_label_only_preset_change_is_no_change() -> None:
+    """M4 D20 (replacing Task 16 ruling 2): the stored `preset` is the label of the grid (the label normal
+    form, `settings.presets`), so a label-only change has the active normal form and derives no new row."""
     custom = proposed(at("scoring.model_policy.preset", "custom"))
-    assert custom.scoring.model_policy.nodes == Settings().scoring.model_policy.nodes
-    assert classify_effects(Settings(), custom) == LLM_TUPLE
-    assert content_hash(derived(custom).model_policy) != content_hash(derived(Settings()).model_policy)
+    assert custom.scoring.model_policy == Settings().scoring.model_policy
+    assert classify_effects(Settings(), custom) == NONE
+    assert content_hash(derived(custom).model_policy) == content_hash(derived(Settings()).model_policy)
 
 
 @pytest.mark.parametrize(("path", "value", "classes"), CASES, ids=[case[0] for case in CASES])

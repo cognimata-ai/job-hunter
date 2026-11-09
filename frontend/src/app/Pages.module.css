@@ -1,0 +1,11 @@
+/* What the pages share: the page title, and the not-found page. */
+.title {
+  font-size: var(--font-size-6);
+  letter-spacing: -0.015em;
+}
+
+.notFound {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-4);
+}

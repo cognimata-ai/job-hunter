@@ -2,12 +2,17 @@
 
 **`resolve_item`** runs the §8.6 transaction of one raw item on the caller's connection, inside a savepoint,
 in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.lock_active_scopes`, the first statement) →
-the job rows → the run's owner row (`ledger.lock_run_owner`) → the other domain rows → `ranking_state`.
+the job rows → the owner row (`ledger.lock_item_owner`) → the other domain rows → `ranking_state`. The owner
+is a `ledger.ItemOwner` (M4 Task 12, M1 Carry-forward 10): a run's admitted attempt (node 6, its run row
+through `ledger.lock_run_owner`), or the claim of a `replay_raw_items` operation (`sources.replay`, which
+resolves the items it moved under a run that is over: its operation row through
+`worker.operations.lock_operation_owner`). Either way an active `global` purge fence is `FencedOut`; every
+owner step below is that one lock.
 
 1. **Fence and idempotency.** An item no longer `pending` or `deferred` is left as it is: its disposition is
    returned (a replay of a linked item writes nothing). An active `source` purge fence for the item's source
    makes it `out_of_scope('source_purged')`; an observation that already names the item links it to that
-   observation. Both are owner writes, after `lock_run_owner`.
+   observation. Both are owner writes, after `lock_item_owner`.
 2. **Read before writing** (plain reads): the sighting time `t = raw_responses.fetched_at`; the posting `P`
    by `(source_instance_id, native_id)`; the keys `K` (`collect_keys`) and their `ad_keys` owners; with `P`'s
    job, every job followed through `merged_into_job_id` to its root: the job set `J`.
@@ -15,11 +20,13 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    lowest (the jobs a merge can take away: its target is always the lowest id), are locked `FOR UPDATE` in
    one ordered statement (`merge.lock_jobs`; the transaction writes every job of `J`, so the spec's `FOR
    SHARE` would only be upgraded: plan Deviation 21; Ruling T18-c), then the owner row. Each read-and-lock
-   round runs in a savepoint: when a job of the set was merged (or deleted) between the read and the lock, or
-   the co-members changed, the savepoint is rolled back, which releases that round's row locks, and the
-   round runs again with a fresh read, so the second set is locked in id order too (at most
-   `_ROOT_ROUNDS`). A fenced job (`merge.fenced_jobs`) makes the item `deferred('job_fenced')`, `normalized`
-   kept, and nothing else is written. Then (`_decide`):
+   round runs in a savepoint: when a job of the set was merged (or deleted) between the read and the lock,
+   the co-members changed, or `P`'s job or an owner of a key of `K` is no longer what the round read (an
+   unmerge moves `P` back and re-owns the keys without merging any job of `J`, so only a re-read of both
+   under the lock sees it: M1 Carry-forward 10), the savepoint is rolled back, which releases that round's
+   row locks, and the round runs again with a fresh read, so the second set is locked in id order too (at
+   most `_ROOT_ROUNDS`, then `CoMemberChanged`). A fenced job (`merge.fenced_jobs`) makes the item
+   `deferred('job_fenced')`, `normalized` kept, and nothing else is written. Then (`_decide`):
    - `J` empty: a new job, its row from `select_canonical` of this observation alone (its provenance is
      written in step 7, when the posting and observation ids exist), `restored_from_tombstone_id` from the
      first key of `K` whose `sha256(ns ‖ 0x00 ‖ value)` is in `tombstone_keys`, and then its
@@ -100,7 +107,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
 from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS
-from jobhunter.errors import DomainError, FencedOut, InvariantViolation
+from jobhunter.errors import CoMemberChanged, DomainError, FencedOut, InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.normalize.fields import CanonicalFields, ObservationView, WatchlistDisplay, select_canonical
 from jobhunter.normalize.keys import AdKey
@@ -382,10 +389,20 @@ async def _decide(conn: AsyncConnection, found: _JobSet, keys: Sequence[AdKey]) 
     return _Decision(jobs[0], "strong_key_merge", merged=jobs[1:])
 
 
-async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _JobSet | None:
-    """One round of step 2's reads and step 3's lock: `P`, the owners of `K` and their roots `J`, then `J` and
-    the group co-members of every job of `J` but the lowest in one ordered statement. `None` when what was
-    read no longer holds under the lock (a job of `J` merged or gone, or other co-members)."""
+@dataclass(frozen=True)
+class _Read:
+    posting: Row[tuple[object, ...]] | None  # P: id, job_id
+    direct: Mapping[AdKey, int]  # the job that owns each key of K that has an owner
+
+    @property
+    def state(self) -> tuple[tuple[int, int] | None, Mapping[AdKey, int]]:
+        """What a re-read compares: `P` and its job, and the owner of each key."""
+        posting = None if self.posting is None else (int(self.posting.id), int(self.posting.job_id))
+        return posting, self.direct
+
+
+async def _read(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _Read:
+    """Step 2's plain reads: `P` and the owners of `K`."""
     posting = (
         await conn.execute(
             _POSTING, {"instance": item.source_instance_id, "native_id": item.posting.native_id}
@@ -397,6 +414,16 @@ async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKe
             _KEY_OWNERS, {"ns": [key.ns for key in keys], "values": [key.value for key in keys]}
         )
     }
+    return _Read(posting, direct)
+
+
+async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _JobSet | None:
+    """One round of step 2's reads and step 3's lock: `P`, the owners of `K` and their roots `J`, then `J` and
+    the group co-members of every job of `J` but the lowest in one ordered statement. `None` when what was
+    read no longer holds under the lock: a job of `J` merged or gone, other co-members, or `P`'s job or a
+    key's owner moved (an unmerge, which merges no job of `J`; module docstring)."""
+    read = await _read(conn, item, keys)
+    posting, direct = read.posting, read.direct
     starts = {*direct.values(), *([int(posting.job_id)] if posting is not None else [])}
     roots = (
         {int(row.start): int(row.root) for row in await conn.execute(_ROOTS, {"ids": sorted(starts)})}
@@ -410,6 +437,8 @@ async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKe
     if any(job not in locked or locked[job] is not None for job in jobs):
         return None
     if not await merge.co_members(conn, mergeable) <= locked.keys():
+        return None
+    if (await _read(conn, item, keys)).state != read.state:  # the re-read under the lock (M1 Carry 10)
         return None
     return _JobSet(
         posting=posting,
@@ -435,7 +464,7 @@ async def _lock_job_set(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey
             return found
         await attempt.rollback()
         log.info("job_set_changed_under_the_lock", raw_item_id=item.raw_item_id)
-    raise InvariantViolation(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
+    raise CoMemberChanged(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
 
 
 async def _dispose(
@@ -557,12 +586,12 @@ async def _posting_for(
 
 
 async def _link(
-    conn: AsyncConnection, owner: RunOwner, item: _Item, active: filters.ActiveScopes
+    conn: AsyncConnection, owner: ledger.ItemOwner, item: _Item, active: filters.ActiveScopes
 ) -> ResolveOutcome:
     """Steps 2 to 7 of an item that no fence and no earlier observation settled."""
     keys = collect_keys(item.posting)
     found = await _lock_job_set(conn, item, keys)
-    await ledger.lock_run_owner(conn, owner)  # the owner row after the job rows (§3.3.3)
+    await ledger.lock_item_owner(conn, owner)  # the owner row after the job rows (§3.3.3)
     if fenced := await merge.fenced_jobs(conn, found.jobs):
         log.info("raw_item_deferred", raw_item_id=item.raw_item_id, fenced_job_ids=fenced)
         await _dispose(conn, item.raw_item_id, item.from_states, "deferred", reason=JOB_FENCED)
@@ -675,7 +704,7 @@ async def _link(
     )
 
 
-async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _resolve(conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int) -> ResolveOutcome:
     active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
     row = (await conn.execute(_ITEM, {"item": raw_item_id})).first()
     if row is None:
@@ -687,11 +716,11 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
         return ResolveOutcome(resolution)
     from_states = (str(row.disposition),)
     if (await conn.execute(_SOURCE_FENCED, {"source": row.source_id})).scalar_one():
-        await ledger.lock_run_owner(conn, owner)
+        await ledger.lock_item_owner(conn, owner)
         await _dispose(conn, raw_item_id, from_states, "out_of_scope", reason=items.SOURCE_PURGED)
         return ResolveOutcome("out_of_scope")
     if row.observation_id is not None:
-        await ledger.lock_run_owner(conn, owner)
+        await ledger.lock_item_owner(conn, owner)
         await _dispose(conn, raw_item_id, from_states, "linked", observation_id=int(row.observation_id))
         return ResolveOutcome("linked")
     item = _Item(
@@ -709,15 +738,17 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
     return await _link(conn, owner, item, active)
 
 
-async def _reject(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _reject(conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int) -> ResolveOutcome:
     """`rejected('identity_error')`, under the owner row, from whichever of `pending` and `deferred` it is."""
-    await ledger.lock_run_owner(conn, owner)
+    await ledger.lock_item_owner(conn, owner)
     disposition = (await conn.execute(_DISPOSITION, {"item": raw_item_id})).scalar_one()
     await _dispose(conn, raw_item_id, (str(disposition),), "rejected", reason=items.IDENTITY_ERROR)
     return ResolveOutcome("rejected")
 
 
-async def _resolve_counted(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _resolve_counted(
+    conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int
+) -> ResolveOutcome:
     try:
         async with conn.begin_nested():
             return await _resolve(conn, owner, raw_item_id)
@@ -729,10 +760,11 @@ async def _resolve_counted(conn: AsyncConnection, owner: RunOwner, raw_item_id: 
             return await _reject(conn, owner, raw_item_id)
 
 
-async def resolve_item(conn: AsyncConnection, *, owner: RunOwner, raw_item_id: int) -> Resolution:
+async def resolve_item(conn: AsyncConnection, *, owner: ledger.ItemOwner, raw_item_id: int) -> Resolution:
     """Resolve one raw item (the §8.6 transaction; module docstring) on the caller's connection, in a
-    savepoint; its resolution. Raises `FencedOut` for a superseded owner (or an active global purge fence),
-    having written nothing, and `LookupError` for an item that does not exist or cannot be resolved."""
+    savepoint, under `owner` (a run's attempt or an operation's claim); its resolution. Raises `FencedOut` for
+    a superseded owner (or an active global purge fence), having written nothing, and `LookupError` for an
+    item that does not exist or cannot be resolved."""
     return (await _resolve_counted(conn, owner, raw_item_id)).resolution
 
 

@@ -25,6 +25,7 @@ x-app-build: &app-build
   args:
     PYTHON_IMAGE: "${python:?}"
     UV_IMAGE: "${uv:?}"
+    NODE_IMAGE: "${node:?}" # the stage that builds the SPA (M4 Task 19)
   # Optional: a CA bundle for the package downloads of the build, for hosts behind a TLS-intercepting proxy
   # (SSL_CERT_FILE of the calling shell; empty when unset). Mounted for the RUN steps only, never in a layer.
   secrets: [build_ca]

@@ -638,7 +638,9 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
         # §7.16.6 (L2948-2962). The CAS on `state` is the ownership predicate (L303), so there are no owner
         # columns. No reason column: `reconcile_report` is jsonb and written by `set_` (A1 issue 14).
         # `submit_rejected`, `submit_ambiguous` and `abandoned` record no time. The self-loops of L2955 and
-        # L2958 are plain UPDATEs of `last_reconcile_at` and `reconcile_report`, not transitions.
+        # L2958 are plain UPDATEs of `last_reconcile_at` and `reconcile_report`, not transitions. M4 adds the
+        # lost-batch release (plan M4 Task 16, U3): `submitted → released` once its retrieval keeps failing
+        # past `expires_at + 1 h` (`scoring.batches.RELEASABLE_SQL`).
         "batch_submissions": TransitionSpec(
             table="batch_submissions",
             state_col="state",
@@ -664,6 +666,7 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                     ("submit_started", "released"),
                     ("submit_ambiguous", "ended"),
                     ("submit_ambiguous", "released"),
+                    ("submitted", "released"),
                     ("released", "ended"),
                     ("submitted", "ended"),
                     ("ended", "reconciled"),

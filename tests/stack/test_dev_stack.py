@@ -10,14 +10,18 @@ anything they print: a secret file is compared by its inode, size and modificati
 
 Run explicitly with `-m stack`. The stack runs as a compose project of its own, `jobhunter-stacktest` (every
 compose call passes `-p jobhunter-stacktest`; ruling T21-g), never as the normal dev stack `jobhunter-dev`,
-whose database it must not touch. The fixture removes every container, network and volume of
-`jobhunter-stacktest`, and its egress probe container, on every path: before the start (what a killed earlier
-run left behind) and after the module, also when the start fails. It never stops or removes anything of
-`jobhunter-dev`: when that project has a running container or a network (its fixed subnet `172.30.0.0/24`
-and port `127.0.0.1:8080` would collide), the module is skipped with a message saying so.
+whose database it must not touch. Its images are not its own, though: the build tags them as
+`compose.dev.yaml` names them, so it rebuilds the shared `jobhunter-app:dev` image tag (and the other `:dev`
+tags it builds), which the next start of `jobhunter-dev` then runs (M0 Carry-forward 7). The fixture removes
+every container, network and volume of `jobhunter-stacktest`, and its egress probe container, on every path:
+before the start (what a killed earlier run left behind) and after the module, also when the start fails. It
+never stops or removes anything of `jobhunter-dev`: when that project has a running container or a network
+(its fixed subnet `172.30.0.0/24` and port `127.0.0.1:8080` would collide), the module is skipped with a
+message saying so.
 """
 
 import os
+import re
 import stat
 import subprocess
 import time
@@ -227,6 +231,52 @@ def test_dev_stack_serves_through_devproxy(stack) -> None:
     while httpx.get("http://localhost:8080/readyz", timeout=5).status_code != 200:
         assert time.monotonic() < deadline, "readyz never 200"
         time.sleep(2)
+
+
+SPA_IMAGE_CHECK: Final = "\n".join(
+    [
+        "import pathlib, shutil",
+        "spa = pathlib.Path('/opt/spa')",
+        "assert (spa / 'index.html').is_file() and list(spa.glob('assets/*.js')), sorted(spa.rglob('*'))",
+        "assert not (spa / 'node_modules').exists() and not pathlib.Path('/src/frontend').exists()",
+        "assert shutil.which('node') is None and shutil.which('npm') is None, shutil.which('node')",
+    ]
+)
+# What a browser sends for a navigation.
+NAVIGATION: Final = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+
+def test_the_spa_is_served_with_the_csp(stack) -> None:
+    """M4 Task 19: the image's node stage built the SPA into /opt/spa and left no Node runtime behind. The api
+    serves it through devproxy with the §16.6 headers: a deep link gets index.html, an asset is immutable."""
+    from jobhunter.api.edge import SECURITY_HEADERS
+
+    r = subprocess.run(
+        ["docker", "run", "--rm", "jobhunter-app:dev", "python", "-I", "-c", SPA_IMAGE_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=CALL_TIMEOUT_S,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    with httpx.Client(base_url=ORIGIN, timeout=10) as client:
+        page = client.get("/settings", headers={"Accept": NAVIGATION})
+        assert page.status_code == 200, page.text
+        assert page.headers["content-type"] == "text/html; charset=utf-8"
+        assert page.headers["cache-control"] == "no-cache"
+        assert page.headers["content-security-policy"] == SECURITY_HEADERS["Content-Security-Policy"]
+        assert '<div id="root"></div>' in page.text
+        assert "<style" not in page.text and " style=" not in page.text, page.text  # what the CSP blocks
+        scripts = re.findall(r'<script\b[^>]*\ssrc="(/assets/[^"]+\.js)"[^>]*></script>', page.text)
+        assert len(scripts) == 1 and page.text.count("<script") == 1, page.text  # no inline script
+        asset = client.get(scripts[0])
+        assert asset.status_code == 200
+        assert asset.headers["content-type"] == "text/javascript; charset=utf-8"
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+        assert asset.headers["content-security-policy"] == SECURITY_HEADERS["Content-Security-Policy"]
+        problem = client.get("/settings")  # curl's `*/*`: no page
+        assert (problem.status_code, problem.json()["code"]) == (404, "not_found")
+        api = client.get("/api/no-such-route", headers={"Accept": NAVIGATION})
+        assert (api.status_code, api.json()["code"]) == (404, "not_found")
 
 
 def test_embedder_is_healthy_and_readiness_reports_no_embedder_failure(stack) -> None:

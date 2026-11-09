@@ -1,0 +1,17 @@
+/* A button that reads as a link: it shows another job in the same drawer. */
+.ref {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+}
+
+.ref:hover {
+  color: var(--color-accent-hover);
+}

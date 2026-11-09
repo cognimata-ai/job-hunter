@@ -36,6 +36,7 @@ from tests.support.settings import (
     active_row,
     active_scope_id,
     change_interval,
+    fail_for_good,
     generation,
     held_save,
     incomplete_jobs_for,
@@ -181,19 +182,6 @@ async def make_due(engine: AsyncEngine, op_id: int) -> None:
     """The operation's retry delay has passed (`not_before` cleared), so the runner claims it again."""
     async with engine.begin() as conn:
         await conn.execute(text("UPDATE operations SET not_before = NULL WHERE id = :i"), {"i": op_id})
-
-
-async def fail_for_good(engine: AsyncEngine, op_id: int) -> None:
-    """The apply ends `failed('attempts_exhausted')` through the two edges of the transition matrix, as a
-    reclaim that spent its last attempt leaves it; the pointer is left for the reconciler."""
-    async with engine.begin() as conn:
-        for statement in (
-            "UPDATE operations SET status = 'running', claim_id = gen_random_uuid(), worker_epoch = 1, "
-            "heartbeat_at = now(), started_at = now() WHERE id = :i",
-            "UPDATE operations SET status = 'failed', claim_id = NULL, worker_epoch = NULL, "
-            "heartbeat_at = NULL, last_error_code = 'attempts_exhausted', finished_at = now() WHERE id = :i",
-        ):
-            await conn.execute(text(statement), {"i": op_id})
 
 
 def on_fixed_clock(op_runner: Any) -> None:

@@ -16,10 +16,10 @@ from typing import Any, Final
 import httpx
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.errors import Problem
 from jobhunter.api.routes import settings as settings_routes
 from jobhunter.db import ranking
 from jobhunter.db.seed import ensure_hashed, load_settings_v1
+from jobhunter.errors import Refusal
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.llm.spend_ledger import ensure_month
@@ -300,6 +300,20 @@ async def test_unknown_queries_and_watchlist_companies_are_refused(logged_in_cli
     ]
     await assert_refused_like_the_dry_run(logged_in_client, engine, payload, expected)
     assert await count_rows(engine, "source_instances") == 4
+
+
+async def test_a_retired_query_id_is_refused_like_a_missing_one(logged_in_client, engine) -> None:
+    """An edit retires its query (plan M4 Task 29, Ruling T29-c): the document names live queries only."""
+    insert = text("INSERT INTO queries (text, lang, origin) VALUES (:text, 'en', 'user') RETURNING id")
+    async with engine.begin() as conn:
+        retired = (await conn.execute(insert, {"text": "Backend Engineer"})).scalar_one()
+        live = (await conn.execute(insert, {"text": "Backend Developer"})).scalar_one()
+        await conn.execute(text("UPDATE queries SET retired_at = now() WHERE id = :i"), {"i": retired})
+    payload = await active_payload(logged_in_client)
+    payload["queries"] = [{"query_id": retired, "enabled": True}, {"query_id": live, "enabled": True}]
+    await assert_refused_like_the_dry_run(
+        logged_in_client, engine, payload, [("payload.queries[0].query_id", "invalid")]
+    )
 
 
 @pytest.mark.parametrize(
@@ -692,7 +706,7 @@ async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
     before = await active_row(engine)
     generation_before = await generation(engine)
     payload = with_generator_effort(await active_payload(logged_in_client), "high")
-    assert "llm_rescore" in await warning_codes(logged_in_client, payload)
+    assert "llm_rescore" not in await warning_codes(logged_in_client, payload)  # no tuple (M4 D22)
     body = await save(logged_in_client, payload)
     assert body["version"]["effect_classes"] == ["llm_tuple"]
     after = await active_row(engine)
@@ -1029,8 +1043,8 @@ async def test_two_direct_saves_on_two_connections_never_deadlock(engine: AsyncE
                 outcome = await save_settings(conn, request, now=NOW, defer=defer_in_tx)
                 await asyncio.sleep(0.2)  # hold the lock while the other save starts
                 return outcome.version_no
-        except Problem as problem:  # str() is its code
-            return str(problem)
+        except Refusal as refusal:  # str() is its code
+            return str(refusal)
 
     results = await asyncio.gather(one_save("de"), one_save("en"))
     assert sorted(results, key=str) == [2, "stale_base_version"]
@@ -1075,7 +1089,7 @@ async def test_an_internal_save_copies_the_active_acknowledgements(logged_in_cli
     assert outcome.effects == frozenset({"collection"}) and outcome.version_no == 3
     stored = await version_row(engine, outcome.version_id)
     assert stored.acknowledged_warnings == ["llm_cap_binding", "serpapi_disabled_no_fallback"]
-    with pytest.raises(Problem, match="validation_failed"):  # field validation still runs
+    with pytest.raises(Refusal, match="validation_failed"):  # field validation still runs
         async with engine.begin() as conn:
             bad = copy.deepcopy(payload)
             bad["schedule"]["interval_hours"] = 0

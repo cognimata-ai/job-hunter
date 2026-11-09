@@ -127,6 +127,6 @@ async def test_a_proposal_item_the_current_model_refuses_is_left_out(
     )
     r = await logged_in_client.get(f"/api/profile/query-proposals/{proposal_id}")
     assert r.status_code == 200, r.text
-    assert r.json() == {"status": "ready", "items": queries[1:]}
+    assert r.json() == {"status": "ready", "items": queries[1:], "failure_code": None}
     assert_nothing_quoted(r)
     await assert_no_alert(engine)

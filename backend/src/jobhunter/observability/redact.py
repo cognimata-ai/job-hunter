@@ -38,6 +38,11 @@ REDACT_KEYS: Final[frozenset[str]] = frozenset(
         "secret",
         "redirect_url",
         "outbound_url_private",
+        "primary_link",  # a posting's ad link and a card's (M4 Task 5): private-ish, never logged
+        "open_ad",
+        "adzuna",  # a card's Adzuna attribution link (M4 Task 5)
+        "link",  # a posting's link in the drawer (M4 Task 6)
+        "note",  # the user's note on a job (M4 Task 6): no note in a log line
         "stripped_text",
         "reviewed_text",
     }

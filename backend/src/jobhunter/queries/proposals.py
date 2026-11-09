@@ -41,8 +41,10 @@ nothing).
 **The row** (`lock_proposal`, `publish`, `fail`, `end_obsolete`): every write runs after the owner row of the
 proposal's operation (§9.1: the owner row, then the domain rows). `publish` moves `running → ready` with
 `items = {"queries": [<kept items>]}` and the call's id; `fail` moves `running → failed`
-(`query_proposals` has no reason column: the code is the operation's); `end_obsolete` ends an operation whose
-proposal is no longer `running` as `succeeded`, leaving the row. Logs carry ids and codes only, never a text.
+(`query_proposals` has no reason column: the code is the operation's, which `FAILURE_CODE_SQL` reads back for
+the api: the `last_error_code` of the proposal's newest operation while it is `failed`); `end_obsolete` ends
+an operation whose proposal is no longer `running` as `succeeded`, leaving the row. Logs carry ids and codes
+only, never a text.
 """
 
 import functools
@@ -302,6 +304,15 @@ _TABLE: Final = "query_proposals"
 
 def dedup_key(proposal_id: int) -> str:
     return f"{KIND}:{proposal_id}"
+
+
+# A failed proposal's code (module docstring, the row), as a column of a statement over `query_proposals p`:
+# its newest operation's, by id under `dedup_key`'s key (`operations_dedup_newest` serves the newest), `NULL`
+# for a proposal in any other status.
+FAILURE_CODE_SQL: Final = (
+    "CASE WHEN p.status = 'failed' THEN (SELECT o.last_error_code FROM operations o "  # noqa: S608 (constants)
+    f"WHERE o.kind = '{KIND}' AND o.dedup_key = '{KIND}:' || p.id ORDER BY o.id DESC LIMIT 1) END"
+)
 
 
 async def _operation(conn: AsyncConnection, proposal_id: int, defer: Deferrer | None) -> tuple[int, bool]:

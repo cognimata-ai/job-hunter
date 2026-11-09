@@ -703,7 +703,14 @@ async def test_the_profile_list_shows_the_confirmed_version(logged_in_client, en
         "purged": False,
         "profile": version.profile_json,
     }
-    assert listed == {"active": expected, "versions": [expected]}
+    (proposal,) = await rows(engine, "SELECT id FROM query_proposals")  # the confirm's
+    assert listed == {
+        "active": expected,
+        "versions": [expected],
+        "open_draft": None,  # the confirmed draft is not open
+        "latest_proposal": {"id": proposal.id, "status": "running", "failure_code": None},
+        "estimates": {"extract_profile_usd": "0.140000", "propose_queries_usd": "0.094000"},
+    }
 
 
 async def test_the_profile_list_leaves_the_adversarial_seeds_synthetic_versions_out(
@@ -751,6 +758,13 @@ async def test_the_rescore_estimate_previews_the_count_the_costs_and_the_month(
         "est_usd_batch": format(4 * central_batch_cost_per_target(policy), "f"),
         "month_spend": format(Decimal(counted).quantize(budget.USD_QUANTUM), "f"),
         "cap": "100.00",
+        "bulk_budget_usd": BULK_BUDGET,
+        "bulk_share": "0.4",
+        "batch_targets": 0,  # below `batch_min_targets`
+        "online_targets": 4,
+        # October's bucket, $3.003216 a day, over the central $0.057569 a target with its cache writes
+        "online_per_day": 52,
+        "next_version_no": 1,
     }
     assert (await draft_row(engine, ready_draft)).status == "ready"  # a preview writes nothing
 

@@ -1,12 +1,31 @@
-"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings.
+"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings, the
+live windows and the run-now estimate of the header strip (§15.1 L5123; plan M4 Task 11, D16, Ruling T11-c).
 
 `quota_projections` covers the `jsearch`, `adzuna`, `arbeitnow`, `serpapi_fallback` and `stale_ttl_short`
 parts of §6.8's `dry_run`, on window snapshots the caller read (M2 composes `dry_run()` around it, Deviation
 10). It is pure: windows are rolled forward (or bootstrapped) in memory to `now` and nothing is written.
 Figures are rounded to 3 decimals in the projections and to 1 in the warning details.
 
+`per_run(settings, w)` is the one computation of a paid provider's units per run, `min(per-run cap, fair
+share)`, which the JSearch and SerpApi projections and `run_now_units` share.
+
+`live_windows(conn, settings, now)` is each quota provider's window as a run would find it at `now`: the
+stored current one (`windows.current_snapshot`, a plain read) rolled forward in memory exactly as here, so a
+stored window that has ended is replaced by its successor, which starts unspent; a provider without a stored
+window gets the window its first reservation would bootstrap (JSearch and Adzuna always; SerpApi only from an
+account read, so `None`). Nothing is written. The header status computes it once and judges every quota
+figure on it (Ruling T11-c).
+
+`run_now_units(settings, windows)` is `per_run` of JSearch and the SerpApi fallback on those windows, rounded
+up to whole units: an estimate (the even pace), not a bound, since a run spends what the bucket holds, up to
+twice the fair share after an idle stretch and next to nothing right after a run. A JSearch without a stored
+window counts the units of the window its first run would bootstrap. A provider the settings disable counts
+0, and so does SerpApi without a window or with one not yet validated (`extrapolated_unvalidated`), which
+admits no search (Ruling T7-a).
+
 - **JSearch.** `fair_share = N x interval / window length` units per run; `units_per_run = min(per-run cap,
-  fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run`. Warnings:
+  fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run` (`refresh_cadence_days`, which
+  the query lists show too). Warnings:
   `paid_run_cap_binding` (an explicit cap below the fair share), `paid_refresh_slow` (cadence over 7 days) and
   `coverage_gap_guaranteed` (cadence x 24 h + 24 h beyond JSearch's 720 h date window).
 - **Adzuna.** Every cell runs every run (its first page, §5.5.3): `calls_per_day = cells x runs per day`. The
@@ -24,13 +43,16 @@ Figures are rounded to 3 decimals in the projections and to 1 in the warning det
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple, get_args
+
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.quota.pacing import fair_share, per_run_cap
-from jobhunter.quota.windows import Provider, Window, roll_forward
+from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
 from jobhunter.run_settings import RunSettings
 from jobhunter.types import JSONValue
 
@@ -73,15 +95,38 @@ def _length_days(w: Window) -> float:
     return (w.window_end - w.window_start) / _DAY
 
 
-def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning], dict[str, JSONValue]]:
-    warns: list[Warning] = []
+class PerRun(NamedTuple):
+    """A paid provider's units per run on a window: `units = min(cap, fair_share)`."""
+
+    units: float
+    fair_share: float
+    cap: int
+
+
+def per_run(settings: RunSettings, w: Window) -> PerRun:
+    """The fair share of a run on `w` at the schedule's interval, the per-run cap of `settings` and the units
+    per run they allow (module docstring)."""
     fair = fair_share(w, settings.interval_s)
     cap = per_run_cap(settings.quota, fair)
-    units_per_run = min(cap, fair)
+    return PerRun(units=min(cap, fair), fair_share=fair, cap=cap)
+
+
+def _cadence_days(settings: RunSettings, units_per_run: float, cells: int) -> float:
+    return cells * (settings.interval_s / 86400) / max(units_per_run, 1e-9)
+
+
+def refresh_cadence_days(settings: RunSettings, w: Window, cells: int) -> float:
+    """The JSearch projection's `refresh_cadence_days` on `w` for `cells` paid cells, `cells x interval_days /
+    units_per_run`, rounded as the projection shows it (module docstring)."""
+    return round(_cadence_days(settings, per_run(settings, w).units, cells), 3)
+
+
+def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning], dict[str, JSONValue]]:
+    warns: list[Warning] = []
+    units_per_run, fair, cap = per_run(settings, w)
     if cap < fair:
         warns.append(Warning("paid_run_cap_binding", cap=cap, fair_share=round(fair, 1)))
-    interval_days = settings.interval_s / 86400
-    cadence_days = cells * interval_days / max(units_per_run, 1e-9)
+    cadence_days = _cadence_days(settings, units_per_run, cells)  # the warnings judge it unrounded
     if cadence_days > PAID_REFRESH_SLOW_DAYS:
         warns.append(Warning("paid_refresh_slow", cadence_days=round(cadence_days, 1)))
     if cadence_days * 24 + 24 > JSEARCH_DATE_WINDOW_H:
@@ -92,7 +137,7 @@ def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning
         )
     projection: dict[str, JSONValue] = {
         "units_per_run": round(units_per_run, 3),
-        "refresh_cadence_days": round(cadence_days, 3),
+        "refresh_cadence_days": refresh_cadence_days(settings, w, cells),
         "cells": cells,
     }
     return warns, projection
@@ -130,12 +175,11 @@ def _arbeitnow(settings: RunSettings) -> tuple[list[Warning], dict[str, JSONValu
 def _serpapi(settings: RunSettings, w: Window | None) -> JSONValue:
     if w is None:
         return None  # no account read yet: SerpApi has no window, so no fallback is admitted
-    fair = fair_share(w, settings.interval_s)
     hourly_cap = settings.quota.serpapi_hourly_cap
     if w.observed_hourly_cap is not None:
         hourly_cap = min(hourly_cap, w.observed_hourly_cap)
     return {
-        "units_per_run": round(min(per_run_cap(settings.quota, fair), fair), 3),
+        "units_per_run": round(per_run(settings, w).units, 3),
         "hourly_cap": hourly_cap,
         "state": w.state,
     }
@@ -169,3 +213,39 @@ def quota_projections(
         warns.append(Warning("stale_ttl_short", label_after_days=settings.stale_ttl_days))
     proj["serpapi_fallback"] = _serpapi(settings, _rolled(serpapi, "serpapi", settings, now))
     return warns, proj
+
+
+@dataclass(frozen=True)
+class RunNowUnits:
+    """The run-now estimate: whole units of JSearch and of the SerpApi fallback (module docstring)."""
+
+    jsearch_units: int
+    serpapi_fallback_units: int
+
+
+async def live_windows(
+    conn: AsyncConnection, settings: RunSettings, now: datetime
+) -> dict[Provider, Window | None]:
+    """Each quota provider's window at `now`, the stored one rolled forward in memory, or the one its first
+    reservation would bootstrap (module docstring). Plain reads, nothing written."""
+    return {
+        provider: _rolled(await current_snapshot(conn, provider), provider, settings, now)
+        for provider in get_args(Provider)
+    }
+
+
+def _admits(provider: Provider, enabled: bool, w: Window | None) -> Window | None:
+    if not enabled or w is None or (provider == "serpapi" and w.state == "extrapolated_unvalidated"):
+        return None
+    return w
+
+
+def run_now_units(settings: RunSettings, windows: Mapping[Provider, Window | None]) -> RunNowUnits:
+    """`per_run(settings, w).units`, rounded up, of JSearch and SerpApi on `windows` (`live_windows`); 0 for a
+    provider `settings` disable, and for SerpApi without a validated window (module docstring)."""
+    jsearch = _admits("jsearch", settings.sources.jsearch, windows.get("jsearch"))
+    serpapi = _admits("serpapi", settings.sources.serpapi, windows.get("serpapi"))
+    return RunNowUnits(
+        jsearch_units=0 if jsearch is None else ceil(per_run(settings, jsearch).units),
+        serpapi_fallback_units=0 if serpapi is None else ceil(per_run(settings, serpapi).units),
+    )

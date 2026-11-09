@@ -1,0 +1,50 @@
+.group {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.card,
+.drawer {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.drawer {
+  gap: var(--space-3);
+  border: 0;
+  background: transparent;
+}
+
+.line,
+.bar,
+.barWide,
+.barShort {
+  display: block;
+  height: 12px;
+  border-radius: var(--radius-1);
+  background: var(--color-surface-sunken);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.barWide {
+  width: 60%;
+  height: 16px;
+}
+
+.bar {
+  width: 85%;
+}
+
+.barShort {
+  width: 35%;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}

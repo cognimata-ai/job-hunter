@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/api/alerts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Alerts
+         * @description The alerts, newest first, with their status, keyset-paged (§14.3).
+         */
+        get: operations["list_alerts_api_alerts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts/{alert_id}/ack": {
         parameters: {
             query?: never;
@@ -24,6 +44,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/ats-snapshots/{snapshot_id}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Snapshot
+         * @description Confirm the mass disappearance of the snapshot (its opening snapshot or a follow-up) at once: the
+         *     postings of the event that are still unknown close.
+         */
+        post: operations["acknowledge_snapshot_api_ats_snapshots__snapshot_id__acknowledge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/login": {
         parameters: {
             query?: never;
@@ -35,7 +76,8 @@ export interface paths {
         put?: never;
         /**
          * Login
-         * @description Log in: 204 with the session cookie, 401 for any failure, 429 when locked out or busy.
+         * @description Log in: 204 with the session cookie; 401 `totp_required` when TOTP is on and no code was sent, 401
+         *     `unauthenticated` for any other failure; 429 when locked out or busy.
          */
         post: operations["login_api_auth_login_post"];
         delete?: never;
@@ -95,11 +137,116 @@ export interface paths {
         put?: never;
         /**
          * Release Batch
-         * @description Release a quarantined batch submission and re-score its targets; its reserved spend stays counted as
+         * @description Release a quarantined batch submission, or a submitted batch whose retrieval still fails more than 1 h
+         *     past its expiry (its alert open), and re-score its targets; its reserved spend stays counted as
          *     `ambiguous` unless the batch is found later (202).
          */
         post: operations["release_batch_api_batches__submission_id__release_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/duplicate-groups/{group_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Group
+         * @description Confirm that the group's members are one job: every other member is merged into the representative
+         *     (202).
+         */
+        post: operations["confirm_group_api_duplicate_groups__group_id__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/duplicate-groups/{group_id}/score-individually": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Score Individually
+         * @description Score the member on its own: it stays in the group, but its score is no longer the representative's.
+         *     A member waiting for the representative's score is scored in the normal order. Answers the group.
+         */
+        post: operations["score_individually_api_duplicate_groups__group_id__score_individually_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/duplicate-groups/{group_id}/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Split Member
+         * @description Split the job out of its duplicate group for good: it is never grouped with the other members again,
+         *     and its score is its own. A group left with one member is dissolved. Answers the group after the
+         *     split.
+         */
+        post: operations["split_member_api_duplicate_groups__group_id__split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/eval-runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Eval Runs
+         * @description The eval runs of one kind, newest first, keyset-paged (§14.3), with the active configuration's gate.
+         */
+        get: operations["list_eval_runs_api_eval_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/feedback/{feedback_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Feedback
+         * @description Delete a label or a wrong score (204); the golden case it made stays in the golden set.
+         */
+        delete: operations["delete_feedback_api_feedback__feedback_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -169,6 +316,108 @@ export interface paths {
         patch: operations["set_golden_case_flags_api_golden_cases__case_id__patch"];
         trace?: never;
     };
+    "/api/identity-conflicts/{conflict_id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve Conflict
+         * @description Settle an open identity conflict: keep its jobs apart, or merge them into the posting's job (202).
+         */
+        post: operations["resolve_conflict_api_identity_conflicts__conflict_id__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Jobs
+         * @description A page of the Jobs list in one read snapshot, with its ranking generation.
+         */
+        get: operations["list_jobs_api_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Job Facets
+         * @description The companies and sources of the listed cards, with their counts.
+         */
+        get: operations["list_job_facets_api_jobs_facets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Job
+         * @description A job's detail in one read snapshot, its history's first page with a signed cursor.
+         */
+        get: operations["get_job_api_jobs__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Job Actions
+         * @description Mark the job seen, saved, applied or hidden, clear a mark or edit its note, and with `apply_to_group`
+         *     write `saved`, `applied` and `hidden` on the other members of its duplicate group; the rows after the
+         *     write.
+         */
+        put: operations["put_job_actions_api_jobs__job_id__actions_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/jobs/{job_id}/feedback": {
         parameters: {
             query?: never;
@@ -184,6 +433,27 @@ export interface paths {
          *     (201).
          */
         post: operations["record_feedback_api_jobs__job_id__feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Job History
+         * @description A page of the job's score history in one read snapshot. The cursor is read before the snapshot, so a
+         *     cursor this route did not sign is 400 even for a gone job, before its 404.
+         */
+        get: operations["get_job_history_api_jobs__job_id__history_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -210,6 +480,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/jobs/{job_id}/unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unmerge Job
+         * @description Reverse the merge of another job into this one: its postings, keys and user actions go back to it, and
+         *     the two jobs are never merged again by a shared key (202).
+         */
+        post: operations["unmerge_job_api_jobs__job_id__unmerge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/labelling/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Labelling Queue
+         * @description The next ads to label, spread over the score bands with the unlabelled ones first, and the labelling
+         *     progress; neither shows a score.
+         */
+        get: operations["get_labelling_queue_api_labelling_queue_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/profile": {
         parameters: {
             query?: never;
@@ -219,7 +531,8 @@ export interface paths {
         };
         /**
          * Get Profile
-         * @description The active profile version and every version, newest first (empty until a draft is confirmed).
+         * @description The active profile version and every version, newest first (empty until a draft is confirmed), the
+         *     draft in progress, the newest query proposal, and what one call of each profile step costs.
          */
         get: operations["get_profile_api_profile_get"];
         put?: never;
@@ -463,13 +776,55 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Queries
+         * @description The live queries by id, each with whether the active settings enable it and the coverage of its planned
+         *     cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
+         *     too broad, and JSearch's refresh cadence.
+         *
+         *     A query's planned cells are those a run searches while the query is enabled: one per enabled source and
+         *     location of the scope, counted whether a run has created them yet or not, so that a disabled query is
+         *     judged on the scope as it is now. Cells no longer planned (a location removed from the scope, a source
+         *     switched off, an edited query's previous text) are not counted here, while the open-gap total of the
+         *     status header also counts their open gaps, and those of the cells without a query (Arbeitnow's and the
+         *     watchlist boards').
+         */
+        get: operations["list_queries_api_queries_get"];
         put?: never;
         /**
          * Add Query
          * @description Add a query (201); it is not enabled until a settings save lists it.
          */
         post: operations["add_query_api_queries_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/queries/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Query Cell Stats
+         * @description Every planned coverage cell of a live query, by query, source, instance and place: its coverage, its
+         *     yield, its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh
+         *     cadence for a JSearch cell.
+         *
+         *     A planned cell is one a run searches while its query is enabled: a cell of an enabled source at one of the
+         *     scope's locations, listed for a disabled query too. Only the cells that exist are listed: a planned cell
+         *     a run has not created yet has no id, though the query list counts it. Cells no longer planned (a location
+         *     removed from the scope, a source switched off, an edited query's previous text) are not listed, while the
+         *     open-gap total of the status header also counts their open gaps, and those of the cells without a query
+         *     (Arbeitnow's and the watchlist boards').
+         */
+        get: operations["query_cell_stats_api_queries_stats_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -503,13 +858,57 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Runs
+         * @description The runs, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_runs_api_runs_get"];
         put?: never;
         /**
          * Run Now
          * @description 202 with the active collection (`created=false`) or a new manual one (`created=true`).
          */
         post: operations["run_now_api_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run
+         * @description A run with its report and the partial causes the report names.
+         */
+        get: operations["get_run_api_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/score-cycles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Score Cycles
+         * @description The score cycles, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_score_cycles_api_score_cycles_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -525,7 +924,8 @@ export interface paths {
         };
         /**
          * Get Settings
-         * @description The active settings version, its document and the scope being applied, if any.
+         * @description The active settings version, its document, the scope being applied, if any, and whether the active
+         *     version's scope is in force.
          */
         get: operations["get_settings_api_settings_get"];
         put?: never;
@@ -602,6 +1002,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/prompt-schema-versions/{version_id}/activation-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview Prompt Schema Activation
+         * @description What activating a shipped prompt-schema version would check and re-score: the live schema dry-runs it
+         *     lacks for the active model policy, the eval gate of the candidate, its latest golden run and the
+         *     re-score's estimate, read without writing anything.
+         */
+        get: operations["preview_prompt_schema_activation_api_settings_prompt_schema_versions__version_id__activation_preview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/rubric-versions": {
         parameters: {
             query?: never;
@@ -636,6 +1058,29 @@ export interface paths {
          * @description Activate a shipped rubric version: an `llm_tuple` change (§13.3), its re-score acknowledged (201).
          */
         post: operations["activate_rubric_version_api_settings_rubric_versions__version_id__activate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/rubric-versions/{version_id}/activation-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview Rubric Activation
+         * @description What activating a shipped rubric version would check and re-score: the verification of the active
+         *     prompt-schema version for the active model policy, which the activation checks (`schema_verified`, and in
+         *     `unverified_models` the models without a passed live schema dry-run), the eval gate of the candidate, its
+         *     latest golden run and the re-score's estimate, read without writing anything.
+         */
+        get: operations["preview_rubric_activation_api_settings_rubric_versions__version_id__activation_preview_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -723,6 +1168,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/needs-attention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Needs Attention
+         * @description What needs the user: rejected raw items, identity conflicts, refused and failed targets, quarantined
+         *     batches, batches whose retrieval keeps failing, mass disappearances, unscorable duplicate groups, broken
+         *     sources, the score lane's acknowledgeable pause and a failed scope apply.
+         */
+        get: operations["get_needs_attention_api_system_needs_attention_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Quota
+         * @description Each quota provider's current window with its counted usage, its reserved, ambiguous and adjustment
+         *     units and its bucket; null for a provider without a current window.
+         */
+        get: operations["get_quota_api_system_quota_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/raw-items/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay Raw Items
+         * @description Replay rejected raw items (202): each item still rejected whose run has ended and whose stored body is
+         *     kept and at most 30 days old is parsed again by its source's current parser, and the items it now reads
+         *     are resolved to jobs. The same set of items reuses the replay already queued for it.
+         */
+        post: operations["replay_raw_items_api_system_raw_items_replay_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/system/score-cycle": {
         parameters: {
             query?: never;
@@ -765,6 +1275,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get System Status
+         * @description The header strip: the last and the active run, the next slots, the quota windows, the month's LLM
+         *     spend and its pace, the open coverage gaps, the pending targets, the unacknowledged alerts, the re-score,
+         *     the paid-search pause, the run-now estimate, the scope's apply and the banners.
+         */
+        get: operations["get_system_status_api_system_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/targets/{target_id}/retry": {
         parameters: {
             query?: never;
@@ -792,7 +1324,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Companies
+         * @description Every watchlist company by display name, then id: its board, its validation, whether the active
+         *     settings enable it, its source instance's health, last error, last success and last complete snapshot,
+         *     and its postings by availability.
+         */
+        get: operations["list_companies_api_watchlist_get"];
         put?: never;
         /**
          * Add Company
@@ -902,6 +1440,50 @@ export interface components {
             id: number;
         };
         /**
+         * ActionsIn
+         * @description The user's actions to write on a job.
+         *
+         *     For each of `seen`, `saved`, `applied` and `hidden`, `true` marks it at the time of the request unless it
+         *     is marked already (the earlier time is kept), `false` clears it, and an absent or null one is left as it
+         *     is. `note` replaces the note: at most 2,000 characters, `""` clears it. `seen_on_open`, which the drawer
+         *     sends when it opens, marks the job seen as `seen: true` does without moving the ranking generation; it
+         *     cannot be combined with `seen`. With `apply_to_group`, `saved`, `applied` and `hidden` are written on the
+         *     other members of the job's active duplicate group too. A body that gives none of `seen`, `saved`,
+         *     `applied`, `hidden`, `note` and `seen_on_open` is refused.
+         */
+        ActionsIn: {
+            /** Applied */
+            applied?: boolean | null;
+            /**
+             * Apply To Group
+             * @default false
+             */
+            apply_to_group: boolean;
+            /** Hidden */
+            hidden?: boolean | null;
+            /** Note */
+            note?: string | null;
+            /** Saved */
+            saved?: boolean | null;
+            /** Seen */
+            seen?: boolean | null;
+            /**
+             * Seen On Open
+             * @default false
+             */
+            seen_on_open: boolean;
+        };
+        /**
+         * ActionsOut
+         * @description The job's actions after the write and, for a write with `apply_to_group`, those of each other member of
+         *     its active duplicate group it wrote, by job id (otherwise none).
+         */
+        ActionsOut: {
+            job: components["schemas"]["UserActionsOut"];
+            /** Members */
+            members: components["schemas"]["UserActionsOut"][];
+        };
+        /**
          * ActivateIn
          * @description An activation (§14.2): `expected_rescore_ack` acknowledges the re-score of the retained ads (required
          *     while there are any), `eval_override_ack` a failed eval gate (§11.13).
@@ -938,6 +1520,129 @@ export interface components {
              */
             version: number;
         };
+        /**
+         * ActivationPreviewOut
+         * @description What activating the version would check and re-score, read without writing anything.
+         */
+        ActivationPreviewOut: {
+            /**
+             * Active
+             * @description The version is the active one, which cannot be activated again
+             */
+            active: boolean;
+            /**
+             * Bulk Budget Usd
+             * @description The budget of the re-score's bulk operation
+             */
+            bulk_budget_usd: string;
+            /**
+             * Est Usd Batch
+             * @description The re-score's estimated cost in batches
+             */
+            est_usd_batch: string;
+            /**
+             * Est Usd Online
+             * @description The re-score's estimated cost online
+             */
+            est_usd_online: string;
+            /**
+             * Gate State
+             * @description The eval gate of the candidate, the active configuration with this version
+             * @enum {string}
+             */
+            gate_state: "uncalibrated" | "passed" | "failed";
+            latest_golden_run: components["schemas"]["GoldenRunOut"] | null;
+            /**
+             * Schema Verified
+             * @description Whether passed live schema dry-runs cover every model the activation checks: for a prompt-schema version, the active model policy on this version; for a rubric version, the active model policy on the active prompt-schema version. Null on the fake LLM, where none is checked
+             */
+            schema_verified: boolean | null;
+            /**
+             * Targets
+             * @description The retained ads the activation re-scores; 0 while no profile is active
+             */
+            targets: number;
+            /**
+             * Unverified Models
+             * @description The models without a passed live schema dry-run of a schema they need, sorted
+             */
+            unverified_models: string[];
+            /** Version Id */
+            version_id: number;
+        };
+        /**
+         * ActiveGateOut
+         * @description The active configuration's eval gate and the number of the user's golden cases it counts.
+         */
+        ActiveGateOut: {
+            /** Cases */
+            cases: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "uncalibrated" | "passed" | "failed";
+        };
+        /**
+         * AdzunaProjectionOut
+         * @description Adzuna under the proposed settings: the calls a day the cells need and the allowance a day.
+         */
+        AdzunaProjectionOut: {
+            /** Allowance Per Day */
+            allowance_per_day: number;
+            /**
+             * Cadence Days
+             * @description Days to refresh every cell; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed
+             */
+            cadence_days: number | null;
+            /** Calls Per Day */
+            calls_per_day: number;
+            /** Cells */
+            cells: number;
+        };
+        /**
+         * AlertOut
+         * @description An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
+         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback.
+         */
+        AlertOut: {
+            /** Acknowledged At */
+            acknowledged_at: string | null;
+            /** Code */
+            code: string;
+            /** Context */
+            context: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /**
+             * First At
+             * Format: date-time
+             */
+            first_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Last At
+             * Format: date-time
+             */
+            last_at: string;
+            /** Message */
+            message: string;
+            /** Occurrences */
+            occurrences: number;
+            /** Resolved At */
+            resolved_at: string | null;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "info" | "warn" | "critical";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "open" | "acknowledged" | "resolved";
+        };
         /** AlertsOpen */
         AlertsOpen: {
             /** Critical */
@@ -946,6 +1651,103 @@ export interface components {
             info: number;
             /** Warn */
             warn: number;
+        };
+        /** AlertsPageOut */
+        AlertsPageOut: {
+            /** Items */
+            items: components["schemas"]["AlertOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
+         * ArbeitnowProjectionOut
+         * @description Arbeitnow: the pages a run may read and the pages the interval is expected to need.
+         */
+        ArbeitnowProjectionOut: {
+            /** Expected Pages */
+            expected_pages: number;
+            /** Page Cap */
+            page_cap: number;
+        };
+        /**
+         * AttentionOut
+         * @description What needs the user: each list section's full count and at most 50 of its items, the score lane's
+         *     acknowledgeable pause and a failed scope apply (each null when there is none).
+         */
+        AttentionOut: {
+            broken_sources: components["schemas"]["BrokenSourcesSectionOut"];
+            failed_targets: components["schemas"]["FailedTargetsSectionOut"];
+            identity_conflicts: components["schemas"]["IdentityConflictsSectionOut"];
+            mass_disappearances: components["schemas"]["MassDisappearancesSectionOut"];
+            paused_lane: components["schemas"]["PausedLaneOut"] | null;
+            quarantined_batches: components["schemas"]["QuarantinedBatchesSectionOut"];
+            raw_items: components["schemas"]["RawItemsSectionOut"];
+            retrieve_failing: components["schemas"]["RetrieveFailingSectionOut"];
+            scope_apply_failed: components["schemas"]["ScopeApplyFailedOut"] | null;
+            unscorable_groups: components["schemas"]["UnscorableGroupsSectionOut"];
+        };
+        /**
+         * BannerOut
+         * @description A banner: a client shows it by its `code`, with `params` (JSON values; instants as ISO 8601 UTC
+         *     strings).
+         */
+        BannerOut: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "stale_data" | "cap_reached" | "reservation_bound_violated" | "scoring_paused" | "critical_alerts" | "paid_search_paused" | "scope_not_applied" | "applying_settings" | "rescoring";
+            /** Params */
+            params: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "critical" | "warn" | "info";
+        };
+        /**
+         * BrokenSourceOut
+         * @description A source instance that does not collect (`critical`), or collects with failures (`degraded`, `warn`):
+         *     its health, its last error and its breaker's times.
+         */
+        BrokenSourceOut: {
+            /** Breaker Opened At */
+            breaker_opened_at: string | null;
+            /** Half Open After */
+            half_open_after: string | null;
+            /**
+             * Health
+             * @enum {string}
+             */
+            health: "breaker_open" | "auth_failed" | "contract_broken" | "not_found" | "degraded";
+            /** Instance Id */
+            instance_id: number;
+            /**
+             * Label
+             * @description The watchlist company's name, else the instance key
+             */
+            label: string;
+            /** Last Error Code */
+            last_error_code: string | null;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "critical" | "warn";
+            /** Source Id */
+            source_id: string;
+        };
+        /**
+         * BrokenSourcesSectionOut
+         * @description The broken and degraded source instances: how many, and 50 of them, the broken ones first.
+         */
+        BrokenSourcesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["BrokenSourceOut"][];
         };
         /** BucketOut */
         BucketOut: {
@@ -978,6 +1780,89 @@ export interface components {
              */
             state: "active" | "completed" | "cancelled";
         };
+        /** CapOut */
+        CapOut: {
+            /** Code */
+            code: string;
+            /** Kind */
+            kind: string;
+        };
+        /** CardUserOut */
+        CardUserOut: {
+            /** Applied At */
+            applied_at: string | null;
+            /** Has Note */
+            has_note: boolean;
+            /** Hidden At */
+            hidden_at: string | null;
+            /** Saved At */
+            saved_at: string | null;
+            /** Seen At */
+            seen_at: string | null;
+        };
+        /**
+         * CellStatsOut
+         * @description An existing planned coverage cell of a live query (one source instance, one query, one place) and its
+         *     statistics.
+         */
+        CellStatsOut: {
+            /**
+             * Cadence Days
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null for a cell of another source
+             */
+            cadence_days: number | null;
+            /** Cell Id */
+            cell_id: number;
+            /**
+             * Consecutive Incomplete
+             * @description Consecutive runs that left it incomplete
+             */
+            consecutive_incomplete: number;
+            /**
+             * Instance Label
+             * @description The source instance's key
+             */
+            instance_label: string;
+            /**
+             * Last Covered At
+             * @description Its contiguous coverage frontier; null when it was never covered
+             */
+            last_covered_at: string | null;
+            /**
+             * Last Success At
+             * @description Its last successful request
+             */
+            last_success_at: string | null;
+            /**
+             * Location Key
+             * @description The scope location's key, or `remote-de`
+             */
+            location_key: string;
+            /**
+             * Open Gaps
+             * @description Its open coverage gaps
+             */
+            open_gaps: number;
+            /** Query Id */
+            query_id: number;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Too Broad
+             * @description A paid cell (JSearch, SerpApi) left incomplete in 3 runs in a row
+             */
+            too_broad: boolean;
+            /**
+             * Yield Ema
+             * @description New postings per request, smoothed; a cell never searched shows its starting value
+             */
+            yield_ema: number;
+            /**
+             * Zero Yield Streak
+             * @description Consecutive runs in which its requests found no new posting
+             */
+            zero_yield_streak: number;
+        };
         /** Certification */
         Certification: {
             /** Issuer */
@@ -986,6 +1871,20 @@ export interface components {
             name: string;
             /** Year */
             year: number | null;
+        };
+        /** Collection */
+        Collection: {
+            /** Stale Ttl Days */
+            stale_ttl_days: number | null;
+        };
+        /** CompanyFacetOut */
+        CompanyFacetOut: {
+            /** Company Key */
+            company_key: string;
+            /** Count */
+            count: number;
+            /** Display Name */
+            display_name: string;
         };
         /**
          * ConfirmIn
@@ -1014,8 +1913,16 @@ export interface components {
             targets_to_create: number;
         };
         /**
+         * ConfirmedOut
+         * @description The job the group's other members were merged into: the group's representative.
+         */
+        ConfirmedOut: {
+            /** Job Id */
+            job_id: number;
+        };
+        /**
          * ConfirmedProfile
-         * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
+         * @description A profile as a confirmed version or a draft holds it: the extraction plus `user_entered`.
          */
         ConfirmedProfile: {
             /** Certifications */
@@ -1043,10 +1950,140 @@ export interface components {
             total_years_experience: number | null;
             user_entered?: components["schemas"]["UserEntered"];
         };
+        /**
+         * ConflictResolvedOut
+         * @description The conflict and its status after the resolution.
+         */
+        ConflictResolvedOut: {
+            /** Conflict Id */
+            conflict_id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "resolved_separate" | "resolved_merged";
+        };
+        /** ContestedOut */
+        ContestedOut: {
+            /** Nulled Criteria */
+            nulled_criteria: string[];
+            /** Rejected Drafts */
+            rejected_drafts: components["schemas"]["RejectedDraftOut"][];
+            /** Rounds */
+            rounds: components["schemas"]["RoundOut"][];
+        };
+        /** CountsOut */
+        CountsOut: {
+            /** Capped */
+            capped: boolean;
+            /** Total Estimate */
+            total_estimate: number;
+            /** Unscored */
+            unscored: number;
+        };
+        /** CriterionOut */
+        CriterionOut: {
+            /** Basis */
+            basis: string;
+            /** Criterion */
+            criterion: string;
+            /** Evidence */
+            evidence: components["schemas"]["EvidenceOut"][];
+            /** Level */
+            level: number | null;
+            /** Rationale */
+            rationale: string;
+            /** Weight */
+            weight: number | null;
+        };
         /** CvTextIn */
         CvTextIn: {
             /** Text */
             text: string;
+        };
+        /** DescriptionOut */
+        DescriptionOut: {
+            /** Completeness */
+            completeness: string;
+            /** From Job Id */
+            from_job_id: number;
+            /** Lang */
+            lang: ("de" | "en") | null;
+            /** Text */
+            text: string;
+        };
+        /** DetCriterionOut */
+        DetCriterionOut: {
+            /** Basis */
+            basis: string;
+            /** Criterion */
+            criterion: string;
+            /** Inputs */
+            inputs: {
+                [key: string]: components["schemas"]["JSONValue"];
+            };
+            /** Level */
+            level: number | null;
+            /** Weight */
+            weight: number | null;
+        };
+        /**
+         * DetailScoreOut
+         * @description The card's score and the rest of the result.
+         */
+        DetailScoreOut: {
+            /** Caps Applied */
+            caps_applied: components["schemas"]["CapOut"][];
+            /**
+             * Confidence
+             * @enum {string}
+             */
+            confidence: "low" | "medium" | "high";
+            /** Corrected Fields */
+            corrected_fields: string[];
+            /** Coverage */
+            coverage: string;
+            /** Criteria */
+            criteria: components["schemas"]["CriterionOut"][];
+            /**
+             * Critic Outcome
+             * @enum {string}
+             */
+            critic_outcome: "not_run" | "accepted" | "contested";
+            /** Det Criteria */
+            det_criteria: components["schemas"]["DetCriterionOut"][];
+            /** Det Result Id */
+            det_result_id: number;
+            /** Fact Evidence */
+            fact_evidence: components["schemas"]["EvidenceOut"][];
+            /** High */
+            high: string;
+            /** Industry Match */
+            industry_match: string;
+            /** Injection Suspected */
+            injection_suspected: boolean;
+            /** Knockouts */
+            knockouts: components["schemas"]["KnockoutOut"][];
+            /** Low */
+            low: string;
+            /** Mid */
+            mid: string;
+            /** Result Id */
+            result_id: number;
+            /**
+             * Result Status
+             * @enum {string}
+             */
+            result_status: "accepted" | "contested";
+            /** Scored Via Job Id */
+            scored_via_job_id: number | null;
+            /** Shortened Fields */
+            shortened_fields: string[];
+            /** Summary De */
+            summary_de: string;
+            /** Summary En */
+            summary_en: string;
+            versions: components["schemas"]["VersionsOut"];
         };
         /**
          * DiffEntryOut
@@ -1066,6 +2103,20 @@ export interface components {
             path: string;
             /** Total Bytes */
             total_bytes: number;
+        };
+        /** Display */
+        Display: {
+            /**
+             * Timezone
+             * @default Europe/Berlin
+             */
+            timezone: string;
+            /**
+             * Ui Language
+             * @default en
+             * @enum {string}
+             */
+            ui_language: "en" | "de";
         };
         /** DraftCreatedOut */
         DraftCreatedOut: {
@@ -1117,13 +2168,8 @@ export interface components {
             effects: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
             /** Errors */
             errors: components["schemas"]["FieldIssueOut"][];
-            /**
-             * Projections
-             * @description The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
-             */
-            projections: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            /** @description The preview by part; null with errors */
+            projections: components["schemas"]["ProjectionsOut"] | null;
             /** Warnings */
             warnings: components["schemas"]["WarningOut"][];
         };
@@ -1155,6 +2201,75 @@ export interface components {
             ok: boolean;
         };
         /**
+         * EvalRunOut
+         * @description An eval run with its gate's figures; a run not calibrated (running, crashed, a schema dry-run) has
+         *     none of them.
+         */
+        EvalRunOut: {
+            /** Contested Rate */
+            contested_rate: string | null;
+            /** Cost Usd */
+            cost_usd: string;
+            /**
+             * Failed Gates
+             * @description The gates a failed run missed
+             */
+            failed_gates: string[];
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Gate
+             * @description The state of the gate the run measured
+             */
+            gate: ("uncalibrated" | "passed" | "failed") | null;
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "golden" | "schema_dry_run";
+            /**
+             * Pairwise
+             * @description The pairwise agreement of score and label order
+             */
+            pairwise: string | null;
+            /**
+             * Passed
+             * @description Whether it passed; null while it runs or when never gated
+             */
+            passed: boolean | null;
+            /** Prompt Schema Version Id */
+            prompt_schema_version_id: number | null;
+            /**
+             * Route
+             * @enum {string}
+             */
+            route: "production" | "forced_critic";
+            /** Rubric Version Id */
+            rubric_version_id: number | null;
+            /** Spearman Rho */
+            spearman_rho: string | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+        };
+        /** EvalRunsPageOut */
+        EvalRunsPageOut: {
+            active_gate: components["schemas"]["ActiveGateOut"];
+            /** Items */
+            items: components["schemas"]["EvalRunOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
          * EvalSpendGroupOut
          * @description The month's tries of eval runs (golden, canary, schema dry-run) of one model and role, and what they
          *     count.
@@ -1172,6 +2287,74 @@ export interface components {
              */
             role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
         };
+        /** Evaluation */
+        Evaluation: {
+            /** Critic Light Triggers */
+            critic_light_triggers: ("T2" | "T3" | "T8")[];
+            /**
+             * Relevance Threshold
+             * @default 60
+             */
+            relevance_threshold: number;
+            /**
+             * T2 Band
+             * @default 5
+             */
+            t2_band: number;
+            /**
+             * T2 Straddle Max Coverage
+             * @default 0.7
+             */
+            t2_straddle_max_coverage: string;
+            /**
+             * T3 Min Mid
+             * @default 80
+             */
+            t3_min_mid: number;
+            /**
+             * T8 Sample Pct
+             * @default 5
+             */
+            t8_sample_pct: number;
+        };
+        /** EvidenceOut */
+        EvidenceOut: {
+            /** Field Name */
+            field_name: string | null;
+            /** Quote */
+            quote: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "description" | "structured_field" | "profile";
+            /** Span End */
+            span_end: number | null;
+            /** Span Start */
+            span_start: number | null;
+            /** Subject */
+            subject: string;
+        };
+        /**
+         * ExecutionConfig
+         * @description The §10.3 table.
+         */
+        ExecutionConfig: {
+            critic: components["schemas"]["ExecutionNode"];
+            extract_profile: components["schemas"]["ExecutionNode"];
+            generate: components["schemas"]["ExecutionNode"];
+            propose_queries: components["schemas"]["ExecutionNode"];
+            revise: components["schemas"]["ExecutionNode"];
+        };
+        /** ExecutionNode */
+        ExecutionNode: {
+            /** Deadline S */
+            deadline_s: number;
+            /** Max Tokens */
+            max_tokens: number;
+            /** Max Tokens Retry */
+            max_tokens_retry: number;
+        };
         /** ExtractingOut */
         ExtractingOut: {
             /**
@@ -1181,8 +2364,46 @@ export interface components {
             status: "extracting_profile";
         };
         /**
+         * FacetsOut
+         * @description The Company and Source options of the listed cards, with their counts.
+         */
+        FacetsOut: {
+            /** Companies */
+            companies: components["schemas"]["CompanyFacetOut"][];
+            /** Sources */
+            sources: components["schemas"]["SourceFacetOut"][];
+        };
+        /**
+         * FailedTargetOut
+         * @description A target of the active scoring tuple that was refused or failed, which a retry can take back.
+         */
+        FailedTargetOut: {
+            /** Job Id */
+            job_id: number;
+            /** Refusal Category */
+            refusal_category: string | null;
+            /** State */
+            state: string;
+            /** State Reason */
+            state_reason: string | null;
+            /** Target Id */
+            target_id: number;
+            /** Title */
+            title: string;
+        };
+        /**
+         * FailedTargetsSectionOut
+         * @description The refused and failed targets: how many, and the 50 that changed state last.
+         */
+        FailedTargetsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["FailedTargetOut"][];
+        };
+        /**
          * FeedbackIn
-         * @description A label, or a "wrong score" with the label the user expected (§14.2 L4977).
+         * @description A label, or a "wrong score" with the label the user expected (§14.2).
          */
         FeedbackIn: {
             /** Comment */
@@ -1209,7 +2430,7 @@ export interface components {
          * FieldError
          * @description One invalid field of a `validation_failed` problem; `field` is the pydantic `loc` joined with ".".
          *
-         *     `message` can echo the sender's own input (ruling T14-h).
+         *     `message` can echo the sender's own input.
          */
         FieldError: {
             /** Code */
@@ -1221,8 +2442,7 @@ export interface components {
         };
         /**
          * FieldIssueOut
-         * @description A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
-         *     never repeats the value.
+         * @description A refused field: its path from `payload`, a code and a message that never repeats the value.
          */
         FieldIssueOut: {
             /**
@@ -1235,9 +2455,27 @@ export interface components {
             /** Message */
             message: string;
         };
+        /** FieldProvenanceOut */
+        FieldProvenanceOut: {
+            /** Observation Id */
+            observation_id: number;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Posting Id */
+            posting_id: number;
+            /** Rule */
+            rule: string;
+            /** Source Id */
+            source_id: string | null;
+            /** Source Instance Id */
+            source_instance_id: number;
+        };
         /**
          * FlagsIn
-         * @description The case's flags to set; an absent one is kept. At most two cases are canaries (L4632).
+         * @description The case's flags to set; an absent one is kept. At most two cases are canaries.
          */
         FlagsIn: {
             /** Active */
@@ -1247,14 +2485,19 @@ export interface components {
         };
         /**
          * GoldenCaseOut
-         * @description A golden case: its job, label and comment, its profile version's number and its scope version's id, its
-         *     source and its flags.
+         * @description A golden case: its job with the labelled ad's title and the company, its label and comment, its profile
+         *     version's number and its scope version's id, its source and its flags.
          */
         GoldenCaseOut: {
             /** Active */
             active: boolean;
             /** Comment */
             comment: string | null;
+            /**
+             * Company
+             * @description The job's company, as the job list shows it
+             */
+            company: string;
             /** Id */
             id: number;
             /** Is Canary */
@@ -1275,6 +2518,11 @@ export interface components {
              * @enum {string}
              */
             source: "week1" | "feedback" | "adversarial";
+            /**
+             * Title
+             * @description The title of the ad version the case was labelled on (the job's title when that version names none)
+             */
+            title: string;
         };
         /** GoldenCasesPageOut */
         GoldenCasesPageOut: {
@@ -1282,6 +2530,129 @@ export interface components {
             items: components["schemas"]["GoldenCaseOut"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * GoldenRunOut
+         * @description The golden run that decides the candidate's eval gate once it is calibrated: the newest completed run
+         *     of the candidate on the production route with an accepted transport.
+         */
+        GoldenRunOut: {
+            /** Eval Run Id */
+            eval_run_id: number;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Passed
+             * @description Whether it passed; null when it was never gated
+             */
+            passed: boolean | null;
+            /**
+             * Spearman Rho
+             * @description Spearman's rho of score and label; null when undefined
+             */
+            spearman_rho: string | null;
+        };
+        /** GroupBadgeOut */
+        GroupBadgeOut: {
+            /** Group Id */
+            group_id: number;
+            /** Unscorable Reason */
+            unscorable_reason: string | null;
+        };
+        /** GroupCardOut */
+        GroupCardOut: {
+            /** Group Id */
+            group_id: number;
+            /** Members */
+            members: components["schemas"]["MemberBriefOut"][];
+            representative: components["schemas"]["RefOut"];
+            /** Size */
+            size: number;
+        };
+        /**
+         * GroupMemberIn
+         * @description The member of the duplicate group the move is about.
+         */
+        GroupMemberIn: {
+            /** Job Id */
+            job_id: number;
+        };
+        /** GroupMemberOut */
+        GroupMemberOut: {
+            /** Availability */
+            availability: string;
+            /** Company */
+            company: string;
+            /** Completeness */
+            completeness: string;
+            /** Is Representative */
+            is_representative: boolean;
+            /** Job Id */
+            job_id: number;
+            /** Locations */
+            locations: string[];
+            /** Score Individually */
+            score_individually: boolean;
+            /** Source Ids */
+            source_ids: string[];
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
+        };
+        /**
+         * GroupOut
+         * @description A duplicate group and its members, by job id.
+         */
+        GroupOut: {
+            /** Election Reason */
+            election_reason: string | null;
+            /** Id */
+            id: number;
+            /** Members */
+            members: components["schemas"]["GroupMemberOut"][];
+            /** Representative Job Id */
+            representative_job_id: number | null;
+            /** Status */
+            status: string;
+            /** Unscorable Reason */
+            unscorable_reason: string | null;
+        };
+        /**
+         * HeaderLlmOut
+         * @description The month's counted LLM spend against the cap, in USD, and whether the month's counted scoring spend is
+         *     ahead of the even pace of the scoring share over the month.
+         */
+        HeaderLlmOut: {
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /**
+             * Pace
+             * @enum {string}
+             */
+            pace: "ok" | "ahead";
+        };
+        /**
+         * HeaderQuotaOut
+         * @description A provider's current quota window: the counted usage against its limit, its reset and its state.
+         */
+        HeaderQuotaOut: {
+            /** Limit */
+            limit: number;
+            /**
+             * Reset At
+             * Format: date-time
+             */
+            reset_at: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Used */
+            used: number;
         };
         /** HealthOut */
         HealthOut: {
@@ -1291,9 +2662,400 @@ export interface components {
              */
             status: "ok";
         };
+        /**
+         * HistoryItemOut
+         * @description One result of the job's history with every instance of it.
+         */
+        HistoryItemOut: {
+            /** Instances */
+            instances: components["schemas"]["InstanceOut"][];
+            /** Llm Tuple Id */
+            llm_tuple_id: number;
+            /** Profile Version No */
+            profile_version_no: number;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /** Result Id */
+            result_id: number;
+            /** Rubric Version */
+            rubric_version: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "accepted" | "contested";
+        };
+        /**
+         * HistoryPageOut
+         * @description A page of the history and the cursor of the next (`None` on the last page).
+         */
+        HistoryPageOut: {
+            /** Items */
+            items: components["schemas"]["HistoryItemOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
+         * IdentityConflictOut
+         * @description An open identity conflict: the jobs whose strong keys disagree, the posting's job first.
+         */
+        IdentityConflictOut: {
+            /** Conflict Id */
+            conflict_id: number;
+            /** Job Ids */
+            job_ids: number[];
+            /**
+             * Opened At
+             * Format: date-time
+             */
+            opened_at: string;
+            /**
+             * Reason
+             * @description The exclusive key namespaces in which the jobs carry different values, comma-separated (for example `pub:stepstone.de`); `exclusive_conflict` when none is named
+             */
+            reason: string;
+        };
+        /**
+         * IdentityConflictsSectionOut
+         * @description The open identity conflicts: how many, and the 50 opened last.
+         */
+        IdentityConflictsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["IdentityConflictOut"][];
+        };
+        /**
+         * InstanceOut
+         * @description One score instance of a result (`None` scores: a verified not-a-job-ad).
+         */
+        InstanceOut: {
+            /**
+             * Computed At
+             * Format: date-time
+             */
+            computed_at: string;
+            /** Confidence */
+            confidence: ("low" | "medium" | "high") | null;
+            /** Coverage */
+            coverage: string | null;
+            /** Det Result Id */
+            det_result_id: number;
+            /** High */
+            high: string | null;
+            /** Is Current */
+            is_current: boolean;
+            /** Low */
+            low: string | null;
+            /** Mid */
+            mid: string | null;
+            /** Scope Version Id */
+            scope_version_id: number;
+        };
         /** @enum {string} */
         IssueCode: "limit" | "date_invalid" | "date_order" | "years_mismatch" | "contact_removed" | "ungrounded" | "language_without_evidence" | "code_other" | "unverifiable";
+        /** IssueOut */
+        IssueOut: {
+            /** Criterion */
+            criterion: string;
+            /** Issue */
+            issue: string;
+            /** Suggested Level */
+            suggested_level: number | null;
+        };
+        JSONValue: boolean | number | string | components["schemas"]["JSONValue"][] | {
+            [key: string]: components["schemas"]["JSONValue"];
+        } | null;
+        /**
+         * JobCardOut
+         * @description One card of the Jobs list.
+         */
+        JobCardOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Availability */
+            availability: string;
+            /** Badges */
+            badges: ("contested" | "partial" | "shortened" | "possibly_not_a_job_ad" | "injection_suspected" | "stale" | "closed" | "adzuna")[];
+            /**
+             * Bucket
+             * @enum {string}
+             */
+            bucket: "scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad";
+            /** Company */
+            company: string;
+            /** Company Key */
+            company_key: string;
+            /** Completeness */
+            completeness: string;
+            /** Filter Keyword */
+            filter_keyword: string | null;
+            /** Filter Reasons */
+            filter_reasons: string[];
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            group: components["schemas"]["GroupCardOut"] | null;
+            group_badge: components["schemas"]["GroupBadgeOut"] | null;
+            /** Job Id */
+            job_id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "job" | "group";
+            /** Knockouts */
+            knockouts: components["schemas"]["KnockoutOut"][];
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            links: components["schemas"]["LinksOut"];
+            /** Location Kind */
+            location_kind: string;
+            /** Locations */
+            locations: string[];
+            possible_duplicate_of: components["schemas"]["RefOut"] | null;
+            /** Posted At */
+            posted_at: string | null;
+            /** Posted Precision */
+            posted_precision: string;
+            previous: components["schemas"]["PreviousOut"] | null;
+            score: components["schemas"]["ScoreOut"] | null;
+            /** Source Ids */
+            source_ids: string[];
+            target: components["schemas"]["TargetOut"] | null;
+            /** Title */
+            title: string;
+            user: components["schemas"]["CardUserOut"] | null;
+            /** Work Mode Known */
+            work_mode_known: boolean;
+            /** Work Modes */
+            work_modes: string[];
+        };
+        /**
+         * JobDetailOut
+         * @description A job's detail.
+         */
+        JobDetailOut: {
+            /** Bucket */
+            bucket: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad") | null;
+            contested: components["schemas"]["ContestedOut"] | null;
+            description: components["schemas"]["DescriptionOut"];
+            /** Feedback */
+            feedback: components["schemas"]["JobFeedbackOut"][];
+            group: components["schemas"]["GroupOut"] | null;
+            history: components["schemas"]["HistoryPageOut"];
+            job: components["schemas"]["JobOut"];
+            links: components["schemas"]["LinksOut"];
+            /** Merge Events */
+            merge_events: components["schemas"]["MergeEventOut"][];
+            /** Postings */
+            postings: components["schemas"]["PostingOut"][];
+            score: components["schemas"]["DetailScoreOut"] | null;
+            target: components["schemas"]["TargetOut"] | null;
+            user: components["schemas"]["UserActionsOut"] | null;
+        };
+        /** JobFeedbackOut */
+        JobFeedbackOut: {
+            /** Comment */
+            comment: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "label" | "wrong_score";
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "good" | "ok" | "poor";
+        };
+        /** JobOut */
+        JobOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Availability */
+            availability: string;
+            /** Company */
+            company: string;
+            /** Company Key */
+            company_key: string;
+            /** Completeness */
+            completeness: string;
+            /** Employment Types */
+            employment_types: string[];
+            /** Field Provenance */
+            field_provenance: {
+                [key: string]: components["schemas"]["FieldProvenanceOut"];
+            };
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            /** Job Id */
+            job_id: number;
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            /** Location Kind */
+            location_kind: string;
+            /** Locations */
+            locations: string[];
+            /** Posted At */
+            posted_at: string | null;
+            /** Posted Precision */
+            posted_precision: string;
+            salary: components["schemas"]["SalaryOut"] | null;
+            /** Source Ids */
+            source_ids: string[];
+            /** Title */
+            title: string;
+            /** Work Mode Known */
+            work_mode_known: boolean;
+            /** Work Mode Source Id */
+            work_mode_source_id: string | null;
+            /** Work Modes */
+            work_modes: string[];
+        };
+        /** JobsPageOut */
+        JobsPageOut: {
+            counts: components["schemas"]["CountsOut"] | null;
+            /** Items */
+            items: components["schemas"]["JobCardOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Ranking Changed */
+            ranking_changed: boolean;
+            /** Ranking Generation */
+            ranking_generation: number;
+        };
+        /**
+         * JsearchProjectionOut
+         * @description JSearch under the proposed settings: units per run, days to refresh every paid cell, the cells.
+         */
+        JsearchProjectionOut: {
+            /** Cells */
+            cells: number;
+            /** Refresh Cadence Days */
+            refresh_cadence_days: number;
+            /** Units Per Run */
+            units_per_run: number;
+            window: components["schemas"]["QuotaWindowOut"] | null;
+        };
         JsonValue: unknown;
+        /** KnockoutOut */
+        KnockoutOut: {
+            /** Binding */
+            binding: boolean;
+            /** Code */
+            code: string;
+            /** Profile Value */
+            profile_value: string | null;
+            /** Requirement */
+            requirement: string | null;
+            /** Severity */
+            severity: string;
+            /** Status */
+            status: string;
+        };
+        /**
+         * KnockoutSeverity
+         * @description The severity per §11.4 knockout code; `mandatory_language` follows `language_policy` (§13.6).
+         */
+        KnockoutSeverity: {
+            /**
+             * Certification
+             * @default soft
+             * @enum {string}
+             */
+            certification: "hard" | "soft";
+            /**
+             * Contract Type
+             * @default hard
+             * @enum {string}
+             */
+            contract_type: "hard" | "soft";
+            /**
+             * Degree
+             * @default soft
+             * @enum {string}
+             */
+            degree: "hard" | "soft";
+            /**
+             * Onsite Required
+             * @default hard
+             * @enum {string}
+             */
+            onsite_required: "hard" | "soft";
+            /**
+             * Security Clearance
+             * @default hard
+             * @enum {string}
+             */
+            security_clearance: "hard" | "soft";
+            /**
+             * Work Permit
+             * @default hard
+             * @enum {string}
+             */
+            work_permit: "hard" | "soft";
+        };
+        /**
+         * LabelItemOut
+         * @description An ad to label: its job, title, company, location labels, ad language and the first 600 characters
+         *     (code points) of its description. It carries no score.
+         */
+        LabelItemOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Company */
+            company: string;
+            /** Excerpt */
+            excerpt: string;
+            /** Job Id */
+            job_id: number;
+            /** Locations */
+            locations: string[];
+            /** Title */
+            title: string;
+        };
+        /**
+         * LabelProgressOut
+         * @description The active week-1 golden cases of the active profile, and the number to reach.
+         */
+        LabelProgressOut: {
+            /** Labelled */
+            labelled: number;
+            /** Target */
+            target: number;
+        };
+        /**
+         * LabellingQueueOut
+         * @description The ads to label next, spread over the score bands, those without a label for the active profile
+         *     first, and the labelling progress. Neither carries a score or a band.
+         */
+        LabellingQueueOut: {
+            /** Items */
+            items: components["schemas"]["LabelItemOut"][];
+            progress: components["schemas"]["LabelProgressOut"];
+        };
         /** Language */
         Language: {
             /**
@@ -1312,10 +3074,117 @@ export interface components {
             evidence: string;
         };
         /**
+         * LastRunOut
+         * @description The newest run, its age in seconds since it was queued, and the causes of a partial run.
+         */
+        LastRunOut: {
+            /** Age S */
+            age_s: number;
+            /** Partial Causes */
+            partial_causes: ("fetch_failed" | "fetch_ambiguous" | "source_breaker_open" | "source_auth_failed" | "source_contract_broken" | "source_not_found" | "awaiting_embedding" | "raw_item_rejected")[];
+            run: components["schemas"]["RunOut"];
+        };
+        /**
+         * LatestProposalOut
+         * @description The newest query proposal, of any profile version.
+         */
+        LatestProposalOut: {
+            /**
+             * Failure Code
+             * @description Why a failed proposal failed: the error code of its newest operation; null in every other status
+             */
+            failure_code: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready" | "failed" | "purged";
+        };
+        /** LevelDiffOut */
+        LevelDiffOut: {
+            /** Criterion */
+            criterion: string;
+            /** From Level */
+            from_level: number | null;
+            /** To Level */
+            to_level: number | null;
+        };
+        /** LinksOut */
+        LinksOut: {
+            /** Adzuna */
+            adzuna: string | null;
+            /** Open Ad */
+            open_ad: string | null;
+        };
+        /** Llm */
+        Llm: {
+            /**
+             * Cap Usd
+             * @default 100.00
+             */
+            cap_usd: string;
+            /**
+             * Min Bucket Capacity Usd
+             * @default 1.00
+             */
+            min_bucket_capacity_usd: string;
+            /**
+             * Nonscoring Reserve Pct
+             * @default 5
+             */
+            nonscoring_reserve_pct: number;
+            /**
+             * Overrun Buffer Usd
+             * @default 2.00
+             */
+            overrun_buffer_usd: string;
+        };
+        /**
+         * LlmProjectionOut
+         * @description The scoring budget under the proposed settings (§6.9.2, §21): the bucket, the expected cost per target,
+         *     the projected critic rate, the targets a month can score against those expected to arrive, and the
+         *     month's figures as a save would leave them.
+         */
+        LlmProjectionOut: {
+            /**
+             * Arrival Per Month
+             * @description New targets a month: the active tuple's rate of new targets over the last 7 days, an activation's catch-up of retained ads not counted; 3,000 without 7 days of history, and while the active tuple's latest activation is younger than 7 days
+             */
+            arrival_per_month: number;
+            /** Bucket Capacity */
+            bucket_capacity: string;
+            /** Bucket Rate Per H */
+            bucket_rate_per_h: string;
+            /**
+             * C Hat
+             * @description The expected cost per target: the active tuple's 7-day mean while the model and evaluation policies are unchanged, else the central estimate of the proposed model policy
+             */
+            c_hat: string;
+            /** Cap Usd */
+            cap_usd: string;
+            /** Counted Usd */
+            counted_usd: string;
+            /** Headroom Usd */
+            headroom_usd: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /** Projected Critic Rate */
+            projected_critic_rate: string;
+            /** Projected Month Spend */
+            projected_month_spend: string;
+            /** Targets Per Month */
+            targets_per_month: number;
+        };
+        /**
          * LlmSpendOut
-         * @description The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
-         *     headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
-         *     without a row is the one a reservation would create, with the settings' cap and nothing counted.
+         * @description The month's LLM spend (§17.5 "LLM spend"): the counted spend, the cap, the scoring headroom (§6.9.4)
+         *     and the USD bucket accrued to now, from the month row as `read_month` gives it; a month without a row is
+         *     the one a reservation would create, with the settings' cap and nothing counted.
          */
         LlmSpendOut: {
             /** Bucket Usd */
@@ -1336,15 +3205,187 @@ export interface components {
         LoginIn: {
             /** Password */
             password: string;
-            /** Totp */
+            /**
+             * Totp
+             * @description The six-digit code of the authenticator app, needed when TOTP is on; an empty string counts as no code
+             */
             totp?: string | null;
             /** Username */
             username: string;
+        };
+        /**
+         * MassDisappearanceOut
+         * @description An unconfirmed mass disappearance of a board, by its opening snapshot: the postings absent from it
+         *     against the board's active count before it.
+         */
+        MassDisappearanceOut: {
+            /** Absent Count */
+            absent_count: number | null;
+            /** Baseline Active Count */
+            baseline_active_count: number | null;
+            /**
+             * Instance Label
+             * @description The watchlist company's name, else the board's instance key
+             */
+            instance_label: string;
+            /** Snapshot Id */
+            snapshot_id: number;
+            /**
+             * Taken At
+             * Format: date-time
+             */
+            taken_at: string;
+        };
+        /**
+         * MassDisappearancesSectionOut
+         * @description The open mass disappearances: how many, and the 50 opened last.
+         */
+        MassDisappearancesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["MassDisappearanceOut"][];
+        };
+        /** MemberBriefOut */
+        MemberBriefOut: {
+            /** Availability */
+            availability: string;
+            /** Completeness */
+            completeness: string;
+            /** Job Id */
+            job_id: number;
+            /** Source Ids */
+            source_ids: string[];
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
+        };
+        /** MergeEventOut */
+        MergeEventOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** From Job Id */
+            from_job_id: number;
+            /** Id */
+            id: number;
+            /** Into Job Id */
+            into_job_id: number;
+            /** Kind */
+            kind: string;
+            /** Reversible */
+            reversible: boolean;
+        };
+        /** ModelOut */
+        ModelOut: {
+            /** Effort */
+            effort: string;
+            /** Model */
+            model: string;
+        };
+        /**
+         * ModelPolicy
+         * @description The model and effort of each node, and the critic's effort for a light round (§10.3). `preset` is the
+         *     label of that grid, `A`, `B` or `C` for a preset's, `custom` for any other; a label a request sends is
+         *     replaced by it.
+         */
+        ModelPolicy: {
+            /**
+             * Critic Light Effort
+             * @default low
+             * @enum {string}
+             */
+            critic_light_effort: "low" | "medium" | "high" | "xhigh" | "max";
+            nodes: components["schemas"]["ModelPolicyNodes"];
+            /**
+             * Preset
+             * @default B
+             * @enum {string}
+             */
+            preset: "A" | "B" | "C" | "custom";
+        };
+        /**
+         * ModelPolicyNodes
+         * @description The model and effort of each node; the defaults are model policy B (§10.3).
+         */
+        ModelPolicyNodes: {
+            critic: components["schemas"]["NodeChoice"];
+            extract_profile: components["schemas"]["NodeChoice"];
+            generate: components["schemas"]["NodeChoice"];
+            propose_queries: components["schemas"]["NodeChoice"];
+            revise: components["schemas"]["NodeChoice"];
+        };
+        /** NodeChoice */
+        NodeChoice: {
+            /**
+             * Effort
+             * @enum {string}
+             */
+            effort: "low" | "medium" | "high" | "xhigh" | "max";
+            /**
+             * Model
+             * @enum {string}
+             */
+            model: "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-haiku-5-5" | "claude-fable-5-1";
+        };
+        /**
+         * NodeEstimatesOut
+         * @description What one call of each profile step is expected to cost under the active model policy.
+         */
+        NodeEstimatesOut: {
+            /**
+             * Extract Profile Usd
+             * @description Extracting a profile from a CV's text
+             */
+            extract_profile_usd: string;
+            /**
+             * Propose Queries Usd
+             * @description Proposing search queries for a profile
+             */
+            propose_queries_usd: string;
         };
         /** NotReadyOut */
         NotReadyOut: {
             /** Failing */
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
+        };
+        /** Notifications */
+        Notifications: {
+            /**
+             * Push Min Severity
+             * @default warn
+             * @enum {string}
+             */
+            push_min_severity: "warn" | "critical";
+        };
+        /**
+         * OpenDraftOut
+         * @description The draft in progress: uploaded, being extracted, in review or ready to confirm.
+         */
+        OpenDraftOut: {
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready";
+        };
+        /**
+         * PaidSearchOut
+         * @description Whether paid search is paused (JSearch exhausted and SerpApi unable to fall back), until when and
+         *     why.
+         */
+        PaidSearchOut: {
+            /** Paused */
+            paused: boolean;
+            /** Reason */
+            reason: ("serpapi_disabled" | "serpapi_unavailable" | "serpapi_exhausted") | null;
+            /** Until */
+            until: string | null;
         };
         /** ParseUrlIn */
         ParseUrlIn: {
@@ -1367,12 +3408,25 @@ export interface components {
             slug: string;
         };
         /**
+         * PausedLaneOut
+         * @description The alert that pauses the score lane until it is acknowledged, and why.
+         */
+        PausedLaneOut: {
+            /** Alert Id */
+            alert_id: number | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "reservation_bound_violated" | "auth_failed";
+        };
+        /**
          * PendingScopeOut
-         * @description The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
-         *     live (one that failed for good, until the pointer is cleared).
+         * @description The scope being applied (§13.4) and its live apply's progress in both phases; `progress` is `null`
+         *     while no apply is live (one that failed for good, until the pointer is cleared).
          */
         PendingScopeOut: {
-            progress: components["schemas"]["ProgressOut"] | null;
+            progress: components["schemas"]["ScopeProgressOut"] | null;
             /** Version Id */
             version_id: number;
         };
@@ -1392,6 +3446,50 @@ export interface components {
             postal_codes: string[];
         };
         /**
+         * PostingCountsOut
+         * @description The board's postings by availability.
+         */
+        PostingCountsOut: {
+            /** Active */
+            active: number;
+            /** Closed */
+            closed: number;
+            /** Stale */
+            stale: number;
+            /** Unknown */
+            unknown: number;
+        };
+        /** PostingOut */
+        PostingOut: {
+            /** Availability */
+            availability: string;
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            /** Link */
+            link: string | null;
+            /** Native Id */
+            native_id: string;
+            /** Source Id */
+            source_id: string;
+        };
+        /** PreviousOut */
+        PreviousOut: {
+            /** Mid */
+            mid: string;
+            /** Profile Version No */
+            profile_version_no: number;
+        };
+        /**
          * Problem
          * @description The `application/problem+json` document of every error response (RFC 9457, §14.4).
          *
@@ -1404,7 +3502,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
+            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
             /**
              * Detail
              * @default null
@@ -1431,6 +3529,9 @@ export interface components {
         /** ProfileListOut */
         ProfileListOut: {
             active: components["schemas"]["ProfileVersionOut"] | null;
+            estimates: components["schemas"]["NodeEstimatesOut"];
+            latest_proposal: components["schemas"]["LatestProposalOut"] | null;
+            open_draft: components["schemas"]["OpenDraftOut"] | null;
             /** Versions */
             versions: components["schemas"]["ProfileVersionOut"][];
         };
@@ -1449,12 +3550,37 @@ export interface components {
             /** Version No */
             version_no: number;
         };
-        /** ProgressOut */
-        ProgressOut: {
-            /** Done */
-            done: number;
-            /** Total */
-            total: number;
+        /**
+         * ProjectionsOut
+         * @description The preview by part (§13.5). The last four are present only where an effect class adds them.
+         */
+        ProjectionsOut: {
+            adzuna: components["schemas"]["AdzunaProjectionOut"];
+            arbeitnow: components["schemas"]["ArbeitnowProjectionOut"];
+            /**
+             * Critic Rate
+             * @description With an evaluation-policy change: its projected critic rate
+             */
+            critic_rate?: string | null;
+            /**
+             * Det Recompute
+             * @description With a scope change: the published results recomputed without an LLM call
+             */
+            det_recompute?: number | null;
+            /**
+             * Eval Gate
+             * @description With a model- or evaluation-policy change: the eval gate a save checks
+             */
+            eval_gate?: ("uncalibrated" | "passed" | "failed") | null;
+            jsearch: components["schemas"]["JsearchProjectionOut"];
+            llm: components["schemas"]["LlmProjectionOut"];
+            /**
+             * Next Slot
+             * @description With a schedule change: the next slot, null while the schedule is disabled
+             */
+            next_slot?: string | null;
+            /** @description Null before the first SerpApi account read: no window, so no fallback */
+            serpapi_fallback: components["schemas"]["SerpapiProjectionOut"] | null;
         };
         /**
          * PromptSchemaVersionOut
@@ -1482,9 +3608,15 @@ export interface components {
         };
         /**
          * ProposalOut
-         * @description A proposal's status and, once `ready`, its kept queries; `items` is `null` in every other status.
+         * @description A proposal's status, once `ready` its kept queries (`items`, `null` in every other status), and once
+         *     `failed` why (`failure_code`).
          */
         ProposalOut: {
+            /**
+             * Failure Code
+             * @description Why a failed proposal failed (for example `budget_exhausted`, `invalid_output` or `refused`): the error code of its newest operation; null in every other status
+             */
+            failure_code: string | null;
             /** Items */
             items: components["schemas"]["ProposedQueryOut"][] | null;
             /**
@@ -1513,6 +3645,44 @@ export interface components {
             text: string;
         };
         /**
+         * QuarantinedBatchOut
+         * @description A batch submission whose send is ambiguous (`submit_ambiguous`) or that was released and is still
+         *     reconciled (`released`): the spend it holds, its requests, when it was sent, the last reconciliation pass
+         *     and the candidate batches that pass could not read.
+         */
+        QuarantinedBatchOut: {
+            /** Last Reconcile At */
+            last_reconcile_at: string | null;
+            /** Request Count */
+            request_count: number;
+            /** Reserved Usd */
+            reserved_usd: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "submit_ambiguous" | "released";
+            /** Submission Id */
+            submission_id: number;
+            /**
+             * Submit Started At
+             * Format: date-time
+             */
+            submit_started_at: string;
+            /** Unread Candidates */
+            unread_candidates: number;
+        };
+        /**
+         * QuarantinedBatchesSectionOut
+         * @description The quarantined batch submissions: how many, and the 50 sent last.
+         */
+        QuarantinedBatchesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["QuarantinedBatchOut"][];
+        };
+        /**
          * QueryEditIn
          * @description An absent member keeps the query's value.
          */
@@ -1521,6 +3691,13 @@ export interface components {
             lang?: ("de" | "en") | null;
             /** Text */
             text?: string | null;
+        };
+        /** QueryEntry */
+        QueryEntry: {
+            /** Enabled */
+            enabled: boolean;
+            /** Query Id */
+            query_id: number;
         };
         /** QueryIn */
         QueryIn: {
@@ -1541,6 +3718,72 @@ export interface components {
             proposal_id?: number | null;
             /** Text */
             text: string;
+        };
+        /**
+         * QueryListOut
+         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: one per
+         *     enabled source and scope location, which a run searches while it is enabled, judged on the scope as it is
+         *     now whether the query is enabled or not.
+         */
+        QueryListOut: {
+            /**
+             * Cells
+             * @description Its planned coverage cells, one per enabled source and scope location, counted whether a run has created them yet or not
+             */
+            cells: number;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Enabled
+             * @description Its flag in the active settings; false for a query they do not list
+             */
+            enabled: boolean;
+            /** Exploration */
+            exploration: boolean;
+            /** Id */
+            id: number;
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /**
+             * Last Covered At
+             * @description The oldest coverage of the scope's locations for it, a location being covered as of the newer frontier of its JSearch cell and its SerpApi fallback cell; null when a location is covered by neither (also when those cells do not exist yet), or when neither JSearch nor SerpApi is enabled
+             */
+            last_covered_at: string | null;
+            /**
+             * Open Gaps
+             * @description The open coverage gaps of its planned cells
+             */
+            open_gaps: number;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "llm_proposal" | "user";
+            /** Proposal Id */
+            proposal_id: number | null;
+            /**
+             * Refresh Cadence Days
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null when JSearch is not enabled or the scope has no location
+             */
+            refresh_cadence_days: number | null;
+            /** Text */
+            text: string;
+            /**
+             * Too Broad
+             * @description One of its planned cells is too broad
+             */
+            too_broad: boolean;
+            /**
+             * Yield Ema
+             * @description The mean yield of its planned cells that a run has searched; null when none has been
+             */
+            yield_ema: number | null;
         };
         /** QueryOut */
         QueryOut: {
@@ -1564,8 +3807,97 @@ export interface components {
             text: string;
         };
         /**
+         * Quota
+         * @description The quota limits (§6).
+         */
+        Quota: {
+            /**
+             * Adzuna Cap Day
+             * @default 225
+             */
+            adzuna_cap_day: number;
+            /**
+             * Adzuna Cap Minute
+             * @default 20
+             */
+            adzuna_cap_minute: number;
+            /**
+             * Adzuna Cap Month
+             * @default 2250
+             */
+            adzuna_cap_month: number;
+            /**
+             * Adzuna Cap Week
+             * @default 900
+             */
+            adzuna_cap_week: number;
+            /**
+             * Jsearch Monthly Limit
+             * @default 200
+             */
+            jsearch_monthly_limit: number;
+            /**
+             * Paid Max Requests Per Run
+             * @default auto
+             */
+            paid_max_requests_per_run: number | "auto";
+            /**
+             * Reserve Pct
+             * @default 10
+             */
+            reserve_pct: number;
+            /**
+             * Serpapi Hourly Cap
+             * @default 45
+             */
+            serpapi_hourly_cap: number;
+            /**
+             * Serpapi Monthly Limit
+             * @default 250
+             */
+            serpapi_monthly_limit: number;
+        };
+        /**
+         * QuotaDetailOut
+         * @description A provider's current quota window and its ledger: `used` is the window's counted usage (the attempts
+         *     that count and every adjustment), `reserved` the units reserved or in flight, `ambiguous` the units of
+         *     attempts that settled ambiguous, `adjustments` the units of the adjustments; `tokens` is the window's
+         *     bucket as stored.
+         */
+        QuotaDetailOut: {
+            /** Adjustments */
+            adjustments: number;
+            /** Ambiguous */
+            ambiguous: number;
+            /** Limit Units */
+            limit_units: number;
+            /** Reserved */
+            reserved: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Tokens */
+            tokens: number;
+            /** Used */
+            used: number;
+            /**
+             * Window End
+             * Format: date-time
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date-time
+             */
+            window_start: string;
+        };
+        /**
          * QuotaOut
-         * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
+         * @description A provider's quota window at the time of the request (§7.8): counted usage against its limit, and its
+         *     bucket. A stored window whose reset has passed shows its successor, which starts unspent; a provider with
+         *     no stored window shows the window its first request would open.
          */
         QuotaOut: {
             /** Limit Units */
@@ -1593,6 +3925,31 @@ export interface components {
             window_start: string;
         };
         /**
+         * QuotaWindowOut
+         * @description A paid provider's quota window at the time of the preview: its counted units, limit and reset.
+         */
+        QuotaWindowOut: {
+            /** Limit Units */
+            limit_units: number;
+            /**
+             * Reset At
+             * Format: date-time
+             */
+            reset_at: string;
+            /** Used Units */
+            used_units: number;
+        };
+        /**
+         * RawItemsSectionOut
+         * @description The responses with rejected items: how many, and the 50 fetched last.
+         */
+        RawItemsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["RejectedResponseOut"][];
+        };
+        /**
          * ReadyOut
          * @description Every serving prerequisite holds; the body is `{}`.
          */
@@ -1604,9 +3961,56 @@ export interface components {
             /** Ok */
             ok: boolean;
         };
+        /** RefOut */
+        RefOut: {
+            /** Job Id */
+            job_id: number;
+            /** Source Ids */
+            source_ids: string[];
+            /** Title */
+            title: string;
+        };
+        /** RejectedDraftOut */
+        RejectedDraftOut: {
+            /** Level Diff */
+            level_diff: components["schemas"]["LevelDiffOut"][];
+            /** Round */
+            round: number;
+        };
+        /**
+         * RejectedResponseOut
+         * @description A stored response with rejected items: its source and instance, when it was fetched, how many of its
+         *     items are rejected and why, and whether they can be replayed (the run that fetched it has ended, and its
+         *     body is kept and at most 30 days old).
+         */
+        RejectedResponseOut: {
+            /**
+             * Fetched At
+             * Format: date-time
+             */
+            fetched_at: string;
+            /**
+             * Instance Label
+             * @description The watchlist company's name, else the instance key
+             */
+            instance_label: string;
+            /** Raw Response Id */
+            raw_response_id: number;
+            /**
+             * Reasons
+             * @description The distinct reason codes of its rejected items, sorted
+             */
+            reasons: string[];
+            /** Rejected */
+            rejected: number;
+            /** Replayable */
+            replayable: boolean;
+            /** Source Id */
+            source_id: string;
+        };
         /**
          * ReleaseIn
-         * @description The release of a quarantined submission (§10.10): `confirm` must be `true`.
+         * @description The release of a quarantined or lost batch submission (§10.10): `confirm` must be `true`.
          */
         ReleaseIn: {
             /**
@@ -1631,11 +4035,49 @@ export interface components {
             submission_id: number;
         };
         /**
+         * ReplayIn
+         * @description The rejected raw items to replay: every rejected item of one stored response, or a list of raw item
+         *     ids (1 to 500); exactly one of the two.
+         */
+        ReplayIn: {
+            /** Raw Item Ids */
+            raw_item_ids?: number[] | null;
+            /** Raw Response Id */
+            raw_response_id?: number | null;
+        };
+        /**
+         * ReplayQueuedOut
+         * @description The replay operation and how many of the listed items it replays: those still rejected whose run has
+         *     ended and whose stored body is kept and at most 30 days old.
+         */
+        ReplayQueuedOut: {
+            /** Items */
+            items: number;
+            /** Operation Id */
+            operation_id: number;
+        };
+        /**
          * RescoreEstimateOut
-         * @description The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
-         *     Batches, the month's counted spend and its cap.
+         * @description The re-score preview (§12.6 step 2, §15.7, §21.4): the retained ads to score again, their cost online
+         *     and in Batches, the month's counted spend and its cap, the batch allocation and how the ads split between
+         *     one batch and the online pace, and the number of the profile version a confirm creates.
          */
         RescoreEstimateOut: {
+            /**
+             * Batch Targets
+             * @description The ads one batch holds within the allocation, each at its worst-case cost plus its expected critic follow-ups; 0 when batches are off or fewer than the minimum batch would fit
+             */
+            batch_targets: number;
+            /**
+             * Bulk Budget Usd
+             * @description The batch allocation: `bulk_share` of the month's remaining scoring budget
+             */
+            bulk_budget_usd: string;
+            /**
+             * Bulk Share
+             * @description The share of the remaining scoring budget a re-score may batch
+             */
+            bulk_share: string;
             /** Cap */
             cap: string;
             /** Est Usd Batch */
@@ -1644,8 +4086,92 @@ export interface components {
             est_usd_online: string;
             /** Month Spend */
             month_spend: string;
+            /**
+             * Next Version No
+             * @description The number of the profile version a confirm creates
+             */
+            next_version_no: number;
+            /**
+             * Online Per Day
+             * @description The monthly pace: the ads a day the budget's hourly accrual pays for at the expected cost per ad, which includes the cache writes: a cost measured from recent scoring as it is, the central estimate with its share of a cycle's cache writes added
+             */
+            online_per_day: number;
+            /**
+             * Online Targets
+             * @description The other ads, scored online at the monthly pace
+             */
+            online_targets: number;
             /** Targets */
             targets: number;
+        };
+        /**
+         * RescoreOut
+         * @description The re-score of the active scoring tuple: of its targets (`total`), those that left the unscored
+         *     states (`done`); `creating` while its targets are still being created.
+         */
+        RescoreOut: {
+            /** Bulk Operation Id */
+            bulk_operation_id: number;
+            /** Creating */
+            creating: boolean;
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ResolveIn
+         * @description How the identity conflict is settled: `separate` keeps the posting's job and the other jobs apart,
+         *     `merge` merges the other jobs into the posting's job.
+         */
+        ResolveIn: {
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "separate" | "merge";
+        };
+        /** Retention */
+        Retention: {
+            /**
+             * Score History Months
+             * @default 12
+             */
+            score_history_months: number;
+        };
+        /**
+         * RetrieveFailingBatchOut
+         * @description A submitted batch that still cannot be retrieved past its expiry, with its open alert.
+         */
+        RetrieveFailingBatchOut: {
+            /** Alert Id */
+            alert_id: number;
+            /** Expires At */
+            expires_at: string | null;
+            /** Provider Batch Id */
+            provider_batch_id: string;
+            /**
+             * Releasable
+             * @description Whether it can be released: more than 1 h past its expiry
+             */
+            releasable: boolean;
+            /**
+             * Reserved Usd
+             * @description The spend the submission holds, which a release leaves counted as ambiguous
+             */
+            reserved_usd: string;
+            /** Submission Id */
+            submission_id: number;
+        };
+        /**
+         * RetrieveFailingSectionOut
+         * @description The submitted batches whose retrieval keeps failing: how many, and the 50 sent last.
+         */
+        RetrieveFailingSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["RetrieveFailingBatchOut"][];
         };
         /** RetryApplyOut */
         RetryApplyOut: {
@@ -1688,6 +4214,19 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** RoundOut */
+        RoundOut: {
+            /** Issues */
+            issues: components["schemas"]["IssueOut"][];
+            /** Outcome */
+            outcome: string;
+            /** Round */
+            round: number;
+            /** Triggers */
+            triggers: string[];
+            /** Verdict */
+            verdict: string;
+        };
         /**
          * RubricVersionOut
          * @description A shipped rubric version; `content_hash` in hex, `active` when `active_config` points at it.
@@ -1708,6 +4247,19 @@ export interface components {
             version: string;
         };
         /**
+         * RunDetailOut
+         * @description A run, its stored report (null while none is stored) and the partial causes the report names.
+         */
+        RunDetailOut: {
+            /** Partial Causes */
+            partial_causes: ("fetch_failed" | "fetch_ambiguous" | "source_breaker_open" | "source_auth_failed" | "source_contract_broken" | "source_not_found" | "awaiting_embedding" | "raw_item_rejected")[];
+            /** Report */
+            report: {
+                [key: string]: components["schemas"]["JsonValue"];
+            } | null;
+            run: components["schemas"]["RunOut"];
+        };
+        /**
          * RunNowIn
          * @description `include_paid` only: an unknown member is refused (422 `validation_failed`), as by every other body.
          */
@@ -1722,8 +4274,20 @@ export interface components {
             run: components["schemas"]["RunOut"];
         };
         /**
+         * RunNowUnitsOut
+         * @description What a run with paid sources may spend, in whole units: an estimate (the even pace).
+         */
+        RunNowUnitsOut: {
+            /** Jsearch Units */
+            jsearch_units: number;
+            /** Serpapi Fallback Units */
+            serpapi_fallback_units: number;
+        };
+        /**
          * RunOut
-         * @description A run as the api shows it (`runs` row, §7.6); its times in UTC.
+         * @description A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
+         *     status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
+         *     `orphaned_queue`, …), null when it has none.
          */
         RunOut: {
             /** Attempt No */
@@ -1745,10 +4309,38 @@ export interface components {
             scheduled_slot: string | null;
             /** Started At */
             started_at: string | null;
-            /** Status */
-            status: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "partial" | "failed" | "failed_invariant" | "cancelled" | "missed" | "skipped_overlap";
+            /** Status Reason */
+            status_reason: string | null;
             /** Trigger */
             trigger: string;
+        };
+        /** RunsPageOut */
+        RunsPageOut: {
+            /** Items */
+            items: components["schemas"]["RunOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /** SalaryOut */
+        SalaryOut: {
+            /** Currency */
+            currency: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "stated" | "estimate";
+            /** Max */
+            max: string | null;
+            /** Min */
+            min: string | null;
+            /** Period */
+            period: string;
         };
         /**
          * SaveIn
@@ -1785,6 +4377,29 @@ export interface components {
             /** Version No */
             version_no: number;
         };
+        /** Schedule */
+        Schedule: {
+            /**
+             * Anchor Local
+             * @default 06:00
+             */
+            anchor_local: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Include Paid
+             * @default true
+             */
+            include_paid: boolean;
+            /**
+             * Interval Hours
+             * @default 6
+             */
+            interval_hours: number;
+        };
         /**
          * SchemaDryRunOut
          * @description A schema dry-run of a prompt-schema version (§10.11): `passed`, `transport` (`live` or `fake`) and
@@ -1800,8 +4415,152 @@ export interface components {
             /** Transport */
             transport: string | null;
         };
-        /** ScoreCycleOut */
+        /** Scope */
+        Scope: {
+            /** Accepted Ad Languages */
+            accepted_ad_languages: ("de" | "en" | "other")[];
+            /** Employment Types */
+            employment_types: ("full_time" | "part_time" | "contract" | "temporary" | "internship" | "working_student" | "apprenticeship" | "freelance")[];
+            /**
+             * Exclude Keywords In Description
+             * @default false
+             */
+            exclude_keywords_in_description: boolean;
+            /** Excluded Companies */
+            excluded_companies: string[];
+            /** Excluded Keywords */
+            excluded_keywords: string[];
+            /** Industries Exclude */
+            industries_exclude: string[];
+            /** Industries Include */
+            industries_include: string[];
+            knockout_severity: components["schemas"]["KnockoutSeverity"];
+            /** Language Policy */
+            language_policy: {
+                [key: string]: "hard" | "soft";
+            };
+            /**
+             * Language Policy Default
+             * @default hard
+             * @enum {string}
+             */
+            language_policy_default: "hard" | "soft";
+            /** Locations */
+            locations: components["schemas"]["ScopeLocation"][];
+            /**
+             * Max Ad Age Days
+             * @default 30
+             */
+            max_ad_age_days: number;
+            /** Min Salary Eur Year */
+            min_salary_eur_year: number | null;
+            /**
+             * Remote Within Germany
+             * @default true
+             */
+            remote_within_germany: boolean;
+            seniority_range: components["schemas"]["SeniorityRange"];
+            /** Work Modes */
+            work_modes: ("remote" | "hybrid" | "onsite")[];
+        };
+        /**
+         * ScopeApplyFailedOut
+         * @description The scope whose apply failed, and its open alert (null until the alert is raised).
+         */
+        ScopeApplyFailedOut: {
+            /** Alert Id */
+            alert_id: number | null;
+            /** Version Id */
+            version_id: number;
+        };
+        /**
+         * ScopeLocation
+         * @description A gazetteer place (§8.12), chosen through the gazetteer search.
+         */
+        ScopeLocation: {
+            /** Gazetteer Id */
+            gazetteer_id: string;
+            /** Label */
+            label: string;
+            /** Lat */
+            lat: number;
+            /** Lon */
+            lon: number;
+            /** Radius Km */
+            radius_km: number;
+        };
+        /**
+         * ScopeProgressOut
+         * @description A scope apply's progress in both of its phases: the jobs (`done` of `total`) and the published results
+         *     (`det_done` of `det_total`).
+         */
+        ScopeProgressOut: {
+            /** Det Done */
+            det_done: number;
+            /** Det Total */
+            det_total: number;
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ScopeStatusOut
+         * @description The scope being applied, if any, with its live apply's progress (null while no apply is live), and
+         *     whether the active settings version's scope is the applied one.
+         */
+        ScopeStatusOut: {
+            /** Applied */
+            applied: boolean;
+            /** Pending Version Id */
+            pending_version_id: number | null;
+            progress: components["schemas"]["ScopeProgressOut"] | null;
+        };
+        /**
+         * ScoreCycleOut
+         * @description A score cycle: its trigger and status (`status_reason` says why it failed), its tuple, its admission
+         *     size and the admitted targets per lane, the counted spend of its attempts in USD, its report (null while
+         *     it runs) and its times in UTC.
+         */
         ScoreCycleOut: {
+            /** Admission Size */
+            admission_size: number;
+            /** Admitted */
+            admitted: {
+                [key: string]: number;
+            };
+            /** Finished At */
+            finished_at: string | null;
+            /** Id */
+            id: number;
+            /** Llm Tuple Id */
+            llm_tuple_id: number;
+            /** Report */
+            report: {
+                [key: string]: components["schemas"]["JsonValue"];
+            } | null;
+            /** Spent Usd */
+            spent_usd: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+            /** Status Reason */
+            status_reason: string | null;
+            /**
+             * Trigger
+             * @enum {string}
+             */
+            trigger: "periodic" | "score_now" | "batch_followup" | "manual";
+        };
+        /** ScoreCycleQueuedOut */
+        ScoreCycleQueuedOut: {
             /**
              * Queued
              * @description False when a manual cycle job already waits: it serves this request
@@ -1812,6 +4571,13 @@ export interface components {
              * @description Why the cycle would start nothing now: the score lane's pause reason, or `no_pending` without an admissible target; null otherwise
              */
             reason: ("reservation_bound_violated" | "auth_failed" | "cap_reached" | "global_fence" | "schema_unverified") | "no_pending" | null;
+        };
+        /** ScoreCyclesPageOut */
+        ScoreCyclesPageOut: {
+            /** Items */
+            items: components["schemas"]["ScoreCycleOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /**
          * ScoreNowIn
@@ -1824,9 +4590,67 @@ export interface components {
              */
             force: boolean;
         };
+        /** ScoreOut */
+        ScoreOut: {
+            /**
+             * Confidence
+             * @enum {string}
+             */
+            confidence: "low" | "medium" | "high";
+            /** Coverage */
+            coverage: string;
+            /** High */
+            high: string;
+            /** Low */
+            low: string;
+            /** Mid */
+            mid: string;
+            /**
+             * Result Status
+             * @enum {string}
+             */
+            result_status: "accepted" | "contested";
+        };
+        /** Scoring */
+        Scoring: {
+            /**
+             * Batch Bulk Rescore
+             * @default true
+             */
+            batch_bulk_rescore: boolean;
+            /**
+             * Batch Max Items
+             * @default 500
+             */
+            batch_max_items: number;
+            /**
+             * Batch Min Targets
+             * @default 200
+             */
+            batch_min_targets: number;
+            /**
+             * Bulk Rescore Max Budget Share
+             * @default 0.4
+             */
+            bulk_rescore_max_budget_share: string;
+            execution: components["schemas"]["ExecutionConfig"];
+            /**
+             * Max Targets Per Cycle
+             * @default 60
+             */
+            max_targets_per_cycle: number;
+            /**
+             * Min Cycle Targets
+             * @default 10
+             */
+            min_cycle_targets: number;
+            model_policy: components["schemas"]["ModelPolicy"];
+        };
         /**
          * ScoringHealthOut
-         * @description The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD.
+         * @description The score lane: the running cycle, the pause reason, the oldest pending target's age, the pending and
+         *     batched targets and the quarantined batch spend. Ages are seconds at the caller's `now`, the amount in
+         *     USD.
          */
         ScoringHealthOut: {
             /** In Batch Targets */
@@ -1851,11 +4675,11 @@ export interface components {
         };
         /**
          * SegmentOut
-         * @description One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
-         *     characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
-         *     inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
-         *     set cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript
-         *     client must convert them, for example with `Array.from(text)`.
+         * @description One run of `stripped_text_preview` and the raw span it stands for: `text` (the same characters),
+         *     `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact inside a
+         *     restored personal span, which is restored by its span; `restorable` false for one that the edit set
+         *     cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client
+         *     must convert them, for example with `Array.from(text)`.
          */
         SegmentOut: {
             /** Category */
@@ -1878,6 +4702,45 @@ export interface components {
             /** Stripped Start */
             stripped_start: number;
         };
+        /** SeniorityRange */
+        SeniorityRange: {
+            /**
+             * Above
+             * @default 1
+             */
+            above: number;
+            /**
+             * Below
+             * @default 1
+             */
+            below: number;
+            /** Max */
+            max: ("intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head") | null;
+            /** Min */
+            min: ("intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head") | null;
+            /**
+             * Mode
+             * @default profile_relative
+             * @enum {string}
+             */
+            mode: "profile_relative" | "explicit";
+        };
+        /**
+         * SerpapiProjectionOut
+         * @description The SerpApi fallback: units per run, the effective hourly cap and the window's state.
+         */
+        SerpapiProjectionOut: {
+            /** Hourly Cap */
+            hourly_cap: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Units Per Run */
+            units_per_run: number;
+            window: components["schemas"]["QuotaWindowOut"] | null;
+        };
         /** SessionOut */
         SessionOut: {
             /**
@@ -1895,13 +4758,36 @@ export interface components {
             /** Username */
             username: string;
         };
+        /**
+         * Settings
+         * @description The settings document (§13.1): every group with each of its fields.
+         */
+        Settings: {
+            collection: components["schemas"]["Collection"];
+            display: components["schemas"]["Display"];
+            evaluation: components["schemas"]["Evaluation"];
+            llm: components["schemas"]["Llm"];
+            notifications: components["schemas"]["Notifications"];
+            /** Queries */
+            queries: components["schemas"]["QueryEntry"][];
+            quota: components["schemas"]["Quota"];
+            retention: components["schemas"]["Retention"];
+            schedule: components["schemas"]["Schedule"];
+            scope: components["schemas"]["Scope"];
+            scoring: components["schemas"]["Scoring"];
+            sources: components["schemas"]["Sources"];
+            /** Watchlist */
+            watchlist: components["schemas"]["WatchlistEntry"][];
+        };
         /** SettingsOut */
         SettingsOut: {
-            /** Payload */
-            payload: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            payload: components["schemas"]["Settings"];
             pending_scope: components["schemas"]["PendingScopeOut"] | null;
+            /**
+             * Scope Applied
+             * @description Whether the active version's scope is in force; false while one is pending, and after an apply that failed for good, until a retried apply succeeds
+             */
+            scope_applied: boolean;
             version: components["schemas"]["VersionOut"];
         };
         /** Skill */
@@ -1922,6 +4808,56 @@ export interface components {
             name: string;
             /** Years */
             years: number | null;
+        };
+        /**
+         * SnapshotAcknowledgedOut
+         * @description The acknowledged snapshot and how many postings of its mass disappearance closed (0 for an event that
+         *     is no longer open).
+         */
+        SnapshotAcknowledgedOut: {
+            /** Closed */
+            closed: number;
+            /** Snapshot Id */
+            snapshot_id: number;
+        };
+        /** SourceFacetOut */
+        SourceFacetOut: {
+            /** Count */
+            count: number;
+            /** Source Id */
+            source_id: string;
+        };
+        /** SourceSwitches */
+        SourceSwitches: {
+            /**
+             * Adzuna
+             * @default true
+             */
+            adzuna: boolean;
+            /**
+             * Arbeitnow
+             * @default true
+             */
+            arbeitnow: boolean;
+            /**
+             * Ats
+             * @default true
+             */
+            ats: boolean;
+            /**
+             * Jsearch
+             * @default true
+             */
+            jsearch: boolean;
+            /**
+             * Serpapi
+             * @default true
+             */
+            serpapi: boolean;
+        };
+        /** Sources */
+        Sources: {
+            enabled: components["schemas"]["SourceSwitches"];
         };
         /**
          * SpanEditIn
@@ -2021,6 +4957,38 @@ export interface components {
             /** Reserved */
             reserved: string;
         };
+        /**
+         * StatusOut
+         * @description The header strip: the last and the active run, the next slots, the quota windows, the month's LLM
+         *     spend, the open coverage gaps, the pending targets, the unacknowledged alerts, the re-score, the
+         *     paid-search pause, the run-now estimate, the scope's apply and the banners, critical first.
+         */
+        StatusOut: {
+            /** Active Run Id */
+            active_run_id: number | null;
+            alerts: components["schemas"]["UnackedAlertsOut"];
+            /** Banners */
+            banners: components["schemas"]["BannerOut"][];
+            /** Coverage Gaps Open */
+            coverage_gaps_open: number;
+            last_run: components["schemas"]["LastRunOut"] | null;
+            llm: components["schemas"]["HeaderLlmOut"] | null;
+            /**
+             * Next Slots
+             * @description The schedule's next 3 slots; empty while it is disabled
+             */
+            next_slots: string[];
+            paid_search: components["schemas"]["PaidSearchOut"];
+            /** Pending Targets */
+            pending_targets: number;
+            /** Quota */
+            quota: {
+                [key: string]: components["schemas"]["HeaderQuotaOut"] | null;
+            };
+            rescore: components["schemas"]["RescoreOut"] | null;
+            run_now: components["schemas"]["RunNowUnitsOut"];
+            scope: components["schemas"]["ScopeStatusOut"];
+        };
         /** StrippedTextOut */
         StrippedTextOut: {
             /**
@@ -2038,11 +5006,12 @@ export interface components {
          *       `last_fully_successful_run_age_s`: of a `succeeded` one only.
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
-         *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
-         *     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
-         *     - `scoring`: the score lane (`scoring_health`).
-         *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
-         *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
+         *     - `quota`: each quota provider's window at the time of the request, as the header status shows it;
+         *       `null` for SerpApi before its first account read.
+         *     - `llm`: the month's LLM spend, `null` when nothing is seeded.
+         *     - `scoring`: the score lane.
+         *     - `table_bytes`: the size of every table of the `public` schema, in bytes.
+         *     - `embedder`: the embedder's health as the readiness check read it.
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
@@ -2091,6 +5060,21 @@ export interface components {
             /** Target Id */
             target_id: number;
         };
+        /** TargetOut */
+        TargetOut: {
+            /** Id */
+            id: number;
+            /** Override */
+            override: string;
+            /** Refusal Category */
+            refusal_category: string | null;
+            /** Similarity */
+            similarity: number | null;
+            /** State */
+            state: string;
+            /** State Reason */
+            state_reason: string | null;
+        };
         /** TargetTitle */
         TargetTitle: {
             /**
@@ -2103,7 +5087,7 @@ export interface components {
         };
         /**
          * TextEditsIn
-         * @description The draft's complete edit set, never a delta (plan Deviation 29): an edit left out is undone.
+         * @description The draft's complete edit set, never a delta: an edit left out is undone.
          */
         TextEditsIn: {
             /** Span Edits */
@@ -2111,14 +5095,80 @@ export interface components {
         };
         /**
          * TextEditsOut
-         * @description The draft's stored edit set (ruling R14-1): the replacements put back and the spans removed, as spans
-         *     of the raw text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
+         * @description The draft's stored edit set: the replacements put back and the spans removed, as spans of the raw
+         *     text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
          */
         TextEditsOut: {
             /** Removed */
             removed: components["schemas"]["SpanOut"][];
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
+        };
+        /**
+         * UnackedAlertsOut
+         * @description The alerts that are unresolved and unacknowledged, and the critical ones among them.
+         */
+        UnackedAlertsOut: {
+            /** Critical Unacked */
+            critical_unacked: number;
+            /** Total Unacked */
+            total_unacked: number;
+        };
+        /**
+         * UnmergeIn
+         * @description The merge to reverse: an event that merged another job into this one.
+         */
+        UnmergeIn: {
+            /** Merge Event Id */
+            merge_event_id: number;
+        };
+        /**
+         * UnmergedOut
+         * @description The unmerge event that reversed the merge.
+         */
+        UnmergedOut: {
+            /** Unmerge Event Id */
+            unmerge_event_id: number;
+        };
+        /**
+         * UnscorableGroupOut
+         * @description An active duplicate group that no member can represent, why, and its members by job id.
+         */
+        UnscorableGroupOut: {
+            /** Group Id */
+            group_id: number;
+            /** Members */
+            members: components["schemas"]["UnscorableMemberOut"][];
+            /**
+             * Unscorable Reason
+             * @enum {string}
+             */
+            unscorable_reason: "all_failed" | "all_filtered" | "no_active_member";
+        };
+        /**
+         * UnscorableGroupsSectionOut
+         * @description The unscorable duplicate groups: how many, and the 50 elected last.
+         */
+        UnscorableGroupsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["UnscorableGroupOut"][];
+        };
+        /**
+         * UnscorableMemberOut
+         * @description A member of an unscorable group, with its current revision's target of the active scoring tuple (null
+         *     without one).
+         */
+        UnscorableMemberOut: {
+            /** Job Id */
+            job_id: number;
+            /** Target Id */
+            target_id: number | null;
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
         };
         /** UnsupportedUrlOut */
         UnsupportedUrlOut: {
@@ -2127,6 +5177,29 @@ export interface components {
              * @enum {string}
              */
             unsupported: "workable" | "unsupported_pattern" | "bad_slug" | "not_a_url";
+        };
+        /**
+         * UserActionsOut
+         * @description The user's actions on a job, its note included (`user_job_actions`).
+         */
+        UserActionsOut: {
+            /** Applied At */
+            applied_at: string | null;
+            /** Hidden At */
+            hidden_at: string | null;
+            /** Job Id */
+            job_id: number;
+            /** Note */
+            note: string | null;
+            /** Saved At */
+            saved_at: string | null;
+            /** Seen At */
+            seen_at: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
         };
         /**
          * UserEntered
@@ -2144,9 +5217,9 @@ export interface components {
         };
         /**
          * ValidationIssueOut
-         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
-         *     code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
-         *     schema and is not shown.
+         * @description An issue of the profile: where, what kind, a fixed message, a proposal. The code `schema_mismatch`
+         *     (path `""`, no proposal) says that the stored profile no longer matches the profile schema and is not
+         *     shown.
          */
         ValidationIssueOut: {
             /** Code */
@@ -2166,10 +5239,7 @@ export interface components {
         VersionDetailOut: {
             /** Diff */
             diff: components["schemas"]["DiffEntryOut"][];
-            /** Payload */
-            payload: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            payload: components["schemas"]["Settings"];
             version: components["schemas"]["VersionOut"];
         };
         /**
@@ -2206,6 +5276,17 @@ export interface components {
             /** Sqlalchemy */
             sqlalchemy: string;
         };
+        /** VersionsOut */
+        VersionsOut: {
+            critic: components["schemas"]["ModelOut"] | null;
+            generator: components["schemas"]["ModelOut"];
+            /** Profile Version No */
+            profile_version_no: number;
+            /** Prompt Schema Hash */
+            prompt_schema_hash: string;
+            /** Rubric Version */
+            rubric_version: string;
+        };
         /** VersionsPageOut */
         VersionsPageOut: {
             /** Items */
@@ -2228,6 +5309,45 @@ export interface components {
                 [key: string]: components["schemas"]["JsonValue"];
             };
         };
+        /**
+         * WatchlistCompanyOut
+         * @description A watchlist company: its board, its validation, whether the active settings enable it, its source
+         *     instance and its postings.
+         */
+        WatchlistCompanyOut: {
+            /**
+             * Ats Type
+             * @enum {string}
+             */
+            ats_type: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /** Board Slug */
+            board_slug: string;
+            /** Display Name */
+            display_name: string;
+            /**
+             * Enabled
+             * @description Its flag in the active settings; false for a company they do not list
+             */
+            enabled: boolean;
+            /** Id */
+            id: number;
+            /** @description Null for a company without a source instance */
+            instance: components["schemas"]["WatchlistInstanceOut"] | null;
+            /**
+             * Lever Region
+             * @description Lever's region; null for every other ATS
+             */
+            lever_region: ("global" | "eu") | null;
+            /** @description All 0 for a company without a source instance */
+            postings: components["schemas"]["PostingCountsOut"];
+            /** Validated At */
+            validated_at: string | null;
+            /**
+             * Validation Status
+             * @enum {string}
+             */
+            validation_status: "unvalidated" | "ok" | "not_found" | "error";
+        };
         /** WatchlistCreatedOut */
         WatchlistCreatedOut: {
             /** Id */
@@ -2237,6 +5357,13 @@ export interface components {
              * @constant
              */
             validation_status: "unvalidated";
+        };
+        /** WatchlistEntry */
+        WatchlistEntry: {
+            /** Enabled */
+            enabled: boolean;
+            /** Watchlist Company Id */
+            watchlist_company_id: number;
         };
         /** WatchlistIn */
         WatchlistIn: {
@@ -2260,6 +5387,26 @@ export interface components {
              */
             lever_region?: ("global" | "eu") | null;
         };
+        /**
+         * WatchlistInstanceOut
+         * @description The board as a source: its health, its last error, its last success and its last complete snapshot.
+         */
+        WatchlistInstanceOut: {
+            /**
+             * Health
+             * @enum {string}
+             */
+            health: "ok" | "degraded" | "breaker_open" | "auth_failed" | "contract_broken" | "not_found" | "disabled";
+            /**
+             * Last Complete Snapshot At
+             * @description When its last structurally complete snapshot was taken; null before the first
+             */
+            last_complete_snapshot_at: string | null;
+            /** Last Error Code */
+            last_error_code: string | null;
+            /** Last Success At */
+            last_success_at: string | null;
+        };
     };
     responses: never;
     parameters: never;
@@ -2269,6 +5416,68 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_alerts_api_alerts_get: {
+        parameters: {
+            query?: {
+                /** @description Only the alerts of this status */
+                status?: ("open" | "acknowledged" | "resolved") | null;
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     acknowledge_api_alerts__alert_id__ack_post: {
         parameters: {
             query?: never;
@@ -2337,6 +5546,83 @@ export interface operations {
             };
         };
     };
+    acknowledge_snapshot_api_ats_snapshots__snapshot_id__acknowledge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an ATS snapshot */
+                snapshot_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotAcknowledgedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ATS snapshot has the id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The snapshot is no mass disappearance (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     login_api_auth_login_post: {
         parameters: {
             query?: never;
@@ -2357,7 +5643,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Invalid credentials (`unauthenticated`) */
+            /** @description Invalid credentials (`unauthenticated`), or TOTP is on and no code was sent (`totp_required`) */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2550,7 +5836,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The submission is not quarantined (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The submission cannot be released now (`conflict_state` with detail `not_releasable`): it is neither quarantined nor a submitted batch whose retrieval still fails more than 1 h past its expiry with its alert open, or a request with this key is still running (`idempotency_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2569,6 +5855,391 @@ export interface operations {
                 };
             };
             /** @description Invalid body or no `confirm: true` (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    confirm_group_api_duplicate_groups__group_id__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfirmedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such duplicate group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The group is not active or has no representative (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    score_individually_api_duplicate_groups__group_id__score_individually_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupMemberIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The job is not a member of the group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    split_member_api_duplicate_groups__group_id__split_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupMemberIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such duplicate group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The group is not active or the job is not its member (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_eval_runs_api_eval_runs_get: {
+        parameters: {
+            query: {
+                /** @description The kind of run to list */
+                kind: "golden" | "schema_dry_run";
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvalRunsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_feedback_api_feedback__feedback_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a label or a wrong score */
+                feedback_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such label or wrong score (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -2857,6 +6528,447 @@ export interface operations {
             };
         };
     };
+    resolve_conflict_api_identity_conflicts__conflict_id__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an identity conflict */
+                conflict_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConflictResolvedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such identity conflict (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The conflict is not open (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_jobs_api_jobs_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+                /** @description Default `score_mid` */
+                sort?: ("score_mid" | "score_low" | "posted" | "first_seen") | null;
+                /** @description A keyword: 1 to 200 characters */
+                q?: string | null;
+                /** @description Default `30d` */
+                posted?: ("24h" | "3d" | "7d" | "14d" | "30d" | "any" | "custom") | null;
+                /** @description With `posted=custom` only */
+                posted_from?: string | null;
+                /** @description With `posted=custom` only */
+                posted_to?: string | null;
+                /** @description 0 to 100, default 0 */
+                score_min?: number | null;
+                /** @description 0 to 100, default 100 */
+                score_max?: number | null;
+                /** @description 0 to 100 (%), default 0 */
+                coverage_min?: number | null;
+                /** @description Default `any` */
+                confidence?: ("any" | "medium" | "high") | null;
+                /** @description A `gazetteer_id` of `GET /api/geo/places` */
+                loc_id?: string | null;
+                /** @description The place's `lat` */
+                loc_lat?: number | null;
+                /** @description The place's `lon` */
+                loc_lon?: number | null;
+                /** @description 1 to 200 */
+                radius_km?: number | null;
+                /** @description Default true */
+                include_remote?: boolean | null;
+                /** @description Default all four */
+                work_mode?: ("remote" | "hybrid" | "onsite" | "unknown")[] | null;
+                /** @description Company keys; default any */
+                company?: string[] | null;
+                /** @description Source ids; default any */
+                source?: string[] | null;
+                /** @description Default all four */
+                lang?: ("de" | "en" | "other" | "unknown")[] | null;
+                /** @description Employment types or `unknown` */
+                employment?: string[] | null;
+                /** @description Seniority levels */
+                seniority?: string[] | null;
+                /** @description Default all but `hidden` */
+                status?: ("unseen" | "seen" | "saved" | "applied" | "hidden")[] | null;
+                /** @description Default `active`, `unknown` */
+                availability?: ("active" | "unknown" | "stale" | "closed")[] | null;
+                /** @description Default `any` */
+                contested?: ("any" | "only" | "exclude") | null;
+                /** @description Default `any` */
+                partial?: ("any" | "only" | "exclude") | null;
+                /** @description Default all but `not_a_job_ad` */
+                scoring_state?: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad")[] | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for this sort and these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A filter of the wrong type, outside its set or refused by the list, or a `limit` outside 1 to 100 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_job_facets_api_jobs_facets_get: {
+        parameters: {
+            query?: {
+                /** @description A prefix of a company's name or key, folded; empty: every company */
+                company_q?: string;
+                limit?: number;
+                /** @description Default `score_mid` */
+                sort?: ("score_mid" | "score_low" | "posted" | "first_seen") | null;
+                /** @description A keyword: 1 to 200 characters */
+                q?: string | null;
+                /** @description Default `30d` */
+                posted?: ("24h" | "3d" | "7d" | "14d" | "30d" | "any" | "custom") | null;
+                /** @description With `posted=custom` only */
+                posted_from?: string | null;
+                /** @description With `posted=custom` only */
+                posted_to?: string | null;
+                /** @description 0 to 100, default 0 */
+                score_min?: number | null;
+                /** @description 0 to 100, default 100 */
+                score_max?: number | null;
+                /** @description 0 to 100 (%), default 0 */
+                coverage_min?: number | null;
+                /** @description Default `any` */
+                confidence?: ("any" | "medium" | "high") | null;
+                /** @description A `gazetteer_id` of `GET /api/geo/places` */
+                loc_id?: string | null;
+                /** @description The place's `lat` */
+                loc_lat?: number | null;
+                /** @description The place's `lon` */
+                loc_lon?: number | null;
+                /** @description 1 to 200 */
+                radius_km?: number | null;
+                /** @description Default true */
+                include_remote?: boolean | null;
+                /** @description Default all four */
+                work_mode?: ("remote" | "hybrid" | "onsite" | "unknown")[] | null;
+                /** @description Company keys; default any */
+                company?: string[] | null;
+                /** @description Source ids; default any */
+                source?: string[] | null;
+                /** @description Default all four */
+                lang?: ("de" | "en" | "other" | "unknown")[] | null;
+                /** @description Employment types or `unknown` */
+                employment?: string[] | null;
+                /** @description Seniority levels */
+                seniority?: string[] | null;
+                /** @description Default all but `hidden` */
+                status?: ("unseen" | "seen" | "saved" | "applied" | "hidden")[] | null;
+                /** @description Default `active`, `unknown` */
+                availability?: ("active" | "unknown" | "stale" | "closed")[] | null;
+                /** @description Default `any` */
+                contested?: ("any" | "only" | "exclude") | null;
+                /** @description Default `any` */
+                partial?: ("any" | "only" | "exclude") | null;
+                /** @description Default all but `not_a_job_ad` */
+                scoring_state?: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad")[] | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FacetsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A filter of the wrong type, outside its set or refused by the list, a `company_q` over 200 characters or with a NUL, or a `limit` outside 1 to 100 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_job_api_jobs__job_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_job_actions_api_jobs__job_id__actions_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActionsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1, or an invalid body: an unknown field, none of `seen`, `saved`, `applied`, `hidden`, `note` and `seen_on_open`, `seen_on_open` with `seen`, or a note over 2,000 characters or holding a NUL or a lone surrogate (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     record_feedback_api_jobs__job_id__feedback_post: {
         parameters: {
             query?: never;
@@ -2928,6 +7040,78 @@ export interface operations {
                 };
             };
             /** @description Invalid body: a comment over 2,000 characters or holding a NUL or a lone surrogate, an unknown kind or label (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_job_history_api_jobs__job_id__history_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryPageOut"];
+                };
+            };
+            /** @description A cursor this job's history did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1, a `limit` outside 1 to 50 or a `cursor` over 2,048 characters (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3029,6 +7213,145 @@ export interface operations {
                 };
             };
             /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    unmerge_job_api_jobs__job_id__unmerge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnmergeIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnmergedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No merge event of that id merged a job into this one (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The event is an unmerge, is reversed already or is no longer the latest state of its jobs (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_labelling_queue_api_labelling_queue_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabellingQueueOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `limit` outside 1 to 50 (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4051,6 +8374,44 @@ export interface operations {
             };
         };
     };
+    list_queries_api_queries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryListOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     add_query_api_queries_post: {
         parameters: {
             query?: never;
@@ -4111,6 +8472,44 @@ export interface operations {
             };
             /** @description Invalid body, text or proposal (`validation_failed`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    query_cell_stats_api_queries_stats_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CellStatsOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4219,6 +8618,68 @@ export interface operations {
             };
         };
     };
+    list_runs_api_runs_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+                /** @description Only the runs of this status */
+                status?: ("queued" | "running" | "succeeded" | "partial" | "failed" | "failed_invariant" | "cancelled" | "missed" | "skipped_overlap") | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     run_now_api_runs_post: {
         parameters: {
             query?: never;
@@ -4289,6 +8750,125 @@ export interface operations {
                 };
             };
             /** @description Invalid body, or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_run_api_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a run */
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such run (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_score_cycles_api_score_cycles_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScoreCyclesPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4643,6 +9223,65 @@ export interface operations {
             };
         };
     };
+    preview_prompt_schema_activation_api_settings_prompt_schema_versions__version_id__activation_preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivationPreviewOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_rubric_versions_api_settings_rubric_versions_get: {
         parameters: {
             query?: never;
@@ -4763,6 +9402,65 @@ export interface operations {
                 };
             };
             /** @description Invalid body, the re-score of retained ads not acknowledged (`validation_failed` at `body.expected_rescore_ack`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    preview_rubric_activation_api_settings_rubric_versions__version_id__activation_preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivationPreviewOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4995,6 +9693,171 @@ export interface operations {
             };
         };
     };
+    get_needs_attention_api_system_needs_attention_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttentionOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_quota_api_system_quota_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: components["schemas"]["QuotaDetailOut"] | null;
+                    };
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    replay_raw_items_api_system_raw_items_replay_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplayIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReplayQueuedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No stored response has the id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description None of the listed items can be replayed, for example while their run still runs (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Both or neither of the two, or no or too many ids (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     request_score_cycle_api_system_score_cycle_post: {
         parameters: {
             query?: never;
@@ -5012,7 +9875,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScoreCycleOut"];
+                    "application/json": components["schemas"]["ScoreCycleQueuedOut"];
                 };
             };
             /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
@@ -5109,6 +9972,44 @@ export interface operations {
             };
         };
     };
+    get_system_status_api_system_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     retry_target_api_targets__target_id__retry_post: {
         parameters: {
             query?: never;
@@ -5179,6 +10080,44 @@ export interface operations {
             };
             /** @description Invalid path (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_companies_api_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchlistCompanyOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

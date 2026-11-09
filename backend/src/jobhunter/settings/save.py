@@ -10,7 +10,7 @@ r2 B7).
 3. The dry-run again (`dryrun.dry_run`, §13.2), on the payload against the active settings: its errors (the
    field rules, and `queries[]`/`watchlist[]` entries that name no row) are 422 `validation_failed` with each
    issue's path, code and message; each warning code missing from `acknowledged_warnings` is 422
-   `validation_failed` with `FieldError("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
+   `validation_failed` with `RefusalField("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
    internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
    version's acknowledgements. The classes are the dry-run's with `forced_effects` merged in (M3 Task 21):
    the shipped-version activation (`settings.activate`) saves the unchanged document with `llm_tuple` forced,
@@ -78,6 +78,8 @@ serialises the save with every score-lane transaction (each takes `active_config
 transactions that take a month row together with bulk or target rows; and none of them, nor any other
 month-row writer, waits for a `scope.apply_failed` alert. `ranking_state` is always the last lock.
 
+Every refusal is a `jobhunter.errors.Refusal` (M4 Task 1, R6), which the api answers with its problem.
+
 `ensure_tuple` is the one select-or-insert of an `llm_tuples` row (Task 21's confirm reuses it). Neither this
 module nor `scope_apply` logs: the caller logs ids and codes after its commit. (`spend_ledger.change_cap` and
 `change_buffer` log the month row's change in the transaction, as every month-row writer of Task 3 does.)
@@ -92,7 +94,6 @@ from typing import Final
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db import ranking
 from jobhunter.db.seed import (
     SETTINGS_SCHEMA_VERSION,
@@ -102,6 +103,7 @@ from jobhunter.db.seed import (
     latest_slot_at_or_before,
 )
 from jobhunter.db.sql import q
+from jobhunter.errors import Refusal, RefusalField
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
@@ -229,11 +231,14 @@ class _Activation:
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
-async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
-    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
-    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
-    found or inserted by hash in the save's transaction, then Task 11's `validate.schema_verified` on it."""
-    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
+async def unverified_on_active_schema(
+    conn: AsyncConnection, proposed: Settings, *, model_policy_id: int
+) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of `proposed`'s model policy, row `model_policy_id`, without a passed live
+    schema dry-run of the active prompt-schema version, none when it is verified: Task 11's
+    `validate.schema_verified` on the row, then the pairs it lacks (`validate.unverified_pairs`). Plain reads,
+    so a read-only snapshot may call it: the rubric activation's preview predicts with it what this save's
+    step 3 checks after a rubric version's pointer flip (M4 Task 14, Ruling T14-e)."""
     pointers = (await conn.execute(_TUPLE_POINTERS)).one()
     if pointers.prompt_schema_version_id is None:
         raise LookupError("active_config has no prompt-schema version (migrate seeds it)")
@@ -245,12 +250,20 @@ async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[t
     )
 
 
-def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Problem:
+async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
+    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
+    found or inserted by hash in the save's transaction, then `unverified_on_active_schema` on it."""
+    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
+    return await unverified_on_active_schema(conn, proposed, model_policy_id=model_policy_id)
+
+
+def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Refusal:
     """409 `conflict_state` (`schema_dry_run_required`) of a model policy without a passed live schema
     dry-run of the (schema, model) pairs `missing`, which its title names (the save, and the shipped-version
     activation's step 4, `settings.activate`)."""
     pairs = ", ".join(f"{schema} on {model}" for schema, model in missing)
-    return Problem(
+    return Refusal(
         409,
         "conflict_state",
         f"The model policy has no passed live schema dry-run for {pairs}",
@@ -258,9 +271,9 @@ def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Problem:
     )
 
 
-def eval_gate_failed() -> Problem:
+def eval_gate_failed() -> Refusal:
     """409 `eval_gate_failed` of a gated change whose candidate failed the eval gate, without the override."""
-    return Problem(
+    return Refusal(
         409,
         "eval_gate_failed",
         "The eval gate failed",
@@ -384,8 +397,8 @@ _ACTIONS: Final[Mapping[EffectClass, Callable[[_Activation], Awaitable[None]]]] 
 ACTION_ORDER: Final[tuple[EffectClass, ...]] = tuple(_ACTIONS)
 
 
-def _validation_failed(errors: list[FieldError]) -> Problem:
-    return Problem(422, "validation_failed", "Settings validation failed", errors=errors)
+def _validation_failed(fields: list[RefusalField]) -> Refusal:
+    return Refusal(422, "validation_failed", "Settings validation failed", fields=fields)
 
 
 async def save_settings(
@@ -401,7 +414,7 @@ async def save_settings(
     `forced_effects` merged into the dry-run's classes (step 3)."""
     active = (await conn.execute(_LOCK_ACTIVE)).one()
     if req.base_version_id != active.settings_version_id:
-        raise Problem(
+        raise Refusal(
             409,
             "stale_base_version",
             "The settings changed since this edit began",
@@ -412,7 +425,7 @@ async def save_settings(
 
     result = await dry_run(conn, req.payload, active=before, now=now)
     if result.errors:
-        raise _validation_failed([FieldError(e.field, e.code, e.message) for e in result.errors])
+        raise _validation_failed([RefusalField(e.field, e.code, e.message) for e in result.errors])
     if internal:
         acknowledged = sorted(stored.acknowledged_warnings)
     else:
@@ -423,7 +436,7 @@ async def save_settings(
         ]
         if missing:
             raise _validation_failed(
-                [FieldError(ACKNOWLEDGED_FIELD, NOT_ACKNOWLEDGED, code) for code in missing]
+                [RefusalField(ACKNOWLEDGED_FIELD, NOT_ACKNOWLEDGED, code) for code in missing]
             )
         acknowledged = sorted(req.acknowledged_warnings)
     proposed = Settings.model_validate(req.payload)  # valid: the dry-run found no error

@@ -14,9 +14,9 @@ its profile in the caller's **one transaction**, and returns the response `(stat
    a stored profile that no longer validates as a `ConfirmedProfile` (step 4).
 4. The profile is validated again: `draft_json` as a `ConfirmedProfile`, `validate_profile` against the
    approved text (against nothing for a native PDF) and `validate_user_entered`. Each issue whose code is in
-   `BLOCKING_ISSUES` (Deviation 19) is a `FieldError` at its path, with its code and message; the other issues
-   are warnings the review showed. Every string of `user_entered` that holds a contact
-   (`contacts.scan_value`) is a `FieldError` at its path with the code `contact_found` (Deviation 36):
+   `BLOCKING_ISSUES` (Deviation 19) is a `RefusalField` at its path, with its code and message; the other
+   issues are warnings the review showed. Every string of `user_entered` that holds a contact
+   (`contacts.scan_value`) is a `RefusalField` at its path with the code `contact_found` (Deviation 36):
    `validate_user_entered` neither scans nor repairs the user's own values, and
    `profile_versions.profile_json` stays contact-stripped. Any of them is 422 `validation_failed`. The profile
    stored is the one `validate_profile` returns (repaired).
@@ -80,7 +80,8 @@ is requested before the proposal: a running `embed_profile` write holds the vers
 share lets through and `FOR NO KEY UPDATE` waits for. A live operation of a dedup key is reused, never locked
 (a superseded `create_targets_for_tuple` excepted, which the activation cancels).
 
-The module does not log: the route logs the ids that `activated` collects, after its commit. `afault_point`
+Every refusal is a `jobhunter.errors.Refusal` (M4 Task 1, R6), which the api answers with its problem. The
+module does not log: the route logs the ids that `activated` collects, after its commit. `afault_point`
 is a name of this module, so a test replaces it.
 """
 
@@ -93,12 +94,11 @@ from typing import Final
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db import ranking
 from jobhunter.db.seed import content_hash
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
-from jobhunter.errors import InvariantViolation
+from jobhunter.errors import InvariantViolation, Refusal, RefusalField
 from jobhunter.faults import afault_point
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.profile import estimate, vectors
@@ -189,13 +189,13 @@ class ProfileActivated:
     targets_to_create: int
 
 
-def draft_not_found() -> Problem:
+def draft_not_found() -> Refusal:
     """404 `not_found` for a draft id with no row (the confirm and the estimate route)."""
-    return Problem(404, "not_found", "Profile draft not found")
+    return Refusal(404, "not_found", "Profile draft not found")
 
 
-def _not_ready(status: str) -> Problem:
-    return Problem(
+def _not_ready(status: str) -> Refusal:
+    return Refusal(
         409,
         "conflict_state",
         "The draft is not in a state that allows this",
@@ -203,8 +203,8 @@ def _not_ready(status: str) -> Problem:
     )
 
 
-def _content_purged() -> Problem:
-    return Problem(
+def _content_purged() -> Refusal:
+    return Refusal(
         409,
         "conflict_state",
         "The draft's content was deleted",
@@ -212,8 +212,8 @@ def _content_purged() -> Problem:
     )
 
 
-def _schema_mismatch() -> Problem:
-    return Problem(
+def _schema_mismatch() -> Refusal:
+    return Refusal(
         409,
         "conflict_state",
         "The draft's profile cannot be read",
@@ -222,12 +222,12 @@ def _schema_mismatch() -> Problem:
     )
 
 
-def _validation_failed(errors: list[FieldError]) -> Problem:
-    return Problem(422, "validation_failed", "Profile validation failed", errors=errors)
+def _validation_failed(fields: list[RefusalField]) -> Refusal:
+    return Refusal(422, "validation_failed", "Profile validation failed", fields=fields)
 
 
-def _purge_in_progress() -> Problem:
-    return Problem(
+def _purge_in_progress() -> Refusal:
+    return Refusal(
         409,
         "profile_purge_in_progress",
         "This profile is being deleted",
@@ -235,34 +235,34 @@ def _purge_in_progress() -> Problem:
     )
 
 
-def user_entered_contacts(profile: ConfirmedProfile) -> list[FieldError]:
+def user_entered_contacts(profile: ConfirmedProfile) -> list[RefusalField]:
     """A `contact_found` error for each string of `user_entered` that holds a contact (Deviation 36). The
     message names the categories, never the value."""
-    errors: list[FieldError] = []
+    errors: list[RefusalField] = []
     for path, value in json_strings(profile.user_entered.model_dump(mode="json"), "user_entered"):
         found = scan_value(value)
         if found:
             message = f"Contact data ({', '.join(found)}) is not allowed in this value; remove it to confirm."
-            errors.append(FieldError(field=path, code=CONTACT_FOUND, message=message))
+            errors.append(RefusalField(field=path, code=CONTACT_FOUND, message=message))
     return errors
 
 
 def revalidated(
     draft_json: JSONValue, *, transmitted_text: str | None, today: date
-) -> tuple[ConfirmedProfile, list[FieldError]]:
+) -> tuple[ConfirmedProfile, list[RefusalField]]:
     """Step 4: the repaired profile of `draft_json` and the errors that refuse its confirm (pure). A stored
     profile that is no `ConfirmedProfile` is 409 `conflict_state`; the validation error, which quotes the
     stored values, goes nowhere."""
     try:
         draft: ConfirmedProfile | None = ConfirmedProfile.model_validate(draft_json)
     except ValidationError:
-        draft = None  # raised below, outside the handler: the problem carries no `__context__` either
+        draft = None  # raised below, outside the handler: the refusal carries no `__context__` either
     if draft is None:
         raise _schema_mismatch()
     profile, issues = validate_profile(draft, transmitted_text=transmitted_text, today=today)
     issues = [*issues, *validate_user_entered(profile.user_entered)]
     errors = [
-        FieldError(field=issue.path, code=issue.code, message=issue.message)
+        RefusalField(field=issue.path, code=issue.code, message=issue.message)
         for issue in issues
         if issue.code in BLOCKING_ISSUES
     ]
@@ -318,7 +318,7 @@ async def confirm_draft(
     preview = await estimate.rescore_estimate(conn, settings, now=now)
     if preview.targets > 0 and not expected_rescore_ack:
         message = f"Confirming re-scores {preview.targets} retained ads; acknowledge the estimate to confirm."
-        raise _validation_failed([FieldError(field=ACK_FIELD, code=ACK_REQUIRED, message=message)])
+        raise _validation_failed([RefusalField(field=ACK_FIELD, code=ACK_REQUIRED, message=message)])
 
     profile_json = profile.model_dump(mode="json")
     version_id, version_created = await _version(conn, draft_id, int(draft.cv_file_id), profile_json, now=now)

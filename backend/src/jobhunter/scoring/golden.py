@@ -356,16 +356,41 @@ async def record_feedback(
     return Feedback(feedback_id, case_id)
 
 
+_DELETE_FEEDBACK: Final = q("DELETE FROM score_feedback WHERE id = :i RETURNING id")
+
+
+class FeedbackMissing(LookupError):
+    """No `score_feedback` row has the id (its message names the id only)."""
+
+    def __init__(self, feedback_id: int) -> None:
+        super().__init__(f"score_feedback {feedback_id}: no such feedback")
+        self.feedback_id = feedback_id
+
+
+async def delete_feedback(conn: AsyncConnection, feedback_id: int) -> None:
+    """Delete the label or "wrong score" `feedback_id` (`DELETE /api/feedback/{id}`, §14.2) in the caller's
+    transaction: its `score_feedback` row alone. The golden case it upserted stays: the golden set is edited
+    through `/api/golden-cases` (plan M4 Deviation 24), and no foreign key references `score_feedback`, so
+    nothing else changes; the Jobs list does not read it, so the ranking is not bumped. `FeedbackMissing` (a
+    `LookupError`) when there is no such row."""
+    if (await conn.execute(_DELETE_FEEDBACK, {"i": feedback_id})).first() is None:
+        raise FeedbackMissing(feedback_id)
+    log.info("golden_feedback_deleted", feedback_id=feedback_id)
+
+
 # ---- the cases (§14.2 L4978-4979) --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class CaseRow:
-    """A golden case as the API lists it: its job (the revision's), label, comment, profile version number,
-    scope version id, source and flags."""
+    """A golden case as the API lists it: its job (the revision's) with the title the case was labelled on
+    (the revision's own; the job's title for a revision without one) and the job's company, its label,
+    comment, profile version number, scope version id, source and flags."""
 
     id: int
     job_id: int
+    title: str
+    company: str
     label: Label
     comment: str | None
     profile_version: int
@@ -375,10 +400,13 @@ class CaseRow:
     is_canary: bool
 
 
+# A case's revision is retention-exempt and its job is never deleted while the revision exists, so both are
+# always there; the revision's material names the title the case was labelled on (`llm_input ->> 'title'`).
 _CASE_COLUMNS: Final = (
-    "g.id, r.job_id, g.label, g.comment, v.version_no AS profile_version, "
+    "g.id, r.job_id, coalesce(r.llm_input ->> 'title', j.title) AS title, j.company_display AS company, "
+    "g.label, g.comment, v.version_no AS profile_version, "
     "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary "
-    "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "
+    "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id JOIN jobs j ON j.id = r.job_id "
     "JOIN profile_versions v ON v.id = g.profile_version_id"
 )
 _LIST: Final = q(
@@ -408,6 +436,8 @@ def _case(row: Row[Any]) -> CaseRow:
     return CaseRow(
         id=int(row.id),
         job_id=int(row.job_id),
+        title=str(row.title),
+        company=str(row.company),
         label=row.label,
         comment=row.comment,
         profile_version=int(row.profile_version),

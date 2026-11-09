@@ -17,7 +17,9 @@ After the embeddings are written it sets the similarity of the active tuple's ta
 and whose tuple's profile has vectors, a revision embedded by this pass or earlier), in one transaction in
 the lock schedule's order: `fence_epoch` (step 1), `active_config FOR SHARE` (step 2), the targets `FOR UPDATE
 SKIP LOCKED` (other domain rows); then, when the embedder answered, `embedder.unavailable` resolved once no
-revision awaits at all ("embedder healthy and backlog cleared", §17.6). Ids and counts only reach a log line.
+revision awaits at all ("embedder healthy and backlog cleared", §17.6); and last, when a similarity was set
+(the unscored section ranks by it, §7.1 L1255), the ranking bump (`ranking_state`, the last lock). Ids and
+counts only reach a log line.
 """
 
 from datetime import timedelta
@@ -25,6 +27,7 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.embeddings import (
     ALERT_SUBJECT,
@@ -55,7 +58,7 @@ log = get_logger("jobhunter.worker.embedding_reconcile")
 
 async def _after_embedding(ctx: ReconcileContext, report: EmbedReport) -> int:
     """The pass's last transaction (module docstring): the similarities set, then the alert resolved when the
-    backlog is cleared; how many targets got a similarity."""
+    backlog is cleared, then the ranking bumped when a similarity was set; how many targets got one."""
     async with ctx.engine.begin() as conn:
         await fence_epoch(conn, ctx.epoch)  # step 1
         tuple_id = (await conn.execute(_LOCK_TUPLE)).scalar_one_or_none()  # step 2
@@ -66,6 +69,8 @@ async def _after_embedding(ctx: ReconcileContext, report: EmbedReport) -> int:
             )
         if not report.unavailable and await count_awaiting(conn) == 0:
             await resolve_alert(conn, code=UNAVAILABLE_ALERT, subject=ALERT_SUBJECT)
+        if filled:
+            await ranking.bump(conn)  # `ranking_state`, the last lock
     if filled:
         log.info("awaiting_embedding_similarity_set", llm_tuple_id=tuple_id, targets=filled)
     return filled

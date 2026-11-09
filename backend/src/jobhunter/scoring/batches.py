@@ -70,7 +70,7 @@ inside a savepoint that a `NotPrepared` rolls back, so nothing of a batch that i
    a `BudgetExhausted` there is a bug and fails the operation), each item's `llm_call_id`, and the
    submission's `request_count`, `request_hash` (SHA-256 over its items sorted by `custom_id`, each
    `custom_id ‖ SHA-256(canonical params)`), `reserved_usd` and `followup_held_usd = m x hold`;
-10. `bulk.add_hold(m x hold)`; 11. `ranking.bump`.
+10. `bulk.add_hold(m x hold)`; no ranking bump (below, the ranking generation).
 `hold` is `bulk.hold_per_item` of the active evaluation policy and model policy; the ledger's
 `prompt_template_version` is the rendered prompt's own.
 
@@ -85,7 +85,7 @@ charged and its target's `charged_attempts + 1`, R6, Deviation 13; the target ro
 **The recording transactions** (steps 4a-4c) share one shape in the schedule's order (Codex r2 B7, B13):
 `active_config FOR SHARE`, the operation owner, the submission `FOR UPDATE` under `state = 'submit_started'`
 and its claim, then the month row and the ledger entries, the bulk row, the targets, then the attempts (the
-order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c), and `ranking_state`.
+order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c); no ranking bump (below).
 Attempts move only while `running` (`transition_where`, zero rows is fine), so an attempt a supersession ended
 keeps its outcome and no accounting of an item depends on it. The handler runs the recording in a transaction
 of its own, retried on a retryable database error (`graphs.sanitize.is_retryable_db_error`: a deadlock, a
@@ -115,7 +115,7 @@ callers are the recovery of a lost execution and `submit_start`, which holds it)
 each entry released (`release_never_dispatched`: the calls `cancelled`, the counters and the bulk debit
 credited); the items' holds released; the submission's `in_batch` targets → `pending`; the attempts still
 `running` → `cancelled('batch_abandoned')` (A2 B10, Deviation 12; the targets first, T16-c); the follow-on;
-`ranking.bump`.
+no ranking bump (below).
 
 **The recovery of a lost execution** (`recover_lost`, Codex r1 #23, r2 B12, r3 B2, B3): every `preparing` or
 `submit_started` submission (of `operation_id`, when given) whose operation is not `running` under the claim
@@ -156,17 +156,31 @@ last open targets, `bulk.complete_if_done` completes the operation in the same p
 `ranking.bump` last when it moved any.
 
 **The release** (`release`, L3991-3997, Codex r2 B7, B13, B15), the user's "release and re-score" of a
-`submit_ambiguous` submission, in the route's transaction (Task 21: `active_config FOR SHARE` and the
-idempotency row held), in the schedule's order: the submission `FOR UPDATE` under `state =
-'submit_ambiguous'` (else `TransitionConflict`) → `released` (`released_at`, outside the `batch_one_in_flight`
-singleton from now on); every item's entry `dispatched → ambiguous` (`settle(outcome="ambiguous")`, the call
-`ambiguous` with `batch_released`), counted at its reservation, which `settle` also adds to the attempt's
-`cost_usd` (Carry T7-b, as the ledger reconciler's `_mark_ambiguous` does); the bulk row and each item's hold
-released once (`bulk.release_item_hold`); the submission's `in_batch` targets → `pending` under the batch pin
-(a cancelled one untouched; their bulk rows first, P52) before the attempts still `running` → `released` (a
-superseded one keeps `cancelled`; T16-c's order); `batch.submit_ambiguous_unresolved` resolved; the follow-on
-(it fires for a release, and never again when the submission is adopted later); `ranking.bump` last. The
-reconciliation keeps listing a released submission for 29 days.
+`submit_ambiguous` submission, or (plan M4 Task 16, U3) of a lost batch: a `submitted` one whose
+`batch.retrieve_failing` is open and whose `expires_at + RETRIEVE_FAILING_AFTER` (1 h) has passed. Both are
+`RELEASABLE_SQL`, the one predicate that Needs attention's `releasable` evaluates too, so the button and the
+route never disagree. In the route's transaction (Task 21: `active_config FOR SHARE` and the idempotency row
+held), in the schedule's order: the submission `FOR UPDATE` under that predicate at the caller's `now`,
+evaluated in the locking statement itself (else `TransitionConflict`: a row another transaction moved
+meanwhile is re-checked on its new version, so a poll that committed `submitted → ended` first leaves nothing
+to release) → `released` (`released_at`, outside the `batch_one_in_flight` singleton from now on; a lost
+batch keeps its `provider_batch_id`, and no provider cancel is sent: a retrieval that keeps failing gives no
+reason to expect one to succeed); every item's entry `dispatched → ambiguous` (`settle(outcome="ambiguous")`,
+the call `ambiguous` with `batch_released`), counted at its reservation, which `settle` also adds to the
+attempt's `cost_usd` (Carry T7-b, as the ledger reconciler's `_mark_ambiguous` does); the bulk row and each
+item's hold released once (`bulk.release_item_hold`); the submission's `in_batch` targets → `pending` under
+the batch pin (a cancelled one untouched; their bulk rows first, P52) before the attempts still `running` →
+`released` (a superseded one keeps `cancelled`; T16-c's order); the alerts of the locked state resolved
+(`batch.submit_ambiguous_unresolved` for a quarantine; `batch.retrieve_failing`, and the 25 h alert should
+one be open, for a lost batch); the follow-on (it fires for a release, and never again when the submission is
+reconciled later); no ranking bump (below). A released quarantine stays the ambiguous reconciliation's to
+find for 29 days (`batch_adoption`), a released lost batch the poll's (`batch_results`), by its provider id.
+
+**The ranking generation** (spec §7.1, B30): the preparation, a rejection, an abandon and a
+release move their targets `pending → in_batch` or `in_batch → pending` only (a cancelled target is left as
+it is), within the unscored bucket of the Jobs list (`ranking.crosses_bucket`), so none of them changes what a
+page shows and none bumps. `rerequest`'s exhaustion sweep (`pending → failed_attempts_exhausted`) crosses into
+the failed bucket and bumps, last.
 
 **The quarantined spend** (`quarantined_usd`, S:L1199, Ruling P31): Σ `reserved_usd` of the `submit_ambiguous`
 submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_batch_usd`, and the context of
@@ -174,14 +188,15 @@ submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_b
 
 **The unresolved submissions** (Task 23, Codex r4 B11, r5 B9): `UNRESOLVED_SUBMISSION_SQL` is the one
 predicate of "a submission still needs target `t`'s items": an item of `t` belongs to a submission in flight
-(`IN_FLIGHT`), or to a `released` one the ambiguous reconciliation still lists, `submit_started_at` within
-`RELEASED_LISTED_FOR` (29 days, L3984, Deviation 27: one clock, `submit_started_at`, the reconciler's, which
-`batch_adoption` binds). Its items and their calls are the item-to-ledger mapping a release and a
-reconciliation join through (`_ITEMS`, `spend_ledger.settle`), so the score-history retention keeps such a
-target while it holds and deletes it in the pass after the submission is resolved; no timeout releases
-anything (C3). It is an SQL predicate correlated to the outer alias `t` of `score_targets` and binds
-`:listed_since`, the caller's `now` less `RELEASED_LISTED_FOR` (Ruling P14: the caller's clock, not the
-database's).
+(`IN_FLIGHT`), or to a `released` one that is still looked for, `submit_started_at` within
+`RELEASED_LISTED_FOR` (29 days, L3984, Deviation 27: one clock, `submit_started_at`): a released quarantine by
+the ambiguous reconciliation (`batch_adoption`), a released lost batch by the poll's 29-day listing of it by
+its provider id (`batch_results`, plan M4 Task 16), both binding that window. Its items and their calls are
+the item-to-ledger mapping a release and a reconciliation join through (`_ITEMS`, `spend_ledger.settle`), so
+the score-history retention keeps such a target while it holds and deletes it in the pass after the
+submission is resolved; no timeout releases anything (C3). It is an SQL predicate correlated to the outer
+alias `t` of `score_targets` and binds `:listed_since`, the caller's `now` less `RELEASED_LISTED_FOR` (Ruling
+P14: the caller's clock, not the database's).
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -266,6 +281,27 @@ ABANDONED_DETAIL: Final = "batch_abandoned"
 RELEASED_CODE: Final = "batch_released"  # the call's code of an entry the release made ambiguous
 # The critical alert of a quarantine 25 h old (L3988), resolved by the release (subject: the submission id).
 UNRESOLVED_ALERT: Final = "batch.submit_ambiguous_unresolved"
+# L3958: a `submitted` batch whose retrieval still fails this long past its `expires_at` (the provider has
+# ended it by then) raises the critical `batch.retrieve_failing` (subject: the submission id), which the
+# poll raises (`batch_results`, which names both) and the poll's move to `ended` or the release resolves.
+RETRIEVE_FAILING_ALERT: Final = "batch.retrieve_failing"
+RETRIEVE_FAILING_AFTER: Final = timedelta(hours=1)
+# Plan M4 Task 16 (U3, the module docstring's release): the one predicate of a releasable submission over
+# `batch_submissions s`, which the release's lock and Needs attention's `releasable` both evaluate
+# (`observability.attention`): `submit_ambiguous`, or `submitted` with its `batch.retrieve_failing` open (by
+# the alert's dedup key, `alerts_open_dedup`) and `now > expires_at + RETRIEVE_FAILING_AFTER`. It binds
+# `:expired_before` (`releasable_params`: the caller's `now` less `RETRIEVE_FAILING_AFTER`, Ruling P14).
+RELEASABLE_SQL: Final = (
+    "(s.state = 'submit_ambiguous' OR (s.state = 'submitted' AND s.expires_at < :expired_before "  # noqa: S608
+    "AND EXISTS (SELECT 1 FROM alerts rf WHERE rf.resolved_at IS NULL "
+    f"AND rf.dedup_key = '{RETRIEVE_FAILING_ALERT}:' || CAST(s.id AS text))))"
+)
+# The alerts a release resolves, each only while it is open (resolving a closed one is a no-op), so the state
+# it locked decides which one it closes: a quarantine's 25 h alert (a quarantine has no provider id, so it is
+# never retrieved and has no `batch.retrieve_failing`); a lost batch's `batch.retrieve_failing`, which
+# `RELEASABLE_SQL` requires open (and the 25 h alert should one be open). `RELEASABLE_SQL` stays the one list
+# of the releasable states.
+_RELEASE_RESOLVES: Final = (UNRESOLVED_ALERT, RETRIEVE_FAILING_ALERT)
 _ONLINE_RETRY_REASONS: Final = (
     "batch_max_tokens",
     "batch_invalid_output",
@@ -366,7 +402,8 @@ _LOCK_STARTED: Final = q(
     "WHERE id = :s AND state = 'submit_started' AND operation_claim_id = :claim FOR UPDATE"
 )
 _LOCK_RELEASABLE: Final = q(
-    "SELECT reserved_usd FROM batch_submissions WHERE id = :s AND state = 'submit_ambiguous' FOR UPDATE"
+    "SELECT s.state, s.reserved_usd FROM batch_submissions s "  # noqa: S608
+    f"WHERE s.id = :s AND {RELEASABLE_SQL} FOR UPDATE OF s"
 )
 _QUARANTINED: Final = q(bulk.QUARANTINED_USD_SQL)
 _LOCK_IN_STATE: Final = q(
@@ -834,8 +871,7 @@ async def _fill(
             "s": submission_id,
         },
     )
-    await bulk.add_hold(conn, bulk_operation_id, held)  # 10.
-    await ranking.bump(conn)  # 11. step 11, last
+    await bulk.add_hold(conn, bulk_operation_id, held)  # 10. (no bump: within the unscored bucket)
     log.info(
         "batch_prepared",
         submission_id=submission_id,
@@ -1048,7 +1084,6 @@ async def record_rejected(
         await raise_auth_failed(conn, http_status=rejected.status)
     # a not-sent rejection's follow-on is the reconciler's (Ruling T16-f): the provider asked for time
     requested = await follow_on(conn, submission_id=submission_id, defer=defer, request=not rejected.not_sent)
-    await ranking.bump(conn)  # step 11, last
     log.warning(
         "batch_submit_rejected",
         submission_id=submission_id,
@@ -1106,7 +1141,6 @@ async def abandon(
     moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "cancelled", ABANDONED_DETAIL)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
-    await ranking.bump(conn)  # step 11, last
     log.warning(
         "batch_abandoned",
         submission_id=submission_id,
@@ -1287,16 +1321,23 @@ class Released:
     reserved_usd: Decimal
 
 
+def releasable_params(now: datetime) -> dict[str, datetime]:
+    """The binds of `RELEASABLE_SQL` at the caller's `now`."""
+    return {"expired_before": now - RETRIEVE_FAILING_AFTER}
+
+
 async def release(
     conn: AsyncConnection, submission_id: int, *, now: datetime, defer: Deferrer | None
 ) -> Released:
-    """The user's release of a `submit_ambiguous` submission (module docstring), in the caller's transaction,
-    which holds `active_config FOR SHARE` and its idempotency row (the route's, Task 21);
-    `TransitionConflict` for a submission in another state."""
-    locked = (await conn.execute(_LOCK_RELEASABLE, {"s": submission_id})).first()  # the owner
+    """The user's release (module docstring) of a submission releasable at `now` (`RELEASABLE_SQL`, evaluated
+    in the locking statement): a `submit_ambiguous` one, or a lost `submitted` one (plan M4 Task 16), in the
+    caller's transaction, which holds `active_config FOR SHARE` and its idempotency row (the route's, Task
+    21); `TransitionConflict` for any other."""
+    params = {"s": submission_id, **releasable_params(now)}
+    locked = (await conn.execute(_LOCK_RELEASABLE, params)).first()  # the owner
     if locked is None:
         raise TransitionConflict(_SUBMISSIONS, submission_id, "released")
-    await transition(conn, _SUBMISSIONS, submission_id, ["submit_ambiguous"], "released")
+    await transition(conn, _SUBMISSIONS, submission_id, [str(locked.state)], "released")  # the locked state
     items = await _items(conn, submission_id)
     call = CallOutcome("ambiguous", error_code=RELEASED_CODE)
     for item in items:  # the month row, the bulk row of each funded entry, the ledger entries
@@ -1307,18 +1348,21 @@ async def release(
         await bulk.release_item_hold(conn, item_id=item.id)
     moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "released", None)
-    resolved = await resolve_alert(conn, code=UNRESOLVED_ALERT, subject=str(submission_id))
+    resolved: list[str] = []
+    for code in _RELEASE_RESOLVES:  # the alerts rows: each a write when the alert is open
+        if await resolve_alert(conn, code=code, subject=str(submission_id)):
+            resolved.append(code)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
-    await ranking.bump(conn)  # step 11, last
     reserved = Decimal(locked.reserved_usd)
     log.warning(
         "batch_released",
         submission_id=submission_id,
+        origin=str(locked.state),
         items=len(items),
         attempts=ended,
         targets=moved,
         reserved_usd=str(reserved),
-        alert_resolved=resolved,
+        alerts_resolved=resolved,
         follow_on=requested,
         at=now.isoformat(),
     )

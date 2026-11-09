@@ -105,7 +105,8 @@ _configuration = _Configuration()
 
 def configure(cfg: AppConfig) -> None:
     """Process-wide: the User-Agent of `cfg`, and in fake mode the fixture transport for every new client (on
-    the wall clock, so the recorded SerpApi account stays current)."""
+    the wall clock as its today: the recorded SerpApi account stays current and the posting dates move with
+    the clock, `fixtures.shift_dates`)."""
     global _configuration
     transport = None
     if cfg.fake_sources:

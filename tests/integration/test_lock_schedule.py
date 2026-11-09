@@ -17,7 +17,7 @@ commit.
   one of its candidates (the target, step 5, then the month row, step 6), and the stated exception itself: a
   candidate whose row another transaction holds while it is still `pending` is skipped, never waited for;
 - the confirm's `activate_tuple` (`active_config FOR UPDATE`) against a cycle's `claim` (`active_config FOR
-  SHARE`, the cycle, then the targets);
+  SHARE`, the cycle, then the targets; no `ranking_state`, M4 Task 3, B30);
 - Carry T14-c: an owner's `publish` or `fail` (the target row, then the bulk row of its follow-up hold)
   against node 9's cancellation (the bulk row first, Ruling P52, then the target row): forced into the
   deadlock, PostgreSQL aborts one and that side's retry of a deadlock (`DB_RETRY`, `is_retryable_db_error`)
@@ -121,6 +121,7 @@ _PROBES: Final[dict[str, str]] = {
     "llm_budget": "SELECT 1 FROM llm_budget WHERE month = :key FOR UPDATE NOWAIT",
     "bulk_operations": "SELECT 1 FROM bulk_operations WHERE id = :key FOR UPDATE NOWAIT",
     "worker_heartbeat": "SELECT 1 FROM worker_heartbeat WHERE id = :key FOR UPDATE NOWAIT",
+    "ranking_state": "SELECT 1 FROM ranking_state WHERE id = :key FOR UPDATE NOWAIT",
 }
 
 
@@ -268,7 +269,7 @@ async def test_an_activation_and_process_item_publishing_never_wait_out_of_order
     first: str,
 ) -> None:
     # the activation is a real settings save (`held_save`: `save_settings` in a transaction left open); the
-    # batch is the smallest the settings allow (`batch_min_targets`, 200)
+    # batch is of the seeded default size (`batch_min_targets`, 200)
     submitted = await submit_batch(engine, op_runner, fake_llm, BATCH)
     target = submitted.setup.targets[0]
     fake_mod.batches(BatchScript(polls_until_ended=0))  # the next poll ends it and processes its items
@@ -572,15 +573,28 @@ async def test_the_confirm_s_tuple_activation_and_a_cycle_s_claim_meet_at_active
         target = await target_of(engine, pending.target_id)
         assert (target.state, target.state_reason) == ("cancelled", "tuple_superseded")
     else:
-        async with holding(engine, _LOCK_RANKING) as blocker:  # the claim's last lock
-            claiming = background(run_claim(deps, cycle_id, pending.target_id))
-            wait = one_wait(await waits(migrated, claiming), "ranking_state")
-            assert blocker in wait.blocking_pids
-            claimer = wait.pid
-            assert not await free(engine, "score_targets", pending.target_id)  # the claimed target, held
-            confirming = background(confirm_new_profile(engine))
-            wait = one_wait(await waits(migrated, claiming, confirming, count=2), "active_config")
-            assert wait.key == "1" and wait.blocking_pids == (claimer,)  # the confirm's first lock
+        # The claim takes no `ranking_state` (B30: `pending → in_progress` stays in the unscored bucket), so
+        # its transaction is held open after its last statement, every lock it took still held.
+        claimed, release, claimer_pids = asyncio.Event(), asyncio.Event(), []
+        real_claim_round = claim_node.claim_round
+
+        async def held_claim_round(conn: AsyncConnection, *args: Any, **kwargs: Any) -> Any:
+            rows = await real_claim_round(conn, *args, **kwargs)
+            claimer_pids.append(await pid_of(conn))
+            claimed.set()
+            await asyncio.wait_for(release.wait(), WAIT_S)
+            return rows
+
+        monkeypatch.setattr(claim_node, "claim_round", held_claim_round)
+        claiming = background(run_claim(deps, cycle_id, pending.target_id))
+        await asyncio.wait_for(claimed.wait(), WAIT_S)
+        (claimer,) = claimer_pids
+        assert not await free(engine, "score_targets", pending.target_id)  # the claimed target, held
+        assert await free(engine, "ranking_state", 1)  # claim_round takes no ranking_state
+        confirming = background(confirm_new_profile(engine))
+        wait = one_wait(await waits(migrated, claiming, confirming), "active_config")
+        assert wait.key == "1" and wait.blocking_pids == (claimer,)  # the confirm's first lock
+        release.set()
         update, _ = await settle(claiming, confirming)
         (ref,) = update["claimed"]
         target = await target_of(engine, pending.target_id)  # claimed, then cancelled by the activation
@@ -754,15 +768,18 @@ async def test_abandon_and_node_9_s_cancellation_take_the_target_rows_before_the
         return await batches.abandon(conn, submission, now=utcnow())
 
     if first == "abandon":
-        async with holding(engine, _LOCK_RANKING) as blocker:  # abandon's last lock
-            abandoning = background(_in_transaction(engine, abandon))
-            assert blocker in one_wait(await waits(migrated, abandoning), "ranking_state").blocking_pids
-            assert not await free(engine, "score_targets", target.target_id)
-            cancelling = background(node_9_cancel(engine, target.job_id, target.job_revision_id))
-            wait = one_wait(await waits(migrated, abandoning, cancelling, count=2), "score_targets")
-            assert wait.key == str(target.target_id)
-            assert await free(engine, "score_attempts", attempt) is False  # abandon ended it; held
-        abandoned, cancelled = await settle(abandoning, cancelling)
+        # abandon takes no `ranking_state` (B30: `in_batch → pending` stays in the unscored bucket), so its
+        # transaction is held open once it returned, every lock taken
+        abandoned_held = Held(engine, abandon)
+        await abandoned_held.holding()
+        assert not await free(engine, "score_targets", target.target_id)
+        cancelling = background(node_9_cancel(engine, target.job_id, target.job_revision_id))
+        wait = one_wait(await waits(migrated, cancelling), "score_targets")
+        assert wait.key == str(target.target_id) and wait.blocking_pids == (abandoned_held.pid,)
+        assert await free(engine, "score_attempts", attempt) is False  # abandon ended it; held
+        assert await free(engine, "ranking_state", 1)
+        abandoned = await abandoned_held.commit()
+        (cancelled,) = await settle(cancelling)
         assert abandoned is True and (cancelled.targets, cancelled.attempts) == (1, 0)
     else:
         held = Held(

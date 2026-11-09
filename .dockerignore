@@ -1,11 +1,15 @@
 # The build context is the repository root; the Dockerfiles copy only pyproject.toml, uv.lock,
-# .python-version and backend/ (Dockerfile), embedder/ (embedder/Dockerfile) or docparse/ (docparse/Dockerfile).
-# Secrets, the local virtualenv, git metadata and caches never enter it.
+# .python-version, backend/ and frontend/ (Dockerfile), embedder/ (embedder/Dockerfile) or docparse/
+# (docparse/Dockerfile). Secrets, the local virtualenv, git metadata and caches never enter it.
 .git
 .venv
 .secrets
 frontend/node_modules
 frontend/dist
+# The E2E suite's results, reports and stored login (M4): local runs only, never part of the SPA build.
+frontend/test-results
+frontend/playwright-report
+frontend/e2e/.auth
 **/__pycache__
 .mypy_cache
 .pytest_cache

@@ -8,10 +8,16 @@ and, outside the test env, the metrics server on port 8001). With `cfg` and `eng
 state, the task app included, is set at once and the lifespan does nothing; the caller owns and disposes that
 engine.
 
+The SPA (M4 Task 19) is `api.state.spa`, an `api.static.SpaFiles` on `cfg.spa_dir`, set with the rest of the
+state: the 404 handler of `api.errors` offers it what no route matched, so it is no Mount.
+
 The embedder client (Task 22) is an `embeddings.EmbedderClient` on `cfg.embedder_url`, which readiness and
 system health probe. The lifespan's HTTP client is closed when the lifespan ends. An injected app (tests) gets
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
 after its answer, so the client holds none open.
+
+The Argon2 gate's thread pool is the first thing the lifespan's end closes (`Argon2Gate.close`, M0
+Carry-forward 7): a computation still running is waited for, so the threads end with the app.
 
 The gazetteer (M2 Task 22) is loaded by the first `/api/geo/places` request, in a worker thread, and kept on
 the state (`deps.get_gazetteer`): `create_app` sets only its slot and the lock that makes a first load happen
@@ -45,9 +51,15 @@ from jobhunter.api.openapi import JobHunterAPI
 from jobhunter.api.routes import (
     alerts,
     auth,
+    cycles,
+    docs,
+    eval_runs,
     geo,
     golden,
+    groups,
     health,
+    jobs,
+    labelling,
     profile,
     profile_review,
     queries,
@@ -58,6 +70,7 @@ from jobhunter.api.routes import (
     targets,
     watchlist,
 )
+from jobhunter.api.static import SpaFiles
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
@@ -146,16 +159,22 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
         api.state.engine = engine
         api.state.queue = queue
         api.state.embedder = EmbedderClient(cfg.embedder_url, embedder_http)
+        api.state.spa = SpaFiles(cfg.spa_dir)
         yield
     finally:
         try:
-            await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
+            gate = getattr(api.state, "argon2_gate", None)
+            if isinstance(gate, Argon2Gate):  # `create_app` made it; a running computation is waited for
+                gate.close()
         finally:
             try:
-                if embedder_http is not None:
-                    await embedder_http.aclose()
+                await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
             finally:
-                await engine.dispose()
+                try:
+                    if embedder_http is not None:
+                        await embedder_http.aclose()
+                finally:
+                    await engine.dispose()
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:
@@ -182,7 +201,8 @@ def create_app(
         version=__version__,
         lifespan=_lifespan if cfg is None else None,
         exception_handlers=exception_handlers(),
-        # No interactive docs and no served schema: the export writes `openapi.json` (§14.5).
+        # No interactive docs and no unauthenticated schema: the export writes `openapi.json` (§14.5), and
+        # `routes.docs` serves the document to a session only (§14.2, `GET /api/openapi.json`).
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -194,16 +214,24 @@ def create_app(
     api.include_router(auth.router)
     api.include_router(runs.router)
     api.include_router(system.router)
+    api.include_router(system.ats_snapshots_router)
     api.include_router(spend.router)
     api.include_router(profile.router)
     api.include_router(profile_review.router)
     api.include_router(settings.router)
+    api.include_router(eval_runs.router)
     api.include_router(queries.router)
     api.include_router(watchlist.router)
     api.include_router(geo.router)
+    # before any `/api/jobs/{job_id}` GET route, so that `/api/jobs/facets` is matched first
+    api.include_router(jobs.router)
     api.include_router(targets.router)
+    api.include_router(groups.router)
     api.include_router(golden.router)
+    api.include_router(labelling.router)
     api.include_router(alerts.router)
+    api.include_router(cycles.router)
+    api.include_router(docs.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()
@@ -216,6 +244,7 @@ def create_app(
         api.state.code_head = code_head()
         api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
         api.state.embedder = EmbedderClient(cfg.embedder_url, make_http_client())
+        api.state.spa = SpaFiles(cfg.spa_dir)
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 

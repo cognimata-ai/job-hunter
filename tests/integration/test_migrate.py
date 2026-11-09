@@ -36,6 +36,7 @@ async def test_first_install_order_and_artifacts(fresh_pg_server, make_config) -
         "replay",
     ]
     assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
+    assert code_head() == "0009_m4_ui"
     for t in ("procrastinate_jobs", "checkpoints", "checkpoint_writes", "checkpoint_blobs"):
         assert one(fresh_pg_server, f"SELECT to_regclass('{t}') IS NOT NULL") == (True,)
     assert one(fresh_pg_server, "SELECT count(*) FROM procrastinate_jobs", role="app") == (0,)

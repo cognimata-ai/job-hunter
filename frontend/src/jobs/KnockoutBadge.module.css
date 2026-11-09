@@ -1,0 +1,31 @@
+.list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.knockout {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px var(--space-2);
+  border: 1px solid;
+  border-radius: var(--radius-1);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height);
+  overflow-wrap: anywhere;
+}
+
+/* Binds (a hard knockout): red. */
+.binding {
+  border-color: var(--color-critical);
+  background: var(--color-critical-bg);
+  color: var(--color-critical);
+}
+
+/* Does not bind (unconfirmed, unverified or soft): amber. */
+.unconfirmed {
+  border-color: var(--color-warn);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+}

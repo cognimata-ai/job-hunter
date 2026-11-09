@@ -103,19 +103,21 @@ async def create_session(
 
 
 async def validate_session(
-    conn: AsyncConnection, token: str, *, pepper: bytes, now: datetime
+    conn: AsyncConnection, token: str, *, pepper: bytes, now: datetime, slide: bool = True
 ) -> SessionInfo | None:
     """The session of `token`, or `None` when there is none, or it is revoked or past either expiry.
 
     When its last use is at least `SLIDE_EVERY` ago, it slides: `last_seen_at = now` and `idle_expires_at =
-    least(now + IDLE, absolute_expires_at)`. The caller commits that write.
+    least(now + IDLE, absolute_expires_at)`. The caller commits that write. With `slide=False` (a background
+    request's validation) it only reads: both expiries are checked alike, nothing is written and no row is
+    locked, and the session comes back as stored.
     """
     hashed = token_hmac(token, pepper)
     row = (await conn.execute(_SELECT_VALID, {"token_hmac": hashed, "now": now})).first()
     if row is None:
         return None
     idle_expires_at = row.idle_expires_at
-    if now - row.last_seen_at >= SLIDE_EVERY:
+    if slide and now - row.last_seen_at >= SLIDE_EVERY:
         slid = await conn.execute(
             _SLIDE,
             {

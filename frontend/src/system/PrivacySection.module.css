@@ -1,0 +1,96 @@
+/* Privacy & data: the retention table, two columns (what, how long) with a rule between rows; the editable row on
+ * an accent band; narrow, each row stacks its two cells. */
+.privacy {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.intro {
+  max-width: var(--measure);
+  color: var(--color-text-muted);
+}
+
+.scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-2);
+}
+
+.caption {
+  padding-bottom: var(--space-2);
+  font-size: var(--font-size-3);
+  font-weight: var(--font-weight-bold);
+  text-align: left;
+}
+
+.table th,
+.table td {
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.table thead th {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.what {
+  width: 38%;
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.table td {
+  overflow-wrap: anywhere;
+}
+
+.kept {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.editable > th,
+.editable > td {
+  background: var(--color-accent-soft);
+}
+
+.later {
+  max-width: var(--measure);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+/* Narrow screens and 200 % zoom: each row a block, its kept-for under what it is. */
+@media (max-width: 640px) {
+  .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .table tbody tr {
+    display: grid;
+    padding-block: var(--space-2);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .table tbody th,
+  .table tbody td {
+    width: auto;
+    padding: 2px var(--space-2);
+    border-bottom: 0;
+  }
+}

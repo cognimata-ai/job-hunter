@@ -48,6 +48,8 @@ DEFAULT_CV_STORE_DIR: Final = Path("/data/cv")
 # M2 (plan Task 11): the `parse_jobs` tmpfs the worker shares with docparse (§12.2); docparse's own
 # `docparse.worker.main` reads the same variable.
 DEFAULT_PARSE_JOBS_DIR: Final = Path("/data/parse")
+# M4 (plan Task 19): the built SPA in the app image (the Dockerfile's `spa` stage), which the api serves.
+DEFAULT_SPA_DIR: Final = Path("/opt/spa")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -57,7 +59,15 @@ _TRACING_VARS: Final = (
     "LANGCHAIN_TRACING_V2",
     "LANGCHAIN_TRACING",
 )
-_FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
+# Every fake mode and test control, refused in prod (`fake_mode_in_prod`, §16.8 check 3), M4 Task 18's two
+# stack controls of the fake LLM included.
+_FAKE_MODE_VARS: Final = (
+    "JOBHUNTER_FAKE_SOURCES",
+    "JOBHUNTER_FAKE_LLM",
+    "JOBHUNTER_FAULT",
+    "JOBHUNTER_FAKE_BATCH_SCRIPT",
+    "JOBHUNTER_FAKE_LLM_KEYED_DIR",
+)
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
 # The values with which the Anthropic SDK configures its own logging at its import, and at `debug` logs each
 # request's options, the prompt included (anthropic 1.15.0 `_utils/_logs.py`). The SDK compares exactly; the
@@ -146,12 +156,19 @@ class AppConfig:
     # recorded-SSE fake transport from `fake_llm_dir` (`llm/fake.py`; dev and test only, refused in prod).
     fake_llm: bool
     fake_llm_dir: Path
+    # M4 Task 18, the fake LLM's two stack controls (dev and test only; `None` when unset or empty):
+    # `JOBHUNTER_FAKE_BATCH_SCRIPT`, a JSON file of `BatchScript` fields the fake Batches API reads at each
+    # create, and `JOBHUNTER_FAKE_LLM_KEYED_DIR`, a directory of standing keyed answers read at each try.
+    fake_batch_script: Path | None
+    fake_llm_keyed_dir: Path | None
     embedder_url: str
     http_user_agent: str
     # `JOBHUNTER_CV_STORE_DIR`: where `profile.storage.CvStore` keeps the encrypted CV files.
     cv_store_dir: Path
     # `JOBHUNTER_PARSE_JOBS_DIR`: the root of the docparse jobs (`profile.parse_client.ParseClient`).
     parse_jobs_dir: Path
+    # `JOBHUNTER_SPA_DIR`: the built SPA the api serves (`api.static.SpaFiles`); absent outside the image.
+    spa_dir: Path
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -213,6 +230,10 @@ def _read_secret_files(
     return contents, modes, frozenset(unreadable)
 
 
+def _optional_path(value: str | None) -> Path | None:
+    return Path(value) if value else None
+
+
 def _parse_db_settings(environ: Mapping[str, str]) -> DbSettings:
     name = environ.get("JOBHUNTER_DB_NAME")
     if not name:
@@ -259,10 +280,13 @@ def load_config(
         fixtures_dir=Path(env.get("JOBHUNTER_FIXTURES_DIR") or DEFAULT_FIXTURES_DIR).resolve(),
         fake_llm="JOBHUNTER_FAKE_LLM" in env,
         fake_llm_dir=Path(env.get("JOBHUNTER_FAKE_LLM_DIR") or DEFAULT_FAKE_LLM_DIR).resolve(),
+        fake_batch_script=_optional_path(env.get("JOBHUNTER_FAKE_BATCH_SCRIPT")),
+        fake_llm_keyed_dir=_optional_path(env.get("JOBHUNTER_FAKE_LLM_KEYED_DIR")),
         embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
         cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
         parse_jobs_dir=Path(env.get("JOBHUNTER_PARSE_JOBS_DIR") or DEFAULT_PARSE_JOBS_DIR),
+        spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,

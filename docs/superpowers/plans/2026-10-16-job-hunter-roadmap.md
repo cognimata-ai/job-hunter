@@ -4,7 +4,7 @@
 
 **Goal:** build the approved Job Hunter platform in six milestones. Each milestone ships working, tested software.
 
-**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.5, approved). Council record: [`docs/council/`](../../council/).
+**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.6, approved). Council record: [`docs/council/`](../../council/).
 
 ## Why milestones
 
@@ -62,5 +62,5 @@ Each spike records its result in `docs/spikes/V<n>.md`.
 | M1 | [`2026-10-17-m1-collection-pipeline.md`](2026-10-17-m1-collection-pipeline.md) | complete |
 | M2 | [`2026-10-20-m2-llm-profile-settings.md`](2026-10-20-m2-llm-profile-settings.md) | complete |
 | M3 | [`2026-10-25-m3-agentic-scoring.md`](2026-10-25-m3-agentic-scoring.md) | complete |
-| M4 | written after M3 lands | — |
+| M4 | [`2026-11-02-m4-api-and-web-ui.md`](2026-11-02-m4-api-and-web-ui.md) | in progress |
 | M5 | written after M4 lands | — |

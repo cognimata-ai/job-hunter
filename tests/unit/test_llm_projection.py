@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from jobhunter.settings import presets
 from jobhunter.settings.llm_projection import (
     DEFAULT_ARRIVAL_PER_MONTH,
     LlmProjection,
@@ -18,6 +19,7 @@ from jobhunter.settings.llm_projection import (
     cap_binding,
     central_cost_per_target,
     llm_projection,
+    paced_cost_per_target,
 )
 from jobhunter.settings.model import ModelPolicy, Settings
 
@@ -46,9 +48,8 @@ def policy(preset: str, generate: str, revise: str, critic: str, *, light: str =
 
 
 OPUS, SONNET, HAIKU = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"
-PRESET_A = policy("A", OPUS, OPUS, OPUS)
-PRESET_B = ModelPolicy()  # the default (§10.3): Sonnet generator and reviser, Opus critic, light effort low
-PRESET_C = policy("C", HAIKU, HAIKU, SONNET)
+# §10.3's presets (`settings.presets`): B is the default, Sonnet generator and reviser, Opus critic
+PRESET_A, PRESET_B, PRESET_C = (presets.PRESETS[label].policy() for label in ("A", "B", "C"))
 
 
 def settings(**llm: Any) -> Settings:
@@ -59,7 +60,7 @@ def test_preset_b_is_the_central_figure_of_section_21_2() -> None:
     # generate 2,200 x $2 + 4,500 x $0.20 + 1,700 x $10 = $0.0223; critic 0.45 x (0.35 x $0.0305 + 0.65 x
     # $0.0405 + 0.455 x $0.0405) = $0.024942375; revise 0.45 x 0.455 x $0.0253 = $0.005180175; repairs 1% of
     # the generator, $0.000223: $0.05264555, rounded half-up to $0.000001
-    assert PRESET_B.preset == "B" and PRESET_B.nodes.generate.model == SONNET
+    assert PRESET_B == ModelPolicy() and PRESET_B.nodes.generate.model == SONNET
     cost = central_cost_per_target(PRESET_B)
     assert abs(cost - Decimal("0.0526")) <= TOLERANCE
     assert cost == Decimal("0.052646")
@@ -89,7 +90,8 @@ def test_the_preset_label_alone_changes_no_cost() -> None:
 
 
 def test_the_weaker_generator_funnel_follows_the_generator_model_not_the_label() -> None:
-    # C's nodes labelled `custom` keep C's funnel and uplift; a `C` label on B's models keeps B's figure
+    # C's nodes sent as `custom` keep C's funnel and uplift, and a `C` label on B's models B's figure: the
+    # stored label is the grid's own (the label normal form), and the cost reads the models only
     assert central_cost_per_target(policy("custom", HAIKU, HAIKU, SONNET)) == Decimal("0.019352")
     assert central_cost_per_target(policy("C", SONNET, SONNET, OPUS)) == Decimal("0.052646")
     # the funnel is the generator's: a Haiku reviser under a Sonnet generator keeps the default funnel
@@ -127,6 +129,7 @@ def projected(model_policy: ModelPolicy, *, min_cycle_targets: int = 10) -> LlmP
         s,
         now=OCTOBER,
         c_hat=central_cost_per_target(model_policy),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )
@@ -164,6 +167,7 @@ def test_targets_per_month_for_b_under_the_default_cap() -> None:
         settings(),
         now=OCTOBER,
         c_hat=central_cost_per_target(PRESET_B),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )
@@ -175,11 +179,35 @@ def test_targets_per_month_for_b_under_the_default_cap() -> None:
     assert p.projected_month_spend == Decimal("93.089073")
 
 
+def test_a_history_c_hat_gets_no_cache_write_share() -> None:
+    """A history `ĉ` is the mean of measured attempt costs, whose settlements charged their cache writes: the
+    cycle's share is added to a central `ĉ` only."""
+    scoring = settings().scoring
+    assert paced_cost_per_target(scoring, Decimal("0.052646"), "central") == Decimal("0.057569")
+    assert paced_cost_per_target(scoring, Decimal("0.052646"), "history") == Decimal("0.052646")
+    p = llm_projection(
+        settings(),
+        now=OCTOBER,
+        c_hat=Decimal("0.052646"),
+        c_hat_source="history",
+        projected_critic_rate=Decimal("0.450"),
+        arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
+    )
+    # 93.10 / 0.052646 = 1768.42, not the central figure's 1,617
+    assert p.targets_per_month == 1768
+    assert p.projected_month_spend == Decimal("93.078128")  # 1,768 x $0.052646
+
+
 def test_bucket_rate_and_capacity() -> None:
     def at(now: datetime, **schedule: Any) -> LlmProjection:
         s = Settings.model_validate({"schedule": schedule}) if schedule else Settings()
         return llm_projection(
-            s, now=now, c_hat=Decimal("0.052646"), projected_critic_rate=Decimal("0.450"), arrival_per_month=0
+            s,
+            now=now,
+            c_hat=Decimal("0.052646"),
+            c_hat_source="central",
+            projected_critic_rate=Decimal("0.450"),
+            arrival_per_month=0,
         )
 
     # §6.9.2: rate = $93.10 over the month; B_max = max(2 x rate x 6 h, $1.00)
@@ -199,6 +227,7 @@ def test_a_cap_at_or_below_the_buffer_admits_nothing_and_binds() -> None:
             settings(cap_usd=cap, overrun_buffer_usd="2.00"),
             now=OCTOBER,
             c_hat=Decimal("0.052646"),
+            c_hat_source="central",
             projected_critic_rate=Decimal("0.450"),
             arrival_per_month=0,  # it binds even without any arrival
         )
@@ -213,6 +242,7 @@ def test_a_cap_that_covers_the_arrivals_does_not_bind() -> None:
         settings(cap_usd="200.00"),
         now=OCTOBER,
         c_hat=Decimal("0.052646"),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )

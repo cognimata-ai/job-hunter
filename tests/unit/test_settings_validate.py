@@ -109,7 +109,7 @@ INT_RANGES: list[tuple[str, int, int, dict[str, Any]]] = [
     ("llm.nonscoring_reserve_pct", 0, 20, {}),
     ("scoring.max_targets_per_cycle", 1, 500, {}),
     ("scoring.min_cycle_targets", 1, 100, {}),
-    ("scoring.batch_min_targets", 200, 100_000, {}),
+    ("scoring.batch_min_targets", 20, 100_000, {}),
     ("scoring.batch_max_items", 200, 10_000, {"llm.overrun_buffer_usd": "23.53"}),
     ("retention.score_history_months", 1, 36, {}),
 ]

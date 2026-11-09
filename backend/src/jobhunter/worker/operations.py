@@ -44,9 +44,11 @@ its progress (`operations.progress`, which the API polls) with `set_progress`, u
 every owner write (M2 Task 18).
 
 **Execution locks** (M3 Task 14, Codex r3 B20). A kind of `OPERATION_LOCKS` runs its jobs under that
-procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side): `defer_operation_job`
-reads the row's kind and passes the lock on every enqueue, the first one (`create_operation`), the
-`operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer alike.
+procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side; `replay_raw_items`:
+`replay`, so two replays whose id sets overlap never resolve one item at once, M4 Task 12):
+`defer_operation_job` reads the row's kind and passes the lock on every enqueue, the first one
+(`create_operation`), the `operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer
+alike.
 
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
@@ -107,11 +109,15 @@ OperationKind = Literal[
     "purge",
     "eval_run",
     "watchlist_validate",
+    "replay_raw_items",  # M4 Task 12 registers its handler (migration 0009 adds it to the CHECK)
 ]
 
 # The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue
-# (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4).
-OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType({"batch_submit": "batch"})
+# (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4), and
+# so do the replays of rejected raw items (M4 Task 12, Ruling T12-c: overlapping id sets).
+OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType(
+    {"batch_submit": "batch", "replay_raw_items": "replay"}
+)
 MAX_OPERATION_ATTEMPTS: Final = 10
 # These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on

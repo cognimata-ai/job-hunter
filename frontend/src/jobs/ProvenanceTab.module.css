@@ -1,0 +1,56 @@
+.tab {
+  display: grid;
+  gap: var(--space-5);
+  font-size: var(--font-size-2);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  padding: var(--space-2) var(--space-2) var(--space-2) 0;
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+.table thead th {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.table tbody th {
+  font-weight: var(--font-weight-medium);
+}
+
+/* A server token (a native id, a field, a rule) may break anywhere: it has no spaces to wrap at. */
+.code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.button {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+}

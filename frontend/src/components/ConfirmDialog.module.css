@@ -1,0 +1,92 @@
+.dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 51;
+  width: min(480px, calc(100vw - 2 * var(--space-4)));
+  max-height: calc(100vh - 2 * var(--space-4));
+  overflow-y: auto;
+  padding: var(--space-6);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-3);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-overlay);
+  transform: translate(-50%, -50%);
+}
+
+.title {
+  font-size: var(--font-size-4);
+}
+
+.body {
+  margin-top: var(--space-3);
+  color: var(--color-text-muted);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-6);
+}
+
+.primary,
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.secondary {
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+}
+
+.secondary:hover {
+  background: var(--color-surface-sunken);
+}
+
+.primary {
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.primary:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+/* Disabled without being busy (`confirmDisabled`): the form's disabled look. */
+.primary:disabled[aria-busy="false"] {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.busy {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentcolor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

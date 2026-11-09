@@ -1,6 +1,9 @@
 """`/api/watchlist`: the company watchlist the settings editor authors (spec §5.4, §9.1, §13.1, §14.2; plan
-Task 22, Deviations 3 and 15; taken from M4).
+Task 22, Deviations 3 and 15; taken from M4; the list: plan M4 Task 13).
 
+- `GET /api/watchlist` → every company by display name, then id (`sources.watchlist_listing.watchlist`), with
+  its validation, its flag in the active settings, its instance's health and last complete snapshot, and its
+  posting counts, in one read snapshot (`db.snapshot.read_snapshot`), a fixed number of statements, no lock.
 - `POST /api/watchlist/parse-url` (`{url}`) → 200 `{ats, slug, region}`, or `{unsupported: <reason>}` for a
   URL that names no supported board (`watchlist_patterns.detect`: `workable`, `unsupported_pattern`,
   `bad_slug`, `not_a_url`). It reads the URL by pattern alone and makes no network request.
@@ -52,12 +55,15 @@ from jobhunter.api.errors import FieldError, Problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
+from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
 from jobhunter.normalize.companies import company_key
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.save import SaveOutcome, SaveRequest, save_settings
+from jobhunter.sources import watchlist_listing
 from jobhunter.sources.instances import instance_for_company
+from jobhunter.sources.watchlist_listing import WatchlistCompanyOut
 from jobhunter.sources.watchlist_patterns import (
     SLUG,
     AtsType,
@@ -251,6 +257,15 @@ async def _insert_company(
                 extra={"watchlist_company_id": int(existing)},
             )
     raise RuntimeError("watchlist: the company of a board kept being removed during an insert")
+
+
+@router.get("", response_model=list[WatchlistCompanyOut])
+async def list_companies(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[WatchlistCompanyOut]:
+    """Every watchlist company by display name, then id: its board, its validation, whether the active
+    settings enable it, its source instance's health, last error, last success and last complete snapshot,
+    and its postings by availability."""
+    async with read_snapshot(engine) as conn:
+        return await watchlist_listing.watchlist(conn)
 
 
 @router.post(

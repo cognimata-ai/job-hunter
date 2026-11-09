@@ -1,0 +1,735 @@
+{
+  "problem": [
+    "budget_exhausted",
+    "conflict_state",
+    "csrf_failed",
+    "eval_gate_failed",
+    "filtered_requires_force",
+    "idempotency_in_progress",
+    "idempotency_key_required",
+    "idempotency_key_reused",
+    "internal",
+    "invalid_cursor",
+    "not_found",
+    "profile_purge_in_progress",
+    "run_active",
+    "stale_base_version",
+    "throttled",
+    "totp_required",
+    "unauthenticated",
+    "upload_rejected",
+    "validation_failed"
+  ],
+  "pause": [
+    "auth_failed",
+    "cap_reached",
+    "global_fence",
+    "reservation_bound_violated",
+    "schema_unverified"
+  ],
+  "partial": [
+    "awaiting_embedding",
+    "fetch_ambiguous",
+    "fetch_failed",
+    "raw_item_rejected",
+    "source_auth_failed",
+    "source_breaker_open",
+    "source_contract_broken",
+    "source_not_found"
+  ],
+  "run_status": [
+    "cancelled",
+    "failed",
+    "failed_invariant",
+    "missed",
+    "partial",
+    "queued",
+    "running",
+    "skipped_overlap",
+    "succeeded"
+  ],
+  "target_state": [
+    "budget_deferred",
+    "cancelled",
+    "deferred_duplicate",
+    "expired_unscored",
+    "failed_attempts_exhausted",
+    "failed_invalid_output",
+    "failed_max_tokens",
+    "failed_request",
+    "failed_transient",
+    "filtered_out",
+    "in_batch",
+    "in_progress",
+    "pending",
+    "published_accepted",
+    "published_contested",
+    "refused"
+  ],
+  "draft_status": [
+    "confirmed",
+    "discarded",
+    "extracting_profile",
+    "extracting_text",
+    "failed",
+    "ready",
+    "text_review",
+    "uploaded"
+  ],
+  "draft_repair": [
+    "native_pdf",
+    "paste_text",
+    "retry_llm"
+  ],
+  "upload_reason": [
+    "docx_expansion",
+    "docx_macro",
+    "docx_structure",
+    "extension_mismatch",
+    "not_utf8",
+    "too_large",
+    "too_long",
+    "too_short",
+    "unknown_type"
+  ],
+  "warning": [
+    "adzuna_rotation",
+    "arbeitnow_coverage_risk",
+    "coverage_gap_guaranteed",
+    "eval_failed",
+    "eval_uncalibrated",
+    "llm_cap_binding",
+    "llm_rescore",
+    "paid_refresh_slow",
+    "paid_run_cap_binding",
+    "serpapi_disabled_no_fallback",
+    "stale_ttl_short"
+  ],
+  "issue": [
+    "code_other",
+    "conflict",
+    "contact_removed",
+    "date_invalid",
+    "date_order",
+    "invalid",
+    "language_without_evidence",
+    "limit",
+    "out_of_range",
+    "required",
+    "schema_mismatch",
+    "ungrounded",
+    "unsupported",
+    "unverifiable",
+    "years_mismatch"
+  ],
+  "alert": [
+    "admission.backlog_drain",
+    "admission.exploration_hits",
+    "admission.high_sim_expired",
+    "api.unhandled_exception",
+    "ats.mass_disappearance",
+    "auth.lockout",
+    "auth.totp_key_mismatch",
+    "batch.custom_id_anomaly",
+    "batch.item_unprocessable",
+    "batch.items_missing",
+    "batch.results_unreadable",
+    "batch.retrieve_failing",
+    "batch.submit_ambiguous_unresolved",
+    "coverage.gap_abandoned",
+    "coverage.too_broad",
+    "dedup.ambiguous_grouping",
+    "dedup.field_conflict",
+    "dedup.identity_conflict",
+    "embedder.unavailable",
+    "eval.gate_failed",
+    "llm.auth_failed",
+    "llm.budget_counter_drift",
+    "llm.cache_miss_streak",
+    "llm.cap_80pct",
+    "llm.cap_reached",
+    "llm.model_mismatch",
+    "llm.refusal_rate",
+    "llm.reservation_bound_violated",
+    "llm.unexpected_stop_reason",
+    "operation.failed",
+    "profile.extract_generation_mismatch",
+    "quota.ambiguous_attempt",
+    "quota.exhausted",
+    "quota.fallback_active",
+    "quota.limit_breach",
+    "quota.limit_increased",
+    "quota.serpapi_foreign_usage",
+    "quota.serpapi_renewal_stale",
+    "quota.unaccounted_usage",
+    "reconciler.failed",
+    "retention.failed",
+    "run.failed",
+    "run.failed_invariant",
+    "run.orphaned_queue",
+    "run.partial",
+    "run.resume_exhausted",
+    "schedule.stale_data",
+    "scope.apply_failed",
+    "score_cycle.failed",
+    "score_cycle.orphaned",
+    "scoring.canary_drift",
+    "scoring.critic_rate_high",
+    "scoring.distribution_shift",
+    "scoring.feedback_disagreement",
+    "scoring.publication_invalid",
+    "scoring.stuck_target_repaired",
+    "source.auth_failed",
+    "source.breaker_open",
+    "source.contract_broken",
+    "source.not_found"
+  ],
+  "banner": [
+    "applying_settings",
+    "cap_reached",
+    "critical_alerts",
+    "paid_search_paused",
+    "rescoring",
+    "reservation_bound_violated",
+    "scope_not_applied",
+    "scoring_paused",
+    "stale_data"
+  ],
+  "window_state": [
+    "exhausted_until_reset",
+    "extrapolated_unvalidated",
+    "validated"
+  ],
+  "instance_health": [
+    "auth_failed",
+    "breaker_open",
+    "contract_broken",
+    "degraded",
+    "disabled",
+    "not_found",
+    "ok"
+  ],
+  "alert_status": [
+    "acknowledged",
+    "open",
+    "resolved"
+  ],
+  "pace": [
+    "ahead",
+    "ok"
+  ],
+  "paid_search_reason": [
+    "serpapi_disabled",
+    "serpapi_exhausted",
+    "serpapi_unavailable"
+  ],
+  "provider": [
+    "adzuna",
+    "jsearch",
+    "serpapi"
+  ],
+  "badge": [
+    "adzuna",
+    "closed",
+    "contested",
+    "injection_suspected",
+    "partial",
+    "possibly_not_a_job_ad",
+    "shortened",
+    "stale"
+  ],
+  "knockout": [
+    "certification",
+    "contract_type",
+    "degree",
+    "mandatory_language",
+    "onsite_required",
+    "security_clearance",
+    "work_permit"
+  ],
+  "filter_reason": [
+    "ad_language_excluded",
+    "beyond_radius",
+    "employment_type_excluded",
+    "excluded_company",
+    "excluded_industry",
+    "excluded_keyword",
+    "outside_germany",
+    "seniority_out_of_range",
+    "work_mode_excluded"
+  ],
+  "group_unscorable": [
+    "all_failed",
+    "all_filtered",
+    "no_active_member"
+  ],
+  "completeness": [
+    "full",
+    "partial"
+  ],
+  "confidence": [
+    "high",
+    "low",
+    "medium"
+  ],
+  "source": [
+    "adzuna",
+    "arbeitnow",
+    "ashby",
+    "greenhouse",
+    "jsearch",
+    "lever",
+    "personio",
+    "recruitee",
+    "serpapi",
+    "smartrecruiters"
+  ],
+  "work_authorization": [
+    "authorized",
+    "requires_sponsorship",
+    "unspecified"
+  ],
+  "degree_level": [
+    "bachelor",
+    "master",
+    "none",
+    "none_required",
+    "other",
+    "phd",
+    "unspecified",
+    "vocational"
+  ],
+  "employment": [
+    "apprenticeship",
+    "contract",
+    "freelance",
+    "full_time",
+    "internship",
+    "part_time",
+    "temporary",
+    "unknown",
+    "working_student"
+  ],
+  "seniority": [
+    "apprentice",
+    "head",
+    "intern",
+    "junior",
+    "lead",
+    "mid",
+    "principal",
+    "senior",
+    "working_student"
+  ],
+  "criterion": [
+    "domain",
+    "education_certifications",
+    "employment_salary",
+    "experience_seniority",
+    "languages",
+    "location_work_mode",
+    "role_fit",
+    "skills"
+  ],
+  "basis": [
+    "observed",
+    "unconstrained",
+    "unknown"
+  ],
+  "posted_precision": [
+    "day",
+    "exact",
+    "hour",
+    "ingest",
+    "relative_day",
+    "unknown"
+  ],
+  "salary_period": [
+    "day",
+    "hour",
+    "month",
+    "week",
+    "year"
+  ],
+  "result_status": [
+    "accepted",
+    "contested"
+  ],
+  "critic_outcome": [
+    "accepted",
+    "contested",
+    "not_run"
+  ],
+  "critic_trigger": [
+    "T0",
+    "T1",
+    "T2",
+    "T3",
+    "T4",
+    "T5",
+    "T6",
+    "T7",
+    "T8"
+  ],
+  "critic_verdict": [
+    "accept",
+    "revise"
+  ],
+  "round_outcome": [
+    "accept",
+    "incomplete",
+    "revise"
+  ],
+  "critic_issue": [
+    "anchor_misapplied",
+    "evidence_overlooked",
+    "evidence_ungrounded",
+    "fact_rejected",
+    "fact_uncertain",
+    "fact_unreviewed",
+    "level_too_high",
+    "level_too_low",
+    "should_be_unknown"
+  ],
+  "cap": [
+    "certification",
+    "contract_type",
+    "degree",
+    "industry",
+    "mandatory_language",
+    "onsite_required",
+    "security_clearance",
+    "work_permit"
+  ],
+  "cap_kind": [
+    "hard",
+    "soft"
+  ],
+  "industry_match": [
+    "excluded",
+    "neutral",
+    "outside_include",
+    "unknown"
+  ],
+  "profile_section": [
+    "certifications",
+    "domains",
+    "education",
+    "languages",
+    "roles",
+    "seniority",
+    "skills",
+    "summary",
+    "target_titles"
+  ],
+  "merge_kind": [
+    "strong_key_merge",
+    "unmerge",
+    "user_confirmed_merge"
+  ],
+  "feedback_label": [
+    "good",
+    "ok",
+    "poor"
+  ],
+  "draft_failure": [
+    "already_executing",
+    "attempts_exhausted",
+    "budget_exhausted",
+    "bug",
+    "cv_file_unreadable",
+    "encrypted",
+    "input_unbounded",
+    "invalid_output",
+    "llm_not_configured",
+    "llm_transient",
+    "low_text",
+    "max_tokens",
+    "model_mismatch",
+    "native_pdf_disabled",
+    "no_handler",
+    "parse_error",
+    "parse_limit",
+    "refused",
+    "timeout",
+    "too_many_pages",
+    "unexpected_stop_reason",
+    "unsupported"
+  ],
+  "contact_category": [
+    "address",
+    "email",
+    "name",
+    "personal",
+    "phone",
+    "url"
+  ],
+  "role_seniority": [
+    "apprentice",
+    "head",
+    "intern",
+    "junior",
+    "lead",
+    "mid",
+    "principal",
+    "senior",
+    "unspecified",
+    "working_student"
+  ],
+  "skill_category": [
+    "domain_knowledge",
+    "framework",
+    "method",
+    "other",
+    "platform",
+    "programming_language",
+    "soft_skill",
+    "tool"
+  ],
+  "skill_level": [
+    "advanced",
+    "basic",
+    "expert",
+    "intermediate"
+  ],
+  "cefr": [
+    "A1",
+    "A2",
+    "B1",
+    "B2",
+    "C1",
+    "C2",
+    "native",
+    "unspecified"
+  ],
+  "language_code": [
+    "de",
+    "en",
+    "es",
+    "fr",
+    "it",
+    "nl",
+    "other",
+    "pl",
+    "pt"
+  ],
+  "effect_class": [
+    "admission",
+    "budget",
+    "collection",
+    "evaluation_policy",
+    "execution",
+    "llm_tuple",
+    "none",
+    "schedule",
+    "scope"
+  ],
+  "c_hat_source": [
+    "central",
+    "history"
+  ],
+  "severity": [
+    "hard",
+    "soft"
+  ],
+  "eval_gate": [
+    "failed",
+    "passed",
+    "uncalibrated"
+  ],
+  "query_origin": [
+    "llm_proposal",
+    "user"
+  ],
+  "proposal_failure": [
+    "attempts_exhausted",
+    "budget_exhausted",
+    "input_unbounded",
+    "invalid_output",
+    "llm_not_configured",
+    "max_tokens",
+    "model_mismatch",
+    "no_handler",
+    "profile_unavailable",
+    "refused",
+    "unexpected_stop_reason"
+  ],
+  "watchlist_validation": [
+    "error",
+    "not_found",
+    "ok",
+    "unvalidated"
+  ],
+  "watchlist_unsupported": [
+    "bad_slug",
+    "not_a_url",
+    "unsupported_pattern",
+    "workable"
+  ],
+  "lever_region": [
+    "eu",
+    "global"
+  ],
+  "llm_node": [
+    "critic",
+    "extract_profile",
+    "generate",
+    "propose_queries",
+    "revise"
+  ],
+  "model_preset": [
+    "A",
+    "B",
+    "C",
+    "custom"
+  ],
+  "eval_run_status": [
+    "completed",
+    "failed",
+    "running"
+  ],
+  "schema_transport": [
+    "fake",
+    "live"
+  ],
+  "attention_section": [
+    "broken_sources",
+    "failed_targets",
+    "identity_conflicts",
+    "mass_disappearances",
+    "paused_lane",
+    "quarantined_batches",
+    "raw_items",
+    "retrieve_failing",
+    "scope_apply_failed",
+    "unscorable_groups"
+  ],
+  "conflict_reason": [
+    "exclusive_conflict"
+  ],
+  "batch_state": [
+    "released",
+    "submit_ambiguous"
+  ],
+  "run_trigger": [
+    "catch_up",
+    "manual",
+    "schedule"
+  ],
+  "cycle_trigger": [
+    "batch_followup",
+    "manual",
+    "periodic",
+    "score_now"
+  ],
+  "cycle_status": [
+    "completed",
+    "failed",
+    "running"
+  ],
+  "golden_source": [
+    "adversarial",
+    "feedback",
+    "week1"
+  ],
+  "alert_severity": [
+    "critical",
+    "info",
+    "warn"
+  ],
+  "readiness": [
+    "db",
+    "embedder",
+    "migrations",
+    "worker_heartbeat"
+  ],
+  "run_age_state": [
+    "critical",
+    "grace",
+    "none",
+    "ok",
+    "warn"
+  ],
+  "queue": [
+    "aux",
+    "collect",
+    "score",
+    "tick"
+  ],
+  "queue_status": [
+    "aborted",
+    "aborting",
+    "cancelled",
+    "doing",
+    "failed",
+    "succeeded",
+    "todo"
+  ],
+  "ui_language": [
+    "de",
+    "en"
+  ],
+  "order": {
+    "effort": {
+      "claude-opus-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-sonnet-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-haiku-5-5": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "claude-fable-5-1": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "seniority": [
+      "intern",
+      "working_student",
+      "apprentice",
+      "junior",
+      "mid",
+      "senior",
+      "lead",
+      "principal",
+      "head"
+    ],
+    "attention_section": [
+      "raw_items",
+      "identity_conflicts",
+      "failed_targets",
+      "quarantined_batches",
+      "retrieve_failing",
+      "mass_disappearances",
+      "unscorable_groups",
+      "broken_sources",
+      "paused_lane",
+      "scope_apply_failed"
+    ],
+    "retryable_target_state": [
+      "refused",
+      "failed_max_tokens",
+      "failed_invalid_output",
+      "failed_request",
+      "failed_transient",
+      "failed_attempts_exhausted"
+    ]
+  }
+}

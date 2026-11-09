@@ -6,7 +6,11 @@ proposed settings document against the active one (`settings.dryrun.dry_run`). E
 preview and come with a 200; the save answers them with a 422. The dry-run runs in a read-only transaction
 (`SET TRANSACTION READ ONLY`, the transaction's first statement), where PostgreSQL refuses any write and any
 `SELECT … FOR UPDATE | SHARE` (SQLSTATE 25006): it writes nothing and takes no row lock, so a preview never
-waits for a settings save or a reservation in progress. `effects` are sorted by name.
+waits for a settings save or a reservation in progress. `effects` are sorted by name. The request's
+`payload` is plain JSON, so an invalid draft reaches the dry-run and comes back as its field issues; the
+response's `projections` are typed (`ProjectionsOut`, plan M4 Task 14, D17): the five parts every valid
+document has, and `det_recompute`, `critic_rate`, `eval_gate` and `next_slot` only where an effect class adds
+them (absent otherwise: the route leaves unset fields out); `null` with errors, where there is no projection.
 
 `POST /api/settings` (`Idempotency-Key`; `{payload, base_version_id, acknowledged_warnings,
 eval_override_ack?}`) → 201 `{version: {id, version_no, effect_classes}, apply_scope_operation_id}`: the save
@@ -20,26 +24,36 @@ logged after the commit when the save ran (a replay is `run_idempotent`'s `idemp
 `eval_gate_failed` (§11.13) and `idempotency_in_progress`; 422 is `validation_failed` (the dry-run's errors,
 an unacknowledged warning, an unknown query or watchlist company) and `idempotency_key_reused`.
 
-The reads, each a plain `SELECT` (no lock):
-- `GET /api/settings` → `{version: {id, version_no, created_at, effect_classes}, payload, pending_scope}`.
-  `pending_scope` is `null` without a pending scope, else `{version_id, progress}`: the live `apply_scope`
-  operation's `{done, total}` (`0`/`0` before its first chunk), or `null` when no apply is live (one that
-  failed for good, until the `scope_apply_failed` reconciler clears the pointer);
+The reads, each a plain `SELECT` (no lock); a stored document is published as the typed `Settings` (D17),
+validated from its JSON (every stored version is a normal form the model wrote, so it validates):
+- `GET /api/settings` → `{version: {id, version_no, created_at, effect_classes}, payload, pending_scope,
+  scope_applied}` in one read snapshot (`db.snapshot.read_snapshot`). `pending_scope` is `null` without a
+  pending scope, else `{version_id, progress}`: the live `apply_scope` operation's progress in both of its
+  phases, `{done, total, det_done, det_total}` (the jobs, then the published results; a count it has not
+  reported yet is 0, as the header status reads it, `observability.status.ScopeProgressOut`), or `null` when
+  no apply is live (one that failed for good, until the `scope_apply_failed` reconciler clears the pointer).
+  `scope_applied` is `scope_apply.scope_applied` (D11): false while a scope is pending, and after a failed
+  apply the reconciler cleared, until retry-apply's apply succeeds;
 - `GET /api/settings/versions?cursor&limit` (limit 1 to 100, default 50) → `{items, next_cursor}`, newest
-  first (`version_no DESC`), keyset-paged with §14.3's signed cursor (`api.pagination`: sort `version_no`,
-  section `all`, `last_key = [version_no]`, no filters). A cursor this list did not sign is 400
-  `invalid_cursor`;
+  first (`version_no DESC`), keyset-paged with §14.3's signed cursor (`api.pagination`: sort
+  `settings_versions.version_no`, `desc`, `last_key = [version_no]`, no filters). A cursor this list did not
+  sign is 400 `invalid_cursor`;
 - `GET /api/settings/versions/{id}` → `{version, payload, diff}`, `diff` the `effects.diff_payloads` of the
   previous version's document and this one's (empty for version 1), both read as normal forms. 404
   `not_found` for an unknown id.
 
-The shipped versions (M3 Task 21, §13.3 L4896-4900, §14.2 L5005-5006, Deviation 23):
+The shipped versions (M3 Task 21, §13.3 L4896-4900, §14.2 L5005-5006, Deviation 23; the previews: M4 Task 14,
+D8):
 - `GET /api/settings/rubric-versions` → `[{id, version, content_hash, created_at, active}]` and `GET
   /api/settings/prompt-schema-versions` → `[{id, prompt_schema_hash, created_at, active, dry_run}]`, by id,
   plain reads: `active` is the version `active_config` points at, the hashes are hex, and `dry_run` is the
   version's newest schema dry-run (`{eval_run_id, passed, transport, finished_at}`, by `started_at`; its
   `passed`, `transport` and `finished_at` null while it runs) or `null` without one, so the id to activate is
   discoverable;
+- `GET /api/settings/rubric-versions/{id}/activation-preview` and `GET /api/settings/prompt-schema-versions/
+  {id}/activation-preview` → `settings.activate.activation_preview` in one read snapshot: what the activation
+  would check and re-score, the activation's own computation, nothing written. 404 `not_found` for no such
+  version;
 - `POST /api/settings/rubric-versions/{id}/activate` and `POST /api/settings/prompt-schema-versions/{id}/
   activate` (`Idempotency-Key`; `{expected_rescore_ack, eval_override_ack?}`) → 201 `{version, llm_tuple_id,
   targets_to_create, bulk_budget_usd}` (Ruling P41): `settings.activate.activate_shipped_version` in one
@@ -65,7 +79,7 @@ refused. `scope_apply_retry_requested` is logged with the ids after the commit, 
 warning codes and effect classes only, never a value of the payload.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Header, Path, Query
@@ -74,16 +88,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem
+from jobhunter.api.errors import Problem, as_problem
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
-    CURSOR_VERSION,
-    SECTION_ALL,
+    SETTINGS_VERSIONS_SORT,
     cursor_key,
-    decode_cursor,
-    encode_cursor,
-    filters_hash,
+    decode_list_cursor,
+    encode_list_cursor,
     invalid_cursor,
 )
 from jobhunter.api_idempotency import (
@@ -95,14 +107,20 @@ from jobhunter.api_idempotency import (
 )
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
+from jobhunter.errors import Refusal
 from jobhunter.observability.logging import get_logger
+from jobhunter.observability.status import ScopeProgressOut, scope_progress
+from jobhunter.quota.windows import WindowState
 from jobhunter.settings import scope_apply
 from jobhunter.settings.activate import (
     ActivateRequest,
+    ActivationPreviewOut,
     ShippedActivation,
     ShippedKind,
     activate_shipped_version,
+    activation_preview,
 )
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
@@ -111,7 +129,7 @@ from jobhunter.settings.effects import EffectClass, diff_payloads
 from jobhunter.settings.model import Settings
 from jobhunter.settings.save import SCHEMA_DRY_RUN_REQUIRED, SaveOutcome, SaveRequest, save_settings
 from jobhunter.settings.scope_apply import KIND as APPLY_SCOPE
-from jobhunter.settings.validate import IssueCode
+from jobhunter.settings.validate import GateState, IssueCode
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import defer_in_tx
 
@@ -121,7 +139,6 @@ router = APIRouter(
 log = get_logger("jobhunter.api.settings")
 
 SAVE_ROUTE: Final = "settings.save"
-VERSIONS_SORT: Final = "version_no"
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 _BIGINT_MAX: Final = 2**63 - 1
@@ -177,9 +194,9 @@ class DryRunIn(BaseModel):
     payload: JsonValue
 
 
+# A `settings.validate.FieldIssue`.
 class FieldIssueOut(BaseModel):
-    """A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
-    never repeats the value."""
+    """A refused field: its path from `payload`, a code and a message that never repeats the value."""
 
     field: str
     code: IssueCode
@@ -195,12 +212,120 @@ class WarningOut(BaseModel):
     )
 
 
+# The dry-run's parts as `settings.dryrun` builds them: a key it adds that a part does not declare is an
+# error, never dropped.
+_PART: Final = ConfigDict(extra="forbid")
+
+
+class QuotaWindowOut(BaseModel):
+    """A paid provider's quota window at the time of the preview: its counted units, limit and reset."""
+
+    model_config = _PART
+
+    used_units: int
+    limit_units: int
+    reset_at: UtcDatetime
+
+
+class JsearchProjectionOut(BaseModel):
+    """JSearch under the proposed settings: units per run, days to refresh every paid cell, the cells."""
+
+    model_config = _PART
+
+    units_per_run: float
+    refresh_cadence_days: float
+    cells: int
+    window: QuotaWindowOut | None
+
+
+class AdzunaProjectionOut(BaseModel):
+    """Adzuna under the proposed settings: the calls a day the cells need and the allowance a day."""
+
+    model_config = _PART
+
+    calls_per_day: float
+    allowance_per_day: float
+    cadence_days: float | None = Field(description=f"Days to refresh every cell; {_NEVER}")
+    cells: int
+
+
+class ArbeitnowProjectionOut(BaseModel):
+    """Arbeitnow: the pages a run may read and the pages the interval is expected to need."""
+
+    model_config = _PART
+
+    page_cap: int
+    expected_pages: float
+
+
+class SerpapiProjectionOut(BaseModel):
+    """The SerpApi fallback: units per run, the effective hourly cap and the window's state."""
+
+    model_config = _PART
+
+    units_per_run: float
+    hourly_cap: int
+    state: WindowState
+    window: QuotaWindowOut | None
+
+
+class LlmProjectionOut(BaseModel):
+    """The scoring budget under the proposed settings (§6.9.2, §21): the bucket, the expected cost per target,
+    the projected critic rate, the targets a month can score against those expected to arrive, and the
+    month's figures as a save would leave them."""
+
+    model_config = _PART
+
+    bucket_rate_per_h: DecimalOut
+    bucket_capacity: DecimalOut
+    c_hat: DecimalOut = Field(
+        description="The expected cost per target: the active tuple's 7-day mean while the model and "
+        "evaluation policies are unchanged, else the central estimate of the proposed model policy"
+    )
+    projected_critic_rate: DecimalOut
+    targets_per_month: int
+    arrival_per_month: int = Field(
+        description="New targets a month: the active tuple's rate of new targets over the last 7 days, an "
+        "activation's catch-up of retained ads not counted; 3,000 without 7 days of history, and while the "
+        "active tuple's latest activation is younger than 7 days"
+    )
+    projected_month_spend: DecimalOut
+    month: date
+    cap_usd: DecimalOut
+    counted_usd: DecimalOut
+    headroom_usd: DecimalOut
+
+
+class ProjectionsOut(BaseModel):
+    """The preview by part (§13.5). The last four are present only where an effect class adds them."""
+
+    model_config = _PART
+
+    jsearch: JsearchProjectionOut
+    adzuna: AdzunaProjectionOut
+    arbeitnow: ArbeitnowProjectionOut
+    serpapi_fallback: SerpapiProjectionOut | None = Field(
+        description="Null before the first SerpApi account read: no window, so no fallback"
+    )
+    llm: LlmProjectionOut
+    det_recompute: int | None = Field(
+        None, description="With a scope change: the published results recomputed without an LLM call"
+    )
+    critic_rate: DecimalOut | None = Field(
+        None, description="With an evaluation-policy change: its projected critic rate"
+    )
+    eval_gate: GateState | None = Field(
+        None, description="With a model- or evaluation-policy change: the eval gate a save checks"
+    )
+    next_slot: UtcDatetime | None = Field(
+        None, description="With a schedule change: the next slot, null while the schedule is disabled"
+    )
+
+
 class DryRunOut(BaseModel):
     errors: list[FieldIssueOut]
     warnings: list[WarningOut]
-    projections: dict[str, JsonValue] = Field(
-        description=f"The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; {_NEVER}."
-    )
+    projections: ProjectionsOut | None = Field(description="The preview by part; null with errors")
     effects: list[EffectClass]
 
 
@@ -218,23 +343,22 @@ class VersionOut(BaseModel):
         return value.astimezone(UTC)
 
 
-class ProgressOut(BaseModel):
-    done: int
-    total: int
-
-
 class PendingScopeOut(BaseModel):
-    """The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
-    live (one that failed for good, until the pointer is cleared)."""
+    """The scope being applied (§13.4) and its live apply's progress in both phases; `progress` is `null`
+    while no apply is live (one that failed for good, until the pointer is cleared)."""
 
     version_id: int
-    progress: ProgressOut | None
+    progress: ScopeProgressOut | None
 
 
 class SettingsOut(BaseModel):
     version: VersionOut
-    payload: dict[str, JsonValue]
+    payload: Settings
     pending_scope: PendingScopeOut | None
+    scope_applied: bool = Field(
+        description="Whether the active version's scope is in force; false while one is pending, and after "
+        "an apply that failed for good, until a retried apply succeeds"
+    )
 
 
 WarningCode = Annotated[str, StringConstraints(pattern=_WARNING_CODE)]
@@ -280,7 +404,7 @@ class DiffEntryOut(BaseModel):
 
 class VersionDetailOut(BaseModel):
     version: VersionOut
-    payload: dict[str, JsonValue]
+    payload: Settings
     diff: list[DiffEntryOut]
 
 
@@ -345,6 +469,7 @@ ShippedVersionId = Annotated[
 @router.post(
     "/dry-run",
     response_model=DryRunOut,
+    response_model_exclude_unset=True,  # a projection no effect class adds is absent, not null
     responses={
         422: {"description": "Invalid body (`validation_failed`)"},
         **CSRF_RESPONSES,
@@ -365,35 +490,28 @@ async def settings_dry_run(body: DryRunIn, engine: Annotated[AsyncEngine, Depend
     return DryRunOut(
         errors=[FieldIssueOut(field=e.field, code=e.code, message=e.message) for e in result.errors],
         warnings=[WarningOut(code=w.code, detail=dict(w.detail)) for w in result.warnings],
-        projections=result.projections,
+        # validated from the parts the dry-run built, so the parts it left out stay unset
+        projections=ProjectionsOut.model_validate(result.projections) if result.projections else None,
         effects=sorted(result.effects),
     )
 
 
-def _progress(progress: JSONValue) -> ProgressOut:
-    """`operations.progress` as `{done, total}`; a count the apply has not reported yet is 0."""
-    counts = progress if isinstance(progress, dict) else {}
-
-    def count(name: str) -> int:
-        value = counts.get(name)
-        return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-    return ProgressOut(done=count("done"), total=count("total"))
-
-
 @router.get("", response_model=SettingsOut)
 async def get_settings(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> SettingsOut:
-    """The active settings version, its document and the scope being applied, if any."""
-    async with engine.connect() as conn:
+    """The active settings version, its document, the scope being applied, if any, and whether the active
+    version's scope is in force."""
+    async with read_snapshot(engine) as conn:
         row = (await conn.execute(_ACTIVE, {"kind": APPLY_SCOPE})).one()
+        applied = await scope_apply.scope_applied(conn)
     pending = None
     if row.pending_scope_version_id is not None:
-        progress = None if row.operation_id is None else _progress(row.progress)
+        progress = None if row.operation_id is None else scope_progress(row.progress)
         pending = PendingScopeOut(version_id=row.pending_scope_version_id, progress=progress)
     return SettingsOut(
         version=VersionOut.model_validate(row, from_attributes=True),
-        payload=row.payload,
+        payload=Settings.model_validate(row.payload),
         pending_scope=pending,
+        scope_applied=applied,
     )
 
 
@@ -457,7 +575,8 @@ async def save_settings_version(
             stored = await run_idempotent(
                 conn, route=SAVE_ROUTE, key=key, fingerprint=fingerprint, now=now, handler=handler
             )
-    except Problem as problem:  # counts and codes: a field path can hold a key the sender typed
+    except (Problem, Refusal) as refused:  # counts and codes: a field path can hold a key the sender typed
+        problem = as_problem(refused)
         log.info(
             "settings_save_refused",
             code=problem.code,
@@ -480,11 +599,7 @@ def _version_after(cursor: str | None, key: bytes) -> int | None:
     """The `version_no` the next page starts below, from a cursor of this list; `None` for the first page."""
     if cursor is None:
         return None
-    body = decode_cursor(cursor, key=key, sort=VERSIONS_SORT, filters_hash=filters_hash({}))
-    last_key = body.get("last_key")
-    if body.get("section") != SECTION_ALL or body.get("dir") != "desc" or not isinstance(last_key, list):
-        raise invalid_cursor()
-    match last_key:
+    match decode_list_cursor(cursor, key=key, sort=SETTINGS_VERSIONS_SORT, dir="desc", filters={}):
         case [int(version_no)] if not isinstance(version_no, bool) and version_no >= 1:
             return version_no
     raise invalid_cursor()
@@ -511,16 +626,8 @@ async def list_versions(
     items = [VersionOut.model_validate(row, from_attributes=True) for row in rows[:limit]]
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = encode_cursor(
-            {
-                "v": CURSOR_VERSION,
-                "sort": VERSIONS_SORT,
-                "dir": "desc",
-                "section": SECTION_ALL,
-                "last_key": [items[-1].version_no],
-                "filters_hash": filters_hash({}),
-            },
-            key=key,
+        next_cursor = encode_list_cursor(
+            sort=SETTINGS_VERSIONS_SORT, dir="desc", last_key=[items[-1].version_no], filters={}, key=key
         )
     return VersionsPageOut(items=items, next_cursor=next_cursor)
 
@@ -539,11 +646,12 @@ async def get_version(
         if row is None:
             raise Problem(404, "not_found", "Settings version not found")
         previous = (await conn.execute(_PREVIOUS, {"no": row.version_no - 1})).scalar_one_or_none()
-    payload = Settings.model_validate(row.payload).to_payload()
+    document = Settings.model_validate(row.payload)
+    payload = document.to_payload()
     diff = [] if previous is None else diff_payloads(Settings.model_validate(previous).to_payload(), payload)
     return VersionDetailOut(
         version=VersionOut.model_validate(row, from_attributes=True),
-        payload=payload,
+        payload=document,
         diff=[DiffEntryOut(path=e.path, before=e.before, after=e.after) for e in diff],
     )
 
@@ -590,6 +698,45 @@ async def list_prompt_schema_versions(
         )
         for row in rows
     ]
+
+
+_PREVIEW_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    404: {"description": "No such version (`not_found`)"},
+}
+
+
+async def _preview(kind: ShippedKind, version_id: int, engine: AsyncEngine) -> ActivationPreviewOut:
+    async with read_snapshot(engine) as conn:  # read-only: the preview cannot write
+        return await activation_preview(conn, kind=kind, version_id=version_id, now=utcnow())
+
+
+@router.get(
+    "/rubric-versions/{version_id}/activation-preview",
+    response_model=ActivationPreviewOut,
+    responses=_PREVIEW_RESPONSES,
+)
+async def preview_rubric_activation(
+    version_id: ShippedVersionId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> ActivationPreviewOut:
+    """What activating a shipped rubric version would check and re-score: the verification of the active
+    prompt-schema version for the active model policy, which the activation checks (`schema_verified`, and in
+    `unverified_models` the models without a passed live schema dry-run), the eval gate of the candidate, its
+    latest golden run and the re-score's estimate, read without writing anything."""
+    return await _preview("rubric", version_id, engine)
+
+
+@router.get(
+    "/prompt-schema-versions/{version_id}/activation-preview",
+    response_model=ActivationPreviewOut,
+    responses=_PREVIEW_RESPONSES,
+)
+async def preview_prompt_schema_activation(
+    version_id: ShippedVersionId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> ActivationPreviewOut:
+    """What activating a shipped prompt-schema version would check and re-score: the live schema dry-runs it
+    lacks for the active model policy, the eval gate of the candidate, its latest golden run and the
+    re-score's estimate, read without writing anything."""
+    return await _preview("prompt_schema", version_id, engine)
 
 
 _ACTIVATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
@@ -640,7 +787,8 @@ async def _activate(
                 now=now,
                 handler=handler,
             )
-    except Problem as problem:
+    except (Problem, Refusal) as refused:
+        problem = as_problem(refused)
         log.info(
             "shipped_version_activation_refused",
             kind=kind,

@@ -80,7 +80,7 @@ from tests.support.settings import confirm_new_profile
 
 pytestmark = pytest.mark.integration
 
-BATCH = 200  # the smallest batch the settings allow (`batch_min_targets`)
+BATCH = 200  # `scoring.batch_min_targets`, the seeded default
 _REVISION = sa.text(
     "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
     "description_completeness, ad_language, embedding_status) VALUES (:j, :n, :h, '{}', "

@@ -28,8 +28,11 @@ and `counted_at_cap_change_usd`, so the cap invariant of §7.17 #6 is `counted_u
 counted_at_cap_change_usd)` (`cap_holds`).
 
 **Scoring estimates** (M3). `r_first` is §6.9.4's worst-case reservation of a first generator call, the unit
-of the headroom that returns `budget_deferred` targets; `c_hat_followup` is §6.9.3's `ĉ_followup`, the
-expected online critic-plus-revise cost of a triggered draft, which a batch submission holds per item.
+of the headroom that returns `budget_deferred` targets, over the §21.4 sizing bound (`sizing_input_bound`,
+which the confirm estimate's planning figure for a batch item uses too); `c_hat_followup` is §6.9.3's
+`ĉ_followup`, the expected online critic-plus-revise cost of a triggered draft, which a batch submission holds
+per item. `rate_per_h` is the bucket's accrual an hour as the spend view, the dry-run and the confirm estimate
+show it.
 """
 
 from collections.abc import Mapping
@@ -39,7 +42,7 @@ from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Final, Literal
 
 from jobhunter.llm import bounds
-from jobhunter.llm.pricing import worst_case_usd
+from jobhunter.llm.pricing import Model, worst_case_usd
 from jobhunter.types import JSONValue, get_int, json_get
 
 if TYPE_CHECKING:
@@ -58,6 +61,7 @@ CAP_ALERT_SHARE: Final = Decimal("0.8")
 # 9.5 KB, role 1.3 KB, ad 8.0 KB, output schema 8.0 KB) plus the 1,000-token overhead floor (plan Deviation
 # 22: `r_first` re-derives it at the measured overhead).
 SIZING_INPUT_BOUND_TOKENS: Final = 36_800
+_SECONDS_PER_HOUR: Final = 3600
 _ZERO: Final = Decimal(0)
 
 
@@ -140,9 +144,23 @@ def reserve_frac(p: BudgetParams) -> Decimal:
     return Decimal(p.nonscoring_reserve_pct) / 100
 
 
+def scoring_share(p: BudgetParams) -> Decimal:
+    """`A x (1 - reserve_frac)`: the month's share of `A` that scoring may spend at an even pace, $93.10 with
+    the defaults (the bucket's rate over the month, and the header status's pace line)."""
+    return admissible(p) * (1 - reserve_frac(p))
+
+
 def rate_per_s(p: BudgetParams, month: date) -> Decimal:
     """The bucket's accrual in USD per second: the scoring share of `A` spread over the month."""
-    return admissible(p) * (1 - reserve_frac(p)) / month_length_s(month)
+    return scoring_share(p) / month_length_s(month)
+
+
+def rate_per_h(p: BudgetParams, month: date) -> Decimal:
+    """The bucket's accrual in USD per hour as it is shown, rounded half-up to $0.000001: never negative (a
+    cap at or below the buffer, `A ≤ 0`, accrues nothing). $0.129306 in a month of 30 days with the defaults,
+    $0.125134 in one of 31."""
+    hourly = max(_ZERO, rate_per_s(p, month)) * _SECONDS_PER_HOUR
+    return hourly.quantize(USD_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def bucket_capacity(p: BudgetParams, month: date) -> Decimal:
@@ -278,15 +296,22 @@ def cap_share_reached(row: BudgetRow) -> bool:
     return row.cap_usd > 0 and row.counted_usd >= CAP_ALERT_SHARE * row.cap_usd
 
 
+def sizing_input_bound(model: Model) -> int:
+    """The §21.4 input bound of a score request on `model`, re-derived from the current overhead,
+    `PROMPT_OVERHEAD_TOKENS[model] + 36,800 - 1,000` (plan Deviation 22): the component sizes of L6624 with
+    the measured overhead in place of the floor they were sized with (37,678 tokens at the V19 overhead)."""
+    return bounds.PROMPT_OVERHEAD_TOKENS[model] + SIZING_INPUT_BOUND_TOKENS - bounds.PROMPT_OVERHEAD_FLOOR
+
+
 def r_first(model_policy: "ModelPolicy", execution: "ExecutionConfig") -> Decimal:
     """§6.9.4's `r_first`: the worst-case reservation of a first generator call, on the policy's generate
-    model at the execution config's first stage, over the §21.4 input bound re-derived from the current
-    overhead,
-    `PROMPT_OVERHEAD_TOKENS[model] + 36,800 - 1,000` (plan Deviation 22): the component sizes of L6624 with
-    the measured overhead in place of the floor they were sized with."""
+    model at the execution config's first stage, over `sizing_input_bound`. The confirm estimate prices a
+    batch item over the same bound (`profile.estimate.batch_item_worst_usd`, at the batch prices); a batch
+    submission reserves each item over its own rendered prompt's bound."""
     model = model_policy.nodes.generate.model
-    bound = bounds.PROMPT_OVERHEAD_TOKENS[model] + SIZING_INPUT_BOUND_TOKENS - bounds.PROMPT_OVERHEAD_FLOOR
-    return worst_case_usd(model, input_tokens_bound=bound, max_tokens=execution.generate.max_tokens)
+    return worst_case_usd(
+        model, input_tokens_bound=sizing_input_bound(model), max_tokens=execution.generate.max_tokens
+    )
 
 
 def c_hat_followup(model_policy: "ModelPolicy") -> Decimal:

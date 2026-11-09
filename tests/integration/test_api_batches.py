@@ -3,8 +3,9 @@
 
 `POST /api/batches/{id}/release` (`Idempotency-Key`, `{confirm: true}`) runs `batches.release` after
 `active_config FOR SHARE` and the idempotency row: 202 `{submission_id, state: "released", reserved_usd}`,
-the amount the submission's entries keep counted as `ambiguous`. 409 `conflict_state` unless the submission
-is `submit_ambiguous`, 404 for no such submission, 422 without `confirm: true`.
+the amount the submission's entries keep counted as `ambiguous`. 409 `conflict_state` with `detail =
+"not_releasable"` unless the submission is releasable (`submit_ambiguous`, or a lost `submitted` batch: plan
+M4 Task 16, `test_lost_batch_release`), 404 for no such submission, 422 without `confirm: true`.
 
 C21's user half: the connection dropped before the batch existed, the submission stays quarantined until the
 user releases it; the release re-scores its targets. The targets are 250 synthetic ads of the score tuple in
@@ -101,7 +102,11 @@ async def test_the_release_of_a_quarantined_submission_re_scores_its_targets(
     replay = await logged_in_client.post(release_url(row.id), json=CONFIRM, headers=idem(key))
     assert (replay.status_code, replay.json()) == (202, r.json())  # the stored response
     again = await logged_in_client.post(release_url(row.id), json=CONFIRM, headers=idem(fresh_key("release")))
-    assert (again.status_code, again.json()["code"]) == (409, "conflict_state")  # released already
+    assert (again.status_code, again.json()["code"], again.json()["detail"]) == (  # released already
+        409,
+        "conflict_state",
+        "not_releasable",
+    )
     assert len(await operations_of(engine, "batch_submit")) == 2  # neither the replay nor the 409 asked again
     r = await logged_in_client.post(release_url(10**12), json=CONFIRM, headers=idem(fresh_key("release")))
     assert (r.status_code, r.json()["code"]) == (404, "not_found")
@@ -120,7 +125,7 @@ async def test_a_submission_that_is_not_quarantined_is_a_state_conflict(
     (row,) = await submission_rows(engine)
     assert row.state == "submitted"
     r = await logged_in_client.post(release_url(row.id), json=CONFIRM, headers=idem(fresh_key("release")))
-    assert (r.status_code, r.json()["code"]) == (409, "conflict_state"), r.text
+    assert (r.status_code, r.json()["code"], r.json()["detail"]) == (409, "conflict_state", "not_releasable")
     (after,) = await submission_rows(engine)
     assert after.state == "submitted" and await targets_by_state(engine, setup.llm_tuple_id) == {
         "in_batch": N

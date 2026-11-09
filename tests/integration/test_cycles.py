@@ -19,8 +19,9 @@ import asyncio
 import hashlib
 import inspect
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -149,6 +150,51 @@ async def test_a_periodic_start_needs_pending_targets_the_bucket_and_no_running_
     assert row.c_hat_usd == CENTRAL
     assert row.admission_size == 18  # min(60, floor(1.00 / 0.052646))
     assert await start(engine, "periodic", now) is None  # one cycle runs
+
+
+async def test_a_full_bucket_opens_the_gate_when_the_threshold_is_b_max(
+    engine: AsyncEngine, current_epoch: int, now: datetime
+) -> None:
+    """Task 18 ruling T18-b: with `min_cycle_targets x ĉ >= B_max` the gate's threshold is `B_max`, which a
+    full bucket meets at the precision it is stored at (`budget.USD_QUANTUM`, rounded down), even when `B_max`
+    itself has more decimals (the dev defaults: $1.551666...). Before the fix the stored $1.551666 never
+    reached the unrounded $1.5516666..., so no periodic, manual or follow-up cycle could start again."""
+    (pending,) = await insert_targets(engine, 1)
+    month = month_of(now)
+    async with engine.begin() as conn:
+        params = await current_params(conn)
+        await ensure_month(conn, month, params, now)
+        # the dev stack's cap and buffer, and a bucket a month behind: the lock accrues it to capacity
+        await conn.execute(
+            sa.text(
+                "UPDATE llm_budget SET cap_usd = 100.00, overrun_buffer_usd = 2.00, bucket_usd = 0, "
+                "bucket_at = :at WHERE month = :m"
+            ),
+            {"at": now - timedelta(days=31), "m": month},
+        )
+        for number in range(1, 21):  # ĉ from history: 20 published attempts at $0.30
+            await insert_attempt(
+                conn,
+                pending.target_id,
+                attempt_no=number,
+                outcome="published_accepted",
+                charged=True,
+                cost_usd=Decimal("0.300000"),
+                ended_at=now - timedelta(hours=1),
+            )
+        config = await cycles.scoring_config(conn)
+        assert await cycles.periodic_gate(conn, config, now=now) is True
+        row = (await conn.execute(sa.text("SELECT * FROM llm_budget WHERE month = :m"), {"m": month})).one()
+    row_params = replace(params, cap_usd=row.cap_usd, overrun_buffer_usd=row.overrun_buffer_usd)
+    capacity = budget.bucket_capacity(row_params, month)
+    assert capacity != capacity.quantize(budget.USD_QUANTUM)  # more than six decimals
+    assert 10 * Decimal("0.300000") >= capacity  # the threshold is B_max
+    assert row.bucket_usd == capacity.quantize(budget.USD_QUANTUM, rounding=ROUND_FLOOR)  # full, as stored
+    cycle_id = await start(engine, "manual", now)
+    assert cycle_id is not None
+    started = await cycle_of(engine, cycle_id)
+    assert (started.trigger, started.c_hat_usd) == ("manual", Decimal("0.300000"))
+    assert started.bucket_usd_at_start == row.bucket_usd
 
 
 async def test_the_admission_size_is_capped_by_max_targets_and_floored_at_zero(

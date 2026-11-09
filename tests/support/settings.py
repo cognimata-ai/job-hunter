@@ -26,6 +26,8 @@ Task 18 adds the scope apply's side:
 - `active_scope_id(engine)`, `pending_scope_id(engine)`: the two scope pointers of `active_config`;
 - `scope_ids_of(engine, *saved)`: the scope version of each saved version (a save's 201 body), in order;
 - `operation_end(engine, op_id)`: the operation's `(status, progress)`;
+- `fail_for_good(engine, op_id)`: the apply ended `failed('attempts_exhausted')` as a reclaim that spent its
+  last attempt leaves it, the pointer left for the `scope_apply_failed` reconciler;
 - `incomplete_jobs_for(engine, scope_id)`: how many unmerged jobs lack a current `hard_filter_results` row for
   the scope (none, another `inputs_hash` than `jobs.det_facts_hash`, or another algorithm version). It states
   §13.4 step 3's check in a statement of its own (`INCOMPLETE_SQL`), independent of `filters.STALE_PREDICATE`,
@@ -336,6 +338,22 @@ async def operation_end(engine: AsyncEngine, op_id: int) -> tuple[str, Any]:
     async with engine.connect() as conn:
         row = (await conn.execute(_OPERATION_END, {"i": op_id})).one()
     return str(row.status), row.progress
+
+
+_FAIL_FOR_GOOD: Final = (
+    "UPDATE operations SET status = 'running', claim_id = gen_random_uuid(), worker_epoch = 1, "
+    "heartbeat_at = now(), started_at = now() WHERE id = :i",
+    "UPDATE operations SET status = 'failed', claim_id = NULL, worker_epoch = NULL, "
+    "heartbeat_at = NULL, last_error_code = 'attempts_exhausted', finished_at = now() WHERE id = :i",
+)
+
+
+async def fail_for_good(engine: AsyncEngine, op_id: int) -> None:
+    """The apply ends `failed('attempts_exhausted')` through the two edges of the transition matrix, as a
+    reclaim that spent its last attempt leaves it; the pointer is left for the reconciler."""
+    async with engine.begin() as conn:
+        for statement in _FAIL_FOR_GOOD:
+            await conn.execute(sa.text(statement), {"i": op_id})
 
 
 async def incomplete_jobs_for(engine: AsyncEngine, scope_id: int) -> int:

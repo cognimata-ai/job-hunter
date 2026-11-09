@@ -1,0 +1,246 @@
+/* The filter panel: a column of groups beside the list; at 768 px and below, above the list and folded away
+ * behind its Filters button until opened. */
+.panel {
+  display: grid;
+  align-content: start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.heading {
+  font-size: var(--font-size-4);
+}
+
+.toggle {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-weight: var(--font-weight-bold);
+  cursor: pointer;
+}
+
+.chevron {
+  color: var(--color-text-muted);
+}
+
+.body {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.group {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-3) 0 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.legend {
+  float: left; /* a legend as a grid item, below the border, not in it */
+  padding: 0;
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-bold);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+/* A field among the groups, set off as they are. */
+.separated {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.label {
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+}
+
+.choice {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 28px;
+  font-size: var(--font-size-2);
+  cursor: pointer;
+}
+
+.choice input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.choice input:disabled,
+.choice input:disabled + span {
+  cursor: not-allowed;
+}
+
+.input {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.input[aria-invalid="true"] {
+  border-color: var(--color-critical);
+}
+
+.radius {
+  max-width: 8rem;
+}
+
+.dates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-2);
+}
+
+.date {
+  display: grid;
+  gap: var(--space-1);
+  font-size: var(--font-size-2);
+}
+
+.hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+}
+
+.error {
+  grid-column: 1 / -1;
+  color: var(--color-critical);
+  font-size: var(--font-size-1);
+}
+
+.value {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+/* The Radix slider: a track, the selected range on it, and a thumb per value (Radix places them). */
+.slider {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 28px;
+  margin: 0 var(--space-2);
+  touch-action: none;
+  user-select: none;
+}
+
+.track {
+  position: relative;
+  flex-grow: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-border);
+}
+
+.range {
+  position: absolute;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--color-accent);
+}
+
+.thumb {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--color-accent);
+  border-radius: 50%;
+  background: var(--color-surface);
+  cursor: grab;
+}
+
+.thumb:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.button {
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+}
+
+.button[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+/* Folded: the button alone, with the panel's frame around the opened body. */
+@media (max-width: 768px) {
+  .panel {
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .heading {
+    display: none;
+  }
+
+  .toggle {
+    display: flex;
+  }
+
+  .body:not(.open) {
+    display: none;
+  }
+
+  .body {
+    padding: var(--space-4);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-2);
+    background: var(--color-surface);
+  }
+}

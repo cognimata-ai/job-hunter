@@ -99,6 +99,13 @@ With `pending = P` and no live apply of `P`:
 already the active one or while `live_apply(conn)` finds an apply of any scope, then calls
 `set_desired_scope`.
 
+**`scope_applied(conn)`** (plan M4 Task 11, D11; the header status and Task 14's settings read): whether the
+active settings version's scope is in force, read without a lock (a read-only snapshot may call it). True when
+nothing is pending, the scope that version derives with the active profile (`derive.derived`, as retry-apply
+derives it; compared by content hash, so nothing is inserted) is `active_config.scope_version_id`, and the
+newest apply of that scope that ended `succeeded` or `failed` did not fail (no apply of it ever ended counts
+as applied: the seeded scope was never applied). False is what retry-apply would act on.
+
 Lock order (§9.1): `active_config`, then job rows, then the operation row, then the other domain rows, then
 `ranking_state`. `request_apply` and `set_desired_scope` do not log (their caller logs the ids after its
 commit); the handler and the reconciler log ids and codes after their commits.
@@ -112,6 +119,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
+from jobhunter.db.seed import content_hash
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
@@ -122,6 +130,8 @@ from jobhunter.scoring import det_results, targets
 from jobhunter.scoring.det_results import ScopeRow
 from jobhunter.scoring.filters import BATCH, STALE_PREDICATE, recompute_stale
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
+from jobhunter.settings.derive import active_profile, derived
+from jobhunter.settings.model import Settings
 from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.operations import (
@@ -174,9 +184,21 @@ _INCOMPLETE: Final = q(
 _ANY_LIVE: Final = q(
     "SELECT id FROM operations WHERE kind = :kind AND status IN ('pending', 'running') ORDER BY id LIMIT 1"
 )
-# The newest operation of a dedup key, live or ended (`operations_live_dedup` covers the live ones only).
+# The newest operation of a dedup key, live or ended (`operations_dedup_newest`, backwards; the partial
+# `operations_live_dedup` covers the live ones only).
 _NEWEST: Final = q(
     "SELECT id, status FROM operations WHERE kind = :kind AND dedup_key = :key ORDER BY id DESC LIMIT 1"
+)
+# `scope_applied`'s reads: the pointers with the active document and the active scope's hash, then the end of
+# the newest apply of a scope that ended `succeeded` or `failed` (`operations_dedup_newest`, backwards).
+_APPLIED_POINTERS: Final = q(
+    "SELECT a.pending_scope_version_id, a.scope_version_id, a.profile_version_id, v.payload, s.scope_hash "
+    "FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "JOIN scope_versions s ON s.id = a.scope_version_id WHERE a.id = 1"
+)
+_NEWEST_END: Final = q(
+    "SELECT status FROM operations WHERE kind = :kind AND dedup_key = :key "
+    "AND status IN ('succeeded', 'failed') ORDER BY id DESC LIMIT 1"
 )
 
 log = get_logger("jobhunter.settings.scope_apply")
@@ -255,6 +277,21 @@ async def live_apply(conn: AsyncConnection) -> int | None:
     """The id of a live (`pending` or `running`) `apply_scope` operation of any scope, or `None`."""
     found = (await conn.execute(_ANY_LIVE, {"kind": KIND})).scalar_one_or_none()
     return None if found is None else int(found)
+
+
+async def scope_applied(conn: AsyncConnection) -> bool:
+    """Whether the active settings version's scope is the active, applied one (module docstring); plain reads,
+    no lock."""
+    pointers = (await conn.execute(_APPLIED_POINTERS)).one()
+    if pointers.pending_scope_version_id is not None:
+        return False
+    profile = await active_profile(conn, pointers.profile_version_id)
+    desired = derived(Settings.model_validate(pointers.payload), profile=profile).scope
+    if content_hash(desired) != bytes(pointers.scope_hash):
+        return False
+    key = dedup_key(int(pointers.scope_version_id))
+    ended = (await conn.execute(_NEWEST_END, {"kind": KIND, "key": key})).scalar_one_or_none()
+    return ended != "failed"
 
 
 # --- the handler --------------------------------------------------------------------------------------------

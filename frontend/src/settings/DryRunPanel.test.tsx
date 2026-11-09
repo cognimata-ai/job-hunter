@@ -1,0 +1,317 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { components } from "../api/schema";
+import { ProblemError } from "../api/client";
+import de from "../i18n/de.json";
+import en from "../i18n/en.json";
+import i18n from "../i18n/index";
+import { type FakeApi, dryRunOut, fakeApi, json, problem, requestsTo, settingsRead } from "../test/api";
+import { renderApp, settled } from "../test/app";
+import { dryRunPayloads, renderSettings } from "../test/settings";
+import { Problem } from "./DryRunPanel";
+
+type Settings = components["schemas"]["Settings"];
+type DryRunOut = components["schemas"]["DryRunOut"];
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await i18n.changeLanguage("en");
+});
+
+/** Answers the base document's dry-run with `base`, any other with `draft`. */
+function dryRuns(api: FakeApi, draft: DryRunOut, base: DryRunOut = dryRunOut()) {
+  const basePayload = JSON.stringify(settingsRead().payload);
+  api.routes.set("POST /api/settings/dry-run", (request) => {
+    const { payload } = JSON.parse(request.body ?? "{}") as { payload: Settings };
+    return json(JSON.stringify(payload) === basePayload ? base : draft);
+  });
+}
+
+function section(id: string): HTMLElement {
+  const element = document.getElementById(id);
+  if (element === null) {
+    throw new Error(`no section ${id}`);
+  }
+  return element;
+}
+
+async function change(): Promise<void> {
+  const interval = await screen.findByRole("spinbutton", { name: en["settings_schedule.interval"] });
+  fireEvent.change(interval, { target: { value: "8" } });
+}
+
+function saveIn(id: string): HTMLButtonElement {
+  return within(section(id)).getByRole<HTMLButtonElement>("button", { name: en["settings_form.save"] });
+}
+
+function warningIn(id: string, code: keyof typeof en): HTMLElement {
+  const item = within(section(id)).getByText(en[code]).closest("li");
+  if (item === null) {
+    throw new Error(`no warning ${code}`);
+  }
+  return item;
+}
+
+const OUT_OF_RANGE = { field: "payload.schedule.interval_hours", code: "out_of_range" as const, message: "must be from 1 to 168" };
+
+describe("DryRunPanel", () => {
+  it("in German an error of a known code shows its translation only; an unknown code keeps the server's text", async () => {
+    await i18n.changeLanguage("de");
+    const api = fakeApi({ signedIn: true });
+    const unknown = { field: "payload.schedule.anchor_local", code: "brand_new_rule" as unknown as "out_of_range", message: "a rule the catalogue lacks" };
+    dryRuns(api, dryRunOut({ errors: [OUT_OF_RANGE, unknown], projections: null, effects: [] }));
+    renderSettings(["scope", "schedule"]);
+    const interval = await screen.findByRole("spinbutton", { name: de["settings_schedule.interval"] });
+    fireEvent.change(interval, { target: { value: "8" } });
+    const panel = section("schedule");
+    const known = await within(panel).findByRole("link", { name: new RegExp(de["issue.out_of_range"]) });
+    expect(known.textContent).toBe(de["issue.out_of_range"]);
+    expect(panel.textContent).not.toContain("must be from 1 to 168");
+    expect(within(panel).getByRole("link", { name: /a rule the catalogue lacks/ }).textContent).toBe(
+      "brand_new_rule – a rule the catalogue lacks",
+    );
+  });
+
+  it("the quiet problem shows the detail in English, in German a known code's translation only, else the server's text", async () => {
+    const known = new ProblemError({
+      status: 409, code: "conflict_state", title: "Conflict", detail: "the jobs changed; send it again", requestId: "req-1", errors: [],
+    });
+    const unknown = new ProblemError({
+      status: 418, code: "teapot", title: "I'm a teapot", detail: "Short and stout", requestId: null, errors: [],
+    });
+    const english = render(<Problem error={known} alert={false} />);
+    expect(english.container.textContent).toContain(en["problem.conflict_state"]);
+    expect(english.container.textContent).toContain("the jobs changed; send it again");
+    english.unmount();
+    await i18n.changeLanguage("de");
+    const german = render(<Problem error={known} alert={false} />);
+    expect(german.container.textContent).toContain(de["problem.conflict_state"]);
+    expect(german.container.textContent).not.toContain("the jobs changed");
+    german.unmount();
+    const fallback = render(<Problem error={unknown} alert={false} />);
+    expect(fallback.container.textContent).toContain("I'm a teapot");
+    expect(fallback.container.textContent).toContain("Short and stout");
+    fallback.unmount();
+    const coded = new ProblemError({
+      status: 409, code: "conflict_state", title: "Conflict", detail: "purge_in_progress", requestId: null, errors: [],
+    });
+    const verbatim = render(<Problem error={coded} alert={false} />); // a code-shaped detail: verbatim, in German too
+    expect(verbatim.container.querySelector("code")?.textContent).toBe("purge_in_progress");
+  });
+
+  it("errors block Save and are linked to their fields", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ errors: [OUT_OF_RANGE], projections: null, effects: [] }));
+    renderSettings(["scope", "schedule"]);
+    await change();
+    const interval = screen.getByRole("spinbutton", { name: en["settings_schedule.interval"] });
+    await waitFor(() => {
+      expect(interval.getAttribute("aria-invalid")).toBe("true");
+    });
+    const described = (interval.getAttribute("aria-describedby") ?? "").split(" ").map((id) => document.getElementById(id));
+    const error = described.find((element) => element?.textContent.includes(en["issue.out_of_range"]));
+    expect(error?.textContent).toContain("must be from 1 to 168");
+    expect(section("schedule").contains(error ?? null)).toBe(true); // the error in its own section's panel
+    expect(saveIn("schedule").disabled).toBe(true);
+    expect(saveIn("scope").disabled).toBe(true);
+    // the error's link takes focus to its field
+    await userEvent.setup().click(within(section("schedule")).getByRole("link", { name: /must be from 1 to 168/ }));
+    expect(document.activeElement).toBe(interval);
+    // no projection with errors
+    expect(within(section("schedule")).queryByText(en["dry_run.llm"])).toBeNull();
+  });
+
+  it("an error in another section links to its anchor", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ errors: [OUT_OF_RANGE], projections: null, effects: [] }));
+    renderSettings(["scope", "schedule"]);
+    await change();
+    const link = await within(section("scope")).findByRole("link", { name: /must be from 1 to 168/ });
+    expect(link.getAttribute("href")).toBe("#schedule");
+    expect(link.textContent).toContain(`${en["settings.section.schedule"]}:`);
+  });
+
+  it("each warning needs its tick", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(
+      api,
+      dryRunOut({
+        warnings: [
+          { code: "paid_refresh_slow", detail: { cadence_days: 9.5 } },
+          { code: "adzuna_rotation", detail: { cadence_days: null } },
+        ],
+        effects: ["schedule"],
+      }),
+    );
+    renderSettings(["scope", "schedule"]);
+    await change();
+    const slow = await waitFor(() => warningIn("schedule", "warning.paid_refresh_slow"));
+    const rotation = warningIn("schedule", "warning.adzuna_rotation");
+    expect(slow.textContent).toContain("9.5");
+    expect(rotation.textContent).toContain(en["warning_detail.adzuna_rotation_never"]);
+    expect(saveIn("schedule").disabled).toBe(true);
+    await userEvent.setup().click(within(slow).getByRole("checkbox", { name: en["settings_form.understand"] }));
+    expect(saveIn("schedule").disabled).toBe(true);
+    // ticked in one panel, ticked in every panel
+    const inScope = within(warningIn("scope", "warning.paid_refresh_slow")).getByRole<HTMLInputElement>("checkbox");
+    expect(inScope.checked).toBe(true);
+    await userEvent.setup().click(within(warningIn("scope", "warning.adzuna_rotation")).getByRole("checkbox"));
+    expect(saveIn("schedule").disabled).toBe(false);
+    expect(saveIn("scope").disabled).toBe(false);
+  });
+
+  it("effect chips and the re-score cost", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(
+      api,
+      dryRunOut({
+        warnings: [{ code: "llm_rescore", detail: { targets: 1180, est_usd: "41.300000", bulk_budget_usd: "22.440000" } }],
+        effects: ["llm_tuple", "none", "scope"],
+      }),
+    );
+    renderSettings(["schedule"]);
+    await change();
+    const chips = await within(section("schedule")).findByRole("list", { name: en["settings_form.effects"] });
+    const texts = within(chips).getAllByRole("listitem").map((chip) => chip.textContent);
+    expect(texts).toEqual(["LLM re-score ≈ $41.30", en["effect_class.scope"]]);
+    expect(within(section("schedule")).getByText(en["settings_form.cost_note"])).toBeTruthy();
+    expect(warningIn("schedule", "warning.llm_rescore").textContent).toContain("1,180");
+  });
+
+  it("the LLM re-score chip without its warning has no cost", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ effects: ["llm_tuple"] }));
+    renderSettings(["schedule"]);
+    await change();
+    const chips = await within(section("schedule")).findByRole("list", { name: en["settings_form.effects"] });
+    expect(within(chips).getAllByRole("listitem").map((chip) => chip.textContent)).toEqual([en["effect_class.llm_tuple"]]);
+  });
+
+  it("a standing warning is compact", async () => {
+    const api = fakeApi({ signedIn: true });
+    const binding = { code: "llm_cap_binding", detail: { expected_scored_per_month: 1700 } };
+    dryRuns(
+      api,
+      dryRunOut({ warnings: [binding, { code: "paid_refresh_slow", detail: { cadence_days: 9.5 } }], effects: ["schedule"] }),
+      dryRunOut({ warnings: [binding] }),
+    );
+    renderSettings(["schedule"]);
+    await change();
+    const full = await waitFor(() => warningIn("schedule", "warning.paid_refresh_slow"));
+    expect(within(full).getByRole("checkbox", { name: en["settings_form.understand"] })).toBeTruthy();
+    const standing = warningIn("schedule", "warning.llm_cap_binding");
+    expect(within(standing).queryByText(en["settings_form.understand"])).toBeNull();
+    expect(within(standing).queryByText(/1,700/)).toBeNull(); // one line: no detail
+    expect(standing.textContent).toContain(en["settings_form.standing"]);
+    const tick = within(standing).getByRole("checkbox", { name: new RegExp(en["warning.llm_cap_binding"]) });
+    await userEvent.setup().click(within(full).getByRole("checkbox"));
+    expect(saveIn("schedule").disabled).toBe(true); // a standing warning needs its tick too
+    await userEvent.setup().click(tick);
+    expect(saveIn("schedule").disabled).toBe(false);
+  });
+
+  it("a standing warning comes from the base dry-run", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut(), dryRunOut({ warnings: [{ code: "llm_cap_binding", detail: { expected_scored_per_month: 1700 } }] }));
+    renderSettings(["schedule"]);
+    expect(await within(section("schedule")).findByText(en["settings_form.no_changes"])).toBeTruthy();
+    const standing = await waitFor(() => warningIn("schedule", "warning.llm_cap_binding"));
+    expect(standing.textContent).toContain(en["settings_form.standing"]);
+    expect(dryRunPayloads(api)).toEqual([settingsRead().payload]); // the base document, once
+    expect(saveIn("schedule").disabled).toBe(true); // nothing to save
+  });
+
+  it("shows the projections as compact rows", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ effects: ["schedule"] }));
+    renderSettings(["schedule"]);
+    await change();
+    const rows = await within(section("schedule")).findByRole("list", { name: en["settings_form.preview"] });
+    const jsearch = within(rows).getByText(en["provider.jsearch"]).closest("li");
+    expect(jsearch?.textContent).toContain("112 of 200");
+    const llm = within(rows).getByText(en["dry_run.llm"]).closest("li");
+    expect(llm?.textContent).toContain("$92.40");
+    expect(llm?.textContent).toContain("1,700");
+  });
+
+  it("a warning code without a text shows the code", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ warnings: [{ code: "brand_new_warning", detail: {} }], effects: ["schedule"] }));
+    renderSettings(["schedule"]);
+    await change();
+    const code = await within(section("schedule")).findByText("brand_new_warning");
+    expect(code.tagName).toBe("CODE");
+  });
+
+  it("a quiet panel keeps Retry and the request id", async () => {
+    const api = fakeApi({ signedIn: true });
+    const basePayload = JSON.stringify(settingsRead().payload);
+    let down = true;
+    api.routes.set("POST /api/settings/dry-run", (request) => {
+      const { payload } = JSON.parse(request.body ?? "{}") as { payload: Settings };
+      return JSON.stringify(payload) === basePayload || !down ? json(dryRunOut({ effects: ["schedule"] })) : problem(503, "internal");
+    });
+    renderSettings(["scope", "schedule"]);
+    await change(); // a change in Schedule: its panel raises the alert
+    const alert = await within(section("schedule")).findByRole("alert");
+    expect(alert.textContent).toContain(en["problem.internal"]);
+    expect(within(section("scope")).queryByRole("alert")).toBeNull();
+    const requestId = en["problem_box.request_id"].replace("{{id}}", "r-1");
+    expect(within(section("scope")).getByText(requestId)).toBeTruthy();
+    const before = requestsTo(api, "POST /api/settings/dry-run").length;
+    down = false;
+    await userEvent.setup().click(within(section("scope")).getByRole("button", { name: en["action.retry"] }));
+    await waitFor(() => {
+      expect(requestsTo(api, "POST /api/settings/dry-run").length).toBeGreaterThan(before);
+    });
+    await waitFor(() => {
+      expect(saveIn("scope").disabled).toBe(false);
+    });
+    expect(within(section("scope")).queryByText(requestId)).toBeNull();
+  });
+
+  it("the active panel's status line is a live region", async () => {
+    const api = fakeApi({ signedIn: true });
+    dryRuns(api, dryRunOut({ effects: ["schedule"] }));
+    renderSettings(["scope", "schedule"]);
+    await change();
+    await waitFor(() => {
+      expect(within(section("schedule")).getByText(en["settings_form.unsaved"]).getAttribute("role")).toBe("status");
+    });
+    expect(within(section("scope")).getByText(en["settings_form.unsaved"]).getAttribute("role")).toBeNull();
+  });
+
+  it("a settings load failure raises one alert", async () => {
+    const api = fakeApi({ signedIn: true });
+    let down = true;
+    api.routes.set("GET /api/settings", () => (down ? problem(503, "internal") : json(settingsRead())));
+    renderSettings(["scope", "schedule"], { retryDelay: 0 });
+    await waitFor(() => {
+      expect(screen.getAllByText(en["problem.internal"])).toHaveLength(2); // the same text in both sections
+    });
+    const alerts = screen.getAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(section("scope").contains(alerts[0])).toBe(true); // the first section's
+    down = false;
+    await userEvent.setup().click(within(section("schedule")).getByRole("button", { name: en["action.retry"] }));
+    expect(await screen.findByRole("spinbutton", { name: en["settings_schedule.interval"] })).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("on the page, a settings load failure is read once and shows the sections with one alert", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/settings", () => problem(503, "internal"));
+    renderApp("/settings", { retryDelay: 0 });
+    expect(await screen.findByRole("heading", { level: 1, name: en["settings.title"] })).toBeTruthy();
+    await waitFor(() => {
+      expect(within(section("scope")).getByRole("alert").textContent).toContain(en["problem.internal"]);
+    });
+    await settled(300);
+    // the shell's read and its three retries; the form's own observer does not read again on mount
+    expect(requestsTo(api, "GET /api/settings")).toHaveLength(4);
+    expect(within(section("schedule")).queryByRole("alert")).toBeNull();
+    expect(within(section("budget")).queryByRole("alert")).toBeNull();
+    expect(within(section("budget")).getByRole("button", { name: en["action.retry"] })).toBeTruthy();
+  });
+});

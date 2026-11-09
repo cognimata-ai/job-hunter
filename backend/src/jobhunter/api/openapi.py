@@ -50,10 +50,11 @@ LOGIN_CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 }
 
 
+# `message` may echo the sender's input: ruling T14-h.
 class FieldError(BaseModel):
     """One invalid field of a `validation_failed` problem; `field` is the pydantic `loc` joined with ".".
 
-    `message` can echo the sender's own input (ruling T14-h).
+    `message` can echo the sender's own input.
     """
 
     field: str

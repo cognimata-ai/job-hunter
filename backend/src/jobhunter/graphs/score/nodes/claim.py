@@ -18,7 +18,8 @@ predicate (`cycles.lock_cycle`, step 5; a lost cycle is `FencedOut(cycles.CYCLE_
    that policy, or a batch follow-up's `resume_draft_id` under any), the newest earlier attempt of the target
    under the policy or of that draft, the link `load_context`'s resume chain follows (Controller carry T9-d;
    final review, Fable I1); else `NULL`.
-3. `ranking.bump` last, when anything was claimed.
+No ranking bump (B30): `pending → in_progress` stays in the unscored bucket of the Jobs list
+(`ranking.crosses_bucket`), so a claim changes nothing a page shows.
 After the commit: the fault point `score.claim.after_claim` (`AFTER_CLAIM`, C29), then `claims.start(ref)` for
 every claim of the round (cycle-owned heartbeats from the first second, so a claim waiting for a fan-out slot
 is never reclaimed while the cycle lives; Codex r2 B5). The state takes the round's claims (`round_claims`,
@@ -32,7 +33,6 @@ from typing import Final
 from langchain_core.runnables import RunnableConfig
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition_where
 from jobhunter.errors import FencedOut
@@ -183,9 +183,7 @@ def make_claim(deps: ScoreDeps) -> CycleNode:
                 cycle_id=ctx.cycle_id,
                 execution_config_id=active.execution_config_id,
                 evaluation_policy_id=active.evaluation_policy_id,
-            )
-            if claimed:
-                await ranking.bump(conn)  # step 11, last
+            )  # no bump: the claim stays in the unscored bucket (B30)
         await afault_point(AFTER_CLAIM)
         refs = [c.ref for c in claimed]
         for ref in refs:  # after the commit: every claim is beaten from its first second (Codex r2 B5)

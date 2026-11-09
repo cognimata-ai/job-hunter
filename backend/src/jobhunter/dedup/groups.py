@@ -66,14 +66,15 @@ T19-a puts it after the job rows). Then the group rows `FOR UPDATE` in id order,
 `ranking_state` last. Each read-and-lock round runs in a savepoint: when the job's company or first sighting
 changed between the read and the lock, or its groups gained a member the round does not hold, the savepoint
 is rolled back, which releases the round's row locks and its advisory lock, and the round runs again (at
-most `_LOCK_ROUNDS`). Every decision reads its rows after the lock.
+most `_LOCK_ROUNDS`, then `CoMemberChanged`). Every decision reads its rows after the lock.
 
 `leave_group` (merge step 5, inside the identity transaction or a standalone merge) takes NO advisory lock: it
 relies on the member rows its caller locked in the ordered statement (`held`; `InvariantViolation` for a
 member that is not held, before anything is written). So no transaction ever waits for a company lock while
 it holds job rows, and a merge and a regroup of one company cannot deadlock: the second waits on the job
-rows. `split_member` and `confirm_group` (user actions) take no advisory lock either: their job rows (the
-group's members), then the group row; `confirm_group` takes `active_config` `FOR SHARE` before them.
+rows. `split_member` and `confirm_group` (user actions) take no advisory lock either: `active_config` `FOR
+SHARE`, then their job rows (the group's members), then the group row. They lock in one round: a group whose
+members changed between the read and the lock is `CoMemberChanged`, and the user's request is sent again.
 
 **`group_representatives`** (cadence `heavy`, §17.4): the active groups that break §7.17 #4, read with §8.7's
 eligibility (A1 issue 27: a representative that is not an eligible member, a failed, refused, expired,
@@ -134,7 +135,7 @@ from jobhunter.dedup.group_rules import (
     same_board,
 )
 from jobhunter.dedup.representative import ELIGIBLE_SQL, TARGET_STATE_SQL, eligible
-from jobhunter.errors import FencedOut, InvariantViolation, TransitionConflict
+from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation, TransitionConflict
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
@@ -559,7 +560,7 @@ async def _lock(conn: AsyncConnection, job_id: int) -> _Locked:
         if locked is not None:
             return locked
         log.info("regroup_set_changed_under_the_lock", job_id=job_id)
-    raise InvariantViolation(f"job {job_id}: its company or its groups kept changing under the lock")
+    raise CoMemberChanged(f"job {job_id}: its company or its groups kept changing under the lock")
 
 
 @dataclass
@@ -857,7 +858,8 @@ async def _lock_group(
 ) -> tuple[Row[tuple[object, ...]], tuple[int, ...], frozenset[int]]:
     """The rows of `job_ids` and of the group's members in one ordered statement, then the group row: the
     group, its members under the lock and the job rows held. Raises `LookupError` for a group that does not
-    exist and `InvariantViolation` for one that is not active or whose members changed meanwhile."""
+    exist, `InvariantViolation` for one that is not active and `CoMemberChanged` for one whose members
+    changed meanwhile (one round: the user's request may be sent again)."""
     read = await representative.member_ids(conn, group_id)
     held = frozenset(await merge.lock_jobs(conn, (*job_ids, *read), with_groups_of=read))
     rows = (await conn.execute(_LOCK_GROUPS, {"ids": [group_id]})).all()
@@ -867,17 +869,21 @@ async def _lock_group(
         raise InvariantViolation(f"duplicate group {group_id} is {rows[0].status}, not active")
     member_ids = await representative.member_ids(conn, group_id)
     if not set(member_ids) <= held:
-        raise InvariantViolation(f"duplicate group {group_id} changed while it was being locked")
+        raise CoMemberChanged(f"duplicate group {group_id} changed while it was being locked")
     return rows[0], member_ids, held
 
 
 async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> None:
     """The user splits the member off the group (§8.7): `dedup_decisions(different, user_split)` against every
     other member, the member leaves, and a group left with one member is `dissolved` (`split`); a group whose
-    representative left re-elects (`split`) and revalidates. Its last statement bumps the ranking.
+    representative left re-elects (`split`) and revalidates. `active_config FOR SHARE` is its first lock (the
+    schedule's step 2, as `confirm_group`'s), before any job or target row: the deferred targets it settles
+    move under the configuration they were read with. Its last statement bumps the ranking.
 
-    Raises `LookupError` for a group that does not exist and `InvariantViolation` for a group that is not
-    active or a job that is not its member, having written nothing."""
+    Raises `LookupError` for a group that does not exist, `InvariantViolation` for a group that is not
+    active or a job that is not its member, and `CoMemberChanged` for a group whose members changed
+    while they were locked, having written nothing."""
+    await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
     group, member_ids, _ = await _lock_group(conn, group_id, (job_id,))
     if job_id not in member_ids:
         raise InvariantViolation(f"job {job_id} is not a member of duplicate group {group_id}")
@@ -903,7 +909,8 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
     Ruling T22-e), and the ranking bumped last. Returns the representative's job id.
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for one that is not active or
-    has no representative, and `FencedOut` for a fenced member, having written nothing."""
+    has no representative, `CoMemberChanged` for one whose members (or a member's group) changed while
+    they were locked, and `FencedOut` for a fenced member, having written nothing."""
     active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
     group, member_ids, held = await _lock_group(conn, group_id, ())
     rep = group.representative_job_id

@@ -1,0 +1,107 @@
+/* The model and execution grids of Scoring & models: a header row naming the columns, then one row per node, its
+ * name and its cells; a line about a cell (the generator's `low`) under the row's cells. Narrow screens and
+ * 200 % zoom read each row as a card: its name above its cells, each under its own label, the model wider than
+ * the effort (a grid of other cells sets `--narrow-cells`). */
+.grid {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.head,
+.row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 13rem) repeat(var(--grid-cells, 2), minmax(0, 1fr));
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  min-width: 0;
+}
+
+.head {
+  padding-inline: var(--space-3);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.row {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.row[data-tone="warn"] {
+  border-color: var(--color-warn);
+  box-shadow: inset 4px 0 0 var(--color-warn);
+}
+
+.row[data-tone="critical"] {
+  border-color: var(--color-critical);
+  box-shadow: inset 4px 0 0 var(--color-critical);
+}
+
+.node {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* The light row's model: the critic's, as text. */
+.same {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+  overflow-wrap: anywhere;
+}
+
+/* The line about a cell: under the row's cells, as wide as they are. */
+.note {
+  grid-column: 2 / -1;
+  max-width: var(--measure);
+  color: var(--color-text);
+  font-size: var(--font-size-2);
+}
+
+.critical {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}
+
+/* The header names the columns: each cell's own label (its field's) is for screen readers only. */
+.row label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .head {
+    display: none;
+  }
+
+  .row {
+    grid-template-columns: var(--narrow-cells, minmax(0, 3fr) minmax(0, 2fr));
+    align-items: start;
+    padding: var(--space-3);
+  }
+
+  .node,
+  .note {
+    grid-column: 1 / -1;
+  }
+
+  .same {
+    align-self: end;
+  }
+
+  .row label {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+    white-space: normal;
+  }
+}

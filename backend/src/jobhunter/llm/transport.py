@@ -11,7 +11,8 @@ the `httpx2` client the SDK sends through.
 - In fake LLM mode (`AppConfig.fake_llm`) the client sends every request for the API origin to
   `fake.RecordedSSETransport(cfg.fake_llm_dir)`, and nothing else is reachable. The one mount covers every
   route of the origin: the Messages API, `count_tokens` and the Message Batches API (`fake.BATCHES_PATH`, M3
-  Task 8), which the fake answers from the state's batch script.
+  Task 8), which the fake answers from the state's batch script. The config's two stack controls (M4 Task 18,
+  `AppConfig.fake_batch_script` and `fake_llm_keyed_dir`) are handed to the fake as they are.
 
 `httpx2` is the SDK's transport (`anthropic` 1.x). It is not `httpx`, the adapters' transport, and an object
 of one is never passed to the other.
@@ -72,7 +73,9 @@ def make_http_client(
         raise ValueError("an injected read timeout or transport is for tests only")
     timeout = http_timeout(read_timeout_s)
     if mount is None and cfg.fake_llm:
-        mount = fake.RecordedSSETransport(cfg.fake_llm_dir)
+        mount = fake.RecordedSSETransport(
+            cfg.fake_llm_dir, batch_script=cfg.fake_batch_script, keyed_dir=cfg.fake_llm_keyed_dir
+        )
     if mount is None:
         return anthropic.DefaultAsyncHttpxClient(timeout=timeout)
     return anthropic.DefaultAsyncHttpxClient(

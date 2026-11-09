@@ -1,0 +1,29 @@
+/* A label's comment: its label, the field, the count at the end of the row, and the too-long hint. */
+.label {
+  font-weight: var(--font-weight-medium);
+}
+
+.comment {
+  width: 100%;
+  min-height: 80px;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  resize: vertical;
+}
+
+.comment[aria-invalid="true"] {
+  border-color: var(--color-critical);
+}
+
+.count {
+  justify-self: end;
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+}
+
+.error {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}

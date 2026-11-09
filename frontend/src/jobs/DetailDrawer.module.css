@@ -1,0 +1,214 @@
+/* The detail drawer's content: the header, the score, then the tabs. */
+.detail {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.header {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.title {
+  font-size: var(--font-size-5);
+  overflow-wrap: anywhere;
+}
+
+.company {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-muted);
+}
+
+.fact {
+  font-size: var(--font-size-2);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.toggle {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.toggle:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+}
+
+.toggle[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.toggle:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.open {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 32px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+/* Adzuna's attribution badge: at least 116 × 23 px (spec §5). */
+.attribution {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 116px;
+  min-height: 23px;
+  padding: 1px var(--space-2);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-1);
+  background: var(--color-surface);
+  color: var(--color-accent);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+}
+
+.score {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.heading {
+  font-size: var(--font-size-4);
+}
+
+.chip {
+  justify-self: start;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface-sunken);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.scoreLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.scoreFacts {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--font-size-2);
+}
+
+.versions {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.summary {
+  display: grid;
+  gap: var(--space-1);
+  max-width: var(--measure);
+  font-size: var(--font-size-2);
+}
+
+.label {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.marker {
+  display: inline-block;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-1);
+  background: var(--color-surface-sunken);
+  font-weight: var(--font-weight-regular);
+}
+
+.limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  font-size: var(--font-size-2);
+}
+
+.limit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.tabs {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.tabList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* Six tabs fit one row of the 50 % drawer at 1280 px in both languages; narrower, the list wraps. */
+.tab {
+  min-height: 36px;
+  margin-bottom: -1px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-2) var(--radius-2) 0 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--color-text);
+}
+
+.tab[data-state="active"] {
+  border-color: var(--color-border);
+  border-bottom-color: var(--color-surface);
+  background: var(--color-surface);
+  color: var(--color-accent);
+}
+
+.panel {
+  min-width: 0;
+}

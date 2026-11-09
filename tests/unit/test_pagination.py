@@ -1,29 +1,59 @@
-"""The signed keyset cursor (spec §14.3; plan Task 17, Deviation 3): `base64url(JSON) + "." +
-base64url(HMAC-SHA256(key, JSON))`, the key `HKDF(session_secret, "cursor")`."""
+"""The signed keyset cursors (spec §14.3; plan M3 Task 17, Deviation 3; M4 Task 2, D35, B7, B31):
+`base64url(JSON) + "." + base64url(HMAC-SHA256(key, JSON))`, the key `HKDF(session_secret, "cursor")`.
+
+A list cursor (`encode_list_cursor`) carries its list's namespaced sort, so one list never accepts another's
+cursor; a job cursor (`encode_job_cursor`) carries its section, the sort value of its last row, the job id,
+the ranking generation and the posted window's bounds, `posted_after` and `posted_before`, the filters' hash
+is computed with.
+"""
 
 import base64
 import hashlib
 import hmac
 import json
+from collections.abc import Callable, Mapping
+from decimal import Decimal
+from functools import partial
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import pytest
 from jobhunter.api.errors import Problem
-from jobhunter.api.pagination import CURSOR_VERSION, cursor_key, decode_cursor, encode_cursor, filters_hash
+from jobhunter.api.pagination import (
+    ALERTS_SORT,
+    CURSOR_VERSION,
+    EVAL_RUNS_SORT,
+    GOLDEN_CASES_SORT,
+    JOB_HISTORY_SORT,
+    RUNS_SORT,
+    SCORE_CYCLES_SORT,
+    SETTINGS_VERSIONS_SORT,
+    JobCursor,
+    JobSort,
+    ListDir,
+    canonical_json,
+    cursor_key,
+    decode_id_cursor,
+    decode_job_cursor,
+    decode_list_cursor,
+    encode_job_cursor,
+    encode_list_cursor,
+    filters_hash,
+    list_page,
+)
 from jobhunter.config import AppConfig
 from jobhunter.crypto import hkdf_sha256
-from jobhunter.db.seed import canonical_json
+from jobhunter.types import JSONValue
 
 KEY = hkdf_sha256(b"\x07" * 32, b"cursor")
-FILTERS = filters_hash({"status": "open"})
-BODY: dict[str, Any] = {
+FILTERS: dict[str, JSONValue] = {"status": "open"}
+LIST_BODY: dict[str, Any] = {
     "v": 2,
-    "sort": "version_no",
+    "sort": SETTINGS_VERSIONS_SORT,
     "dir": "desc",
     "section": "all",
     "last_key": [17],
-    "filters_hash": FILTERS,
+    "filters_hash": filters_hash(FILTERS),
 }
 
 
@@ -35,43 +65,117 @@ def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def invalid(cursor: str, *, sort: str = "version_no", filters: str = FILTERS, key: bytes = KEY) -> None:
+def sign(body: object, key: bytes = KEY) -> str:
+    """A cursor of any body, signed with `key` as the server signs its own: the forgeries below are bodies
+    this server never issues, so only the body's own checks can refuse them."""
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return f"{_b64(raw)}.{_b64(hmac.new(key, raw, hashlib.sha256).digest())}"
+
+
+def body_of(cursor: str) -> dict[str, Any]:
+    return cast(dict[str, Any], json.loads(_unb64(cursor.split(".")[0])))
+
+
+def refused(decode: Callable[[], object]) -> None:
     with pytest.raises(Problem) as caught:
-        decode_cursor(cursor, key=key, sort=sort, filters_hash=filters)
+        decode()
     assert (caught.value.status, caught.value.code) == (400, "invalid_cursor")
 
 
+def list_cursor(
+    *,
+    sort: str = SETTINGS_VERSIONS_SORT,
+    dir: ListDir = "desc",
+    last_key: list[JSONValue] | None = None,
+    filters: Mapping[str, JSONValue] = FILTERS,
+    key: bytes = KEY,
+) -> str:
+    return encode_list_cursor(
+        sort=sort, dir=dir, last_key=[17] if last_key is None else last_key, filters=filters, key=key
+    )
+
+
+def decode_list(
+    cursor: str,
+    *,
+    sort: str = SETTINGS_VERSIONS_SORT,
+    dir: ListDir = "desc",
+    filters: Mapping[str, JSONValue] = FILTERS,
+    key: bytes = KEY,
+) -> list[JSONValue]:
+    return decode_list_cursor(cursor, key=key, sort=sort, dir=dir, filters=filters)
+
+
+# ---- the list cursors --------------------------------------------------------------------------------------
+
+
 def test_round_trip() -> None:
-    cursor = encode_cursor(BODY, key=KEY)
-    assert decode_cursor(cursor, key=KEY, sort="version_no", filters_hash=FILTERS) == BODY
+    assert decode_list(list_cursor()) == [17]
+    assert decode_list(list_cursor(last_key=["2026-10-26T12:00:00.000000+00:00", 4])) == [
+        "2026-10-26T12:00:00.000000+00:00",
+        4,
+    ]
     assert CURSOR_VERSION == 2
 
 
 def test_the_format_is_the_json_and_its_hmac_in_base64url() -> None:
-    cursor = encode_cursor(BODY, key=KEY)
+    cursor = list_cursor()
     data, signature = cursor.split(".")
-    assert _unb64(data) == canonical_json(BODY) and json.loads(_unb64(data)) == BODY
-    assert _unb64(signature) == hmac.new(KEY, canonical_json(BODY), hashlib.sha256).digest()
+    assert _unb64(data) == canonical_json(LIST_BODY) and json.loads(_unb64(data)) == LIST_BODY
+    assert _unb64(signature) == hmac.new(KEY, canonical_json(LIST_BODY), hashlib.sha256).digest()
     assert "=" not in cursor and "+" not in cursor and "/" not in cursor  # safe in a query string
 
 
 def test_a_bad_signature_is_refused() -> None:
-    data, signature = encode_cursor(BODY, key=KEY).split(".")
-    forged = _b64(canonical_json({**BODY, "last_key": [3]}))
-    invalid(f"{forged}.{signature}")
-    invalid(f"{data}.{_b64(b'\x00' * 32)}")
-    invalid(encode_cursor(BODY, key=hkdf_sha256(b"\x08" * 32, b"cursor")))
+    data, signature = list_cursor().split(".")
+    forged = _b64(canonical_json({**LIST_BODY, "last_key": [3]}))
+    refused(lambda: decode_list(f"{forged}.{signature}"))
+    refused(lambda: decode_list(f"{data}.{_b64(b'\x00' * 32)}"))
+    refused(lambda: decode_list(list_cursor(key=hkdf_sha256(b"\x08" * 32, b"cursor"))))
 
 
-def test_a_different_filters_hash_or_sort_is_refused() -> None:
-    cursor = encode_cursor(BODY, key=KEY)
-    invalid(cursor, filters=filters_hash({"status": "resolved"}))
-    invalid(cursor, sort="created_at")
+def test_other_filters_another_sort_or_another_direction_is_refused() -> None:
+    cursor = list_cursor()
+    refused(lambda: decode_list(cursor, filters={"status": "resolved"}))
+    refused(lambda: decode_list(cursor, filters={}))
+    refused(lambda: decode_list(cursor, sort=RUNS_SORT))
+    refused(lambda: decode_list(cursor, dir="asc"))
+
+
+def test_a_golden_case_cursor_is_refused_by_another_list() -> None:
+    """The sorts are namespaced (D35): M3's lists sorted by a bare `id`, so one list's cursor would have paged
+    another; the same last key and filters under another list's sort are refused."""
+    cursor = list_cursor(sort=GOLDEN_CASES_SORT, dir="asc", last_key=[5], filters={})
+    assert decode_list(cursor, sort=GOLDEN_CASES_SORT, dir="asc", filters={}) == [5]
+    refused(lambda: decode_list(cursor, sort=ALERTS_SORT, dir="asc", filters={}))
+
+
+def test_a_cursor_of_the_m3_form_is_refused() -> None:
+    """Resolution (c): a cursor issued before the namespaced sorts (`"sort": "version_no"`), or one without a
+    `dir`, is 400 `invalid_cursor`; the client starts again from the first page."""
+    refused(lambda: decode_list(sign({**LIST_BODY, "sort": "version_no"})))
+    refused(lambda: decode_list(sign({k: v for k, v in LIST_BODY.items() if k != "dir"})))
+    assert decode_list(sign(LIST_BODY)) == [17]  # the same body, namespaced and with its `dir`, is accepted
 
 
 def test_another_cursor_version_is_refused() -> None:
-    invalid(encode_cursor({**BODY, "v": 1}, key=KEY))
-    invalid(encode_cursor({key: value for key, value in BODY.items() if key != "v"}, key=KEY))
+    refused(lambda: decode_list(sign({**LIST_BODY, "v": 1})))
+    refused(lambda: decode_list(sign({k: v for k, v in LIST_BODY.items() if k != "v"})))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"section": "scored"},
+        {"section": None},
+        {"last_key": 17},
+        {"last_key": None},
+        {"last_key": {"id": 17}},
+    ],
+    ids=["scored-section", "no-section", "scalar-key", "null-key", "object-key"],
+)
+def test_a_list_cursor_needs_the_all_section_and_a_list_key(change: dict[str, Any]) -> None:
+    refused(lambda: decode_list(sign({**LIST_BODY, **change})))
 
 
 @pytest.mark.parametrize(
@@ -79,12 +183,13 @@ def test_another_cursor_version_is_refused() -> None:
     ["", ".", "abc", "a.b.c", "!!!.???", f"{_b64(b'[1, 2]')}.x", f"{_b64(b'not json')}.x"],
 )
 def test_malformed_cursors_are_refused(cursor: str) -> None:
-    invalid(cursor)
+    refused(lambda: decode_list(cursor))
+    refused(lambda: decode_job_cursor(cursor, key=KEY, sort="score_mid", filters_hash=lambda *_: "h"))
 
 
 def test_a_signed_body_that_is_no_object_is_refused() -> None:
-    raw = b"[2]"
-    invalid(f"{_b64(raw)}.{_b64(hmac.new(KEY, raw, hashlib.sha256).digest())}")
+    refused(lambda: decode_list(sign([2])))
+    refused(lambda: decode_job_cursor(sign([2]), key=KEY, sort="posted", filters_hash=lambda *_: "h"))
 
 
 def test_filters_hash_is_the_canonical_json_digest() -> None:
@@ -93,9 +198,334 @@ def test_filters_hash_is_the_canonical_json_digest() -> None:
     assert filters_hash({"a": 1}) != filters_hash({"a": True})
 
 
+def test_decimals_encode_as_fixed_point_strings() -> None:
+    """B7: a `Decimal` filter is its fixed-point string, never an exponent and never a float."""
+    assert canonical_json(
+        {"min_score": Decimal("71.50"), "radius_km": Decimal("1E+2"), "tiny": Decimal("1E-7")}
+    ) == (b'{"min_score":"71.50","radius_km":"100","tiny":"0.0000001"}')
+    assert canonical_json({"b": Decimal("0.10"), "a": "München"}) == '{"a":"München","b":"0.10"}'.encode()
+    assert filters_hash({"min_score": Decimal("71.50")}) == filters_hash({"min_score": "71.50"})
+    assert (
+        filters_hash({"min_score": Decimal("71.50")}) == hashlib.sha256(b'{"min_score":"71.50"}').hexdigest()
+    )
+    for not_finite in (Decimal("NaN"), Decimal("Infinity"), float("nan")):
+        with pytest.raises(ValueError):
+            canonical_json({"min_score": not_finite})
+
+
+# ---- the id cursor and the page (M4 Task 10) ---------------------------------------------------------------
+
+
+def decode_id(cursor: str, **kw: Any) -> int:
+    args: dict[str, Any] = {
+        "key": KEY,
+        "sort": SETTINGS_VERSIONS_SORT,
+        "dir": "desc",
+        "filters": FILTERS,
+    } | kw
+    return decode_id_cursor(cursor, **args)
+
+
+def test_an_id_cursor_round_trips_and_refuses_another_list_or_filter() -> None:
+    assert decode_id(list_cursor(last_key=[17])) == 17
+    assert (
+        decode_id(list_cursor(sort=ALERTS_SORT, last_key=[1], filters={}), sort=ALERTS_SORT, filters={}) == 1
+    )
+    cursor = list_cursor(last_key=[17])
+    refused(lambda: decode_id(cursor, filters={}))
+    refused(lambda: decode_id(cursor, sort=SCORE_CYCLES_SORT))
+    refused(lambda: decode_id(cursor, dir="asc"))
+    refused(lambda: decode_id("not-a-cursor"))
+
+
+@pytest.mark.parametrize(
+    "last_key",
+    [[0], [-3], [True], ["17"], [1.5], [None], [], [17, 1]],
+    ids=["zero", "negative", "bool", "string", "float", "null", "empty", "two-parts"],
+)
+def test_an_id_cursor_needs_one_id_of_at_least_1(last_key: list[JSONValue]) -> None:
+    refused(lambda: decode_id(list_cursor(last_key=last_key)))
+
+
+def test_a_page_keeps_limit_rows_and_has_a_cursor_only_when_more_were_read() -> None:
+    def page(rows: list[int], limit: int) -> tuple[list[int], str | None]:
+        return list_page(
+            rows,
+            limit=limit,
+            last_key=lambda n: [n * 10],
+            sort=SCORE_CYCLES_SORT,
+            dir="desc",
+            filters=FILTERS,
+            key=KEY,
+        )
+
+    items, cursor = page([5, 4, 3], 2)  # read with `limit + 1`: a third row means a next page
+    assert items == [5, 4] and cursor is not None
+    assert decode_list(cursor, sort=SCORE_CYCLES_SORT) == [40]  # the last kept row's key, this list's sort
+    assert page([5, 4], 2) == ([5, 4], None)  # exactly `limit`: the last page
+    assert page([5], 2) == ([5], None)
+    assert page([], 2) == ([], None)
+
+
+def test_the_list_sorts_are_namespaced_and_distinct() -> None:
+    sorts = [
+        GOLDEN_CASES_SORT,
+        SETTINGS_VERSIONS_SORT,
+        RUNS_SORT,
+        SCORE_CYCLES_SORT,
+        ALERTS_SORT,
+        EVAL_RUNS_SORT,
+        JOB_HISTORY_SORT,
+        *(f"jobs.{sort}" for sort in get_args(JobSort)),
+    ]
+    assert sorts == [
+        "golden_cases.id",
+        "settings_versions.version_no",
+        "runs.queued_at",
+        "score_cycles.id",
+        "alerts.id",
+        "eval_runs.id",
+        "jobs.history",
+        "jobs.score_mid",
+        "jobs.score_low",
+        "jobs.posted",
+        "jobs.first_seen",
+    ]
+    assert len(set(sorts)) == len(sorts)
+
+
 def test_cursor_key_is_hkdf_of_the_session_secret() -> None:
     secret = b"\x05" * 32
     cfg = cast(
         AppConfig, SimpleNamespace(secret_b64=lambda name: secret if name == "session_secret" else b"")
     )
     assert cursor_key(cfg) == hkdf_sha256(secret, b"cursor") != hkdf_sha256(secret, b"session")
+
+
+# ---- the job cursors ---------------------------------------------------------------------------------------
+
+POSTED_AFTER = "2026-10-19T12:00:00.000000+00:00"
+POSTED_BEFORE = "2026-10-31T23:00:00.000000+00:00"
+
+
+def job_filters_hash(posted_after: str | None, posted_before: str | None = None) -> str:
+    """The jobs list's filters with the window's bounds the cursor carries (B31)."""
+    return filters_hash({"remote": True, "posted_after": posted_after, "posted_before": posted_before})
+
+
+def job_cursor(c: JobCursor) -> str:
+    return encode_job_cursor(c, filters_hash=job_filters_hash(c.posted_after, c.posted_before), key=KEY)
+
+
+def decode_job(
+    cursor: str, sort: JobSort, hash_of: Callable[[str | None, str | None], str] = job_filters_hash
+) -> JobCursor:
+    return decode_job_cursor(cursor, key=KEY, sort=sort, filters_hash=hash_of)
+
+
+ROUND_TRIPS = [
+    JobCursor("score_mid", "scored", "71.50", 4711, 1834, None),
+    JobCursor("score_mid", "scored", "100.00", 1, 0, POSTED_AFTER),
+    JobCursor("score_mid", "unscored", 0.8312000036239624, 12, 7, None),
+    JobCursor("score_mid", "unscored", None, 12, 7, POSTED_AFTER),
+    JobCursor("score_low", "scored", "0.00", 9, 3, None),
+    JobCursor("score_low", "unscored", -1.0, 9, 3, None),
+    JobCursor("posted", "all", "2026-10-26T12:00:00.123456+00:00", 5, 2, POSTED_AFTER),
+    JobCursor("posted", "all", None, 5, 2, None),
+    JobCursor("first_seen", "all", "2026-10-26T12:00:00.000001+00:00", 8, 9, None),
+    JobCursor("first_seen", "all", "2026-10-26T12:00:00Z", 8, 9, POSTED_AFTER),
+    JobCursor("score_mid", "scored", "71.50", 4711, 1834, POSTED_AFTER, POSTED_BEFORE),  # a custom window
+    JobCursor("posted", "all", "2026-10-26T12:00:00.123456+00:00", 5, 2, POSTED_AFTER, POSTED_BEFORE),
+]
+
+
+@pytest.mark.parametrize("c", ROUND_TRIPS, ids=[f"{c.sort}-{c.section}-{c.last_value}" for c in ROUND_TRIPS])
+def test_job_cursor_round_trips_per_sort_and_section(c: JobCursor) -> None:
+    cursor = job_cursor(c)
+    assert decode_job(cursor, c.sort) == c
+    assert body_of(cursor) == {
+        "v": 2,
+        "sort": f"jobs.{c.sort}",
+        "dir": "desc",
+        "section": c.section,
+        "last_key": [c.last_value],
+        "job_id": c.job_id,
+        "gen": c.gen,
+        "posted_after": c.posted_after,
+        "posted_before": c.posted_before,
+        "filters_hash": job_filters_hash(c.posted_after, c.posted_before),
+    }
+    for other in get_args(JobSort):
+        if other != c.sort:
+            refused(partial(decode_job, cursor, other))  # another sort's cursor
+
+
+SCORED = body_of(job_cursor(ROUND_TRIPS[0]))
+UNSCORED = body_of(job_cursor(ROUND_TRIPS[2]))
+POSTED = body_of(job_cursor(ROUND_TRIPS[6]))
+FIRST_SEEN = body_of(job_cursor(ROUND_TRIPS[8]))
+
+
+@pytest.mark.parametrize(
+    ("sort", "section", "value"),
+    [
+        ("score_mid", "all", "2026-10-26T12:00:00.000000+00:00"),
+        ("score_low", "all", None),
+        ("posted", "scored", "71.50"),
+        ("posted", "unscored", 0.5),
+        ("first_seen", "scored", "71.50"),
+        ("first_seen", "unscored", None),
+        ("score_mid", "other", "71.50"),
+        ("posted", None, "2026-10-26T12:00:00.000000+00:00"),
+    ],
+)
+def test_job_cursor_refuses_a_section_the_sort_lacks(
+    sort: JobSort, section: str | None, value: JSONValue
+) -> None:
+    """`scored` and `unscored` belong to the score sorts, `all` to the date sorts (§14.3); each value would
+    be valid in its section, so the section alone is what is refused."""
+    forged = sign({**SCORED, "sort": f"jobs.{sort}", "section": section, "last_key": [value]})
+    refused(lambda: decode_job(forged, sort))
+    with pytest.raises(ValueError):
+        JobCursor(sort, cast(Any, section), cast(Any, value), 5, 2, None)  # nor can an encoder make one
+
+
+@pytest.mark.parametrize(
+    ("template", "change"),
+    [
+        (SCORED, {"last_key": [71.5]}),  # a float score
+        (SCORED, {"last_key": ["71.5"]}),
+        (SCORED, {"last_key": ["1071.50"]}),
+        (SCORED, {"last_key": ["71.50\n"]}),
+        (SCORED, {"last_key": ["\u0667\u0661.\u0665\u0660"]}),  # Arabic-Indic digits, not ASCII ones
+        (SCORED, {"last_key": [None]}),  # the scored section has a score
+        (SCORED, {"gen": -1}),
+        (SCORED, {"gen": True}),
+        (SCORED, {"gen": 1.0}),
+        (SCORED, {"gen": None}),
+        (SCORED, {"job_id": 0}),
+        (SCORED, {"job_id": True}),
+        (SCORED, {"job_id": "4711"}),
+        (SCORED, {"last_key": []}),
+        (SCORED, {"last_key": ["71.50", 4711]}),
+        (SCORED, {"last_key": "71.50"}),
+        (SCORED, {"dir": "asc"}),
+        (UNSCORED, {"last_key": [1.5]}),
+        (UNSCORED, {"last_key": [-1.0000001]}),
+        (UNSCORED, {"last_key": [True]}),
+        (UNSCORED, {"last_key": ["0.5"]}),
+        (UNSCORED, {"last_key": [[0.5]]}),
+        (POSTED, {"last_key": ["2026-13-01T00:00:00+00:00"]}),  # an unparsable time
+        (POSTED, {"last_key": ["yesterday"]}),
+        (POSTED, {"last_key": ["2026-10-26T12:00:00.123456"]}),  # no zone
+        (POSTED, {"last_key": ["2026-10-26T14:00:00.123456+02:00"]}),  # not UTC
+        (POSTED, {"last_key": [1761480000]}),
+        (FIRST_SEEN, {"last_key": [None]}),  # `first_seen_at` is never null
+    ],
+)
+def test_job_cursor_refuses_a_malformed_last_key(template: dict[str, Any], change: dict[str, Any]) -> None:
+    sort = cast(JobSort, template["sort"].removeprefix("jobs."))
+    assert decode_job(sign(template), sort).job_id == template["job_id"]  # the template itself is accepted
+    refused(lambda: decode_job(sign({**template, **change}), sort))
+
+
+@pytest.mark.parametrize(
+    "posted_after",
+    [
+        5,
+        True,
+        "yesterday",
+        "2026-13-01T00:00:00+00:00",  # an unparsable time
+        "2026-10-19T12:00:00.000000",  # no zone
+        "2026-10-19T14:00:00.000000+02:00",  # not UTC
+        "2026-10-19",
+    ],
+)
+def test_job_cursor_refuses_a_posted_after_that_is_no_utc_time(posted_after: JSONValue) -> None:
+    """Ruling T2-b: the cut-off is `None` or a UTC time. The hash callable here ignores its argument and
+    returns the template's own hash, so the cut-off's check alone can refuse; the route's callable is never
+    asked with such a value."""
+    template = body_of(job_cursor(ROUND_TRIPS[6]))
+    asked: list[str | None] = []
+
+    def any_cut_off(cut_off: str | None, upper: str | None) -> str:
+        asked.append(cut_off)
+        return cast(str, template["filters_hash"])
+
+    for accepted in (POSTED_AFTER, None, "2026-10-20T00:00:00Z"):
+        assert decode_job(sign({**template, "posted_after": accepted}), "posted", any_cut_off).job_id == 5
+    assert asked == [POSTED_AFTER, None, "2026-10-20T00:00:00Z"]
+    refused(lambda: decode_job(sign({**template, "posted_after": posted_after}), "posted", any_cut_off))
+    assert len(asked) == 3
+    with pytest.raises(ValueError):
+        JobCursor("posted", "all", None, 5, 2, cast(Any, posted_after))  # nor can an encoder make one
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"last_value": 71.5},
+        {"last_value": "71.5"},
+        {"job_id": 0},
+        {"job_id": True},
+        {"gen": -1},
+        {"gen": False},
+        {"posted_after": "last week"},
+    ],
+)
+def test_a_job_cursor_that_breaks_its_rules_cannot_be_made(fields: dict[str, Any]) -> None:
+    values: dict[str, Any] = {
+        "sort": "score_mid",
+        "section": "scored",
+        "last_value": "71.50",
+        "job_id": 4711,
+        "gen": 1834,
+        "posted_after": None,
+        **fields,
+    }
+    with pytest.raises(ValueError):
+        JobCursor(**values)
+
+
+def test_job_cursor_hash_is_checked_with_its_own_posted_after() -> None:
+    """B31: the cut-off of a relative date filter is fixed by the first page and travels in the cursor; the
+    hash is computed from the cursor's `posted_after`, never from the time the next page is requested."""
+    c = ROUND_TRIPS[6]
+    cursor = job_cursor(c)
+    asked: list[tuple[str | None, str | None]] = []
+
+    def recording(posted_after: str | None, posted_before: str | None) -> str:
+        asked.append((posted_after, posted_before))
+        return job_filters_hash(posted_after, posted_before)
+
+    assert decode_job(cursor, "posted", recording) == c
+    assert asked == [(POSTED_AFTER, None)]
+    moved = sign({**body_of(cursor), "posted_after": "2026-10-20T12:00:00.000000+00:00"})
+    refused(lambda: decode_job(moved, "posted"))  # another cut-off than the hash was made with
+    other_filters = lambda pa, pb: filters_hash({"remote": False, "posted_after": pa, "posted_before": pb})  # noqa: E731
+    refused(lambda: decode_job(cursor, "posted", other_filters))
+    refused(lambda: decode_job(sign({**body_of(cursor), "posted_after": None}), "posted"))
+
+
+def test_job_cursor_hash_is_checked_with_its_own_posted_before() -> None:
+    """B31: a `custom` window's upper bound (midnight after `posted_to` in `display.timezone`) is fixed by the
+    first page and travels in the cursor too, so a later change of the zone never moves a continued page's
+    window: the hash is computed from the cursor's `posted_before`, and a cursor whose upper bound moved, or
+    that lost it, is refused."""
+    c = ROUND_TRIPS[-1]
+    cursor = job_cursor(c)
+    asked: list[tuple[str | None, str | None]] = []
+
+    def recording(posted_after: str | None, posted_before: str | None) -> str:
+        asked.append((posted_after, posted_before))
+        return job_filters_hash(posted_after, posted_before)
+
+    assert decode_job(cursor, "posted", recording) == c
+    assert asked == [(POSTED_AFTER, POSTED_BEFORE)]
+    moved: JSONValue
+    for moved in ("2026-11-01T00:00:00.000000+00:00", None, 5, "2026-10-31T23:00:00.000000", "tomorrow"):
+        forged = sign({**body_of(cursor), "posted_before": moved})
+        refused(partial(decode_job, forged, "posted"))  # moved, lost, or no UTC time
+    for malformed in (5, "2026-10-31T23:00:00.000000", "2026-11-01T00:00:00.000000+01:00", "tomorrow"):
+        with pytest.raises(ValueError):
+            JobCursor("posted", "all", None, 5, 2, POSTED_AFTER, cast(Any, malformed))

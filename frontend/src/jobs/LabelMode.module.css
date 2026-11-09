@@ -1,0 +1,64 @@
+/* Label mode in the list's column: its heading and note, the progress, the cards, and Next batch below them. */
+.mode {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.head {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.heading {
+  font-size: var(--font-size-5);
+}
+
+.note {
+  font-size: var(--font-size-2);
+  color: var(--color-text-muted);
+}
+
+.list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+/* Next batch, and "Batch done" before it. The status line is always rendered (a live region has to be in the
+ * accessibility tree before it speaks) and takes no room while it is empty. */
+.next {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  row-gap: var(--space-2);
+}
+
+.done {
+  color: var(--color-success);
+  font-weight: var(--font-weight-bold);
+}
+
+.done:not(:empty) {
+  margin-right: var(--space-4);
+}
+
+.button {
+  min-height: 40px;
+  padding: 0 var(--space-5);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+}
+
+.button[aria-disabled="true"],
+.button[aria-busy="true"] {
+  cursor: progress;
+}

@@ -13,7 +13,8 @@ the process's one `Argon2Gate` (`app.state.argon2_gate`, made by `create_app`):
   `GateFull`, before any Argon2 work.
 
 The gate holds no connection and no transaction; whoever holds a slot does its database work around the
-computations, never during them. The counters are read and changed on the event loop only.
+computations, never during them. The counters are read and changed on the event loop only. The api lifespan
+closes the gate when it ends (`close`, M0 Carry-forward 7): the pool's threads end with the app.
 """
 
 import asyncio
@@ -58,5 +59,10 @@ class Argon2Gate:
             self._admitted -= 1
 
     async def run[T, *Ts](self, fn: Callable[[*Ts], T], *args: *Ts) -> T:
-        """`fn(*args)` on one of the gate's threads; the caller holds a slot."""
+        """`fn(*args)` on one of the gate's threads; the caller holds a slot. `RuntimeError` after `close`."""
         return await asyncio.get_running_loop().run_in_executor(self._pool, fn, *args)
+
+    def close(self) -> None:
+        """Shut the pool down: the computations still queued are cancelled, a running one is waited for, and
+        every later `run` raises `RuntimeError`. A second close does nothing."""
+        self._pool.shutdown(wait=True, cancel_futures=True)

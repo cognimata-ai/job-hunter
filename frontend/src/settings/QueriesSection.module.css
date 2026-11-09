@@ -1,0 +1,55 @@
+/* Queries & sources: its groups in a column (the queries table and Add query, the proposal, the sources, the
+ * quota limits); the add and edit forms as a row of fields that wraps. */
+.queries {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
+
+.group {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.add,
+.edit {
+  min-width: 0;
+}
+
+.editFields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+
+.textField {
+  flex: 1 1 16rem;
+  max-width: 32rem;
+}
+
+.addButton {
+  flex: none;
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.notice:empty {
+  display: none;
+}
+
+.notice {
+  color: var(--color-success);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.optional {
+  align-content: start;
+}

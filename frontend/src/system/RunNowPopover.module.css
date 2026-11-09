@@ -1,0 +1,105 @@
+/* Run now: the header's primary action, its popover, and the run's drawer body. */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-2);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.trigger:hover {
+  border-color: var(--color-accent-hover);
+  background: var(--color-accent-hover);
+}
+
+/* A run is active: the button opens its report; its text says so, the softer fill repeats it. */
+.active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.active:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-hover);
+}
+
+.caret {
+  font-size: var(--font-size-1);
+}
+
+/* Radix copies the content's z-index onto its positioned wrapper. */
+.popover {
+  z-index: 30;
+  width: min(340px, calc(100vw - 2 * var(--space-4)));
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-3);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-overlay);
+  animation: appear var(--duration) ease-out;
+}
+
+.form {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-3);
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--font-size-2);
+}
+
+.box {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--color-accent);
+}
+
+.start {
+  min-height: 36px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-2);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.start:hover {
+  background: var(--color-accent-hover);
+}
+
+.start:disabled {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.panel {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.title {
+  font-size: var(--font-size-5);
+}
+
+@keyframes appear {
+  from {
+    transform: translateY(-4px);
+    opacity: 0;
+  }
+}

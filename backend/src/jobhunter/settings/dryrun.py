@@ -4,9 +4,10 @@ settings page shows on every change and that a save runs again (Task 17).
 `dry_run` composes §6.8's pseudo-code in its order:
 1. `validate_fields` (with the eval gate of the payload's candidate, `payload_gate`: the active rubric and
    prompt-schema versions with the payload's model and evaluation policies by hash, M3 Task 20), then
-   `unknown_references` (Task 17): an entry of `queries[]` or `watchlist[]` whose id names no row is an
-   `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview and the
-   save (which runs this again) refuse the same documents;
+   `unknown_references` (Task 17): an entry of `queries[]` whose id names no live query (no row, or a
+   retired one: an edit retires its row, plan M4 Task 29 Ruling T29-c) or of `watchlist[]` whose id names no
+   row is an `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview
+   and the save (which runs this again) refuse the same documents;
 2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `eval_failed`,
    `serpapi_disabled_no_fallback`); both read `active`, which tells a selection of generator effort `low` from
    a kept one (Ruling T20-d);
@@ -15,18 +16,37 @@ settings page shows on every change and that a save runs again (Task 17).
 4. `quota_projections` with the run view of the proposed settings (`RunSettings.from_settings`, the proposed
    interval), on the current window snapshots (none: simulated in memory). Paid search also shows its window:
    the counted units (`ledger.used_units`), the limit and the reset (`window`);
-5. the LLM projection (`llm_projection`) with `ĉ = central_cost_per_target` of the proposed model policy (no
-   attempt history before M3), the proposed evaluation policy's projected critic rate (the stored row's, or
-   the rate a new row gets: the replay over the round-0 drafts, else 0.450), 3,000 arrivals a month, and
-   `llm_cap_binding`; beside it the month's figures as the save would leave them: the month row read without
-   a lock (`spend_ledger.read_month_or_new`), its cap and buffer set to the proposed ones in memory
-   (`budget.change_cap`), its counted spend and scoring headroom;
+5. the LLM projection (`llm_projection`) with `ĉ` (`c_hat`), the proposed evaluation policy's projected
+   critic rate (the stored row's, or the rate a new row gets: the replay over the round-0 drafts, else
+   0.450), the arrivals (`arrival_per_month`) and `llm_cap_binding`; beside it the month's figures as the
+   save would leave them: the month row read without a lock (`spend_ledger.read_month_or_new`), its cap and
+   buffer set to the proposed ones in memory (`budget.change_cap`), its counted spend and scoring headroom.
+   With the active configuration read once (`ActivePolicies`; plan M4 Task 14, D22, spec L1137, L1178):
+   - `ĉ` is §6.9.2's: `cycles.c_hat` of the active tuple and evaluation policy (the trailing 7-day mean of
+     its published online attempts, from 20 of them; else the central estimate) while the proposed model and
+     evaluation policies are the active ones by content hash, else `central_cost_per_target` of the proposed
+     model policy, whose own history no tuple has yet. Without an active tuple it is the central estimate.
+     Its source goes with it: the capacity adds a cycle's cache-write share to a central `ĉ` only
+     (`llm_projection.paced_cost_per_target`), since a history mean already includes its cache writes;
+   - `arrival_per_month` is §6.8's trailing 7-day rate of new targets, a month (Ruling T14-d): the active
+     tuple's targets created in `[now - 7 d, now]` without a bulk operation, x 30 / 7, rounded to the nearest
+     whole number. An ordinary arrival has none (the collection's `enqueue_targets`, the `missing_targets`
+     reconciler and a merge's new current revision create with `bulk_operation_id = NULL`); the targets an
+     activation's `create_targets_for_tuple` creates or revives carry its bulk operation, so a re-activated
+     tuple's catch-up is no arrival. It is 3,000 (`DEFAULT_ARRIVAL_PER_MONTH`) when there is no such history:
+     without an active tuple, while it has no target or its oldest target is younger than 7 days, and while
+     its latest activation is younger than 7 days, so a window never straddles one. The latest activation is
+     the newest `created_at` of the tuple's `bulk_operations`: every activation (`targets.activate_tuple`, a
+     confirm's or an `llm_tuple` save's) opens one (`bulk.open`), with or without retained revisions, and the
+     retention deletes only those that ended 13 months before. One statement;
 6. the effect classes (`classify_effects` against the active settings) and what they add:
    - `scope`: `det_recompute`, the published results of the active tuple that the scope apply recomputes
      without any LLM call (`count_published_results_active_tuple`, M3 Task 15);
-   - `llm_tuple`: the warning `llm_rescore` with `targets` (`count_retained_current_revisions`), `est_usd =
-     targets x ĉ` and `bulk_budget_usd = scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) -
-     scoring_counted_usd)` (§6.9.3; Task 21's confirm preview uses the same share);
+   - `llm_tuple` with an active profile: the warning `llm_rescore` with `targets`
+     (`count_retained_current_revisions`), `est_usd = targets x ĉ` and `bulk_budget_usd =
+     scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) - scoring_counted_usd)` (§6.9.3; Task
+     21's confirm preview uses the same share). Without an active profile there is no tuple to re-score
+     (`active_config` pairs them), so there is no warning (D22);
    - `evaluation_policy`: `critic_rate`, the projected critic rate (published results are not re-reviewed);
    - either of the gated classes (`GATED`, §11.13 "What is gated"): `eval_gate`, the state of the gate a
      save would check (`uncalibrated`, `passed` or `failed`);
@@ -61,13 +81,14 @@ from jobhunter.quota.cells import location_keys
 from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
-from jobhunter.run_settings import RunSettings, ScopeSettings
+from jobhunter.run_settings import RunSettings
 from jobhunter.scoring.det_results import count_published
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy, replay_projected_critic_rate
 from jobhunter.settings.derive import candidate_of, derived
 from jobhunter.settings.effects import EffectClass, classify_effects
 from jobhunter.settings.llm_projection import (
     DEFAULT_ARRIVAL_PER_MONTH,
+    CHatSource,
     LlmProjection,
     cap_binding,
     central_cost_per_target,
@@ -104,12 +125,30 @@ _RETAINED_CURRENT_REVISIONS: Final = q(
     "AND NOT synthetic_eval"
 )
 _ACTIVE_TUPLE: Final = q("SELECT llm_tuple_id FROM active_config WHERE id = 1")
+# The active configuration the LLM projection compares the proposal with (D22).
+_ACTIVE_POLICIES: Final = q(
+    "SELECT a.profile_version_id, a.llm_tuple_id, a.evaluation_policy_id, "
+    "m.policy_hash AS model_policy_hash, e.policy_hash AS evaluation_policy_hash FROM active_config a "
+    "JOIN model_policies m ON m.id = a.model_policy_id "
+    "JOIN evaluation_policies e ON e.id = a.evaluation_policy_id WHERE a.id = 1"
+)
+# A tuple's oldest target, its new targets (no bulk operation) created in `[since, now]`, and its latest
+# activation (the newest of its bulk operations).
+_ARRIVALS: Final = q(
+    "SELECT t.oldest, t.recent, (SELECT max(b.created_at) FROM bulk_operations b "
+    "WHERE b.llm_tuple_id = :tuple) AS activated FROM (SELECT min(created_at) AS oldest, count(*) FILTER "
+    "(WHERE bulk_operation_id IS NULL AND created_at >= :since AND created_at <= :now) AS recent "
+    "FROM score_targets WHERE llm_tuple_id = :tuple) t"
+)
+ARRIVAL_WINDOW: Final = timedelta(days=7)
+_DAYS_PER_MONTH: Final = 30
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
 )
+# A query id is missing when it names no row or a retired one: the document names live queries only.
 _MISSING_QUERIES: Final = q(
     "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
-    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id)"
+    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id AND q.retired_at IS NULL)"
 )
 _MISSING_COMPANIES: Final = q(
     "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
@@ -128,6 +167,71 @@ class DryRunResult:
     effects: frozenset[EffectClass]
 
 
+@dataclass(frozen=True)
+class ActivePolicies:
+    """What the LLM projection compares a proposal with (module docstring, step 5): whether a profile is
+    active, the active tuple and evaluation policy, and the hashes of the active model and evaluation
+    policies."""
+
+    profile_active: bool
+    llm_tuple_id: int | None
+    evaluation_policy_id: int
+    model_policy_hash: bytes
+    evaluation_policy_hash: bytes
+
+
+async def active_policies(conn: AsyncConnection) -> ActivePolicies:
+    """The active configuration's `ActivePolicies` (a plain read)."""
+    row = (await conn.execute(_ACTIVE_POLICIES)).one()
+    return ActivePolicies(
+        profile_active=row.profile_version_id is not None,
+        llm_tuple_id=None if row.llm_tuple_id is None else int(row.llm_tuple_id),
+        evaluation_policy_id=int(row.evaluation_policy_id),
+        model_policy_hash=bytes(row.model_policy_hash),
+        evaluation_policy_hash=bytes(row.evaluation_policy_hash),
+    )
+
+
+async def c_hat(
+    conn: AsyncConnection, proposed: Settings, active: ActivePolicies, *, now: datetime
+) -> tuple[Decimal, CHatSource]:
+    """§6.9.2's `ĉ` for `proposed` and where it came from (module docstring, step 5): the active tuple's
+    history while its model and evaluation policies are the active ones (`cycles.c_hat`, itself central below
+    20 attempts), else the proposed model policy's central estimate."""
+    policy = proposed.scoring.model_policy
+    d = derived(proposed)
+    same = (
+        content_hash(d.model_policy) == active.model_policy_hash
+        and content_hash(d.evaluation) == active.evaluation_policy_hash
+    )
+    if active.llm_tuple_id is None or not same:
+        return central_cost_per_target(policy), "central"
+    # `cycles` imports `llm.bulk`, which imports this module: imported when the dry-run runs
+    from jobhunter.scoring import cycles
+
+    return await cycles.c_hat(
+        conn,
+        llm_tuple_id=active.llm_tuple_id,
+        evaluation_policy_id=active.evaluation_policy_id,
+        model_policy=policy,
+        now=now,
+    )
+
+
+async def arrival_per_month(conn: AsyncConnection, llm_tuple_id: int | None, *, now: datetime) -> int:
+    """§6.8's arrivals a month (module docstring, step 5): the active tuple's new targets of the 7 days up to
+    `now` x 30 / 7, or `DEFAULT_ARRIVAL_PER_MONTH` without 7 days of history since its latest activation."""
+    if llm_tuple_id is None:
+        return DEFAULT_ARRIVAL_PER_MONTH
+    since = now - ARRIVAL_WINDOW
+    row = (await conn.execute(_ARRIVALS, {"tuple": llm_tuple_id, "since": since, "now": now})).one()
+    young = row.oldest is None or row.oldest > since
+    if young or (row.activated is not None and row.activated > since):
+        return DEFAULT_ARRIVAL_PER_MONTH
+    rate = Decimal(int(row.recent) * _DAYS_PER_MONTH) / ARRIVAL_WINDOW.days
+    return int(rate.to_integral_value(rounding=ROUND_HALF_UP))
+
+
 async def active_settings(conn: AsyncConnection) -> Settings:
     """The active settings version's document, read with a plain `SELECT` (no lock)."""
     payload = (await conn.execute(_ACTIVE_PAYLOAD)).scalar_one_or_none()
@@ -137,8 +241,9 @@ async def active_settings(conn: AsyncConnection) -> Settings:
 
 
 async def unknown_references(conn: AsyncConnection, settings: Settings) -> list[FieldIssue]:
-    """An `invalid` issue at each `queries[]` or `watchlist[]` entry of `settings` whose id names no row
-    (plain reads; the ids are bounded by the model, so they fit `bigint`)."""
+    """An `invalid` issue at each `queries[]` entry of `settings` whose id names no live query (no row, or a
+    retired one) and each `watchlist[]` entry whose id names no row (plain reads; the ids are bounded by the
+    model, so they fit `bigint`)."""
     query_ids = [entry.query_id for entry in settings.queries]
     company_ids = [entry.watchlist_company_id for entry in settings.watchlist]
     missing_queries = set((await conn.execute(_MISSING_QUERIES, {"ids": query_ids})).scalars())
@@ -185,10 +290,11 @@ async def projected_critic_rate(conn: AsyncConnection, settings: Settings, *, no
     return DEFAULT_PROJECTED_CRITIC_RATE if replayed is None else replayed
 
 
-def paid_cells(settings: Settings) -> int:
-    """§6.8's paid cells: the enabled queries times the location keys (locations, and `remote-de`)."""
-    queries = sum(1 for entry in settings.queries if entry.enabled)
-    return queries * len(location_keys(ScopeSettings.from_model(settings.scope)))
+def paid_cells(settings: RunSettings) -> int:
+    """§6.8's paid cells of the run view `settings`: the enabled queries times the location keys (locations,
+    and `remote-de`). The query lists count the active settings' paid cells with it too."""
+    queries = sum(1 for enabled in settings.queries.values() if enabled)
+    return queries * len(location_keys(settings.scope))
 
 
 def next_slot(settings: Settings, now: datetime) -> datetime | None:
@@ -284,7 +390,7 @@ async def dry_run(
     adzuna = await current_snapshot(conn, "adzuna")
     serpapi = await current_snapshot(conn, "serpapi")
     quota_warns, proj = quota_projections(
-        run, jsearch=jsearch, adzuna=adzuna, serpapi=serpapi, cells=paid_cells(proposed), now=now
+        run, jsearch=jsearch, adzuna=adzuna, serpapi=serpapi, cells=paid_cells(run), now=now
     )
     warns += quota_warns
     paid_search: tuple[tuple[Provider, Window | None, str], ...] = (
@@ -296,14 +402,16 @@ async def dry_run(
         if isinstance(projection, dict):
             projection["window"] = await _window(conn, provider, snapshot, run, now)
 
-    c_hat = central_cost_per_target(proposed.scoring.model_policy)
+    policies = await active_policies(conn)
+    cost, source = await c_hat(conn, proposed, policies, now=now)
     critic_rate = await projected_critic_rate(conn, proposed, now=now)
     llm = llm_projection(
         proposed,
         now=now,
-        c_hat=c_hat,
+        c_hat=cost,
+        c_hat_source=source,
         projected_critic_rate=critic_rate,
-        arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
+        arrival_per_month=await arrival_per_month(conn, policies.llm_tuple_id, now=now),
     )
     p = BudgetParams.from_payload(proposed.to_payload())
     month = budget.month_of(now)
@@ -321,13 +429,13 @@ async def dry_run(
     effects = classify_effects(active, proposed)
     if "scope" in effects:
         proj["det_recompute"] = await count_published_results_active_tuple(conn)
-    if "llm_tuple" in effects:
+    if "llm_tuple" in effects and policies.profile_active:
         targets = await count_retained_current_revisions(conn)
         warns.append(
             Warning(
                 "llm_rescore",
                 targets=targets,
-                est_usd=_usd(targets * c_hat),
+                est_usd=_usd(targets * cost),
                 bulk_budget_usd=_usd(bulk_budget(proposed, p, after)),
             )
         )

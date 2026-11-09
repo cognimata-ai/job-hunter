@@ -14,7 +14,8 @@ from jobhunter.availability.rules import (
 )
 from jobhunter.clock import utcnow
 from jobhunter.db.transitions import transition
-from jobhunter.errors import FencedOut
+from jobhunter.dedup import merge
+from jobhunter.errors import CoMemberChanged, FencedOut
 from jobhunter.worker import main as worker_main
 from jobhunter.worker import reconcilers as r
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -253,3 +254,35 @@ async def test_the_daily_stale_sweep_loops_over_batches_and_the_tick_runs_one(
     counts = await r.run_reconcilers(ctx(engine, queue_app), "daily")
     assert counts["stale_sweep_daily"] == 4  # batches of 2, 2, then an empty one
     assert {(await one(engine, POSTING, p=p)).availability for p in made} == {"stale"}
+
+
+async def test_a_posting_set_whose_jobs_keep_changing_gives_up_as_a_co_member_change(
+    engine, current_epoch, posting_factory, monkeypatch
+) -> None:
+    """M4 Task 8 (M1 Carry-forward 10): `lock_posting_jobs` whose every round finds a group member it did not
+    lock rolls each round back and, after `_LOCK_ROUNDS`, raises `CoMemberChanged`."""
+    now = utcnow()
+    posting = await posting_factory(
+        engine,
+        source_id="adzuna",
+        native_id="m1",
+        availability="active",
+        last_seen_at=now - DAY,
+        availability_changed_at=now - DAY,
+    )
+    job = await one(engine, sa.text("SELECT job_id FROM postings WHERE id = :p"), p=posting)
+    real_co_members = merge.co_members
+    phantoms = iter(range(10**12, 10**12 + 100))
+    rounds: list[Any] = []
+
+    async def growing(conn: AsyncConnection, job_ids: Any) -> frozenset[int]:
+        """The members as each round re-reads them, with one more no round has locked."""
+        rounds.append(sorted(job_ids))
+        return await real_co_members(conn, job_ids) | {next(phantoms)}
+
+    monkeypatch.setattr(merge, "co_members", growing)
+    with pytest.raises(CoMemberChanged, match="kept changing under the lock"):
+        async with engine.begin() as c:
+            await rules.lock_posting_jobs(c, [posting])
+    assert rounds == [[job.job_id]] * rules._LOCK_ROUNDS  # one re-read per round
+    assert await job_lockable(engine, job.job_id)  # each round's lock went with its savepoint

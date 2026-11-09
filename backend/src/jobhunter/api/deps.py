@@ -2,7 +2,7 @@
 
 import asyncio
 from time import monotonic
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -16,6 +16,10 @@ from jobhunter.config import AppConfig
 from jobhunter.crypto import data_keys
 from jobhunter.embeddings import EmbedderClient
 from jobhunter.geo.gazetteer import Gazetteer
+
+# The request header of the SPA's polls: `X-JH-Background: 1` (that exact value only) marks a poll, not a
+# user's action, which `require_session` validates without sliding the session's idle expiry (plan M4, D28).
+BACKGROUND_HEADER: Final = "X-JH-Background"
 
 
 @runtime_checkable
@@ -128,8 +132,10 @@ async def require_session(request: Request) -> SessionInfo:
     is keyed by the token's HMAC and looked at first, before any SQL, so a request past it costs no database
     round trip; only a request of a valid session is counted (after the validation, which refuses it too
     when a concurrent one took the last place). The validation (and its slide) runs in a transaction of its
-    own that commits before anything is raised. Both clocks (`utcnow`, `monotonic`) are names of this module,
-    so tests can inject them; patching `time.monotonic` itself would also move the event loop's clock.
+    own that commits before anything is raised. A background request (`BACKGROUND_HEADER: 1`) is validated
+    without the slide: it is refused past either expiry and counted by the limit like any other, but it keeps
+    no session alive. Both clocks (`utcnow`, `monotonic`) are names of this module, so tests can inject them;
+    patching `time.monotonic` itself would also move the event loop's clock.
     """
     token = request.cookies.get(sessions.SESSION_COOKIE)
     if not token:
@@ -138,8 +144,9 @@ async def require_session(request: Request) -> SessionInfo:
     limiter = get_rate_limiter(request)
     if limiter.limited(sessions.token_hmac(token, pepper), monotonic()):
         raise _too_many_requests()
+    slide = request.headers.get(BACKGROUND_HEADER) != "1"
     async with get_engine(request).begin() as conn:
-        info = await sessions.validate_session(conn, token, pepper=pepper, now=utcnow())
+        info = await sessions.validate_session(conn, token, pepper=pepper, now=utcnow(), slide=slide)
     if info is None:
         raise _unauthenticated()
     if not limiter.hit(info.token_hmac, monotonic()):

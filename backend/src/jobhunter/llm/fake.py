@@ -45,13 +45,29 @@ key in the current state. A message try is answered by, in this order:
    order), else the key's standing answer (`consume=False`, served to every try; a new one replaces it). A
    body is served as it is (status 200); a scenario is made from the recording as the script's would be. A
    keyed try takes no name of the script;
-2. the scenario script (the next name per try, in arrival order, as above);
-3. the recording `root/<purpose>/<model>/<schema12>.sse`.
+2. on the stack (M4 Task 18), the standing keyed answers of the transport's keyed directory
+   (`JOBHUNTER_FAKE_LLM_KEYED_DIR`, `AppConfig.fake_llm_keyed_dir`): the bytes of
+   `<dir>/<keyed_answer_filename(key)>` when that file exists, read at each try (never cached), served as a
+   keyed body is. `keyed_answer_filename` (`generate:123:0` → `generate_123_0.sse`) is the one place a key
+   becomes a file name: this lookup and the E2E setup that writes the files both call it. As a file is read at
+   every try, its writer writes a temporary file in the same directory and then `os.replace`s it, so a try
+   reads the old answer or the new one, never a partial file;
+3. the scenario script (the next name per try, in arrival order, as above);
+4. the recording `root/<purpose>/<model>/<schema12>.sse`.
 
 **The Message Batches API**, on the same mount (`BATCHES_PATH`), answered from the state's current
 `BatchScript` (`batches(script)`; with none registered, `BatchScript()`, so a dev worker in fake mode answers
 batches too). Every script field is read from the script current when it is needed (Ruling T8-d), so a test
-may register a batch's item outcomes after the batch exists:
+may register a batch's item outcomes after the batch exists. On the stack (M4 Task 18), a transport given a
+batch script file (`JOBHUNTER_FAKE_BATCH_SCRIPT`, `AppConfig.fake_batch_script`) reads it at each create and
+registers it as the state's script (`load_batch_script`: a JSON object of `BatchScript` fields; no file is
+`BatchScript()`), so the E2E setup steers the next batch by writing the file: as it is read at every create,
+its writer writes a temporary file in the same directory and then `os.replace`s it, so a create never reads a
+partial script. A file that cannot be read, is
+no JSON object, or has an unknown field, a field of the wrong type or an unknown outcome fails that create
+with a 400 `invalid_request_error` naming the variable and the fault, logged (`fake_batch_script_invalid`),
+with no batch stored and the script in force kept: never the default in its place, so a mistyped script
+cannot pass by accident:
 - `POST /v1/messages/batches` (create) validates the requests (non-empty, each `custom_id` matching
   `^[a-zA-Z0-9_-]{1,64}$` and unique, params with a model and a positive `max_tokens` and no `stream`; else
   400 `invalid_request_error`), then follows `script.create`: `ok` stores the batch (`msgbatch_<n>`) and
@@ -112,7 +128,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
@@ -121,9 +137,14 @@ import httpx2
 
 from jobhunter.clock import utcnow
 from jobhunter.llm.pricing import MODELS
+from jobhunter.observability.logging import get_logger
 
 PURPOSE_HEADER: Final = "X-JH-Purpose"
 KEY_HEADER: Final = "X-JH-Fake-Key"
+# The variable of M4 Task 18's batch script file (module docstring), as its errors name it.
+BATCH_SCRIPT_VAR: Final = "JOBHUNTER_FAKE_BATCH_SCRIPT"
+
+log = get_logger("jobhunter.llm.fake")
 
 Scenario = Literal[
     "ok",
@@ -221,6 +242,54 @@ class BatchScript:
             raise ValueError("stream_cut_after must not be negative")
 
 
+class BatchScriptInvalid(ValueError):
+    """A batch script file that is no valid `BatchScript` (`load_batch_script`); its message names the
+    fault."""
+
+
+_SCRIPT_FIELDS: Final = frozenset(f.name for f in fields(BatchScript))
+_SCRIPT_TEXT_FIELDS: Final = ("create", "default_item", "listing", "cancel")
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def load_batch_script(path: Path) -> BatchScript:
+    """The `BatchScript` of the JSON object of its fields in `path` (`JOBHUNTER_FAKE_BATCH_SCRIPT`, module
+    docstring); `BatchScript()` when there is no such file. Anything else that is not a valid script raises
+    `BatchScriptInvalid`: an unreadable file, no JSON object, an unknown field, a field of the wrong type, an
+    unknown outcome or a negative count."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return BatchScript()
+    except OSError as exc:
+        raise BatchScriptInvalid(f"unreadable ({type(exc).__name__})") from None
+    try:
+        doc = json.loads(raw)
+    except ValueError:  # not JSON, or not UTF-8
+        raise BatchScriptInvalid("not JSON") from None
+    if not isinstance(doc, dict):
+        raise BatchScriptInvalid("not a JSON object of BatchScript fields")
+    if unknown := sorted(set(doc) - _SCRIPT_FIELDS):
+        known = ", ".join(sorted(_SCRIPT_FIELDS))
+        raise BatchScriptInvalid(f"unknown field {', '.join(unknown)}; known: {known}")
+    if wrong := [name for name in _SCRIPT_TEXT_FIELDS if name in doc and not isinstance(doc[name], str)]:
+        raise BatchScriptInvalid(f"{', '.join(wrong)} must be a string")
+    items = doc.get("items", {})
+    if not isinstance(items, dict) or not all(isinstance(outcome, str) for outcome in items.values()):
+        raise BatchScriptInvalid("items must be an object of custom_id to item outcome")
+    if "polls_until_ended" in doc and not _is_int(doc["polls_until_ended"]):
+        raise BatchScriptInvalid("polls_until_ended must be an integer")
+    if doc.get("stream_cut_after") is not None and not _is_int(doc["stream_cut_after"]):
+        raise BatchScriptInvalid("stream_cut_after must be an integer or null")
+    try:
+        return BatchScript(**doc)
+    except ValueError as exc:  # an unknown outcome, a negative count
+        raise BatchScriptInvalid(str(exc)) from None
+
+
 @dataclass(eq=False)
 class StoredBatch:
     """One batch the fake created: its id and creation order, its creation time, the purpose of its
@@ -279,6 +348,15 @@ def answer_key(purpose: str, input_refs: Mapping[str, object], round: int | None
         or input_refs.get("profile_draft_id")
     )
     return f"{purpose}:{ref}:{round or 0}"
+
+
+def keyed_answer_filename(key: str) -> str:
+    """The file name of `key`'s standing answer in a keyed directory (module docstring): `:` becomes `_`, then
+    `.sse` (`generate:123:0` → `generate_123_0.sse`). A key holding `/`, `\\` or `..` names no file of the
+    directory: `ValueError`."""
+    if "/" in key or "\\" in key or ".." in key:
+        raise ValueError(f"a fake LLM key names no file: {key!r} holds '/', '\\' or '..'")
+    return key.replace(":", "_") + ".sse"
 
 
 def batch_keys(keys: Mapping[str, str]) -> str:
@@ -617,10 +695,27 @@ def _set(doc: Any, path: tuple[Any, ...], value: Any) -> None:
 
 
 class RecordedSSETransport(httpx2.AsyncBaseTransport):
-    """The fake Messages API over the recordings under `root` (see the module docstring)."""
+    """The fake Messages API over the recordings under `root` (see the module docstring); on the stack, with
+    the batch script file `batch_script` and the keyed directory `keyed_dir` (M4 Task 18; `None`: none)."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, *, batch_script: Path | None = None, keyed_dir: Path | None = None
+    ) -> None:
         self._root = root
+        self.batch_script = batch_script
+        self._keyed_dir = keyed_dir
+
+    def keyed_answer(self, key: str) -> bytes | None:
+        """The keyed directory's standing answer of `key`, read now: `None` without a directory, or without
+        its file. A key that names no file of the directory (`keyed_answer_filename`'s `ValueError`) raises:
+        it is never answered by the recording instead."""
+        if self._keyed_dir is None:
+            return None
+        path = self._keyed_dir / keyed_answer_filename(key)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         current = state()
@@ -635,6 +730,8 @@ class RecordedSSETransport(httpx2.AsyncBaseTransport):
         body: dict[str, Any] = json.loads(content)
         key = request.headers.get(KEY_HEADER)
         keyed = current.take_answer(key)
+        if keyed is None and key is not None:  # then the keyed directory's standing answer, if any
+            keyed = self.keyed_answer(key)
         if keyed is None:
             name = current.take()
         else:  # answered by its key: no name of the script is taken
@@ -973,6 +1070,13 @@ class _FakeBatches:
         return httpx2.Response(200, headers={"request-id": "req_fake"}, json=body)
 
     def _create(self, request: httpx2.Request, content: bytes) -> httpx2.Response:
+        if (path := self._transport.batch_script) is not None:  # the stack's file, read at each create
+            try:
+                self._state.batch_script = load_batch_script(path)
+            except BatchScriptInvalid as exc:
+                log.error("fake_batch_script_invalid", variable=BATCH_SCRIPT_VAR, reason=str(exc))
+                message = f"fake: {BATCH_SCRIPT_VAR} {path} is no batch script: {exc}"
+                return _error(400, "invalid_request_error", message, "req_fake")
         script = self._state.current_batch_script
         parsed = _batch_requests(content, request.headers.get(KEY_HEADER))
         if isinstance(parsed, str):

@@ -6,7 +6,6 @@ password, a key, an ad's text, a CV text or a draft; `subprocess` and the HTTP t
 
 import importlib.util
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,45 +17,12 @@ import pytest
 from jobhunter.llm import spend_ledger
 from jobhunter.scoring import batches, targets
 
-from tests.support.profile import SYNTHETIC_CV, SYNTHETIC_PROFILE, SYNTHETIC_QUERIES
+from tests.support.profile import SYNTHETIC_PROFILE
+from tests.support.smoke_stack import AD_TEXT, CONTENT, KEY, M2_CHECK_NAMES, TOKEN, Database, Stack
+from tests.support.smoke_stack import M3_CHECK_NAMES as CHECK_NAMES
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
-M2_CHECK_NAMES: Final = [
-    "user_create",
-    "login",
-    "health_ready",
-    "cv_upload",
-    "text_review",
-    "extract_ready",
-    "confirm",
-    "proposal_ready",
-]
-CHECK_NAMES: Final = [
-    *M2_CHECK_NAMES,
-    "targets_created",
-    "score_cycle",
-    "score_now",
-    "feedback",
-    "scope_apply",
-    "batch_path",
-    "health",
-]
 OVERLAYS: Final = ["compose.dev.yaml", "compose.fixtures.yaml", "compose.fakellm.yaml"]
-TOKEN: Final = "c2Vzc2lvbi10b2tlbi1vZi10aGUtc3R1Yg"  # the stub's session token
-COOKIE: Final = f"__Host-jh_session={TOKEN}"
-KEY: Final = "sk-ant-api03-c3R1Yi1rZXktbmV2ZXItcHJpbnRlZA"  # a key-shaped value in the stub's answers
-AD_TEXT: Final = "Wir suchen eine Backend-Entwicklerin (m/w/d) für unser Plattform-Team in Berlin."
-# Texts the stub's answers hold, as the stack's do, and the output must not: the CV, the profile, the
-# proposal's query texts, an ad, and a key.
-CONTENT: Final = (
-    "Erika Musterfrau",
-    "erika.musterfrau@example.org",
-    "Musterfirma",
-    SYNTHETIC_PROFILE["summary"],
-    *(query["text"] for query in SYNTHETIC_QUERIES["queries"]),
-    AD_TEXT,
-    KEY,
-)
 
 
 def load(name: str) -> ModuleType:
@@ -203,211 +169,6 @@ def test_no_paid_run_is_posted_unless_the_worker_is_on_both_fakes(
     assert all(compose_files(args) == OVERLAYS for args in calls if "printenv" in args)
 
 
-def template(statement: str) -> re.Pattern[str]:
-    """`statement` with each `{name}` placeholder matching what `str.format` puts there."""
-    return re.compile(re.sub(r"\\\{\w+\\\}", r"[^\\s]+?", re.escape(statement)))
-
-
-class Database:
-    """The rows the stubbed stack's `psql` answers, by statement; `seen` the statements' names in order.
-    The first bulk operation is cancelled by the second confirm; `batch_submit` is the bulk operation's
-    `batch_submit` row (status, what it skipped, submissions) and `eligible` its eligible and too-old counts,
-    as the dev stack's fixtures leave them (Ruling T28-e)."""
-
-    def __init__(
-        self,
-        smoke: ModuleType,
-        *,
-        batch_submit: str = "succeeded|below_minimum|0",
-        eligible: str = "117|125",
-        old_bulk: str = "cancelled|0",
-    ) -> None:
-        self.seen: list[str] = []
-        self.batch_submit = batch_submit
-        self.eligible = eligible
-        self.old_bulk = old_bulk
-        self.confirmed = 0
-        self.statements = [
-            (name, template(getattr(smoke, name)))
-            for name in (
-                "SEED_BOARDS",
-                "ACTIVE",
-                "TARGETS_CREATED",
-                "LANE_STATE",
-                "ADVANCE_BUCKET",
-                "PENDING_OF",
-                "CYCLE_AFTER",
-                "INSTANCES_OF",
-                "PUBLISHED_JOB",
-                "PENDING_JOB",
-                "TARGET_STATE",
-                "APPLY_STATE",
-                "FILTERED_BY",
-                "BULK_OF",
-                "BULK_TARGETS",
-                "OLD_BULK",
-                "BATCH_SUBMIT_OF",
-                "ELIGIBLE_OF",
-                "COUNTERS_CLEAN",
-            )
-        ]
-        self.seed_inputs = sys.modules["smoke_m1"].SEED_INPUTS
-        self.proposals = template(sys.modules["smoke_m2"].PROPOSALS_OF)
-
-    def answer(self, sql: str) -> str:
-        if sql == self.seed_inputs:
-            self.seen.append("SEED_INPUTS")
-            return "1|2|3|4"
-        if self.proposals.fullmatch(sql):
-            return "1|7"  # the confirm's one proposal, id 7
-        name = next((name for name, pattern in self.statements if pattern.fullmatch(sql)), None)
-        assert name is not None, f"the stub has no statement {sql[:80]!r}"
-        self.seen.append(name)
-        tuple_id = 1 + self.confirmed
-        rows = {
-            "SEED_BOARDS": "4|4|1",
-            "ACTIVE": f"{tuple_id}|{3 if 'APPLY_STATE' in self.seen else 2}",
-            "TARGETS_CREATED": "succeeded|310|310|0",
-            "LANE_STATE": "0|0|4",
-            "ADVANCE_BUCKET": "1",
-            "PENDING_OF": "250",
-            "CYCLE_AFTER": "5|completed|28|28",
-            "INSTANCES_OF": "29|0",
-            "PUBLISHED_JOB": "41|141",
-            "PENDING_JOB": "42|142",
-            "TARGET_STATE": "published_accepted|score_now",
-            "APPLY_STATE": "succeeded|3|0",
-            "FILTERED_BY": "12",
-            "BULK_OF": f"{tuple_id}|active",
-            "BULK_TARGETS": "succeeded|298|298|0",
-            "OLD_BULK": self.old_bulk,
-            "BATCH_SUBMIT_OF": self.batch_submit,
-            "ELIGIBLE_OF": self.eligible,
-            "COUNTERS_CLEAN": "t|4.120000|3.910000",
-        }
-        return rows[name]
-
-
-class Stack:
-    """The api of a stubbed dev stack: every route the smoke uses, answered as the stack answers it, with the
-    CV, profile, query and ad texts and a key in its answers. `warning` is the scope dry-run's one warning."""
-
-    def __init__(self, database: Database, warning: str = "scope_narrowed") -> None:
-        self.database = database
-        self.warning = warning
-        self.drafts = {11: "uploaded", 12: "uploaded"}
-        self.uploads = 0
-        self.seen: list[tuple[str, str]] = []
-        self.saved_draft: Any = None
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        route = (request.method, request.url.path)
-        self.seen.append(route)
-        if route == ("POST", "/api/auth/login"):
-            return httpx.Response(204, headers={"set-cookie": f"{COOKIE}; Path=/; Secure; HttpOnly"})
-        assert request.headers["cookie"] == COOKIE, route
-        if request.method in ("POST", "PUT"):
-            assert (request.headers["origin"], request.headers["x-jh-request"]) == (
-                "http://localhost:8080",
-                "1",
-            ), route
-        return self.answer(request, route)
-
-    def draft(self, draft_id: int) -> httpx.Response:
-        status = self.drafts[draft_id]
-        report = {"email": 1, "phone": 0, "url": 0, "address": 0, "personal": 0, "name": 1}
-        body = {
-            "status": status,
-            "failure_code": None,
-            "strip_report": report,
-            "stripped_text_preview": SYNTHETIC_CV,
-            "draft": SYNTHETIC_PROFILE if status == "ready" else None,
-            "validation_issues": [{"path": "total_years_experience", "code": "years_mismatch"}],
-        }
-        return httpx.Response(200, json=body)
-
-    def answer(self, request: httpx.Request, route: tuple[str, str]) -> httpx.Response:
-        is_json = request.headers.get("content-type") == "application/json"
-        sent: Any = json.loads(request.content) if is_json else None
-        confirmed = self.database.confirmed
-        match route:
-            case ("GET", "/api/system/health"):
-                scoring = {"running_cycle_id": None, "pause_reason": None, "pending_targets": 0}
-                body = {
-                    "ready": {"ok": True},
-                    "embedder": {"ok": True},
-                    "quota": {},
-                    "last_run": {"id": 3, "status": "succeeded"},
-                    "scoring": scoring,
-                }
-                return httpx.Response(200, json=body)
-            case ("POST", "/api/profile/cv"):
-                assert b"%PDF-1.4" in request.content
-                self.uploads += 1
-                draft_id = 10 + self.uploads
-                self.drafts[draft_id] = "text_review"
-                return httpx.Response(202, json={"draft_id": draft_id})
-            case ("GET", path) if path.startswith("/api/profile/drafts/"):
-                return self.draft(int(path.rsplit("/", 1)[1]))
-            case ("POST", path) if path.endswith("/text-review"):
-                assert request.headers["idempotency-key"]
-                self.drafts[int(path.split("/")[-2])] = "ready"
-                return httpx.Response(202, json={"status": "extracting_profile"})
-            case ("PUT", "/api/profile/drafts/12"):
-                self.saved_draft = sent["draft"]
-                return httpx.Response(200, json={"validation_issues": []})
-            case ("POST", path) if path.endswith("/confirm"):
-                assert sent == {"expected_rescore_ack": True} and request.headers["idempotency-key"]
-                self.database.confirmed += 1
-                body = {"profile_version_id": 5 + confirmed, "targets_to_create": 310 * confirmed}
-                return httpx.Response(201, json={**body, "est_usd": "0.000000", "bulk_budget_usd": "37.24"})
-            case ("GET", "/api/profile"):
-                active = {"id": 4 + confirmed, "version_no": confirmed, "profile": SYNTHETIC_PROFILE}
-                return httpx.Response(200, json={"active": active, "versions": [active]})
-            case ("GET", "/api/profile/query-proposals/7"):
-                return httpx.Response(200, json={"status": "ready", "items": SYNTHETIC_QUERIES["queries"]})
-            case ("POST", "/api/runs"):
-                assert sent == {"include_paid": True} and request.headers["idempotency-key"]
-                return httpx.Response(202, json={"run": {"id": 3}, "created": True})
-            case ("POST", "/api/system/score-cycle"):
-                assert request.headers["idempotency-key"]
-                assert self.database.seen[-2:] == ["ADVANCE_BUCKET", "PENDING_OF"]  # the refill just before
-                return httpx.Response(202, json={"queued": True, "reason": None})
-            case ("GET", "/api/system/spend"):
-                group = {"model": "claude-sonnet-5-5", "effort": "medium", "role": "generate", "calls": 28}
-                body = {"counted": "1.400000", "c_hat": "0.052646", "c_hat_source": "central"}
-                return httpx.Response(
-                    200,
-                    json={
-                        **body,
-                        "critic_rate_7d": None,
-                        "by_model_effort_role": [{**group, "counted": "1.2"}],
-                    },
-                )
-            case ("POST", "/api/jobs/42/score-now"):
-                assert sent == {} and request.headers["idempotency-key"]
-                return httpx.Response(202, json={"target_id": 142, "state": "pending"})
-            case ("POST", "/api/jobs/41/feedback"):
-                assert sent == {"kind": "label", "label": "good"}
-                return httpx.Response(201, json={"feedback_id": 1, "golden_case_id": 9})
-            case ("GET", "/api/golden-cases"):
-                case = {"id": 9, "job_id": 41, "label": "good", "comment": AD_TEXT, "source": "week1"}
-                return httpx.Response(200, json={"items": [{**case, "active": True}], "next_cursor": None})
-            case ("GET", "/api/settings"):
-                payload = {"scope": {"locations": [], "excluded_keywords": [AD_TEXT]}, "anthropic": KEY}
-                return httpx.Response(200, json={"version": {"id": 1}, "payload": payload})
-            case ("POST", "/api/settings/dry-run"):
-                (location,) = sent["payload"]["scope"]["locations"]
-                assert location["radius_km"] == 200 and location["gazetteer_id"] == "geonames:2950159"
-                return httpx.Response(200, json={"errors": [], "warnings": [{"code": self.warning}]})
-            case ("POST", "/api/settings"):
-                assert (sent["base_version_id"], sent["acknowledged_warnings"]) == (1, [self.warning])
-                assert request.headers["idempotency-key"]
-                saved = {"id": 2, "version_no": 2, "effect_classes": ["scope"]}
-                return httpx.Response(201, json={"version": saved, "apply_scope_operation_id": 77})
-        raise AssertionError(f"the stub stack has no route {route}")
-
-
 def run_against(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, stack: Stack, *, exit_code: int = 0
 ) -> list[list[str]]:
@@ -453,8 +214,32 @@ def test_a_whole_run_prints_fifteen_ok_lines_and_never_a_secret_or_a_text(smoke,
     assert stack.saved_draft["target_titles"] == [*titles, smoke.ADDED_TITLE]
     assert ("POST", "/api/runs") in stack.seen and stack.uploads == 2
     batch = lines[CHECK_NAMES.index("batch_path")]["detail"]
-    assert "skipped=below_minimum submissions=0: eligible=117" in batch
-    assert "expired_unscored_too_old=125" in batch
+    assert "batch_min_targets=20 saved as version_no 3 (warnings=['budget_tight'])" in batch
+    assert "submission 7 submitted, ended and reconciled with 243 items" in batch
+    assert "each decided (followup=241,published=2); batch_followup cycle requested (1)" in batch
+    assert "expired_unscored_too_old=28" in batch
+    seen = stack.database.seen
+    assert seen.index("BATCH_SUBMIT_OF") < seen.index("SUBMISSION_OF") < seen.index("FOLLOWUP_REQUESTED")
+
+
+def test_check_14_saves_the_batch_floor_before_its_second_confirm(smoke, monkeypatch) -> None:
+    """Ruling T18-a: one settings save of `scoring.batch_min_targets = SMOKE_BATCH_MIN_TARGETS` (20), with its
+    own key and the dry-run's warnings acknowledged, after check 13's scope save and before the second
+    confirm; nothing else of the payload changes."""
+    stack = Stack(Database(smoke))
+    run_against(smoke, monkeypatch, stack)
+    assert smoke.SMOKE_BATCH_MIN_TARGETS == 20
+    (scope_key, _), (floor_key, floor_payload) = stack.saves
+    assert (scope_key, floor_key) == (smoke.SCOPE_KEY, smoke.BATCH_FLOOR_KEY)
+    assert floor_payload == {  # the active payload (the stub's) with the floor changed, and nothing else
+        "scope": {"locations": [], "excluded_keywords": [AD_TEXT]},
+        "scoring": {"batch_min_targets": 20, "min_cycle_targets": 10},
+        "anthropic": KEY,
+    }
+    confirms = [i for i, (method, path) in enumerate(stack.seen) if path.endswith("/confirm")]
+    saves = [i for i, route in enumerate(stack.seen) if route == ("POST", "/api/settings")]
+    assert len(confirms) == 2 and saves[0] < saves[1] < confirms[1]
+    assert confirms[0] < saves[1]
 
 
 @pytest.mark.parametrize(
@@ -488,22 +273,44 @@ def test_the_first_bulk_operation_has_ended_by_the_second_confirm(
 
 
 @pytest.mark.parametrize(
-    ("batch_submit", "eligible"),
+    ("changes", "detail"),
     [
-        ("succeeded|none|1", "0|125"),  # a submission: the stack's fixtures cannot give one (T28-e)
-        ("failed|none|0", "117|125"),
-        ("succeeded|below_minimum|0", "200|0"),  # skipped although enough targets were eligible
+        (
+            {"batch_submit": "succeeded|below_minimum|0", "eligible": "13|129"},
+            "expected the batch_submit to submit one batch; batch_submit=succeeded skipped=below_minimum "
+            "submissions=0: eligible=13 (batch_min_targets=20) expired_unscored_too_old=129",
+        ),
+        ({"batch_submit": "failed|none|0"}, "expected the batch_submit to submit one batch"),
+        ({"submission": "7|submit_ambiguous|243|f|243|243"}, "submission 7 submit_ambiguous"),
+        ({"submission": "7|submit_rejected|243|f|243|0"}, "submission 7 submit_rejected"),
+        ({"submission": "7|reconciled|243|f|243|0"}, "a stamp of the path is missing"),
+        ({"submission": "7|reconciled|243|t|243|3"}, "an item is undecided"),
+        ({"submission": "7|reconciled|243|t|240|0"}, "an item is undecided"),
+        ({"submission": "7|reconciled|19|t|19|0"}, "fewer requests than the floor"),
+        ({"followups": "0"}, "but no batch_followup cycle"),
     ],
-    ids=["submitted", "failed", "skipped-with-enough"],
+    ids=[
+        "below-minimum",
+        "failed",
+        "ambiguous",
+        "rejected",
+        "a-stamp-missing",
+        "items-awaiting",
+        "items-missing",
+        "below-the-floor",
+        "no-followup-cycle",
+    ],
 )
-def test_the_batch_path_holds_only_a_skip_below_the_minimum(
-    smoke, monkeypatch, capsys, batch_submit: str, eligible: str
+def test_the_batch_path_needs_a_reconciled_submission(
+    smoke, monkeypatch, capsys, changes: dict[str, str], detail: str
 ) -> None:
-    database = Database(smoke, batch_submit=batch_submit, eligible=eligible)
-    run_against(smoke, monkeypatch, Stack(database), exit_code=1)
+    """Check 14 passes only on the full path: one submission, `reconciled` with every stamp of the path set
+    and every item decided, and a `batch_followup` cycle requested; a skip below the minimum (M3's stopping
+    point) now fails with the eligible and too-old counts."""
+    run_against(smoke, monkeypatch, Stack(Database(smoke, **changes)), exit_code=1)
     last = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert (last["check"], last["ok"]) == ("batch_path", False)
-    assert last["detail"].startswith("expected the batch_submit skipped below_minimum")
+    assert detail in last["detail"]
 
 
 def test_a_detail_never_shows_the_session_token(smoke, monkeypatch, capsys) -> None:

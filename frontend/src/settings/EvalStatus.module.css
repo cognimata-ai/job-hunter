@@ -1,0 +1,11 @@
+/* The eval status: the last golden run, the eval gate as term and value pairs (`CriticRouting.module.css`'s
+ * figures), and the command-line note. */
+.eval {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.last {
+  font-weight: var(--font-weight-medium);
+}

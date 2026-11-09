@@ -1,0 +1,77 @@
+/* The activation dialog: the preview as term and value pairs (`CriticRouting.module.css`'s figures), a failed
+ * gate or a missing verification in amber, the override tick, and a refusal, in a column. */
+.content {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.checking {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+.preview {
+  display: grid;
+  gap: var(--space-3);
+  color: var(--color-text);
+}
+
+.preview [data-tone="warn"] {
+  padding-left: var(--space-3);
+  border-left: 4px solid var(--color-warn);
+}
+
+.override {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-warn);
+  border-left-width: 4px;
+  border-radius: var(--radius-2);
+  background: var(--color-warn-bg);
+  color: var(--color-text);
+}
+
+.overrideTitle,
+.problemTitle {
+  font-weight: var(--font-weight-bold);
+}
+
+.tick {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.tick input {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--color-accent);
+}
+
+/* The schema refusal: the ProblemBox's look, with this dialog's own title. */
+.problem {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-critical);
+  border-left-width: 4px;
+  border-radius: var(--radius-2);
+  background: var(--color-critical-bg);
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.problemTitle {
+  color: var(--color-critical);
+}
+
+/* A model id is one word: it breaks between ids, never at its own hyphens. */
+.problem code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-2);
+  white-space: nowrap;
+}

@@ -1,0 +1,37 @@
+/* A settings section on Profile & Settings: framed as the page frames its other sections (a rule above, its
+ * heading), its body, then the dry-run panel. */
+.section {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  padding-block: var(--space-6);
+  border-top: 1px solid var(--color-border);
+  scroll-margin-top: var(--space-4);
+}
+
+.title {
+  font-size: var(--font-size-5);
+}
+
+/* A part of a page section (Display & notifications in System): under the section's heading, no rule above. */
+.part {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.partTitle {
+  font-size: var(--font-size-4);
+}
+
+.body {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+/* Narrow screens and 200 % zoom: the page's navigation is a strip held at the top. */
+@media (max-width: 960px) {
+  .section {
+    scroll-margin-top: 56px;
+  }
+}

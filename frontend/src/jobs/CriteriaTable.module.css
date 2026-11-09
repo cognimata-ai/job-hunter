@@ -1,0 +1,140 @@
+.wrap {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-2);
+}
+
+.caption {
+  padding-bottom: var(--space-2);
+  text-align: left;
+  font-weight: var(--font-weight-bold);
+}
+
+.table th,
+.table td {
+  padding: var(--space-2) var(--space-2) var(--space-2) 0;
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+.table thead th {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.table tbody th {
+  font-weight: var(--font-weight-medium);
+}
+
+.num {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.evidence {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.marker {
+  display: inline-block;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-1);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-regular);
+}
+
+/* A server token (an input key, a path) may break anywhere: it has no spaces to wrap at. */
+.code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-1);
+  overflow-wrap: anywhere;
+}
+
+.paths {
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A narrow drawer (half of a small window, or a phone): each row restacked, its name above the weight, level
+ * and basis, each with its header, and the evidence below. The header row stays for assistive technology. */
+.wrap {
+  container-type: inline-size;
+}
+
+@container (max-width: 520px) {
+  .table,
+  .table tbody,
+  .table caption {
+    display: block;
+  }
+
+  .head {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "name name name"
+      "weight level basis"
+      "evidence evidence evidence";
+    gap: var(--space-1) var(--space-4);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .table .row > th,
+  .table .row > td {
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  .name {
+    grid-area: name;
+  }
+
+  .weight {
+    grid-area: weight;
+  }
+
+  .level {
+    grid-area: level;
+  }
+
+  .basis {
+    grid-area: basis;
+  }
+
+  .evidenceCell {
+    grid-area: evidence;
+  }
+
+  .weight::before,
+  .level::before,
+  .basis::before {
+    content: attr(data-label) " ";
+    color: var(--color-text-muted);
+    font-size: var(--font-size-1);
+  }
+}

@@ -42,10 +42,11 @@ issue it finds is reported:
 refused document.
 
 **`eval_gate_state(conn, candidate=…)`** (M3 Task 20) is the eval gate of a candidate configuration (a
-`Candidate`, by default the active one): `uncalibrated` below 30 of the user's active golden cases (the
-adversarial ones never count, `gate_cases`), else the newest
-completed golden production run of the candidate with live provenance decides, and no run is `failed`. The
-dry-run and the save pass the proposed payload's candidate (`derive.candidate_of`).
+`Candidate`, by default the active one, `active_candidate`): `uncalibrated` below 30 of the user's active
+golden cases (the adversarial ones never count, `gate_cases`), else the newest completed golden production
+run of the candidate with live provenance decides (`gate_run`, which the activation preview shows too, M4
+Task 14), and no run is `failed`. The dry-run and the save pass the proposed payload's candidate
+(`derive.candidate_of`).
 
 **`schema_verified`** (M3 Task 11, Ruling P11) says whether a prompt-schema version's live schema dry-runs
 passed every (schema, model) pair a model policy needs; the score lane's pause guard reads it, and so does the
@@ -56,6 +57,7 @@ pairs without a pass (`unverified_pairs`, the same reads).
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import ROUND_CEILING, Decimal
 from typing import Final, Literal, cast
 
@@ -395,7 +397,8 @@ _ACTIVE_CANDIDATE: Final = q(
 )
 # The newest ended golden run of the candidate on the production route with an accepted transport.
 _GATE_RUN: Final = q(
-    "SELECT r.passed FROM eval_runs r JOIN model_policies m ON m.id = r.model_policy_id "
+    "SELECT r.id, r.passed, r.metrics ->> 'spearman_rho' AS spearman_rho, r.finished_at "
+    "FROM eval_runs r JOIN model_policies m ON m.id = r.model_policy_id "
     "JOIN evaluation_policies e ON e.id = r.evaluation_policy_id "
     "WHERE r.kind = 'golden' AND r.route = 'production' AND r.status = 'completed' "
     "AND r.rubric_version_id = :rubric AND r.prompt_schema_version_id = :prompt "
@@ -419,24 +422,33 @@ async def run_gate_cases(conn: AsyncConnection, eval_run_id: int) -> int:
     return int((await conn.execute(_RUN_GATE_CASES, {"run": eval_run_id})).scalar_one())
 
 
-async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None = None) -> GateState:
-    """The eval gate of `candidate` (§11.13; the active configuration's when `None`), plain reads:
-    `uncalibrated` while fewer than `GATE_MIN_CASES` of the user's golden cases are active (`gate_cases`: the
-    adversarial ones never count); otherwise the newest `completed`
-    golden run of the candidate on the production route whose transport is one `gate_transports` accepts
-    decides: `passed` when it passed, `failed` when it failed or was never gated (`passed` NULL), and `failed`
-    when there is none (user decision "Eval gate = fail until a run": a run is required)."""
-    if await gate_cases(conn) < GATE_MIN_CASES:
-        return "uncalibrated"
-    if candidate is None:
-        row = (await conn.execute(_ACTIVE_CANDIDATE)).one()
-        candidate = Candidate(
-            int(row.rubric_version_id),
-            int(row.prompt_schema_version_id),
-            bytes(row.model_policy_hash),
-            bytes(row.evaluation_policy_hash),
-        )
-    passed = (
+async def active_candidate(conn: AsyncConnection) -> Candidate:
+    """The active configuration's candidate: `active_config`'s rubric and prompt-schema versions and the
+    hashes of its model and evaluation policies (a plain read)."""
+    row = (await conn.execute(_ACTIVE_CANDIDATE)).one()
+    return Candidate(
+        int(row.rubric_version_id),
+        int(row.prompt_schema_version_id),
+        bytes(row.model_policy_hash),
+        bytes(row.evaluation_policy_hash),
+    )
+
+
+@dataclass(frozen=True)
+class GateRun:
+    """The golden run a calibrated gate reads (`gate_run`): its id, whether it passed (`None`: never gated),
+    its Spearman rho (`metrics.spearman_rho`, `None` when undefined) and when it ended."""
+
+    eval_run_id: int
+    passed: bool | None
+    spearman_rho: Decimal | None
+    finished_at: datetime | None
+
+
+async def gate_run(conn: AsyncConnection, candidate: Candidate) -> GateRun | None:
+    """The newest `completed` golden run of `candidate` on the production route whose transport is one
+    `gate_transports` accepts, the run that decides a calibrated gate; `None` without one (plain reads)."""
+    row = (
         await conn.execute(
             _GATE_RUN,
             {
@@ -447,8 +459,23 @@ async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None 
                 "transports": list(gate_transports()),
             },
         )
-    ).scalar_one_or_none()
-    return "passed" if passed is True else "failed"
+    ).first()
+    if row is None:
+        return None
+    rho = None if row.spearman_rho is None else Decimal(row.spearman_rho)
+    return GateRun(int(row.id), row.passed, rho, row.finished_at)
+
+
+async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None = None) -> GateState:
+    """The eval gate of `candidate` (§11.13; the active configuration's when `None`), plain reads:
+    `uncalibrated` while fewer than `GATE_MIN_CASES` of the user's golden cases are active (`gate_cases`: the
+    adversarial ones never count); otherwise the candidate's `gate_run` decides: `passed` when it passed,
+    `failed` when it failed or was never gated (`passed` NULL), and `failed` when there is none (user decision
+    "Eval gate = fail until a run": a run is required)."""
+    if await gate_cases(conn) < GATE_MIN_CASES:
+        return "uncalibrated"
+    run = await gate_run(conn, await active_candidate(conn) if candidate is None else candidate)
+    return "passed" if run is not None and run.passed is True else "failed"
 
 
 # ---- the live schema dry-run (M3 Task 11, Ruling P11) ----------------------------------------------------

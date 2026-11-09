@@ -15,10 +15,10 @@ the schedule action and re-anchors the schedule.
 
 Each derived row (§13.2) changes exactly when its class appears, because both hash the same normal form:
 the scope (every `scope.*` field but `max_ad_age_days`) with `scope`, the whole `scoring.model_policy` object
-with `llm_tuple`, `scoring.execution` with `execution`, and `evaluation` with `evaluation_policy`. That
-includes the model policy's `preset`: §13.1 lists it inside `scoring.model_policy` (effect `llm_tuple`),
-and its hash covers the label, so a label-only preset change derives a new `model_policies` row and is an
-`llm_tuple` change (Task 16 ruling 2).
+with `llm_tuple`, `scoring.execution` with `execution`, and `evaluation` with `evaluation_policy`. The model
+policy's `preset` is part of that object, but its normal form is the label of the grid (`settings.presets`,
+M4 Task 14, D20, replacing Task 16 ruling 2), so a label-only change is no change: it has the active normal
+form, no effect class and no new `model_policies` row.
 
 `diff_payloads` (Task 17) lists what changed between two documents, for `GET /api/settings/versions/{id}`:
 one `DiffEntry` per changed leaf, at its `FieldIssue` path (`payload.scope.locations[0].radius_km`,

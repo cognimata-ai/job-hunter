@@ -19,7 +19,9 @@ generator", triggers more reviews (critic rate 0.55, `q1 = 0.45`, `q2 = 0.35`, �
 is rounded half-up to $0.000001. It needs no input bound, so `PROMPT_OVERHEAD_TOKENS` plays no part. For the
 default policy B it is $0.052646 (§21.2: $0.0526), for A $0.079255 ($0.0793) and for C $0.019352 ($0.0194).
 `target_cost` gives its four parts unrounded: the confirm's re-score estimate prices §21.4's batch path from
-them (`profile.estimate`, Task 21).
+them (`profile.estimate`, Task 21). `call_usd` prices one call of a §21.1 token row (`CallTokens`) on a model;
+the two profile nodes' rows, `EXTRACT_PROFILE` (5,000 in, 6,000 out) and `PROPOSE_QUERIES` (3,500 in, 4,000
+out), have no cached prefix (§21.3: $0.14 and about $0.09 on Opus).
 
 **`cache_writes_per_cycle`** is §21.1's cache-write overhead of one score cycle (Ruling R16-2). The per-call
 costs charge every prefix as a read; a cycle's first call on each (model, effort) prefix writes it instead,
@@ -33,30 +35,39 @@ Sonnet/low 0.8 x $0.01035), rounded half-up to $0.000001.
 
 **`llm_projection`** gives the §6.9.2 bucket of the settings in the month of `now` (rate per hour and
 capacity), `ĉ`, the evaluation policy's projected critic rate, and §21.3's capacity of a month:
-`targets_per_month = floor(scoring share / (ĉ + cache writes per cycle / min_cycle_targets))`, the scoring
-share `A x (1 - reserve_frac)`, with one cycle per `scoring.min_cycle_targets` targets (§6.9.2: a cycle starts
-when the bucket holds that many). With the defaults that is B's 1,617 (§21.3: about 1,620); A gives 1,119
-(about 1,120) and C 4,374 (about 4,370); `min_cycle_targets` 20 gives B 1,689 (§21.5: about +70) with about
-$4.16 of cache writes. `projected_month_spend` is what the targets that arrive and fit cost with their cache
-writes. A cap at or below the overrun buffer admits nothing (`A ≤ 0`): no target, no accrual. `cap_binding`
-is §6.8's `llm_cap_binding` condition: more arrivals than capacity, or no capacity at all.
+`targets_per_month = floor(scoring share / paced_cost_per_target)`, the scoring share `A x (1 -
+reserve_frac)`. **`paced_cost_per_target`** is what one target costs the bucket, its cache writes included:
+a central `ĉ` (`central_cost_per_target`, which charges every prefix as a read) plus its share of a cycle's
+cache writes, `ĉ + cache writes per cycle / min_cycle_targets`, with one cycle per `scoring.min_cycle_targets`
+targets (§6.9.2: a cycle starts when the bucket holds that many); a history `ĉ` (`cycles.c_hat`'s source
+`history`) as it is, since it is the mean of measured attempt costs, whose settlements already charged the
+cache writes their calls made (`pricing.settled_usd`). The confirm estimate's pace divides a day's accrual
+by the same figure (`profile.estimate`). With the defaults and the central `ĉ` that is B's 1,617 (§21.3:
+about 1,620); A gives 1,119 (about 1,120) and C 4,374 (about 4,370); `min_cycle_targets` 20 gives B 1,689
+(§21.5: about +70) with about $4.16 of cache writes. `projected_month_spend` is what the targets that arrive
+and fit cost with their cache writes. A cap at or below the overrun buffer admits nothing (`A ≤ 0`): no
+target, no accrual. `cap_binding` is §6.8's `llm_cap_binding` condition: more arrivals than capacity, or no
+capacity at all.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 from jobhunter.llm import budget, pricing
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.llm.pricing import Effort, Model
-from jobhunter.settings.model import ModelPolicy, Settings
+from jobhunter.settings.model import ModelPolicy, Scoring, Settings
+
+# Where a `ĉ` comes from (`scoring.cycles.c_hat`): the trailing mean of measured attempt costs, or the §21.2
+# central estimate.
+CHatSource = Literal["history", "central"]
 
 DEFAULT_ARRIVAL_PER_MONTH: Final = 3000  # §6.8: new targets a month when there is no target history
 # §21.1: the light critic prefix is written "in about 80% of cycles"
 LIGHT_PREFIX_CYCLE_SHARE: Final = Decimal("0.8")
-_SECONDS_PER_HOUR: Final = 3600
 _TOKENS_PER_MTOK: Final = 1_000_000
 _ZERO: Final = Decimal(0)
 
@@ -75,6 +86,9 @@ GENERATE: Final = CallTokens(2_200, 4_500, 1_700)
 CRITIC: Final = CallTokens(3_400, 4_500, 1_300)
 CRITIC_LOW: Final = CallTokens(3_400, 4_500, 800)
 REVISE: Final = CallTokens(3_700, 4_500, 1_700)
+# §21.1, the profile nodes: no cached prefix
+EXTRACT_PROFILE: Final = CallTokens(5_000, 0, 6_000)
+PROPOSE_QUERIES: Final = CallTokens(3_500, 0, 4_000)
 
 
 @dataclass(frozen=True)
@@ -111,7 +125,7 @@ def _price(model: Model, tokens: CallTokens) -> pricing.Price:
     return pricing.price_for(model, prompt_tokens=int(uplift(model) * (tokens.uncached + tokens.cached)))
 
 
-def _call_usd(model: Model, tokens: CallTokens) -> Decimal:
+def call_usd(model: Model, tokens: CallTokens) -> Decimal:
     """The cost of one call of `tokens` on `model`, the cached prefix read (not rounded)."""
     factor = uplift(model)
     uncached, cached, output = (factor * n for n in (tokens.uncached, tokens.cached, tokens.output))
@@ -135,6 +149,16 @@ def cache_writes_per_cycle(model_policy: ModelPolicy) -> Decimal:
     if (nodes.critic.model, model_policy.critic_light_effort) not in prefixes:
         total += LIGHT_PREFIX_CYCLE_SHARE * _prefix_write_usd(nodes.critic.model)
     return total.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def paced_cost_per_target(scoring: Scoring, c_hat: Decimal, c_hat_source: CHatSource) -> Decimal:
+    """What one target costs the bucket, its cache writes included (module docstring), not rounded: a
+    central `ĉ` plus its share of a cycle's cache writes, `ĉ + cache_writes_per_cycle / min_cycle_targets`; a
+    history `ĉ`, whose measured costs include their cache writes, as it is. What the bucket's accrual is
+    divided by for a month's capacity and a day's pace (§21.3): $0.057569 for policy B at the central `ĉ`."""
+    if c_hat_source == "history":
+        return c_hat
+    return c_hat + cache_writes_per_cycle(scoring.model_policy) / scoring.min_cycle_targets
 
 
 def _critic_tokens(effort: Effort) -> CallTokens:
@@ -162,10 +186,10 @@ def target_cost(model_policy: ModelPolicy) -> TargetCost:
     """The parts of `central_cost_per_target` under `model_policy`, each online (the cached prefix read)."""
     nodes = model_policy.nodes
     funnel_ = funnel(model_policy)
-    generator = _call_usd(nodes.generate.model, GENERATE)
-    full_critic = _call_usd(nodes.critic.model, _critic_tokens(nodes.critic.effort))
-    light_critic = _call_usd(nodes.critic.model, _critic_tokens(model_policy.critic_light_effort))
-    revision = _call_usd(nodes.revise.model, REVISE)
+    generator = call_usd(nodes.generate.model, GENERATE)
+    full_critic = call_usd(nodes.critic.model, _critic_tokens(nodes.critic.effort))
+    light_critic = call_usd(nodes.critic.model, _critic_tokens(model_policy.critic_light_effort))
+    revision = call_usd(nodes.revise.model, REVISE)
     follow_ups = funnel_.q1 + funnel_.q1 * funnel_.q2  # revisions per reviewed draft, each re-reviewed
     first_round = funnel_.light_share * light_critic + (1 - funnel_.light_share) * full_critic
     return TargetCost(
@@ -202,8 +226,9 @@ def _usd(amount: Decimal) -> Decimal:
 
 
 def scoring_share(p: BudgetParams) -> Decimal:
-    """`A x (1 - reserve_frac)`, never below zero (§6.9.1: $93.10 with the defaults)."""
-    return max(_ZERO, budget.admissible(p) * (1 - budget.reserve_frac(p)))
+    """`budget.scoring_share`, `A x (1 - reserve_frac)`, never below zero (§6.9.1: $93.10 with the
+    defaults)."""
+    return max(_ZERO, budget.scoring_share(p))
 
 
 def llm_projection(
@@ -211,18 +236,19 @@ def llm_projection(
     *,
     now: datetime,
     c_hat: Decimal,
+    c_hat_source: CHatSource,
     projected_critic_rate: Decimal,
     arrival_per_month: int,
 ) -> LlmProjection:
-    """The LLM projection of `settings` in the month of `now` (module docstring)."""
+    """The LLM projection of `settings` in the month of `now` (module docstring), with `c_hat` from
+    `c_hat_source`."""
     p = BudgetParams.from_payload(settings.to_payload())
     month = budget.month_of(now)
-    scoring = settings.scoring
-    per_target = c_hat + cache_writes_per_cycle(scoring.model_policy) / scoring.min_cycle_targets
+    per_target = paced_cost_per_target(settings.scoring, c_hat, c_hat_source)
     targets = int((scoring_share(p) / per_target).to_integral_value(rounding=ROUND_FLOOR))
     return LlmProjection(
         # A ≤ 0 accrues nothing; the capacity is then its floor, `min_bucket_capacity_usd`
-        bucket_rate_per_h=_usd(max(_ZERO, budget.rate_per_s(p, month)) * _SECONDS_PER_HOUR),
+        bucket_rate_per_h=budget.rate_per_h(p, month),
         bucket_capacity=_usd(budget.bucket_capacity(p, month)),
         c_hat=c_hat,
         projected_critic_rate=projected_critic_rate,

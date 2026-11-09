@@ -1,0 +1,63 @@
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-1);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height);
+  overflow-wrap: anywhere;
+}
+
+.neutral {
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+}
+
+.info {
+  border-color: var(--color-info);
+  background: var(--color-info-bg);
+  color: var(--color-info);
+}
+
+.warn {
+  border-color: var(--color-warn);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+}
+
+.critical {
+  border-color: var(--color-critical);
+  background: var(--color-critical-bg);
+  color: var(--color-critical);
+}
+
+/* Adzuna's attribution badge: at least 116 × 23 px, linked (spec §5). */
+.attribution {
+  justify-content: center;
+  min-width: 116px;
+  min-height: 23px;
+  border-color: var(--color-accent);
+  background: var(--color-surface);
+  color: var(--color-accent);
+}
+
+.link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.link:hover {
+  color: var(--color-accent-hover);
+  text-decoration: underline;
+}

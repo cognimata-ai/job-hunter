@@ -1,0 +1,37 @@
+.scoreNow {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-1);
+}
+
+.button {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-2);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.button:disabled {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+.button[aria-busy="true"] {
+  cursor: progress;
+}
+
+.hint {
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+}

@@ -2,9 +2,11 @@
 
 `FakeEmbedder` is a `ThreadingHTTPServer` on `127.0.0.1:0` that answers `GET /health` and `POST /v1/embed` as
 `embedder/app.py` does (its field names, its 413 and 422 refusals, a 503 health when the checksum failed),
-with a deterministic unit vector per text, seeded from the sha256 of the text the model would see (a query
-with its `query: ` prefix). A text over 4,000 characters is flagged `truncated` and counted 1,024 tokens, the
-service's own truncation; every other text counts a token per 4 characters. Its switches:
+with the answers of the service's own test-only model, `embedder.app.FakeModel` (M4 Task 18: one
+implementation, which the stack's fake embedder serves too): a deterministic unit vector per text, seeded from
+the sha256 of the text the model would see (a query with its `query: ` prefix), a text over 4,000 characters
+flagged `truncated` and counted 1,024 tokens, the service's own truncation, and every other text a token per
+4 characters. Its switches:
 
 - `down`: every request is refused: the server closes each connection at once, without an answer, so the
   client sees a transport error, as for a refused connection, while the port stays bound and the URL every
@@ -12,7 +14,9 @@ service's own truncation; every other text counts a token per 4 characters. Its 
 - `checksum_ok`: `False` gives a 503 health (`checksum_ok: false`) and a 503 for every embed request, the
   answers of a service whose model failed its check;
 - `dim` and `model_id`: what every embed answer carries (a wrong dimension, a foreign model);
-- `batches`: the size of every embed request it received while up, in order.
+- `batches`: the size of every embed request it received while up, in order;
+- `connections`: how many connections it accepted, down or up (a refused one counts too), so a test can
+  assert that a code path never reached it.
 
 One server per session (`fake_embedder_server`): `make_config` and `proc_env` pass its `base_url` as
 `JOBHUNTER_EMBEDDER_URL` to every configuration and every child process. The function fixture
@@ -20,32 +24,26 @@ One server per session (`fake_embedder_server`): `make_config` and `proc_env` pa
 into the next one.
 """
 
-import hashlib
 import json
-import math
-import random
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socket import socket
-from typing import Any, Final
+from typing import Any
 
 import pytest
 from jobhunter.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_ID, MAX_TEXT_BYTES
 
-TRUNCATE_CHARS: Final = 4_000
-MAX_TOKENS: Final = 1_024
-MAX_BATCH: Final = 16
-QUERY_PREFIX: Final = "query: "
+from embedder.app import MAX_BATCH, QUERY_PREFIX, FakeModel, fake_vector
 
-
-def fake_vector(text: str, dim: int) -> list[float]:
-    """The unit vector of `text` (as the model sees it): Gaussian components seeded from its sha256."""
-    seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
-    rng = random.Random(seed)  # noqa: S311 - a test vector, deterministic on purpose
-    raw = [rng.gauss(0.0, 1.0) for _ in range(dim)]
-    norm = math.sqrt(sum(x * x for x in raw))
-    return [x / norm for x in raw]
+__all__ = [
+    "MAX_BATCH",
+    "QUERY_PREFIX",
+    "FakeEmbedder",
+    "fake_embedder",
+    "fake_embedder_server",
+    "fake_vector",
+]
 
 
 class _Server(ThreadingHTTPServer):
@@ -57,6 +55,7 @@ class _Server(ThreadingHTTPServer):
 
     def verify_request(self, request: socket | tuple[bytes, socket], client_address: Any) -> bool:
         # A refused request is closed by the server at once (`shutdown_request`), without an answer.
+        self.fake.connected()
         return not self.fake.down
 
 
@@ -114,14 +113,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not fake.checksum_ok:
             self._answer(503, {"detail": "the model failed its checksum"})
             return
-        seen = [QUERY_PREFIX + text if kind == "query" else text for text in texts]
-        body = {
-            "model_id": fake.model_id,
-            "vectors": [fake_vector(text, fake.dim) for text in seen],
-            "truncated": [len(text) > TRUNCATE_CHARS for text in texts],
-            "tokens": [MAX_TOKENS if len(t) > TRUNCATE_CHARS else max(1, len(t) // 4) for t in texts],
-        }
-        self._answer(200, body)
+        vectors, truncated, tokens = FakeModel(dim=fake.dim).embed(texts, kind)
+        self._answer(
+            200, {"model_id": fake.model_id, "vectors": vectors, "truncated": truncated, "tokens": tokens}
+        )
 
 
 class FakeEmbedder:
@@ -133,6 +128,7 @@ class FakeEmbedder:
         self.dim = EMBEDDING_DIM
         self.model_id = EMBEDDING_MODEL_ID
         self.batches: list[int] = []
+        self.connections = 0
         self._lock = threading.Lock()
         self._server = _Server(self)
         host, port = self._server.server_address[:2]
@@ -144,14 +140,19 @@ class FakeEmbedder:
         with self._lock:
             self.batches.append(size)
 
+    def connected(self) -> None:
+        with self._lock:
+            self.connections += 1
+
     def reset(self) -> None:
-        """Up, with a good checksum, the pinned model and dimension, and no batch recorded."""
+        """Up, with a good checksum, the pinned model and dimension, and no batch or connection recorded."""
         self.down = False
         self.checksum_ok = True
         self.dim = EMBEDDING_DIM
         self.model_id = EMBEDDING_MODEL_ID
         with self._lock:
             self.batches.clear()
+            self.connections = 0
 
     def close(self) -> None:
         self._server.shutdown()

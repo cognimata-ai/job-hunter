@@ -1,0 +1,115 @@
+/* The CV section's shared controls: its buttons, fields and inline texts (each component lays itself out in its
+   own module). */
+.primary,
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-2);
+  font-weight: var(--font-weight-medium);
+  text-align: center;
+  cursor: pointer;
+}
+
+.primary {
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.secondary {
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.secondary:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+}
+
+.primary:disabled,
+.secondary:disabled {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+.primary[aria-busy="true"],
+.secondary[aria-busy="true"] {
+  cursor: progress;
+}
+
+.label {
+  font-weight: var(--font-weight-medium);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+
+.input[aria-invalid="true"],
+.select[aria-invalid="true"],
+.textarea[aria-invalid="true"] {
+  border-color: var(--color-critical);
+}
+
+.input:disabled,
+.select:disabled,
+.textarea:disabled {
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex: none;
+}
+
+.error {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}
+
+.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent);
+  font-weight: var(--font-weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+}
+
+.link:hover {
+  color: var(--color-accent-hover);
+}

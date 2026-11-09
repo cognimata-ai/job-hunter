@@ -58,8 +58,6 @@ from jobhunter.settings.model import Settings
 
 router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
-_SECONDS_PER_HOUR: Final = 3600
-_ZERO: Final = Decimal(0)
 _ACTIVE: Final = q(
     "SELECT v.payload, e.projected_critic_rate FROM active_config a "
     "JOIN settings_versions v ON v.id = a.settings_version_id "
@@ -182,7 +180,7 @@ async def _spend(conn: AsyncConnection, *, fake_llm: bool) -> SpendOut:
         bucket=BucketOut(
             usd=usd_micro(row.bucket_usd),
             capacity=usd_micro(budget.bucket_capacity(on_row, month)),
-            rate_per_h=usd_micro(max(_ZERO, budget.rate_per_s(on_row, month)) * _SECONDS_PER_HOUR),
+            rate_per_h=budget.rate_per_h(on_row, month),
         ),
         c_hat=c_hat[0],
         c_hat_source=c_hat[1],

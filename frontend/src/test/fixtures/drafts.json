@@ -1,0 +1,1168 @@
+{
+  "hyphen_phone": {
+    "raw": "Max Mustermann\nSenior Backend Engineer\nMobil: 0-170-1234567\nE-Mail: max@example.org",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "[NAME]\nSenior Backend Engineer\nMobil: 0-170-1234567\nE-Mail: [EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 60,
+            "raw_start": 14,
+            "raw_end": 68
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 60,
+            "stripped_end": 67,
+            "raw_start": 68,
+            "raw_end": 83
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 46,
+            "end": 59
+          }
+        ],
+        "stripped_text_preview": "[NAME]\nSenior Backend Engineer\nMobil: [REMOVED]\nE-Mail: [EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 46,
+              "end": 59
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 38,
+            "raw_start": 14,
+            "raw_end": 46
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 38,
+            "stripped_end": 47,
+            "raw_start": 46,
+            "raw_end": 59
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 47,
+            "stripped_end": 56,
+            "raw_start": 59,
+            "raw_end": 68
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 56,
+            "stripped_end": 63,
+            "raw_start": 68,
+            "raw_end": 83
+          }
+        ]
+      }
+    ]
+  },
+  "kaufmann_surname": {
+    "raw": "Kaufmann, Erika\nSenior Backend Engineer\nerika@example.org",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "Kaufmann, Erika\nSenior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 40,
+            "raw_start": 0,
+            "raw_end": 40
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 40,
+            "stripped_end": 47,
+            "raw_start": 40,
+            "raw_end": 57
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 0,
+            "end": 15
+          }
+        ],
+        "stripped_text_preview": "[REMOVED]\nSenior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 0,
+              "end": 15
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 9,
+            "raw_start": 0,
+            "raw_end": 15
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 9,
+            "stripped_end": 34,
+            "raw_start": 15,
+            "raw_end": 40
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 34,
+            "stripped_end": 41,
+            "raw_start": 40,
+            "raw_end": 57
+          }
+        ]
+      }
+    ]
+  },
+  "name_title_line": {
+    "raw": "Lebenslauf\nName: Max Mustermann, Senior Backend Engineer\nTelefon: +49 170 1234567",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "Lebenslauf\nName: Max Mustermann, Senior Backend Engineer\nTelefon: [PHONE]",
+        "strip_report": {
+          "email": 0,
+          "phone": 1,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 66,
+            "raw_start": 0,
+            "raw_end": 66
+          },
+          {
+            "kind": "replacement",
+            "category": "phone",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 66,
+            "stripped_end": 73,
+            "raw_start": 66,
+            "raw_end": 81
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 17,
+            "end": 31
+          }
+        ],
+        "stripped_text_preview": "Lebenslauf\nName: [REMOVED], Senior Backend Engineer\nTelefon: [PHONE]",
+        "strip_report": {
+          "email": 0,
+          "phone": 1,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 17,
+              "end": 31
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 17,
+            "raw_start": 0,
+            "raw_end": 17
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 17,
+            "stripped_end": 26,
+            "raw_start": 17,
+            "raw_end": 31
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 26,
+            "stripped_end": 61,
+            "raw_start": 31,
+            "raw_end": 66
+          },
+          {
+            "kind": "replacement",
+            "category": "phone",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 61,
+            "stripped_end": 68,
+            "raw_start": 66,
+            "raw_end": 81
+          }
+        ]
+      }
+    ]
+  },
+  "glued_dob": {
+    "raw": "Max Mustermann\nGeburtsdatum01.02.1990\nWohnort Berlin",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "[NAME]\nGeburtsdatum01.02.1990\nWohnort Berlin",
+        "strip_report": {
+          "email": 0,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 44,
+            "raw_start": 14,
+            "raw_end": 52
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 27,
+            "end": 37
+          }
+        ],
+        "stripped_text_preview": "[NAME]\nGeburtsdatum[REMOVED]\nWohnort Berlin",
+        "strip_report": {
+          "email": 0,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 27,
+              "end": 37
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 19,
+            "raw_start": 14,
+            "raw_end": 27
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 19,
+            "stripped_end": 28,
+            "raw_start": 27,
+            "raw_end": 37
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 28,
+            "stripped_end": 43,
+            "raw_start": 37,
+            "raw_end": 52
+          }
+        ]
+      }
+    ]
+  },
+  "berlin_germany": {
+    "raw": "Berlin Germany\nSenior Backend Engineer\nmax@example.org",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "[NAME]\nSenior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 31,
+            "raw_start": 14,
+            "raw_end": 39
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 31,
+            "stripped_end": 38,
+            "raw_start": 39,
+            "raw_end": 54
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "restore",
+            "replacement_index": 0
+          }
+        ],
+        "stripped_text_preview": "Berlin Germany\nSenior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [
+            {
+              "start": 0,
+              "end": 14
+            }
+          ],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 39,
+            "raw_start": 0,
+            "raw_end": 39
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 39,
+            "stripped_end": 46,
+            "raw_start": 39,
+            "raw_end": 54
+          }
+        ]
+      }
+    ]
+  },
+  "header_name_title": {
+    "raw": "Max Mustermann | Senior Backend Engineer\nmax@example.org",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "Max Mustermann | Senior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 41,
+            "raw_start": 0,
+            "raw_end": 41
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 41,
+            "stripped_end": 48,
+            "raw_start": 41,
+            "raw_end": 56
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 0,
+            "end": 14
+          }
+        ],
+        "stripped_text_preview": "[REMOVED] | Senior Backend Engineer\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 0,
+              "end": 14
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 9,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 9,
+            "stripped_end": 36,
+            "raw_start": 14,
+            "raw_end": 41
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 36,
+            "stripped_end": 43,
+            "raw_start": 41,
+            "raw_end": 56
+          }
+        ]
+      }
+    ]
+  },
+  "emoji": {
+    "raw": "🚀 Max Mustermann\nSenior Backend Engineer 😀\nmax@example.org",
+    "states": [
+      {
+        "span_edits": [],
+        "stripped_text_preview": "🚀 Max Mustermann\nSenior Backend Engineer 😀\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 43,
+            "raw_start": 0,
+            "raw_end": 43
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 43,
+            "stripped_end": 50,
+            "raw_start": 43,
+            "raw_end": 58
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 2,
+            "end": 16
+          }
+        ],
+        "stripped_text_preview": "🚀 [REMOVED]\nSenior Backend Engineer 😀\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 2,
+              "end": 16
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 2,
+            "raw_start": 0,
+            "raw_end": 2
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 2,
+            "stripped_end": 11,
+            "raw_start": 2,
+            "raw_end": 16
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 11,
+            "stripped_end": 38,
+            "raw_start": 16,
+            "raw_end": 43
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 38,
+            "stripped_end": 45,
+            "raw_start": 43,
+            "raw_end": 58
+          }
+        ]
+      },
+      {
+        "span_edits": [],
+        "stripped_text_preview": "🚀 Max Mustermann\nSenior Backend Engineer 😀\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 43,
+            "raw_start": 0,
+            "raw_end": 43
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 43,
+            "stripped_end": 50,
+            "raw_start": 43,
+            "raw_end": 58
+          }
+        ]
+      }
+    ]
+  },
+  "successive": {
+    "raw": "Berlin Germany\nSenior Backend Engineer\nMobil: 0-170-1234567\nGeburtsdatum01.02.1990\nmax@example.org",
+    "states": [
+      {
+        "span_edits": [
+          {
+            "op": "restore",
+            "replacement_index": 0
+          }
+        ],
+        "stripped_text_preview": "Berlin Germany\nSenior Backend Engineer\nMobil: 0-170-1234567\nGeburtsdatum01.02.1990\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [
+            {
+              "start": 0,
+              "end": 14
+            }
+          ],
+          "removed": []
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 83,
+            "raw_start": 0,
+            "raw_end": 83
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 83,
+            "stripped_end": 90,
+            "raw_start": 83,
+            "raw_end": 98
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "restore",
+            "start": 0,
+            "end": 14
+          },
+          {
+            "op": "remove",
+            "start": 46,
+            "end": 59
+          }
+        ],
+        "stripped_text_preview": "Berlin Germany\nSenior Backend Engineer\nMobil: [REMOVED]\nGeburtsdatum01.02.1990\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [
+            {
+              "start": 0,
+              "end": 14
+            }
+          ],
+          "removed": [
+            {
+              "start": 46,
+              "end": 59
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 46,
+            "raw_start": 0,
+            "raw_end": 46
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 46,
+            "stripped_end": 55,
+            "raw_start": 46,
+            "raw_end": 59
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 55,
+            "stripped_end": 79,
+            "raw_start": 59,
+            "raw_end": 83
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 79,
+            "stripped_end": 86,
+            "raw_start": 83,
+            "raw_end": 98
+          }
+        ]
+      },
+      {
+        "span_edits": [
+          {
+            "op": "restore",
+            "start": 0,
+            "end": 14
+          },
+          {
+            "op": "remove",
+            "start": 46,
+            "end": 59
+          },
+          {
+            "op": "remove",
+            "start": 72,
+            "end": 82
+          }
+        ],
+        "stripped_text_preview": "Berlin Germany\nSenior Backend Engineer\nMobil: [REMOVED]\nGeburtsdatum[REMOVED]\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 0
+        },
+        "edits": {
+          "restored": [
+            {
+              "start": 0,
+              "end": 14
+            }
+          ],
+          "removed": [
+            {
+              "start": 46,
+              "end": 59
+            },
+            {
+              "start": 72,
+              "end": 82
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 0,
+            "stripped_end": 46,
+            "raw_start": 0,
+            "raw_end": 46
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 46,
+            "stripped_end": 55,
+            "raw_start": 46,
+            "raw_end": 59
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 55,
+            "stripped_end": 68,
+            "raw_start": 59,
+            "raw_end": 72
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 68,
+            "stripped_end": 77,
+            "raw_start": 72,
+            "raw_end": 82
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 77,
+            "stripped_end": 78,
+            "raw_start": 82,
+            "raw_end": 83
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 78,
+            "stripped_end": 85,
+            "raw_start": 83,
+            "raw_end": 98
+          }
+        ]
+      }
+    ]
+  },
+  "stale": {
+    "raw": "Max Mustermann\nSenior Backend Engineer\nWohnort: Berlin\nGeburtsdatum01.02.1990\nmax@example.org",
+    "states": [
+      {
+        "span_edits": null,
+        "stale": true,
+        "refused": [
+          0
+        ],
+        "stripped_text_preview": "[NAME]\nSenior Backend Engineer\nWohnort: Berlin\nGeburtsdatum[REMOVED]\nmax@example.org",
+        "strip_report": {
+          "email": 0,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [
+            {
+              "start": 39,
+              "end": 54
+            }
+          ],
+          "removed": [
+            {
+              "start": 67,
+              "end": 77
+            }
+          ]
+        },
+        "segments": []
+      },
+      {
+        "span_edits": [
+          {
+            "op": "remove",
+            "start": 67,
+            "end": 77
+          }
+        ],
+        "stripped_text_preview": "[NAME]\nSenior Backend Engineer\nWohnort: Berlin\nGeburtsdatum[REMOVED]\n[EMAIL]",
+        "strip_report": {
+          "email": 1,
+          "phone": 0,
+          "url": 0,
+          "address": 0,
+          "personal": 0,
+          "name": 1
+        },
+        "edits": {
+          "restored": [],
+          "removed": [
+            {
+              "start": 67,
+              "end": 77
+            }
+          ]
+        },
+        "segments": [
+          {
+            "kind": "replacement",
+            "category": "name",
+            "replacement_index": 0,
+            "restorable": true,
+            "stripped_start": 0,
+            "stripped_end": 6,
+            "raw_start": 0,
+            "raw_end": 14
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 6,
+            "stripped_end": 59,
+            "raw_start": 14,
+            "raw_end": 67
+          },
+          {
+            "kind": "removed",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 59,
+            "stripped_end": 68,
+            "raw_start": 67,
+            "raw_end": 77
+          },
+          {
+            "kind": "text",
+            "category": null,
+            "replacement_index": null,
+            "restorable": false,
+            "stripped_start": 68,
+            "stripped_end": 69,
+            "raw_start": 77,
+            "raw_end": 78
+          },
+          {
+            "kind": "replacement",
+            "category": "email",
+            "replacement_index": 1,
+            "restorable": true,
+            "stripped_start": 69,
+            "stripped_end": 76,
+            "raw_start": 78,
+            "raw_end": 93
+          }
+        ]
+      }
+    ]
+  }
+}

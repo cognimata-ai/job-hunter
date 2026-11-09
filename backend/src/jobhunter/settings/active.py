@@ -13,8 +13,8 @@ the pointer as the save left it, and the next statement, with a fresh snapshot, 
 that edit the active document (the watchlist routes, `queries.authoring.edit_query`), `POST
 /api/settings/scope/retry-apply` and `llm.spend_ledger.current_params` (`share=True`) use this helper. A
 caller that already holds the lock makes the first statement a no-op. The rule holds for any statement that
-locks `active_config` and follows one of its pointers into another table: `scoring.filters.active_scopes`
-reads its scope rows in a second statement for it.
+locks `active_config` and follows one of its pointers into another table:
+`scoring.filters.lock_active_scopes` reads its scope rows in a second statement for it.
 """
 
 from dataclasses import dataclass

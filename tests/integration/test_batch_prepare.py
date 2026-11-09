@@ -8,7 +8,7 @@ and node 9's cancel, a reclaimed execution, the recovery of a lost one whatever 
 lock of a re-deferred job.
 
 `prepare` runs directly (`tests.support.batches.prepared_submission`) with a copy of the active settings
-whose `scoring` fields a test may take below the settings model's floors (`batch_min_targets` 200), or through
+whose `scoring` fields a test may take below the settings model's floors (`batch_min_targets` 20), or through
 the `batch_submit` operation (`op_runner`). The targets are synthetic ads of the score tuple.
 """
 

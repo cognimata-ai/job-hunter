@@ -1,0 +1,7 @@
+/* The execution grid: the model grid's rows (`ModelGrid.module.css`, which also hides each field's own label on a
+ * wide screen, where the header names the columns) with three cells; on a narrow one the cells wrap, each wide
+ * enough for its number and unit on one line. */
+.cells {
+  --grid-cells: 3;
+  --narrow-cells: repeat(auto-fill, minmax(min(100%, 12.5rem), 1fr));
+}

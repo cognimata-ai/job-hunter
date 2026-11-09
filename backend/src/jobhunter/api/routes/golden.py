@@ -9,14 +9,19 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   comment is at most 2,000 characters and holds no NUL and no lone surrogate (422 at the model's edge,
   `models.clean_text`; M2 Deviation 44).
 - `GET /api/golden-cases?cursor&limit&active` → `{items, next_cursor}`: the cases by id ascending,
-  keyset-paged with §14.3's signed cursor (`api.pagination`: sort `id`, section `all`, `last_key = [id]`, the
-  filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list did not sign for these
-  filters is 400 `invalid_cursor`. Each item `{id, job_id, label, comment, profile_version, scope_version,
-  source, active, is_canary}` (`golden.CaseRow`; `profile_version` the version's number).
+  keyset-paged with §14.3's signed cursor (`api.pagination`: sort `golden_cases.id`, `asc`,
+  `last_key = [id]`, the filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list
+  did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, title, company, label,
+  comment, profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `title` the case's
+  revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
+  list's one statement; `profile_version` the version's number).
 - `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
   canary is 422 `validation_failed` (L4632), an unknown case 404.
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
   deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
+- `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
+  row alone; the golden case it upserted stays (Deviation 24). 404 `not_found` for no such feedback
+  (`golden.FeedbackMissing` through `api.errors.domain_problem`).
 
 The domain functions log ids, kinds, labels and flags, never a comment. `utcnow` is a name of this module, so
 a test injects the clock by patching `jobhunter.api.routes.golden.utcnow`.
@@ -25,23 +30,15 @@ a test injects the clock by patching `jobhunter.api.routes.golden.utcnow`.
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Path, Query
-from pydantic import AfterValidator, BaseModel, ConfigDict, StringConstraints
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem
+from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
-from jobhunter.api.pagination import (
-    CURSOR_VERSION,
-    SECTION_ALL,
-    cursor_key,
-    decode_cursor,
-    encode_cursor,
-    filters_hash,
-    invalid_cursor,
-)
+from jobhunter.api.pagination import GOLDEN_CASES_SORT, cursor_key, decode_id_cursor, list_page
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.scoring import golden
@@ -50,7 +47,6 @@ from jobhunter.types import JSONValue
 
 router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
-CASES_SORT: Final = "id"
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 _BIGINT_MAX: Final = 2**63 - 1
@@ -58,8 +54,9 @@ _BIGINT_MAX: Final = 2**63 - 1
 Comment = Annotated[str, StringConstraints(max_length=COMMENT_MAX_CHARS), AfterValidator(clean_text)]
 
 
+# §14.2 L4977.
 class FeedbackIn(BaseModel):
-    """A label, or a "wrong score" with the label the user expected (§14.2 L4977)."""
+    """A label, or a "wrong score" with the label the user expected (§14.2)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -74,11 +71,16 @@ class FeedbackOut(BaseModel):
 
 
 class GoldenCaseOut(BaseModel):
-    """A golden case: its job, label and comment, its profile version's number and its scope version's id, its
-    source and its flags."""
+    """A golden case: its job with the labelled ad's title and the company, its label and comment, its profile
+    version's number and its scope version's id, its source and its flags."""
 
     id: int
     job_id: int
+    title: str = Field(
+        description="The title of the ad version the case was labelled on (the job's title when that version "
+        "names none)"
+    )
+    company: str = Field(description="The job's company, as the job list shows it")
     label: Label
     comment: str | None
     profile_version: int
@@ -92,6 +94,8 @@ class GoldenCaseOut(BaseModel):
         return cls(
             id=case.id,
             job_id=case.job_id,
+            title=case.title,
+            company=case.company,
             label=case.label,
             comment=case.comment,
             profile_version=case.profile_version,
@@ -107,8 +111,9 @@ class GoldenCasesPageOut(BaseModel):
     next_cursor: str | None
 
 
+# The canary bound: §11.13 L4632.
 class FlagsIn(BaseModel):
-    """The case's flags to set; an absent one is kept. At most two cases are canaries (L4632)."""
+    """The case's flags to set; an absent one is kept. At most two cases are canaries."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -118,6 +123,7 @@ class FlagsIn(BaseModel):
 
 JobId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a job")]
 CaseId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a golden case")]
+FeedbackId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a label or a wrong score")]
 _NOT_FOUND: Final[dict[int | str, dict[str, Any]]] = {
     404: {"description": "No such golden case (`not_found`)"}
 }
@@ -156,21 +162,6 @@ def _filters(active: bool | None) -> dict[str, JSONValue]:
     return {} if active is None else {"active": active}
 
 
-def _after(cursor: str | None, key: bytes, filters: dict[str, JSONValue]) -> int | None:
-    """The id the next page starts after, from a cursor of this list and these filters; `None` for the first
-    page."""
-    if cursor is None:
-        return None
-    body = decode_cursor(cursor, key=key, sort=CASES_SORT, filters_hash=filters_hash(filters))
-    last_key = body.get("last_key")
-    if body.get("section") != SECTION_ALL or body.get("dir") != "asc" or not isinstance(last_key, list):
-        raise invalid_cursor()
-    match last_key:
-        case [int(case_id)] if not isinstance(case_id, bool) and case_id >= 1:
-            return case_id
-    raise invalid_cursor()
-
-
 @router.get(
     "/api/golden-cases",
     response_model=GoldenCasesPageOut,
@@ -188,24 +179,23 @@ async def list_golden_cases(
     """The golden cases by id, keyset-paged (§14.3)."""
     key = cursor_key(cfg)
     filters = _filters(active)
-    after = _after(cursor, key, filters)
+    after = (
+        None
+        if cursor is None
+        else decode_id_cursor(cursor, key=key, sort=GOLDEN_CASES_SORT, dir="asc", filters=filters)
+    )
     async with engine.connect() as conn:
         rows = await golden.list_cases(conn, after_id=after, limit=limit + 1, active=active)
-    items = [GoldenCaseOut.of(row) for row in rows[:limit]]
-    next_cursor = None
-    if len(rows) > limit:
-        next_cursor = encode_cursor(
-            {
-                "v": CURSOR_VERSION,
-                "sort": CASES_SORT,
-                "dir": "asc",
-                "section": SECTION_ALL,
-                "last_key": [items[-1].id],
-                "filters_hash": filters_hash(filters),
-            },
-            key=key,
-        )
-    return GoldenCasesPageOut(items=items, next_cursor=next_cursor)
+    cases, next_cursor = list_page(
+        rows,
+        limit=limit,
+        last_key=lambda case: [case.id],
+        sort=GOLDEN_CASES_SORT,
+        dir="asc",
+        filters=filters,
+        key=key,
+    )
+    return GoldenCasesPageOut(items=[GoldenCaseOut.of(case) for case in cases], next_cursor=next_cursor)
 
 
 @router.patch(
@@ -247,4 +237,28 @@ async def delete_golden_case(
     async with engine.begin() as conn:
         if not await golden.delete_case_unless_running(conn, case_id):
             raise Problem(404, "not_found", "Golden case not found")
+    return Response(status_code=204)
+
+
+@router.delete(
+    "/api/feedback/{feedback_id}",
+    status_code=204,
+    response_class=Response,
+    responses={
+        404: {"description": "No such label or wrong score (`not_found`)"},
+        422: {"description": "Invalid path (`validation_failed`)"},
+        **CSRF_RESPONSES,
+    },
+)
+async def delete_feedback(
+    feedback_id: FeedbackId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> Response:
+    """Delete a label or a wrong score (204); the golden case it made stays in the golden set."""
+    try:
+        async with engine.begin() as conn:
+            await golden.delete_feedback(conn, feedback_id)
+    except LookupError as exc:
+        if (problem := domain_problem(exc)) is None:
+            raise
+        raise problem from None
     return Response(status_code=204)

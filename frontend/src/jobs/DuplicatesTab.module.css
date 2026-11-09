@@ -1,0 +1,6 @@
+.tab {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+  font-size: var(--font-size-2);
+}

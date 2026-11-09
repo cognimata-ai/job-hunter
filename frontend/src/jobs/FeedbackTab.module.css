@@ -1,0 +1,115 @@
+.tab {
+  display: grid;
+  gap: var(--space-5);
+  font-size: var(--font-size-2);
+}
+
+.form {
+  display: grid;
+  gap: var(--space-2);
+  max-width: 560px;
+}
+
+.heading {
+  font-size: var(--font-size-3);
+}
+
+.label {
+  font-weight: var(--font-weight-medium);
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.choice {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  cursor: pointer;
+}
+
+.choice:has(input:checked) {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.error {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}
+
+.submit {
+  justify-self: start;
+  min-height: 36px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-2);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.submit:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.submit:disabled {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+.list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.item {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: start;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.given {
+  font-weight: var(--font-weight-bold);
+}
+
+.text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.delete {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-critical);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.delete:hover:not(:disabled) {
+  background: var(--color-critical-bg);
+}

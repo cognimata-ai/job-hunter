@@ -1,0 +1,122 @@
+/* A duplicate group's members: one bordered row per member (its title and markers, its facts, its actions),
+ * then Confirm as one job and any failure of the last write. */
+.group {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  font-size: var(--font-size-2);
+}
+
+.list {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.list:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.member {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.title {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* A member's title that shows its detail: applied over `JobRef`'s button that reads as a link (both classes, by
+   `cx`, not `composes … from`, which trips a PostCSS `from` warning in the build), as heavy as a title. */
+.ref {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.marker {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-1);
+  background: var(--color-info-bg);
+  color: var(--color-info);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.8;
+}
+
+.muted,
+.facts {
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  font-size: var(--font-size-1);
+}
+
+/* The election reason, a server code: it may break anywhere. */
+.code {
+  font-family: var(--font-family-mono);
+  overflow-wrap: anywhere;
+}
+
+.actions,
+.confirm {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.button {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+}
+
+.button:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.unscorable {
+  color: var(--color-critical);
+  font-weight: var(--font-weight-medium);
+}
+
+/* A concurrent change: what happened, and Try again. */
+.conflict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-warn);
+  border-radius: var(--radius-2);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+}

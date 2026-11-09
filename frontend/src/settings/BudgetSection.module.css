@@ -1,0 +1,69 @@
+/* Budget & quota: the fields, then the live figures as term and value pairs and the quota windows as a table that
+ * scrolls sideways on its own when the page is narrow. */
+.budget {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.live {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+  gap: var(--space-3) var(--space-4);
+}
+
+.figure {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.figure dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+.figure dd {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.tableScroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table {
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-2);
+}
+
+.table th,
+.table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.table thead th {
+  color: var(--color-text-muted);
+  font-weight: var(--font-weight-medium);
+}
+
+.table tbody th {
+  font-weight: var(--font-weight-bold);
+}
+
+.none {
+  color: var(--color-text-muted);
+}

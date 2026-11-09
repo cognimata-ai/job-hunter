@@ -1,0 +1,123 @@
+.page {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: var(--space-8) var(--space-4);
+}
+
+.card {
+  width: min(400px, 100%);
+  padding: var(--space-8);
+  border: 1px solid var(--color-border);
+  border-top: 4px solid var(--color-accent);
+  border-radius: var(--radius-3);
+  background: var(--color-surface);
+}
+
+.brand {
+  color: var(--color-accent);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: 0.01em;
+}
+
+.title {
+  margin-top: var(--space-1);
+  font-size: var(--font-size-6);
+  letter-spacing: -0.015em;
+}
+
+.form {
+  display: grid;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.field label {
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.field input {
+  width: 100%;
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.field input:focus-visible {
+  border-color: var(--color-focus);
+  outline-offset: 0;
+}
+
+.field input[aria-invalid="true"] {
+  border-color: var(--color-critical);
+}
+
+.code {
+  font-family: var(--font-family-mono);
+  letter-spacing: 0.2em;
+}
+
+.hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+.error,
+.info {
+  padding: var(--space-2) var(--space-3);
+  border-left: 4px solid var(--color-critical);
+  border-radius: var(--radius-1);
+  background: var(--color-critical-bg);
+  color: var(--color-critical);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.info {
+  border-left-color: var(--color-info);
+  background: var(--color-info-bg);
+  color: var(--color-info);
+}
+
+.submit {
+  min-height: 44px;
+  margin-top: var(--space-2);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-2);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-weight: var(--font-weight-bold);
+  cursor: pointer;
+}
+
+.submit:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.submit:disabled {
+  cursor: progress;
+  opacity: 0.85;
+}
+
+.note {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+}
+
+@media (max-width: 480px) {
+  .card {
+    padding: var(--space-6) var(--space-4);
+  }
+}

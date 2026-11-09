@@ -67,7 +67,7 @@ from tests.support.scoring import (
 pytestmark = pytest.mark.integration
 
 WAIT_S: Final = 60.0
-BATCH: Final = 200  # `scoring.batch_min_targets`, the smallest batch the settings allow
+BATCH: Final = 200  # `scoring.batch_min_targets`, the seeded default
 SONNET: Final = "claude-sonnet-5-5"
 # Each periodic M3 task: its cron, its queue and its queueing lock (spec §3.3.2; Tasks 17 and 20).
 PERIODIC: Final = {

@@ -1,0 +1,23 @@
+/* Schedule: its fields, then the next slots of the saved schedule and of the draft side by side. */
+.schedule {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.next {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4) var(--space-8);
+}
+
+.nextGroup {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+}
+
+.slots {
+  display: grid;
+  gap: var(--space-1);
+}

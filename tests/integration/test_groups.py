@@ -10,7 +10,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.dedup import group_rules, groups, merge, revisions
 from jobhunter.dedup.groups import GroupEffect
-from jobhunter.errors import FencedOut
+from jobhunter.errors import CoMemberChanged, FencedOut
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.normalize.keys import AdKey
@@ -311,6 +311,31 @@ async def test_an_appointment_whose_revalidation_dissolves_the_group_reports_no_
     effect = await regroup(engine, c)
     assert effect == GroupEffect(None, True, False, (p, q, c), False, False)
     assert await group_row(engine, group) == ("dissolved", None, None, "member_left")
+
+
+async def test_a_regroup_whose_groups_keep_changing_gives_up_as_a_co_member_change(
+    engine, current_epoch, job_with_postings, monkeypatch, caplog, migrated
+) -> None:
+    """M4 Task 8 (M1 Carry-forward 10): a regroup whose every round finds a member it did not lock rolls each
+    round back and, after `_LOCK_ROUNDS`, raises `CoMemberChanged`, having written nothing."""
+    caplog.set_level(logging.INFO)
+    make = jobs_maker(engine, job_with_postings)
+    p, _ = [await make("jsearch", description_text=FULL_TEXT) for _ in "pq"]
+    real_co_members = merge.co_members
+    phantoms = iter(range(10**12, 10**12 + 100))
+
+    async def growing(conn: AsyncConnection, job_ids: Any) -> frozenset[int]:
+        """The groups' members as each round re-reads them, with one more no round has locked."""
+        return await real_co_members(conn, job_ids) | {next(phantoms)}
+
+    monkeypatch.setattr(merge, "co_members", growing)
+    before = await generation(engine)
+    with pytest.raises(CoMemberChanged, match="kept changing under the lock"):
+        await regroup(engine, p)
+    rounds = logged(caplog, "regroup_set_changed_under_the_lock")
+    assert [e["job_id"] for e in rounds] == [p] * groups._LOCK_ROUNDS
+    assert await fetch(engine, GROUPS) == [] and await generation(engine) == before
+    assert advisory_held(migrated) == 0 and await job_lockable(engine, p)  # every round's locks released
 
 
 async def test_split_confirm_dissolve_and_reconciler(

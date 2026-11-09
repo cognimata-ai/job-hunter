@@ -1,6 +1,6 @@
 // frontend/src/api/client.test.ts
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apiFetch, ProblemError } from "./client";
+import { apiFetch, isProblem, ProblemError, toProblem } from "./client";
 afterEach(() => vi.restoreAllMocks());
 
 const PROBLEM_JSON = { "content-type": "application/problem+json" };
@@ -90,6 +90,30 @@ describe("apiFetch", () => {
       expect(new Headers(sentInit(f, 1).headers).get("content-type")).toBe("text/plain");
       expect(new Headers(sentInit(f, 2).headers).has("content-type")).toBe(false);
     });
+
+    it("a background call sends X-JH-Background", async () => {
+      const f = mockFetch(() => new Response("{}"));
+      await apiFetch("/api/system/status", { background: true });
+      await apiFetch("/api/system/status");
+      await apiFetch("/api/system/status", { background: false });
+      expect(f).toHaveBeenCalledTimes(3);
+      expect(new Headers(sentInit(f, 0).headers).get("X-JH-Background")).toBe("1");
+      expect(new Headers(sentInit(f, 1).headers).has("X-JH-Background")).toBe(false);
+      expect(new Headers(sentInit(f, 2).headers).has("X-JH-Background")).toBe(false);
+      expect(sentInit(f, 0)).not.toHaveProperty("background");
+    });
+
+    it("an idempotency key is sent as Idempotency-Key", async () => {
+      const f = mockFetch(() => new Response("{}", { status: 202 }));
+      await apiFetch("/api/runs", { method: "POST", body: "{}", idempotencyKey: "k-7" });
+      await apiFetch("/api/runs", { method: "POST", body: "{}" });
+      expect(f).toHaveBeenCalledTimes(2);
+      const keyed = new Headers(sentInit(f, 0).headers);
+      expect(keyed.get("Idempotency-Key")).toBe("k-7");
+      expect(keyed.get("X-JH-Request")).toBe("1");
+      expect(sentInit(f, 0)).not.toHaveProperty("idempotencyKey");
+      expect(new Headers(sentInit(f, 1).headers).has("Idempotency-Key")).toBe(false);
+    });
   });
 
   describe("success", () => {
@@ -137,6 +161,34 @@ describe("apiFetch", () => {
         requestId: "r-2",
         errors,
       });
+    });
+
+    it("a problem keeps detail, instance and extension members", async () => {
+      mockFetch(() => problem(429, {
+        type: "about:blank", code: "throttled", title: "Too many failed logins", status: 429,
+        detail: "Wait before the next attempt", instance: "/api/auth/login", request_id: "r-8",
+        retry_after_s: 540, merged_into_job_id: 12, retryable: true, query_id: null,
+      }));
+      const error = await apiFetch("/api/auth/login", { method: "POST" }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ProblemError);
+      expect(error).toMatchObject({
+        detail: "Wait before the next attempt",
+        instance: "/api/auth/login",
+        extra: { retry_after_s: 540, merged_into_job_id: 12, retryable: true, query_id: null },
+      });
+      // the members a problem document writes itself are fields, never extensions
+      expect(Object.keys((error as ProblemError).extra).sort()).toEqual(
+        ["merged_into_job_id", "query_id", "retry_after_s", "retryable"]);
+    });
+
+    it("has a null detail and instance and no extension members when the problem has none", async () => {
+      mockFetch(() => problem(404, { code: "not_found", title: "Not Found", detail: null }));
+      await expect(apiFetch("/api/x")).rejects.toMatchObject({ detail: null, instance: null, extra: {} });
+    });
+
+    it("has a null detail and instance and no extension members when the answer is no problem", async () => {
+      mockFetch(() => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "content-type": "text/html" } }));
+      await expect(apiFetch("/api/x")).rejects.toMatchObject({ detail: null, instance: null, extra: {} });
     });
 
     it("reads a problem content type with parameters and any case", async () => {
@@ -197,5 +249,27 @@ describe("apiFetch", () => {
       expect(error).toBe(failure);
       expect(error).not.toBeInstanceOf(ProblemError);
     });
+  });
+});
+
+describe("isProblem", () => {
+  const throttled = new ProblemError({ status: 429, code: "throttled", title: "t", requestId: null, errors: [] });
+  it("tells a ProblemError from any other value, and checks its code when given one", () => {
+    expect(isProblem(throttled)).toBe(true);
+    expect(isProblem(throttled, "throttled")).toBe(true);
+    expect(isProblem(throttled, "unauthenticated")).toBe(false);
+    expect(isProblem(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isProblem({ status: 429, code: "throttled" })).toBe(false);
+    expect(isProblem(undefined)).toBe(false);
+  });
+});
+
+describe("toProblem", () => {
+  it("keeps a ProblemError and makes any other failure the network problem (status 0)", () => {
+    const conflict = new ProblemError({ status: 409, code: "conflict_state", title: "t", requestId: "r", errors: [] });
+    expect(toProblem(conflict)).toBe(conflict);
+    const network = toProblem(new TypeError("Failed to fetch"));
+    expect(network).toBeInstanceOf(ProblemError);
+    expect(network).toMatchObject({ status: 0, code: "network", requestId: null, errors: [], detail: null });
   });
 });

@@ -321,6 +321,34 @@ def check_proposal_ready(ctx: Context) -> str | None:
     return f"proposal {proposal_id}: {len(items)} items"
 
 
+def save_settings(
+    ctx: Context, payload: dict[str, Any], base: int, key: str, *, what: str
+) -> tuple[dict[str, Any], list[str]]:
+    """One settings save as the UI makes it (§13.2): the dry-run of `payload`, which must have no errors
+    (`what` names the change in that failure), then the save over the version `base` with every warning code
+    of the dry-run acknowledged and the `Idempotency-Key` `key`. The save's answer and the acknowledged
+    codes."""
+    preview = json_object(
+        ctx.client.post(f"{ORIGIN}/api/settings/dry-run", json={"payload": payload}, headers=mutating(ctx)),
+        200,
+    )
+    errors, warnings = pick(preview, "errors"), pick(preview, "warnings")
+    if not isinstance(errors, list) or not isinstance(warnings, list):
+        raise CheckFailed("the dry-run answered no errors and warnings lists")
+    if errors:
+        raise CheckFailed(f"the dry-run refused {what}: {sorted({str(pick(e, 'code')) for e in errors})}")
+    codes = [str(pick(w, "code")) for w in warnings]
+    saved = json_object(
+        ctx.client.post(
+            f"{ORIGIN}/api/settings",
+            json={"payload": payload, "base_version_id": base, "acknowledged_warnings": codes},
+            headers=mutating(ctx, key),
+        ),
+        201,
+    )
+    return saved, codes
+
+
 def check_settings_save(ctx: Context) -> str | None:
     if STATE.proposal_id is None or STATE.items is None:
         raise CheckFailed("no ready proposal: check proposal_ready did not pass")
@@ -341,26 +369,7 @@ def check_settings_save(ctx: Context) -> str | None:
     if not isinstance(payload, dict) or not isinstance(base, int):
         raise CheckFailed("the active settings have no payload or version id")
     payload["queries"] = [{"query_id": query_id, "enabled": True} for query_id in query_ids]
-    preview = json_object(
-        ctx.client.post(f"{ORIGIN}/api/settings/dry-run", json={"payload": payload}, headers=mutating(ctx)),
-        200,
-    )
-    errors, warnings = pick(preview, "errors"), pick(preview, "warnings")
-    if not isinstance(errors, list) or not isinstance(warnings, list):
-        raise CheckFailed("the dry-run answered no errors and warnings lists")
-    if errors:
-        raise CheckFailed(
-            f"the dry-run refused the payload: {sorted({str(pick(e, 'code')) for e in errors})}"
-        )
-    codes = [str(pick(w, "code")) for w in warnings]
-    saved = json_object(
-        ctx.client.post(
-            f"{ORIGIN}/api/settings",
-            json={"payload": payload, "base_version_id": base, "acknowledged_warnings": codes},
-            headers=mutating(ctx, SAVE_KEY),
-        ),
-        201,
-    )
+    saved, codes = save_settings(ctx, payload, base, SAVE_KEY, what="the payload")
     version_no, classes = pick(saved, "version", "version_no"), pick(saved, "version", "effect_classes")
     return (
         f"queries {query_ids} enabled; version_no={version_no!r} effect_classes={classes!r} warnings={codes}"

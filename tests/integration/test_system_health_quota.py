@@ -1,5 +1,6 @@
 import asyncio
-from datetime import UTC, timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -7,17 +8,24 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.quota import ledger
+from jobhunter.quota.windows import NOMINAL_PERIOD, bootstrap_window
 
 from tests.support import m3
 from tests.support.collect import planned_request, queued_run
-from tests.support.quota import SETTINGS
+from tests.support.quota import SETTINGS, SIX_H, insert_ledger_entry, insert_window
 from tests.support.scoring import activate_score_tuple
 
 pytestmark = pytest.mark.integration
+SYSTEM_UTCNOW = "jobhunter.api.routes.system.utcnow"
 
 
-async def test_health_reports_current_windows(logged_in_client, engine, current_epoch) -> None:
+def iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+async def test_health_reports_current_windows(logged_in_client, engine, current_epoch, monkeypatch) -> None:
     owner, now = await queued_run(engine), utcnow()
+    monkeypatch.setattr(SYSTEM_UTCNOW, lambda: now)
     fr = await planned_request(engine, owner, provider="adzuna", key=bytes(32), attempt_seq=1)
     async with engine.begin() as c:
         r = await ledger.reserve(
@@ -44,7 +52,50 @@ async def test_health_reports_current_windows(logged_in_client, engine, current_
         "remaining_units": 2249,
         "tokens": 32.75,  # the full bucket of a 6 h schedule (33.75) less the one normal request
     }
-    assert body["quota"]["serpapi"] is None and body["quota"]["jsearch"] is None
+    # no JSearch window is stored: the one its first request would open now, unspent; SerpApi has none
+    # before its first account read
+    jsearch = body["quota"]["jsearch"]
+    assert body["quota"]["serpapi"] is None
+    assert (jsearch["window_start"], jsearch["window_end"]) == (
+        iso(now),
+        iso(now + NOMINAL_PERIOD["jsearch"]),
+    )
+    assert (jsearch["state"], jsearch["limit_units"], jsearch["used_units"], jsearch["remaining_units"]) == (
+        "extrapolated_unvalidated",
+        200,
+        0,
+        200,
+    )
+
+
+async def test_health_and_status_show_the_same_window_after_a_reset(
+    logged_in_client, engine, current_epoch, monkeypatch
+) -> None:
+    """A stored JSearch window that ran out and whose reset has passed, before any ledger write rolled it: the
+    detailed health and the header status both show its successor, unspent, with the same reset."""
+    now = utcnow()
+    monkeypatch.setattr(SYSTEM_UTCNOW, lambda: now)
+    start = now - timedelta(days=40)
+    boot = bootstrap_window("jsearch", start, SETTINGS, interval_s=SIX_H, account=None)
+    assert boot is not None
+    ended = start + timedelta(days=31)
+    await insert_window(engine, replace(boot, window_end=ended, state="exhausted_until_reset"))
+    await insert_ledger_entry(engine, "jsearch", start, units=200, state="billed")
+    health = (await logged_in_client.get("/api/system/health")).json()["quota"]["jsearch"]
+    status = (await logged_in_client.get("/api/system/status")).json()["quota"]["jsearch"]
+    successor_end = iso(ended + NOMINAL_PERIOD["jsearch"])
+    assert health["window_start"] == iso(ended) and health["window_end"] == successor_end
+    assert (health["state"], health["used_units"], health["remaining_units"]) == (
+        "extrapolated_unvalidated",
+        0,
+        200,
+    )
+    assert status == {
+        "used": health["used_units"],
+        "limit": health["limit_units"],
+        "reset_at": health["window_end"],
+        "state": health["state"],
+    }
 
 
 async def test_health_reports_the_score_lane_read_without_locks(

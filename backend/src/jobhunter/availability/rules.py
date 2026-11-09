@@ -50,7 +50,7 @@ from jobhunter.db.guards import Guard
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
-from jobhunter.errors import FencedOut, InvariantViolation
+from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import load_run_settings
 from jobhunter.worker.epoch import fence_epoch
@@ -176,7 +176,8 @@ async def _read_and_lock(conn: AsyncConnection, posting_ids: list[int]) -> froze
 async def lock_posting_jobs(conn: AsyncConnection, posting_ids: Iterable[int]) -> frozenset[int]:
     """The job rows of the postings `FOR UPDATE`, with their duplicate-group co-members, in one ordered
     statement per round (module docstring); the ids of every job row held. Every posting that still exists
-    is on one of them. Raises `InvariantViolation` when the set keeps moving for `_LOCK_ROUNDS` rounds."""
+    is on one of them. Raises `CoMemberChanged` (an `InvariantViolation`) when the set keeps moving for
+    `_LOCK_ROUNDS` rounds, having written nothing."""
     ids = sorted(set(posting_ids))
     if not ids:
         return frozenset()
@@ -192,7 +193,7 @@ async def lock_posting_jobs(conn: AsyncConnection, posting_ids: Iterable[int]) -
             return held
         await attempt.rollback()
         log.info("posting_jobs_changed_under_the_lock", postings=len(ids))
-    raise InvariantViolation(f"the jobs of {len(ids)} postings kept changing under the lock")
+    raise CoMemberChanged(f"the jobs of {len(ids)} postings kept changing under the lock")
 
 
 async def stale_sweep(

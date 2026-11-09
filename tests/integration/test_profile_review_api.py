@@ -245,7 +245,16 @@ async def test_an_unknown_draft_is_a_404_on_every_route(logged_in_client) -> Non
 
 async def test_the_profile_list_is_empty_before_any_confirm(logged_in_client) -> None:
     r = await logged_in_client.get("/api/profile")
-    assert (r.status_code, r.json()) == (200, {"active": None, "versions": []})
+    assert (r.status_code, r.json()) == (
+        200,
+        {
+            "active": None,
+            "versions": [],
+            "open_draft": None,
+            "latest_proposal": None,
+            "estimates": {"extract_profile_usd": "0.140000", "propose_queries_usd": "0.094000"},
+        },
+    )
 
 
 # --- PUT /text: the complete edit set (Deviation 29, R14-1, R14-2) ---------------------------------------

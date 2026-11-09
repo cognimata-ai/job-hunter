@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.pagination import encode_cursor, filters_hash
+from jobhunter.api.pagination import SETTINGS_VERSIONS_SORT, encode_list_cursor, filters_hash
 from jobhunter.crypto import hkdf_sha256
 from jobhunter.db.seed import load_settings_v1
 
@@ -21,12 +21,13 @@ VERSIONS_URL = "/api/settings/versions"
 
 async def test_get_settings_shows_the_active_version(logged_in_client, engine) -> None:
     body = await settings_body(logged_in_client)
-    assert set(body) == {"version", "payload", "pending_scope"}
+    assert set(body) == {"version", "payload", "pending_scope", "scope_applied"}
     assert set(body["version"]) == {"id", "version_no", "created_at", "effect_classes"}
     assert body["version"]["id"] == (await active_row(engine)).settings_version_id
     assert (body["version"]["version_no"], body["version"]["effect_classes"]) == (1, ["none"])
     assert body["version"]["created_at"].endswith("Z")
     assert body["payload"] == load_settings_v1() and body["pending_scope"] is None
+    assert body["scope_applied"] is True
 
 
 async def test_get_settings_shows_the_pending_scope_and_its_progress(logged_in_client, engine) -> None:
@@ -37,15 +38,19 @@ async def test_get_settings_shows_the_pending_scope_and_its_progress(logged_in_c
     assert body["version"]["id"] == saved["version"]["id"]
     assert body["pending_scope"] == {
         "version_id": pending,
-        "progress": {"done": 0, "total": 0},
+        "progress": {"done": 0, "total": 0, "det_done": 0, "det_total": 0},
     }  # not started
     async with engine.begin() as conn:
         await conn.execute(
-            sa.text('UPDATE operations SET progress = \'{"done": 500, "total": 1201}\' WHERE id = :i'),
+            sa.text(
+                "UPDATE operations SET progress = "
+                '\'{"done": 500, "total": 1201, "det_done": 2, "det_total": 9}\' WHERE id = :i'
+            ),
             {"i": op_id},
         )
     body = await settings_body(logged_in_client)
-    assert body["pending_scope"] == {"version_id": pending, "progress": {"done": 500, "total": 1201}}
+    progress = {"done": 500, "total": 1201, "det_done": 2, "det_total": 9}
+    assert body["pending_scope"] == {"version_id": pending, "progress": progress}
     async with engine.begin() as conn:  # the apply failed for good; the reconciler has not cleared it yet
         for statement in (
             "UPDATE operations SET status = 'running', claim_id = gen_random_uuid(), worker_epoch = 1, "
@@ -107,23 +112,35 @@ async def test_a_tampered_cursor_is_400_invalid_cursor(logged_in_client, api_app
     body = json.loads(_unb64(data))
     assert body == {
         "v": 2,
-        "sort": "version_no",
+        "sort": "settings_versions.version_no",
         "dir": "desc",
         "section": "all",
         "last_key": [4],
         "filters_hash": filters_hash({}),
     }
     key = hkdf_sha256(api_app.api.state.cfg.secret_b64("session_secret"), b"cursor")
-    assert encode_cursor(body, key=key) == cursor  # signed with HKDF(session_secret, "cursor")
+
+    def signed(*, key: bytes = key, **changes: Any) -> str:
+        fields: dict[str, Any] = {
+            "sort": SETTINGS_VERSIONS_SORT,
+            "dir": "desc",
+            "last_key": [4],
+            "filters": {},
+        }
+        return encode_list_cursor(**{**fields, **changes}, key=key)
+
+    assert signed() == cursor  # signed with HKDF(session_secret, "cursor")
     forged = _b64(json.dumps({**body, "last_key": [2]}, separators=(",", ":"), sort_keys=True).encode())
     other_key = hkdf_sha256(b"\x01" * 32, b"cursor")
-    other_sort = encode_cursor({**body, "sort": "created_at"}, key=key)
-    other_filters = encode_cursor({**body, "filters_hash": filters_hash({"effect": "scope"})}, key=key)
-    bad_key = encode_cursor({**body, "last_key": ["4"]}, key=key)
+    other_sort = signed(sort="created_at")
+    other_filters = signed(filters={"effect": "scope"})
+    bad_key = signed(last_key=["4"])
     for tampered in (
         f"{forged}.{signature}",
         f"{data}.{'B' if signature[0] == 'A' else 'A'}{signature[1:]}",
-        encode_cursor(body, key=other_key),
+        signed(key=other_key),
+        signed(dir="asc"),
+        signed(sort="version_no"),  # the M3 form of this cursor (resolution (c))
         other_sort,
         other_filters,
         bad_key,

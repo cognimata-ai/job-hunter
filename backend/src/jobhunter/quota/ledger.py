@@ -30,6 +30,11 @@ The pure cores (`admission`, `settle_window`, `serpapi_hour_admits`, `note_forei
 are what the property tests drive (§18.1). `quota_windows` changes only through `windows.save_window` and
 `windows.apply_changes` (Ruling P11); ledger rows change state only through `transition()`.
 
+**The item owner** (`lock_item_owner`, M4 Task 12, M1 Carry-forward 10): the owner of an identity resolution
+(`dedup.identity.resolve_item`) is an `ItemOwner`, a run's admitted attempt (`lock_run_owner`) or an
+operation's claim (`worker.operations.lock_operation_owner`, the replay of rejected items, whose run is
+over), held at the same place of the lock order, and refused under an active `global` purge fence either way.
+
 Alerts are raised with the subject `provider:<name>`: `quota.limit_increased` (info),
 `quota.unaccounted_usage` (warn) and the `adjustment` row it explains; `quota.exhausted` (warn, JSearch 429
 exhaustion, resolved by a later validated observation with `remaining > 0`); `quota.ambiguous_attempt` (warn);
@@ -86,11 +91,16 @@ from jobhunter.quota.windows import (
 from jobhunter.run_settings import QuotaSettings, RunSettings
 from jobhunter.sources.base import Observation
 from jobhunter.worker.epoch import fence_epoch
+from jobhunter.worker.operations import OperationClaim, lock_operation_owner
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
 if TYPE_CHECKING:
     # `worker.runs` imports `observability.health`, which imports this module: the owner type only.
     from jobhunter.worker.runs import RunOwner
+
+# The owner of an identity resolution (module docstring, The item owner): lazily evaluated, so the run's type
+# needs no import at run time.
+type ItemOwner = RunOwner | OperationClaim
 
 COUNTED: Final = ("reserved", "dispatched", "billed", "ambiguous")
 RECOVERY_AFTER: Final = timedelta(minutes=15)
@@ -176,9 +186,13 @@ _ENTRY = q(
     "SELECT provider, window_start, request_class, units, state, run_id, run_attempt_no, fetch_request_id, "
     "created_at, dispatched_at FROM quota_ledger WHERE id = :id AND kind = 'request'"
 )
+# The ledger rows a window's counted usage sums (§6.7): the `COUNTED` attempts and every adjustment, with the
+# bind `counted` (`counted_params()`, defined below it). `observability.lists` sums the same rows for every
+# provider at once.
+COUNTED_USAGE_SQL: Final = "(kind = 'adjustment' OR state = ANY(:counted))"
 _USED = q(
-    "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND window_start = :ws "
-    "AND (kind = 'adjustment' OR state = ANY(:counted))"
+    "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND window_start = :ws "  # noqa: S608
+    f"AND {COUNTED_USAGE_SQL}"
 )
 _RUN_NORMAL = q(
     "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND run_id = :run "
@@ -232,7 +246,8 @@ _UNSETTLED = q(
 _LOCK_RUN = q("SELECT attempt_no, status FROM runs WHERE id = :run FOR UPDATE")
 
 
-def _counted() -> dict[str, Any]:
+def counted_params() -> dict[str, Any]:
+    """The bind `counted` of `COUNTED_USAGE_SQL` and of every statement here that names `:counted`."""
     return {"counted": list(COUNTED)}
 
 
@@ -266,13 +281,13 @@ def _set_gauges(w: Window, used: int) -> None:
 # -- counts
 async def used_units(conn: AsyncConnection, provider: Provider, window_start: datetime) -> int:
     """Counted usage of the window (§6.7): `COUNTED` attempts and every adjustment."""
-    params = {"p": provider, "ws": window_start, **_counted()}
+    params = {"p": provider, "ws": window_start, **counted_params()}
     return int((await conn.execute(_USED, params)).scalar_one())
 
 
 async def normal_count_for_run(conn: AsyncConnection, provider: Provider, run_id: int) -> int:
     """The run's counted normal-class units of `provider`, across all its attempts (per-run bound, §6.4)."""
-    params = {"p": provider, "run": run_id, **_counted()}
+    params = {"p": provider, "run": run_id, **counted_params()}
     return int((await conn.execute(_RUN_NORMAL, params)).scalar_one())
 
 
@@ -286,7 +301,7 @@ async def admitted_run_cap(conn: AsyncConnection, provider: Provider, run_id: in
     the cap in force then. A later lower cap is the bound, not an earlier higher one (final review F3, Minor
     1): an admission that exceeded the cap in force is caught, and a refinement after the last admission
     raises no false alarm."""
-    params = {"p": provider, "run": run_id, **_counted()}
+    params = {"p": provider, "run": run_id, **counted_params()}
     cap = (await conn.execute(_RUN_CAP, params)).scalar()
     return None if cap is None else int(cap)
 
@@ -339,7 +354,7 @@ async def serpapi_hour_ok(
     seen_at, this_hour = w.hour_observed_at, w.observed_this_hour
     if seen_at is None or this_hour is None or now - seen_at > SERPAPI_OBSERVATION_FRESH:
         return False
-    params = {"hour_ago": now - HOUR, "since": seen_at - SERPAPI_USAGE_LAG, **_counted()}
+    params = {"hour_ago": now - HOUR, "since": seen_at - SERPAPI_USAGE_LAG, **counted_params()}
     counts = (await conn.execute(_SERPAPI_HOUR, params)).one()
     cap = settings.serpapi_hourly_cap
     if w.observed_hourly_cap is not None:
@@ -374,7 +389,7 @@ async def detect_foreign_usage(
     params = {
         "hour_before": account.observed_at - HOUR,
         "observed_at": account.observed_at,
-        **_counted(),
+        **counted_params(),
     }
     local_before = int((await conn.execute(_SERPAPI_BEFORE, params)).scalar_one())
     foreign = note_foreign_usage(w, this_hour=account.this_hour_searches, local_before=local_before, now=now)
@@ -409,7 +424,7 @@ async def adzuna_windows_ok(
 ) -> bool:
     """The four rolling Adzuna counts over `created_at` (`COUNTED` attempts), then `adzuna_admits`."""
     minute, day, week, month = (now - span for span in ADZUNA_SPANS)
-    params = {"minute": minute, "day": day, "week": week, "month": month, **_counted()}
+    params = {"minute": minute, "day": day, "week": week, "month": month, **counted_params()}
     row = (await conn.execute(_ADZUNA_ROLLING, params)).one()
     return adzuna_admits((int(row.minute), int(row.day), int(row.week), int(row.month)), units, settings)
 
@@ -520,6 +535,18 @@ async def lock_run_owner(conn: AsyncConnection, owner: "RunOwner") -> None:
         raise FencedOut("run")
     if await global_fence_active(conn):
         raise FencedOut("purge_fence")
+
+
+async def lock_item_owner(conn: AsyncConnection, owner: ItemOwner) -> None:
+    """The owner row of an item's resolution (module docstring, The item owner): a run's through
+    `lock_run_owner`; an operation claim's `FOR SHARE` (`lock_operation_owner`, else
+    `FencedOut("operation")`), then no active `global` purge fence, else `FencedOut("purge_fence")`."""
+    if isinstance(owner, OperationClaim):
+        await lock_operation_owner(conn, owner)
+        if await global_fence_active(conn):
+            raise FencedOut("purge_fence")
+        return
+    await lock_run_owner(conn, owner)
 
 
 async def _record_effects(

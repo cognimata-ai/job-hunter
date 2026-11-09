@@ -15,6 +15,8 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from tests.support.fixtures import count_rows
+
 pytestmark = pytest.mark.integration
 PW = "Tannenbaum-Ölfass-7"
 
@@ -193,15 +195,108 @@ async def test_csrf_on_state_changing_routes(logged_in_client) -> None:
     assert (await logged_in_client.get("/api/auth/session")).status_code == 401
 
 
-async def test_totp_required_when_enabled(api_client, make_user, engine, make_config) -> None:
-    from jobhunter.auth import totp, users
+async def test_totp_required_when_enabled(api_client, make_user, engine, make_config, monkeypatch) -> None:
+    import jobhunter.api.routes.auth as auth_routes
+    from jobhunter.auth import passwords, totp, users
 
+    argon2: list[str] = []  # the Argon2 work of the logins, which happens inside the gate only
+    real_check_password = passwords.check_password
+
+    def check_password(stored: str, password: str) -> tuple[bool, bool]:
+        argon2.append("check_password")
+        return real_check_password(stored, password)
+
+    monkeypatch.setattr(auth_routes, "check_password", check_password)
+    monkeypatch.setattr(auth_routes, "dummy_verify", lambda p: argon2.append("dummy_verify"))
     await make_user()
     secret = totp.new_secret()
     async with engine.begin() as c:
         await users.enable_totp(c, secret, data_key=make_config("api").secret_b64("data_key"))
-    assert (await login(api_client)).status_code == 401
-    assert (await login(api_client, totp=pyotp.TOTP(secret).now())).status_code == 204
+    # Without a code: the right password, a wrong one, an unknown username, an empty code and a null one. Six
+    # of them, one more than the per-address lockout's five failures.
+    without_code = [
+        await login(api_client),
+        await login(api_client, password="wrong-password-123"),
+        await api_client.post("/api/auth/login", json={"username": "nobody", "password": PW}),
+        await login(api_client, totp=""),
+        await api_client.post("/api/auth/login", json={"username": "ada", "password": PW, "totp": None}),
+        await login(api_client, password="wrong-password-123", totp=""),
+    ]
+    assert [r.status_code for r in without_code] == [401] * 6
+    first = without_code[0].json()
+    assert (first["code"], first["title"]) == ("totp_required", "TOTP code required")
+    for r in without_code:  # one answer, whoever and whatever was sent: it tells only that TOTP is on
+        assert {**r.json(), "request_id": first["request_id"]} == first
+        sets_cookie = "set-cookie" in r.headers
+        assert not sets_cookie
+    assert argon2 == []  # the Argon2 gate was not entered
+    for table in ("login_attempts", "login_lockouts", "sessions"):
+        assert await count_rows(engine, table) == 0, table
+    # A code that is not six digits fails the request's validation, before the login runs: nothing is
+    # recorded, and the problem names the field only, none of what was sent.
+    for malformed in ("12345", "abcdef", "1234567"):
+        r = await login(api_client, totp=malformed)
+        assert r.status_code == 422 and r.json()["code"] == "validation_failed"
+        assert [e["field"] for e in r.json()["errors"]] == ["body.totp"]
+        shown = json.dumps({k: v for k, v in r.json().items() if k != "request_id"}, ensure_ascii=False)
+        names_a_credential = any(sent in shown for sent in (PW, "ada", malformed))
+        assert not names_a_credential
+    assert argon2 == []
+    assert await count_rows(engine, "login_attempts") == 0
+    # A well-formed wrong code: the generic failure, and an attempt.
+    wrong = await login(api_client, totp=wrong_code(secret))
+    assert wrong.status_code == 401
+    assert (wrong.json()["code"], wrong.json()["title"]) == ("unauthenticated", "Invalid credentials")
+    assert argon2 == ["check_password"]
+    assert await count_rows(engine, "login_attempts", success=False) == 1
+    code = pyotp.TOTP(secret).now()
+    accepted = await login(api_client, totp=code)
+    assert accepted.status_code == 204  # the six logins without a code did not lock the address out
+    async with engine.begin() as c:
+        await users.disable_totp(c)
+    off = [  # TOTP off: a login needs no code, whether `totp` is omitted, empty or null
+        await login(api_client),
+        await login(api_client, totp=""),
+        await api_client.post("/api/auth/login", json={"username": "ada", "password": PW, "totp": None}),
+    ]
+    assert [r.status_code for r in off] == [204] * 3
+
+
+async def test_a_locked_out_client_without_a_totp_code_gets_the_lockout_answer(
+    api_client, make_user, engine, make_config
+) -> None:
+    from jobhunter.auth import totp, users
+
+    await make_user()
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=make_config("api").secret_b64("data_key"))
+        await c.execute(
+            sa.text(
+                "INSERT INTO login_lockouts "
+                "VALUES ('ip:198.51.100.10', now() + interval '15 minutes', 'ip_failures')"
+            )
+        )
+    r = await login(api_client)
+    assert r.status_code == 429 and r.json()["code"] == "throttled"
+    assert await count_rows(engine, "login_attempts") == 0
+
+
+async def test_totp_enabled_for_any_is_the_single_user_s_flag(engine, make_user) -> None:
+    from jobhunter.auth import totp, users
+
+    async def enabled() -> bool:
+        async with engine.connect() as c:
+            return await users.totp_enabled_for_any(c)
+
+    assert await enabled() is False  # no user at all
+    await make_user()
+    assert await enabled() is False
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=os.urandom(32))
+    assert await enabled() is True
+    async with engine.begin() as c:
+        await users.disable_totp(c)
+    assert await enabled() is False
 
 
 async def test_rate_limit_600_per_minute(logged_in_client, monkeypatch) -> None:
@@ -463,9 +558,9 @@ async def test_a_login_without_origin_is_refused(api_client, make_user) -> None:
 
 
 async def test_auth_logs_carry_the_outcome_and_the_address_only(
-    api_client, make_user, make_config, log_events
+    api_client, make_user, make_config, engine, log_events
 ) -> None:
-    from jobhunter.auth import throttle
+    from jobhunter.auth import throttle, totp, users
 
     await make_user("Ada Lovelace")
     body = {"username": "Ada Lovelace", "password": "wrong-password-123"}
@@ -473,16 +568,22 @@ async def test_auth_logs_carry_the_outcome_and_the_address_only(
     r = await api_client.post("/api/auth/login", json={**body, "password": PW})
     assert r.status_code == 204
     token = r.headers["set-cookie"].split(";")[0].split("=", 1)[1]
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=make_config("api").secret_b64("data_key"))
+    required = await api_client.post("/api/auth/login", json={**body, "password": PW})  # TOTP on, no code
+    assert required.status_code == 401 and required.json()["code"] == "totp_required"
     events = log_events()
     logins = [e for e in events if e["event"] == "login"]
-    assert [(e["outcome"], e["ip"]) for e in logins] == [
-        ("rejected", "198.51.100.10"),
-        ("accepted", "198.51.100.10"),
+    assert [(e["outcome"], e["ip"], e["level"]) for e in logins] == [
+        ("rejected", "198.51.100.10", "warning"),
+        ("accepted", "198.51.100.10", "info"),
+        ("totp_required", "198.51.100.10", "info"),  # the first request of every sign-in with TOTP on
     ]
-    dumped = json.dumps(events)
+    dumped = json.dumps(events, ensure_ascii=False)  # unescaped, so the password's "Ö" can be found
     username_hmac = throttle.username_hmac("Ada Lovelace", make_config("api").secret_b64("session_secret"))
-    for value in ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex()):
-        assert value not in dumped
+    sent = ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex())
+    leaked = [n for n, value in enumerate(sent) if value in dumped]  # indices only, never the values
+    assert leaked == []
 
 
 def test_the_username_hmac_normalises_the_name_like_the_user_lookup() -> None:
