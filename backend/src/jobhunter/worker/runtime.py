@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from jobhunter.graphs.score.graph import ScoreGraphs
     from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.observability.ntfy import AlertDispatcher
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
     from jobhunter.worker.operations import OperationDeps
@@ -101,3 +102,6 @@ class WorkerRuntime:
     # M3 (Task 27): the process's one Message Batches client, on the gateway's client, which `batch_poll` and
     # `batch_reconcile_ambiguous` use and `operation_deps` hands to the `batch_submit` handler.
     batches_client: "BatchesClient"
+    # M5 (Task 4): the alert dispatcher `worker_main` runs beside the queue loops when `NTFY_TOPIC_URL` is
+    # set; `None` without it (and for the runtimes tests build without one).
+    dispatcher: "AlertDispatcher | None" = None

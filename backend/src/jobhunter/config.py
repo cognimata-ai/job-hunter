@@ -53,6 +53,10 @@ DEFAULT_SPA_DIR: Final = Path("/opt/spa")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
+# M5 (plan Task 4, spec §19.2 L6167-6168): the two names without a prefix that the worker reads as well, the
+# ntfy topic of the alert dispatcher and the healthchecks Management API base (§17.7).
+ENV_NAMES: Final = ("NTFY_TOPIC_URL", "HEALTHCHECKS_API_URL")
+DEFAULT_HEALTHCHECKS_API_URL: Final = "https://healthchecks.io/api/v3"
 _TRACING_VARS: Final = (
     "LANGSMITH_TRACING",
     "LANGSMITH_TRACING_V2",
@@ -169,6 +173,11 @@ class AppConfig:
     parse_jobs_dir: Path
     # `JOBHUNTER_SPA_DIR`: the built SPA the api serves (`api.static.SpaFiles`); absent outside the image.
     spa_dir: Path
+    # M5 Task 4: `NTFY_TOPIC_URL`, the topic the worker's alert dispatcher pushes to (`None` when unset or
+    # empty: no push; a prod worker needs an https one, `ntfy_in_prod`), registered for log masking by
+    # `startup_or_exit`; and `HEALTHCHECKS_API_URL`, the Management API base of §17.7.
+    ntfy_topic_url: str | None
+    healthchecks_api_url: str
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -252,10 +261,11 @@ def load_config(
     """Build the `AppConfig` of `role` from `environ` (default: the process environment) and the secret files.
 
     The secrets directory is `secrets_dir`, else `JOBHUNTER_SECRETS_DIR`, else `/run/secrets`; the same
-    validation applies to every directory.
+    validation applies to every directory. Of the environment it keeps the names with one of `ENV_PREFIXES`,
+    and the two of `ENV_NAMES`.
     """
     source = os.environ if environ is None else environ
-    env = {k: v for k, v in source.items() if k.startswith(ENV_PREFIXES)}
+    env = {k: v for k, v in source.items() if k.startswith(ENV_PREFIXES) or k in ENV_NAMES}
 
     env_name = env.get("JOBHUNTER_ENV")
     if env_name not in get_args(EnvName):
@@ -287,6 +297,8 @@ def load_config(
         cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
         parse_jobs_dir=Path(env.get("JOBHUNTER_PARSE_JOBS_DIR") or DEFAULT_PARSE_JOBS_DIR),
         spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
+        ntfy_topic_url=env.get("NTFY_TOPIC_URL") or None,
+        healthchecks_api_url=env.get("HEALTHCHECKS_API_URL") or DEFAULT_HEALTHCHECKS_API_URL,
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,
@@ -385,6 +397,18 @@ def _is_serialised_origin(origin: str) -> bool:
     return origin == f"{parts.scheme}://{netloc}"
 
 
+def _is_https_url(url: str | None) -> bool:
+    """`url` is an `https` URL with a host (`ntfy_in_prod`)."""
+    if url is None:
+        return False
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:  # a malformed IPv6 literal or port
+        return False
+    return parts.scheme == "https" and bool(host)
+
+
 def _check_public_origin(cfg: AppConfig) -> None:
     """Rulings T18-c, T18-i: the api and the worker have a public origin (§19.2: the CSRF origin, the ntfy
     click link); a configured one has the exact form of `Origin`, and https in prod."""
@@ -434,6 +458,9 @@ def run_startup_assertions(cfg: AppConfig) -> None:
         absent = [n for n in ("healthchecks_ping_url", "healthchecks_api_key") if not cfg.secrets.get(n)]
         if absent:
             raise StartupCheckFailed("healthchecks_in_prod", f"a prod worker needs {', '.join(absent)}")
+        # Right after it (M5 plan O4, Deviation 11): a prod worker pushes its alerts to this topic, over TLS.
+        if not _is_https_url(cfg.ntfy_topic_url):
+            raise StartupCheckFailed("ntfy_in_prod", "a prod worker needs an https NTFY_TOPIC_URL")
 
     if cfg.env == "prod" and (anthropic := [name for name in _ANTHROPIC_ENV_VARS if name in env]):
         raise StartupCheckFailed("anthropic_env_in_prod", f"{', '.join(anthropic)} must not be set in prod")
@@ -483,8 +510,11 @@ def startup_or_exit(role: Role) -> AppConfig:
     configure_logging()
     try:
         cfg = load_config(role)
-        # From here on a secret value that reaches a log line is masked, whatever shape it has.
+        # From here on a secret value that reaches a log line is masked, whatever shape it has; so is the ntfy
+        # topic URL, whose topic name is all it takes to read the pushes (M5 Task 4).
         register_secret_values(value.decode("utf-8", errors="ignore") for value in cfg.secrets.values())
+        if cfg.ntfy_topic_url is not None:
+            register_secret_values([cfg.ntfy_topic_url])
         run_startup_assertions(cfg)
     except StartupCheckFailed as exc:
         _log_startup_failure(role, exc)

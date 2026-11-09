@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 import psycopg
 import pytest
-from jobhunter.config import ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
+from jobhunter.config import ENV_NAMES, ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
 from psycopg.rows import TupleRow
 
 PgRole = Literal["superuser", "migrator", "app", "backup", "restore"]
@@ -415,11 +415,16 @@ def process_env(
     """The environment of a child process of `role` against `server`.
 
     It is the test process's environment without the variables the application reads (`JOBHUNTER_*`,
-    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` (with `embedder_url`) and `extra`. A
-    worker child is in fake LLM mode too (M2 Task 11): it has no `anthropic_key`, and its gateway is built at
-    its start, on the committed recordings (`FAKE_LLM_DIR`), so nothing it does can reach the network.
+    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`, and M5's `NTFY_TOPIC_URL` and `HEALTHCHECKS_API_URL`),
+    plus `server_env` (with `embedder_url`) and `extra`. A worker child is in fake LLM mode too (M2 Task
+    11): it has no `anthropic_key`, and its gateway is built at its start, on the committed recordings
+    (`FAKE_LLM_DIR`), so nothing it does can reach the network.
     """
-    inherited = {name: value for name, value in os.environ.items() if not name.startswith(ENV_PREFIXES)}
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(ENV_PREFIXES) and name not in ENV_NAMES
+    }
     fake_llm = (
         {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(FAKE_LLM_DIR)} if role == "worker" else {}
     )

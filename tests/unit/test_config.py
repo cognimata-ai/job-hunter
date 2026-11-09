@@ -341,9 +341,8 @@ def test_tracing_with_all_langsmith_requirements_met_passes(
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:
     hc = {"healthchecks_ping_url": b"https://hc.example/ping/x", "healthchecks_api_key": b"k"}
-    cfg = load_config(
-        "worker", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "s", **WORKER_SECRETS, **hc)
-    )
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": "https://ntfy.example/jh-topic"}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS, **hc))
     run_startup_assertions(cfg)
 
 
@@ -734,3 +733,106 @@ def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: st
     # outside prod the app's logging setup holds the SDK's loggers at WARNING (tests/unit/test_redact.py)
     env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value}
     run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))
+
+
+# --- M5 Task 4: the ntfy topic and the healthchecks Management API base (O4, Deviation 11) -----------------
+
+TOPIC_URL = "https://ntfy.example/jh-alerts-4f2a9c"
+PROD_WORKER_SECRETS = {
+    **WORKER_SECRETS,
+    "healthchecks_ping_url": b"https://hc.example/ping/x",
+    "healthchecks_api_key": b"k",
+}
+
+
+def test_ntfy_topic_url_and_healthchecks_api_url_are_loaded(tmp_path: Path) -> None:
+    from jobhunter.config import DEFAULT_HEALTHCHECKS_API_URL
+
+    assert DEFAULT_HEALTHCHECKS_API_URL == "https://healthchecks.io/api/v3"
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    bare = load_config("worker", BASE_ENV, secrets)
+    assert (bare.ntfy_topic_url, bare.healthchecks_api_url) == (None, DEFAULT_HEALTHCHECKS_API_URL)
+    # read by these exact names, which carry none of the prefixes
+    env = {**BASE_ENV, "NTFY_TOPIC_URL": TOPIC_URL, "HEALTHCHECKS_API_URL": "https://hc.example/api/v3"}
+    cfg = load_config("worker", env, secrets)
+    assert (cfg.ntfy_topic_url, cfg.healthchecks_api_url) == (TOPIC_URL, "https://hc.example/api/v3")
+    # an empty variable counts as unset; another spelling is not read
+    empty = load_config("worker", {**BASE_ENV, "NTFY_TOPIC_URL": "", "HEALTHCHECKS_API_URL": ""}, secrets)
+    assert (empty.ntfy_topic_url, empty.healthchecks_api_url) == (None, DEFAULT_HEALTHCHECKS_API_URL)
+    other = load_config("worker", {**BASE_ENV, "ntfy_topic_url": TOPIC_URL, "NTFY_TOPIC": TOPIC_URL}, secrets)
+    assert other.ntfy_topic_url is None and set(other.environ) == set(BASE_ENV)
+
+
+@pytest.mark.parametrize(
+    ("topic", "passes"),
+    [
+        (None, False),  # unset
+        ("http://ntfy.example/jh-alerts", False),  # not https
+        ("https:///jh-alerts", False),  # no host
+        ("ntfy.example/jh-alerts", False),  # no scheme
+        ("https://[::1/jh-alerts", False),  # not a URL at all
+        (TOPIC_URL, True),
+        ("https://ntfy.example:8443/jh-alerts", True),
+    ],
+)
+def test_ntfy_in_prod_requires_an_https_topic(tmp_path: Path, topic: str | None, passes: bool) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod"} | ({} if topic is None else {"NTFY_TOPIC_URL": topic})
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS))
+    if passes:
+        run_startup_assertions(cfg)
+        return
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(cfg)
+    assert (exc.value.check, exc.value.detail) == (
+        "ntfy_in_prod",
+        "a prod worker needs an https NTFY_TOPIC_URL",
+    )
+    assert topic is None or topic not in str(exc.value)  # names the variable, never its value
+
+
+def test_ntfy_in_prod_runs_after_healthchecks_in_prod_and_only_for_a_prod_worker(tmp_path: Path) -> None:
+    # a prod worker missing both: the healthchecks check comes first (O4)
+    assert check_of(
+        "worker", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    ) == ("healthchecks_in_prod")
+    # a worker outside prod, and the api in prod, need no topic; an http one is fine outside prod
+    for env_name in ("dev", "test"):
+        env = {**BASE_ENV, "JOBHUNTER_ENV": env_name}
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+        env["NTFY_TOPIC_URL"] = "http://127.0.0.1:8090/jh-alerts"
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+    run_startup_assertions(
+        load_config(
+            "api", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "a", **API_SECRETS)
+        )
+    )
+
+
+def test_the_topic_url_is_masked_in_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from jobhunter.config import startup_or_exit
+    from jobhunter.observability.logging import configure_logging, get_logger
+    from jobhunter.observability.redact import mask_text
+
+    topic = "https://ntfy.example/jhalertsprivate"  # no digit: the whole URL is what is registered
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    for name, value in {**BASE_ENV, "JOBHUNTER_SECRETS_DIR": str(d), "NTFY_TOPIC_URL": topic}.items():
+        monkeypatch.setenv(name, value)
+    assert mask_text(f"POST {topic}") == f"POST {topic}"  # no pattern knows it
+
+    cfg = startup_or_exit("worker")
+
+    assert cfg.ntfy_topic_url == topic
+    assert mask_text(f"POST {topic}") == "POST [SECRET]"
+    assert mask_text(f"POST {TOPIC_URL}") == f"POST {TOPIC_URL}"  # only the configured topic
+    buffer = io.StringIO()
+    configure_logging("INFO", stream=buffer)
+    try:
+        get_logger("jobhunter.test").info("ntfy_probe", url=topic, nested={"error": f"refused {topic}/json"})
+    finally:
+        configure_logging("INFO")
+    [line] = buffer.getvalue().splitlines()
+    event = json.loads(line)
+    assert (event["url"], event["nested"]) == ("[SECRET]", {"error": "refused [SECRET]/json"})
+    assert topic not in line

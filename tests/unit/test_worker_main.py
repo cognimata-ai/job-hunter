@@ -91,7 +91,15 @@ def test_a_lock_timeout_is_recognised_through_sqlalchemy_and_through_procrastina
 class World:
     """Fakes for every collaborator of `worker_main` that does I/O; `events` records what they did."""
 
-    def __init__(self, monkeypatch, tmp_path, *, fake_llm: bool = True) -> None:
+    def __init__(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        fake_llm: bool = True,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> None:
         from contextlib import asynccontextmanager
 
         from jobhunter.config import load_config
@@ -281,26 +289,27 @@ class World:
             "fence_epoch": fake_fence_epoch,
         }.items():
             monkeypatch.setattr(main, name, fake)
-        secrets = tmp_path / "secrets"
-        secrets.mkdir()
-        for name, value in (("db_app", "pw"), ("data_key", "a" * 43 + "=")):
-            (secrets / name).write_text(value)
-            (secrets / name).chmod(0o440)
+        secrets_dir = tmp_path / "secrets"
+        secrets_dir.mkdir()
+        for name, value in (("db_app", "pw"), ("data_key", "a" * 43 + "="), *(secrets or {}).items()):
+            (secrets_dir / name).write_text(value)
+            (secrets_dir / name).chmod(0o440)
         # Task 11: the gateway is on the fake LLM transport (this worker has no `anthropic_key`), and the
         # parse root and the CV store are the test's own. Task 23: without `fake_llm`, a worker with neither
         # the key nor the fake (its gateway is not configured).
         self.parse_root = tmp_path / "parse"
         self.parse_root.mkdir()
         fake_env = {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(tmp_path / "anthropic")}
-        env = {
+        worker_env = {
             "JOBHUNTER_ENV": "test",
             "JOBHUNTER_DB_NAME": "jobhunter",
             "JOBHUNTER_DB_HOST": "unused",
             **(fake_env if fake_llm else {}),
             "JOBHUNTER_PARSE_JOBS_DIR": str(self.parse_root),
             "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv"),
+            **(env or {}),
         }
-        self.cfg = load_config("worker", env, secrets)
+        self.cfg = load_config("worker", worker_env, secrets_dir)
 
 
 # The executions are cancelled first, then the gateway's tries still in flight settle (`llm_tries`), before
@@ -623,6 +632,151 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
     [event] = logged(caplog, "llm_not_configured")
     assert event["level"] == "warning"
     assert runtime.gateway.http_client.is_closed
+
+
+# --- M5 Task 4: the alert dispatcher runs beside the queue loops when ntfy is configured -------------------
+
+NTFY_TOPIC = "https://ntfy.test/jh-alerts-4f2a9c"
+NTFY_ENV = {"NTFY_TOPIC_URL": NTFY_TOPIC, "JOBHUNTER_PUBLIC_ORIGIN": "https://jobs.example.test"}
+NTFY_TOKEN = "tk_test_0123456789abcdef"
+
+
+def fake_dispatchers(
+    monkeypatch, world: World, *, ends_by_itself: bool = False, stops: bool = True
+) -> list[Any]:
+    """`AlertDispatcher` as `worker_main` builds and runs it; each one made is returned in the list. Its
+    `run` records its start and its stop; with `ends_by_itself` it returns at once, as a loop whose fence
+    refused the worker's epoch does; without `stops` it ignores its stop event until it is cancelled."""
+    from jobhunter.worker import main
+
+    made: list[Any] = []
+
+    class FakeDispatcher:
+        def __init__(
+            self, engine: object, client: object, *, epoch: int, clock: object, sleep: object
+        ) -> None:
+            self.engine, self.client, self.epoch, self.clock, self.sleep = engine, client, epoch, clock, sleep
+            made.append(self)
+
+        async def run(self, stop: asyncio.Event) -> None:
+            world.events.append("dispatcher_run")
+            if ends_by_itself:
+                return
+            try:
+                await (stop.wait() if stops else asyncio.get_running_loop().create_future())
+            except asyncio.CancelledError:
+                world.events.append("dispatcher_cancelled")
+                raise
+            world.events.append("dispatcher_stop")
+
+    monkeypatch.setattr(main, "AlertDispatcher", FakeDispatcher)
+    return made
+
+
+START = [
+    "lock_connect",
+    "lock_acquire",
+    "claim",
+    "watchdog_start",
+    "queue_open",
+    "saver_open",
+    "http_configure",
+    "make_clients",
+    "sync_instances",
+    "reconcile_start",
+]
+
+
+async def test_without_a_topic_url_no_dispatcher_runs_and_ntfy_disabled_is_logged_once(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    made = fake_dispatchers(monkeypatch, world)
+    assert world.cfg.ntfy_topic_url is None
+    assert await worker_main(world.cfg) == 0
+    assert made == [] and world.events == [*START, *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    assert isinstance(runtime, WorkerRuntime) and runtime.dispatcher is None
+    [event] = logged(caplog, "ntfy_disabled")
+    assert event["level"] == "info"
+
+
+async def test_with_a_topic_url_the_dispatcher_runs_beside_the_loops_and_stops_first(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.clock import utcnow
+    from jobhunter.observability.ntfy import NtfyClient
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV, secrets={"ntfy_token": f"{NTFY_TOKEN}\n"})
+    made = fake_dispatchers(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    # step 10 starts it with the loops; the teardown stops it before anything else
+    assert world.events == [*START, "dispatcher_run", "dispatcher_stop", *TEARDOWN]
+    [dispatcher] = made
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and runtime.dispatcher is made[0]
+    assert (dispatcher.engine, dispatcher.epoch, dispatcher.clock, dispatcher.sleep) == (
+        runtime.engine,
+        3,  # the claimed epoch
+        utcnow,
+        asyncio.sleep,
+    )
+    client = dispatcher.client
+    assert isinstance(client, NtfyClient)
+    assert (client._topic_url, client._token, client._public_origin) == (
+        NTFY_TOPIC,
+        NTFY_TOKEN,
+        "https://jobs.example.test",
+    )
+    assert client._http.headers["User-Agent"] == world.cfg.http_user_agent
+    assert client._http.is_closed  # closed by the teardown
+    assert logged(caplog, "ntfy_disabled") == []
+
+
+async def test_without_the_token_the_dispatcher_sends_no_authorization(monkeypatch, tmp_path) -> None:
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV, secrets={"ntfy_token": ""})  # empty: absent
+    made = fake_dispatchers(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    [dispatcher] = made
+    assert dispatcher.client._token is None
+
+
+async def test_a_dispatcher_that_ends_by_itself_requests_the_stop_of_a_superseded_worker(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Its loop ends only when a fence refused the worker's epoch (Ruling T24-a): the worker then stops
+    itself, as a fenced task body does. (It starts before the queue loops, whose fake asks for the stop
+    without a log line.)"""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV)
+    fake_dispatchers(monkeypatch, world, ends_by_itself=True)
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [*START, "dispatcher_run", *TEARDOWN]
+    [event] = logged(caplog, "shutdown_requested")
+    assert (event["level"], event["reason"]) == ("warning", "epoch_superseded")
+
+
+async def test_a_dispatcher_that_does_not_stop_is_cancelled_within_its_bound(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Mid-pass (a backoff sleep or a push) the loop does not see its stop event: the teardown cancels it
+    once `DISPATCHER_STOP_S` is spent, and goes on."""
+    from jobhunter.worker import main
+
+    monkeypatch.setattr(main, "DISPATCHER_STOP_S", 0.01)
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV)
+    fake_dispatchers(monkeypatch, world, stops=False)
+    assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 0
+    assert world.events == [*START, "dispatcher_run", "dispatcher_cancelled", *TEARDOWN]
+    assert logged(caplog, "worker_teardown_failed") == []
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(

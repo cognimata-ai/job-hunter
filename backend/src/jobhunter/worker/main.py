@@ -32,7 +32,10 @@
    transport); the adapters of `registry.build_adapter` on those clients (the provider secrets of `cfg`, the
    keys `b"fake"` in fake mode); the process's one `RateLimiter`; admission stopped with the shutdown; the
    embedder client on `cfg.embedder_url`, which the `embed` node, the `awaiting_embedding` and
-   `profile_vectors` reconcilers and the `embed_profile` handler (through `OperationDeps`) share;
+   `profile_vectors` reconcilers and the `embed_profile` handler (through `OperationDeps`) share. Last, when
+   `NTFY_TOPIC_URL` is set (M5 Task 4), the alert dispatcher (`observability.ntfy.AlertDispatcher`) on an
+   `NtfyClient` of its own (its HTTP client, the topic, the `ntfy_token` secret when set, the public origin),
+   the engine, this worker's epoch, the clock and `asyncio.sleep`, which the runtime carries;
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
    transaction of its own, fenced by this worker's epoch: a source without its secret is
    `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
@@ -46,15 +49,21 @@
    exit 0;
 9. SIGTERM and SIGINT handlers that request the shutdown (`runtime.request_shutdown`, the signal's name as
    the reason);
-10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
+10. the alert dispatcher's loop (`AlertDispatcher.run`) when step 7 built one, else one `ntfy_disabled` line;
+    then one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`. The dispatcher's loop ends
+    by itself only when a fence refused this worker's epoch: it then requests the graceful stop
+    (`EPOCH_SUPERSEDED`, Ruling T24-a);
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
-12. the teardown: the live executions cancelled, then the gateway's tries still in flight settled
-    (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled execution can end before its streams have
-    settled `ambiguous`, because a graph does not wait for a cancelled node's task; M3 Task 28), the watchdog
-    stopped, the saver, the task app, the source clients, the embedder's and the gateway's HTTP clients and
-    the engine closed, and the lock session closed last, which releases the lock; then
-    `worker_shutdown_complete`. Each of its waits takes at most what is left of the stop's one deadline
-    (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
+12. the teardown: the alert dispatcher stopped first (its stop event set, then cancelled once
+    `DISPATCHER_STOP_S` is spent: mid-pass, in a backoff sleep or a push, it does not see the event; an alert
+    pushed but not yet stamped is pushed again by the next worker), the live executions cancelled, then the
+    gateway's tries still in flight settled (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled
+    execution can end before its streams have settled `ambiguous`, because a graph does not wait for a
+    cancelled node's task; M3 Task 28), the watchdog stopped, the saver, the task app, the source clients,
+    the dispatcher's, the embedder's and the gateway's HTTP clients and the engine closed, and the lock
+    session closed last, which releases the lock; then `worker_shutdown_complete`. Each of its waits takes at
+    most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in
+    `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -126,6 +135,8 @@ from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
+from jobhunter.observability.ntfy import make_http_client as make_ntfy_http_client
 from jobhunter.profile.parse_client import ParseClient
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring.batch_results import batches_client as make_batches_client
@@ -151,6 +162,8 @@ QUEUE_POOL_MAX_SIZE: Final = 4
 # stop); each also takes at most what is left of the stop's deadline. `TRIES_SETTLE_S` is what the teardown
 # waits for the gateway's tries still in flight to settle (`LLMGateway.settle_in_flight`).
 EXECUTIONS_CANCEL_S: Final = 30.0
+# How long the teardown waits for the alert dispatcher's loop to see its stop event before cancelling it (M5).
+DISPATCHER_STOP_S: Final = 5.0
 TRIES_SETTLE_S: Final = 10.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
@@ -254,6 +267,10 @@ class _WorkerProcess:
         self.embedder_http: httpx.AsyncClient | None = None
         self.llm_http: httpx2.AsyncClient | None = None  # the gateway's client (step 7), closed at teardown
         self.gateway: LLMGateway | None = None  # step 7's: its tries in flight are settled at teardown
+        # M5 Task 4: the alert dispatcher's HTTP client (step 7), its loop (step 10) and that loop's stop.
+        self.ntfy_http: httpx.AsyncClient | None = None
+        self.dispatching: asyncio.Task[None] | None = None
+        self.dispatch_stop = asyncio.Event()
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -345,6 +362,7 @@ class _WorkerProcess:
             score_steps=score_deps,
             batches_client=batches_client,
         )
+        dispatcher = self._alert_dispatcher(engine, epoch)
         runtime = WorkerRuntime(
             cfg=cfg,
             engine=engine,
@@ -362,6 +380,7 @@ class _WorkerProcess:
             score_graphs=score_graphs,
             score_deps=score_deps,
             batches_client=batches_client,
+            dispatcher=dispatcher,
         )
 
         # 8. The source instances synced with the secrets under this worker's epoch fence, the start
@@ -401,7 +420,13 @@ class _WorkerProcess:
         loop = asyncio.get_running_loop()
         for sig in _SHUTDOWN_SIGNALS:
             loop.add_signal_handler(sig, _on_signal, runtime.shutdown, sig)
-        # 10. One worker loop per queue.
+        # 10. The alert dispatcher's loop, then one worker loop per queue.
+        if dispatcher is None:
+            log.info("ntfy_disabled")
+        else:
+            self.dispatching = asyncio.create_task(
+                self._dispatch(dispatcher, runtime.shutdown), name="jh-alert-dispatcher"
+            )
         loops = [
             asyncio.create_task(
                 queue.run_worker_async(
@@ -422,6 +447,47 @@ class _WorkerProcess:
         if code != 0:
             await asyncio.to_thread(exit_unless_lock_held, self.lock_session, ident.instance_id, epoch)
         return code
+
+    def _alert_dispatcher(self, engine: AsyncEngine, epoch: int) -> AlertDispatcher | None:
+        """Step 7's alert dispatcher when `NTFY_TOPIC_URL` is set, else `None` (module docstring)."""
+        cfg = self.cfg
+        if cfg.ntfy_topic_url is None:
+            return None
+        if cfg.public_origin is None:  # the startup assertions require it of a worker (Ruling T18-i)
+            raise ValueError("the ntfy click link needs JOBHUNTER_PUBLIC_ORIGIN")
+        token = cfg.secrets.get("ntfy_token", b"").decode("utf-8").strip() or None
+        http_client = self.ntfy_http = make_ntfy_http_client(user_agent=cfg.http_user_agent)
+        client = NtfyClient(
+            http_client, topic_url=cfg.ntfy_topic_url, token=token, public_origin=cfg.public_origin
+        )
+        return AlertDispatcher(engine, client, epoch=epoch, clock=utcnow, sleep=asyncio.sleep)
+
+    async def _dispatch(self, dispatcher: AlertDispatcher, shutdown: ShutdownState) -> None:
+        """The alert dispatcher's loop until the teardown stops it. A loop that ends before its stop event is
+        set was refused by its epoch fence: this worker was superseded, so it requests its own stop."""
+        await dispatcher.run(self.dispatch_stop)
+        if not self.dispatch_stop.is_set():
+            request_shutdown(shutdown, reason=EPOCH_SUPERSEDED)
+
+    async def _stop_dispatcher(self, deadline: StopDeadline) -> None:
+        """Set the dispatcher loop's stop event and wait up to `DISPATCHER_STOP_S` for it to end; then cancel
+        it, and wait for the cancel within what is left of the stop (`TimeoutError` when it outlives it)."""
+        self.dispatch_stop.set()
+        task = self.dispatching
+        if task is None:
+            return
+        _, pending = await asyncio.wait({task}, timeout=deadline.remaining(DISPATCHER_STOP_S))
+        if pending:
+            task.cancel()
+            _, pending = await asyncio.wait({task}, timeout=deadline.remaining())
+            if pending:
+                raise TimeoutError("the alert dispatcher did not stop")
+        if not task.cancelled() and (error := task.exception()) is not None:
+            raise error
+
+    async def _close_ntfy(self) -> None:
+        if self.ntfy_http is not None:
+            await self.ntfy_http.aclose()
 
     async def _stop_watchdog(self, timeout_s: float) -> None:
         if self.watchdog is not None:
@@ -473,12 +539,14 @@ class _WorkerProcess:
         """
         deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
+            ("dispatcher", lambda: self._stop_dispatcher(deadline)),  # first: nothing pushes past this point
             ("executions", lambda: EXECUTIONS.cancel_all(timeout_s=deadline.remaining(EXECUTIONS_CANCEL_S))),
             ("llm_tries", lambda: self._settle_tries(deadline.remaining(TRIES_SETTLE_S))),
             ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),
             ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
             ("queue", lambda: _within(deadline, self._close_queue())),
             ("clients", lambda: _within(deadline, self._close_clients())),
+            ("ntfy", lambda: _within(deadline, self._close_ntfy())),
             ("embedder", lambda: _within(deadline, self._close_embedder())),
             ("llm", lambda: _within(deadline, self._close_llm())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),

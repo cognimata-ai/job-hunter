@@ -154,6 +154,7 @@
     "llm.refusal_rate",
     "llm.reservation_bound_violated",
     "llm.unexpected_stop_reason",
+    "notify.delivery_failed",
     "operation.failed",
     "profile.extract_generation_mismatch",
     "quota.ambiguous_attempt",
