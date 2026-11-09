@@ -11,13 +11,16 @@ check's uuid, the last path segment of the ping URL (`check_uuid`; the startup c
 `healthchecks_ping_url_form` refuses any other form in prod, O5).
 
 **The client** (`HealthchecksClient`) takes no proxy or certificates from the environment, follows no
-redirect and waits at most `REQUEST_TIMEOUT_S` a request. A ping makes three tries, at 0, 2 and 10 s
-(`PING_RETRY_DELAYS_S` apart); when all three fail it logs `deadman_ping_failed` with the last error's class
-and returns `False`: it never raises and raises no alert (the off-box switch is the signal). The API calls
-(`read_check`, `update_check`, `pause`) send the key as `X-Api-Key` and raise `DeadmanApiError` with a code:
-`timeout`, `connect`, `invalid_request` (a request that cannot be built or sent as it stands), `http_<status>`
-or `invalid_response`; `apply_check` adds `resume_failed` and `not_applied`. No error is chained to httpx's,
-whose messages name the URL; no log line names the URL, the uuid or the key.
+redirect and waits at most `REQUEST_TIMEOUT_S` a request. A ping makes three tries, each at its offset from
+the first (`PING_TRY_OFFSETS_S`: 0, 2 and 10 s, on an injected monotonic clock) or when the try before it
+ended, whichever is later: 0, 2 and 10 s when the tries fail at once, 0, 10 and 20 s when each waits out its
+timeout. When all three fail it logs `deadman_ping_failed` with the last error's class and returns `False`: it
+never raises and raises no alert (the off-box switch is the signal). The API calls (`read_check`,
+`update_check`, `pause`) send the key as `X-Api-Key` and raise `DeadmanApiError` with a code: `timeout`,
+`connect`, `invalid_request` (a request that cannot be built or sent as it stands), `http_<status>` or
+`invalid_response` (any other request error, an undecodable body among them, and a body that is no check);
+`apply_check` adds `resume_failed` and `not_applied`. No error is chained to httpx's, whose messages name the
+URL; no log line names the URL, the uuid or the key.
 
 **One lock** (`DEADMAN_LOCK_KEY`, a one-key session advisory lock, `deadman_lock`): every ping decision and
 every sync action runs holding it, on a dedicated autocommit connection of an engine without a pool, so no
@@ -32,8 +35,10 @@ was disabled can never resume a check the sync paused (Deviation 9). The waterma
 `runs_to_ping` (`GREATEST`: never back), and moves whether or not healthchecks took the ping (the switch
 alarms on the missing one).
 - `after_run(run_id)`, the fast path, runs after the run-ending commit (never inside it) in
-  `finalize_from_graph` and `runs._finalize`: it pings when the run is one of `runs_to_ping`. It never raises
-  into its caller: a failure is logged `deadman_fast_path_failed` with its class, and the tick covers it.
+  `finalize_from_graph` and `runs._finalize`: it pings every run of `runs_to_ping` up to `run_id`, in id
+  order, so a lower run still waiting for the tick (an end no finalize wrote) is pinged first and never passed
+  over (fix round 1, M1). It never raises into its caller: a failure is logged `deadman_fast_path_failed` with
+  its class, and the tick covers it.
 - `ping_pending()`, the durable path, pings every run of `runs_to_ping` above the watermark, in id order:
   the ends no finalize writes (`resume_exhausted`, `orphaned_queue`, O10) and a ping lost to a crash between a
   commit and its ping. The `deadman_ping` reconciler runs it at every tick; delete-everything shares it.
@@ -42,6 +47,11 @@ alarms on the missing one).
   oldest one still `queued` or `running` (which ends after this start and pings then), sending no ping: an
   upgraded or restored database never replays its history. Logged `deadman_armed` with that run id. A
   watermark already set is left, and a database without a run keeps its NULL, which both paths read as 0.
+
+A ping is sent at least once (fix round 1, M2): the watermark moves in a transaction after the HTTP ping, so
+a cancellation between the two (the fast path is cancelled once the ended run's next heartbeat is refused)
+leaves the run above the watermark, and the next tick sends that ping again. A repeat of the same kind
+changes nothing on the check, and the pings keep their order.
 
 **The period sync** (`DeadmanPinger.sync`, the `deadman_sync` task, O2). The tick compares
 `schedule_state(interval_s, enabled)` with `deadman_state(applied_interval_s, applied_paused)` and, when they
@@ -60,6 +70,7 @@ no sync, and one `deadman_disabled` line at start (Q8).
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -90,8 +101,8 @@ Sleep = Callable[[float], Awaitable[None]]
 DEADMAN_LOCK_KEY: Final = 7261005
 LOCK_POLL_S: Final = 0.5
 REQUEST_TIMEOUT_S: Final = 10.0
-PING_RETRY_DELAYS_S: Final = (2.0, 8.0)  # between three tries: at 0, 2 and 10 s
-PING_TRIES: Final = len(PING_RETRY_DELAYS_S) + 1
+PING_TRY_OFFSETS_S: Final = (0.0, 2.0, 10.0)  # each try's earliest start, from the first's
+PING_TRIES: Final = len(PING_TRY_OFFSETS_S)
 GRACE_MIN_S: Final = 3_600
 GRACE_MAX_S: Final = 43_200
 RESYNC_AFTER: Final = timedelta(hours=24)
@@ -225,6 +236,7 @@ class HealthchecksClient:
         api_url: str,
         api_key: str,
         sleep: Sleep = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         uuid = check_uuid(ping_url)
         self._http = http
@@ -235,6 +247,7 @@ class HealthchecksClient:
         self._check_url = f"{api_url.rstrip('/')}/checks/{uuid}"
         self._api_key = api_key
         self._sleep = sleep
+        self._monotonic = monotonic
 
     async def _ping_once(self, url: str) -> str | None:
         """One `GET` of `url`; `None` when healthchecks answered 2xx, else the error's class (`http_<status>`
@@ -246,17 +259,19 @@ class HealthchecksClient:
         return None if response.is_success else f"http_{response.status_code}"
 
     async def ping(self, kind: PingKind) -> bool:
-        """Ping the check (`success`) or its `/fail` in up to `PING_TRIES` tries at 0, 2 and 10 s; whether one
-        was taken. All failing is logged `deadman_ping_failed`; nothing is raised."""
+        """Ping the check (`success`) or its `/fail` in up to `PING_TRIES` tries, each at its offset or when
+        the one before it ended, whichever is later (module docstring); whether one was taken. All failing is
+        logged `deadman_ping_failed`; nothing is raised."""
         url = self._ping_url if kind == "success" else self._fail_url
-        error = await self._ping_once(url)
-        for delay in PING_RETRY_DELAYS_S:
+        start = self._monotonic()
+        error: str | None = None
+        for offset in PING_TRY_OFFSETS_S:
+            wait = start + offset - self._monotonic()
+            if wait > 0:
+                await self._sleep(wait)
+            error = await self._ping_once(url)
             if error is None:
                 return True
-            await self._sleep(delay)
-            error = await self._ping_once(url)
-        if error is None:
-            return True
         log.warning("deadman_ping_failed", kind=kind, tries=PING_TRIES, error_class=error)
         return False
 
@@ -278,6 +293,9 @@ class HealthchecksClient:
             raise DeadmanApiError("invalid_request") from None
         except httpx.TransportError:
             raise DeadmanApiError("connect") from None
+        except httpx.RequestError:
+            # Any other failure of the exchange (fix round 1, M5): an answer whose body cannot be decoded.
+            raise DeadmanApiError("invalid_response") from None
         if not response.is_success:
             raise DeadmanApiError(f"http_{response.status_code}")
         return response
@@ -287,11 +305,10 @@ class HealthchecksClient:
         response = await self._api("GET", self._check_url)
         try:
             body = response.json()
-        except ValueError:
+            timeout, grace, status = _whole(body.get("timeout", 0)), _whole(body["grace"]), body["status"]
+        except (ValueError, LookupError, TypeError, AttributeError):
+            # No JSON, or no check in it (fix round 1, M5): the failure path, with its alert and backoff.
             raise DeadmanApiError("invalid_response") from None
-        if not isinstance(body, dict):
-            raise DeadmanApiError("invalid_response")
-        timeout, grace, status = _whole(body.get("timeout", 0)), _whole(body.get("grace")), body.get("status")
         if timeout is None or grace is None or not isinstance(status, str):
             raise DeadmanApiError("invalid_response")
         return CheckState(timeout_s=timeout, grace_s=grace, paused=status == "paused")
@@ -445,7 +462,10 @@ class DeadmanPinger:
     async def arm(self) -> int | None:
         """At the worker's start (module docstring): a NULL watermark set past the runs that ended before it,
         under the lock, in one fenced transaction, with no ping; the run id it was set to, or `None` when it
-        was set already or there is no run. Raises `FencedOut` when the fence refuses this worker's epoch."""
+        was set already or there is no run. Raises `FencedOut` when the fence refuses this worker's epoch.
+        The gap (fix round 1, M3, parked): at the first armed start, a run that this start's step-5 takeover
+        sweep ended `failed('resume_exhausted')` lies at or below the arming and is never pinged; the
+        dead-man switch itself still fires on the missing ping."""
         async with self._locked():
             async with self._engine.begin() as conn:
                 await self._fence(conn)
@@ -455,24 +475,27 @@ class DeadmanPinger:
         log.info("deadman_armed", run_id=int(armed))
         return int(armed)
 
+    async def _ping_up_to(self, last_run_id: int | None) -> int:
+        """Every run of `runs_to_ping` above the watermark, up to `last_run_id` (`None`: all), pinged and
+        passed in id order under the lock; how many."""
+        async with self._locked():
+            pending, may_ping = await self._pending()
+            due = [run for run in pending if last_run_id is None or run.run_id <= last_run_id]
+            for run in due:
+                await self._ping(run, may_ping=may_ping)
+        return len(due)
+
     async def ping_pending(self) -> int:
         """The durable path: every run of `runs_to_ping` above the watermark pinged and passed, in id order,
         under the lock; how many."""
-        async with self._locked():
-            pending, may_ping = await self._pending()
-            for run in pending:
-                await self._ping(run, may_ping=may_ping)
-        return len(pending)
+        return await self._ping_up_to(None)
 
     async def after_run(self, run_id: int) -> None:
-        """The fast path, after the commit that ended `run_id`: its ping, when it is one of `runs_to_ping`.
-        Never raises (but a cancellation): a failure is logged with its class, and the tick pings."""
+        """The fast path, after the commit that ended `run_id`: every run of `runs_to_ping` up to it pinged,
+        in id order (module docstring). Never raises (but a cancellation): a failure is logged with its class,
+        and the tick pings."""
         try:
-            async with self._locked():
-                pending, may_ping = await self._pending()
-                for run in pending:
-                    if run.run_id == run_id:
-                        await self._ping(run, may_ping=may_ping)
+            await self._ping_up_to(run_id)
         except Exception as exc:  # noqa: BLE001 - the run's end committed; the durable path sends what this missed
             log.warning("deadman_fast_path_failed", run_id=run_id, error_class=type(exc).__name__)
 

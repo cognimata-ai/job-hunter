@@ -404,9 +404,9 @@ def _is_serialised_origin(origin: str) -> bool:
     return origin == f"{parts.scheme}://{netloc}"
 
 
-def _is_https_url(url: str | None) -> bool:
-    """`url` is an `https` URL with a host and a usable port (`ntfy_in_prod`), read by httpx's own parser, the
-    one the alert dispatcher's client uses: what this accepts, a push can be built from (review M2)."""
+def _is_web_url(url: str | None, *, schemes: tuple[str, ...]) -> bool:
+    """`url` is a URL of one of `schemes` with a host and a usable port, read by httpx's own parser, the one
+    the worker's clients use: what this accepts, a request can be built from (review M2)."""
     if url is None:
         return False
     try:
@@ -414,7 +414,12 @@ def _is_https_url(url: str | None) -> bool:
     except httpx.InvalidURL:  # a malformed IPv6 literal or port, among others
         return False
     port_ok = parsed.port is None or 1 <= parsed.port <= 65535
-    return parsed.scheme == "https" and bool(parsed.host) and port_ok
+    return parsed.scheme in schemes and bool(parsed.host) and port_ok
+
+
+def _is_https_url(url: str | None) -> bool:
+    """`url` is an `https` URL with a host and a usable port (`ntfy_in_prod`; `_is_web_url`)."""
+    return _is_web_url(url, schemes=("https",))
 
 
 def ping_url_uuid(ping_url: str) -> str | None:
@@ -441,17 +446,20 @@ def _check_healthchecks_ping_url(cfg: AppConfig) -> None:
 
 
 def _check_healthchecks_api_url(cfg: AppConfig) -> None:
-    """M5 Task 5 (Ruling T5-3), in every env: a worker with the `healthchecks_api_key` secret sends it to
-    `HEALTHCHECKS_API_URL`, so that URL must be https with a host and a usable port (`_is_https_url`, httpx's
-    parser) and carry no user information (`healthchecks_api_url_safe`). The detail names the variable and the
-    rule, never the URL."""
+    """M5 Task 5 (Rulings T5-3, T5-5), in every env: a worker with the `healthchecks_api_key` secret sends it
+    to `HEALTHCHECKS_API_URL`, so that URL must be one httpx parses, with a host, a port from 1 to 65535 when
+    one is given and no user information, and https in prod; outside prod http is allowed too, for a test
+    stack's stand-in (`healthchecks_api_url_safe`). The detail names the variable and the rule, never the
+    URL."""
     if not cfg.secrets.get("healthchecks_api_key"):
         return
     url = cfg.healthchecks_api_url
-    if not _is_https_url(url) or httpx.URL(url).userinfo:
+    schemes = ("https",) if cfg.env == "prod" else ("http", "https")
+    if not _is_web_url(url, schemes=schemes) or httpx.URL(url).userinfo:
+        scheme = "an https" if cfg.env == "prod" else "an http or https"
         raise StartupCheckFailed(
             "healthchecks_api_url_safe",
-            "HEALTHCHECKS_API_URL must be an https URL with a host, a port from 1 to 65535 when one is "
+            f"HEALTHCHECKS_API_URL must be {scheme} URL with a host, a port from 1 to 65535 when one is "
             "given, and no user information",
         )
 

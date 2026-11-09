@@ -10,6 +10,7 @@ import pytest
 from jobhunter.config import (
     ALL_SECRETS,
     ROLE_SECRETS,
+    AppConfig,
     Role,
     StartupCheckFailed,
     load_config,
@@ -932,16 +933,36 @@ def test_healthchecks_ping_url_form_comes_right_after_healthchecks_in_prod(tmp_p
 
 # --- M5 Task 5 pre-review fix (Ruling T5-3): where the API key goes -----------------------------------------
 
+# Refused wherever the key is set (fix round 1, Ruling T5-5: the scheme alone depends on the env).
 UNSAFE_API_URLS = (
-    "http://healthchecks.example/api/v3",  # not https
     "https:///api/v3",  # no host
+    "http:///api/v3",
     "https://jh:jh@healthchecks.example/api/v3",  # user information
-    "https://jh@healthchecks.example/api/v3",  # a user alone
+    "http://jh@healthchecks.example/api/v3",  # a user alone
     "https://healthchecks.example:0/api/v3",  # no such port
-    "https://healthchecks.example:70000/api/v3",
+    "http://healthchecks.example:70000/api/v3",
     "https://healthchecks.example:abc/api/v3",  # httpx.InvalidURL
     "healthchecks.example/api/v3",  # no scheme
+    "ftp://healthchecks.example/api/v3",  # no web URL
 )
+HTTP_API_URLS = ("http://healthchecks.example/api/v3", "http://stubsvc:8099/hc/api/v3")  # Task 21's stand-in
+
+
+def api_url_refusal(env_name: str) -> str:
+    scheme = "an https" if env_name == "prod" else "an http or https"
+    return (
+        f"HEALTHCHECKS_API_URL must be {scheme} URL with a host, a port from 1 to 65535 when one is given, "
+        "and no user information"
+    )
+
+
+def api_url_config(tmp_path: Path, env_name: str, api_url: str | None, *, key: bool = True) -> AppConfig:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
+    if api_url is not None:
+        env["HEALTHCHECKS_API_URL"] = api_url
+    secrets = PROD_WORKER_SECRETS if key else WORKER_SECRETS
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return load_config("worker", env, write_secrets(tmp_path / "s", **secrets))
 
 
 @pytest.mark.parametrize("api_url", UNSAFE_API_URLS)
@@ -949,37 +970,36 @@ UNSAFE_API_URLS = (
 def test_healthchecks_api_url_safe_refuses_an_unsafe_url_where_the_key_goes(
     tmp_path: Path, api_url: str, env_name: str
 ) -> None:
-    env = {
-        **BASE_ENV,
-        "JOBHUNTER_ENV": env_name,
-        "NTFY_TOPIC_URL": TOPIC_URL,
-        "HEALTHCHECKS_API_URL": api_url,
-    }
-    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS))
     with pytest.raises(StartupCheckFailed) as exc:
-        run_startup_assertions(cfg)
-    assert (exc.value.check, exc.value.detail) == (
-        "healthchecks_api_url_safe",
-        "HEALTHCHECKS_API_URL must be an https URL with a host, a port from 1 to 65535 when one is given, "
-        "and no user information",
-    )
+        run_startup_assertions(api_url_config(tmp_path, env_name, api_url))
+    assert (exc.value.check, exc.value.detail) == ("healthchecks_api_url_safe", api_url_refusal(env_name))
     assert api_url not in str(exc.value) and "healthchecks.example" not in str(exc.value)  # never the URL
+
+
+@pytest.mark.parametrize("api_url", HTTP_API_URLS)
+def test_an_http_api_url_passes_outside_prod_and_is_refused_in_prod(tmp_path: Path, api_url: str) -> None:
+    """Fix round 1, Ruling T5-5: the compose test stack runs `JOBHUNTER_ENV=test` with an http stand-in."""
+    for env_name in ("dev", "test"):
+        run_startup_assertions(api_url_config(tmp_path / env_name, env_name, api_url))
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(api_url_config(tmp_path / "prod", "prod", api_url))
+    assert (exc.value.check, exc.value.detail) == ("healthchecks_api_url_safe", api_url_refusal("prod"))
+    assert api_url not in str(exc.value) and "stubsvc" not in str(exc.value)
 
 
 @pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
 def test_the_default_or_an_https_api_url_passes_and_without_the_key_nothing_is_checked(
     tmp_path: Path, env_name: str
 ) -> None:
-    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
-    with_key = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS)
-    run_startup_assertions(load_config("worker", env, with_key))  # the default, healthchecks.io's v3 API
-    for api_url in ("https://healthchecks.example/api/v3", "https://healthchecks.example:8443/api/v3"):
-        run_startup_assertions(load_config("worker", {**env, "HEALTHCHECKS_API_URL": api_url}, with_key))
+    run_startup_assertions(api_url_config(tmp_path / "default", env_name, None))  # healthchecks.io's v3 API
+    for n, api_url in enumerate(
+        ("https://healthchecks.example/api/v3", "https://healthchecks.example:8443/x")
+    ):
+        run_startup_assertions(api_url_config(tmp_path / f"https{n}", env_name, api_url))
     if env_name == "prod":
         return  # a prod worker needs the key (`healthchecks_in_prod`)
-    no_key = write_secrets(tmp_path / "t", **WORKER_SECRETS)  # the API URL is unused: nothing to check
-    for api_url in UNSAFE_API_URLS:
-        run_startup_assertions(load_config("worker", {**env, "HEALTHCHECKS_API_URL": api_url}, no_key))
+    for n, api_url in enumerate(UNSAFE_API_URLS):  # the API URL is unused without the key: nothing to check
+        run_startup_assertions(api_url_config(tmp_path / f"nokey{n}", env_name, api_url, key=False))
 
 
 def test_healthchecks_api_url_safe_comes_right_after_the_ping_url_form(tmp_path: Path) -> None:

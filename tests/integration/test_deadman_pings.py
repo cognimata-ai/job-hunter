@@ -14,6 +14,7 @@ respx serves healthchecks (`tests.support.healthchecks`; no network) and the pin
 nothing. Every run is invented.
 """
 
+import asyncio
 import dataclasses
 from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -28,18 +29,27 @@ from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes.finalize import finalize_from_graph
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, initial_state
 from jobhunter.observability import deadman
-from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient, RunToPing, runs_to_ping
+from jobhunter.observability.deadman import (
+    DEADMAN_LOCK_KEY,
+    DeadmanPinger,
+    HealthchecksClient,
+    RunToPing,
+    deadman_lock,
+    runs_to_ping,
+)
 from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx
 from jobhunter.worker.tick import run_tick
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from tests.support.collect import insert_revisions_awaiting, make_deps, planned_request, queued_run
 from tests.support.deadman import admitted, deadman_state, manual_queued_ago, scheduled_run, tick
 from tests.support.healthchecks import API_KEY, API_URL, PING_URL, FakeCheck, fake_healthchecks
+from tests.support.pg import PgServer, pg_one
 
 pytestmark = pytest.mark.integration
 
@@ -357,3 +367,75 @@ async def test_a_superseded_worker_arms_nothing(
             await stale.arm()
     assert fenced.value.worker_superseded
     assert await watermark(engine) is None and hc.pings == []
+
+
+# --- Fix round 1 (review M1, M7): the fast path's lower runs, the paths together, a cancelled lock ----------
+
+_LOCK_HELD = (  # 7261005, `DEADMAN_LOCK_KEY` (asserted in the test)
+    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 7261005 AND granted)"
+)
+
+
+async def test_the_fast_path_pings_a_lower_pending_run_first(
+    engine: AsyncEngine, pinger: DeadmanPinger, hc: FakeCheck
+) -> None:
+    """M1: R5 ended with no fast path (here: none ran; in the worker, an end no finalize writes), and R6's end
+    comes before the next tick: R6's fast path pings R5, then R6, in that order."""
+    r5 = await scheduled_run(engine, slot=SLOT)
+    assert await runs.execute_run(engine, raising_graph(), r5, 1, epoch=1) == "started"  # failed: no pinger
+    assert hc.pings == [] and await watermark(engine) is None
+    r6 = await admitted(engine, await scheduled_run(engine, slot=SLOT + SIX_HOURS, trigger="catch_up"))
+    assert await finalized(engine, r6, pinger) == "succeeded"
+    assert hc.pings == ["fail", "success"] and hc.status == "up"
+    assert await watermark(engine) == r6.run_id
+    # a fast path pings nothing above its own run: R7, pending, waits for the tick
+    r7 = await admitted(engine, await scheduled_run(engine, slot=SLOT + 2 * SIX_HOURS))
+    assert await finalized(engine, r7, None) == "succeeded"
+    await pinger.after_run(r6.run_id)
+    assert hc.pings == ["fail", "success"] and await watermark(engine) == r6.run_id
+
+
+async def test_the_fast_path_and_the_tick_together_ping_each_run_once(
+    engine: AsyncEngine, pinger: DeadmanPinger, hc: FakeCheck
+) -> None:
+    """M7 (a): `after_run` and `ping_pending` at once take turns on the lock: each run is pinged once, in
+    order, and the watermark ends at the newest."""
+    failed = await scheduled_run(engine, slot=SLOT)
+    assert await runs.execute_run(engine, raising_graph(), failed, 1, epoch=1) == "started"
+    succeeded = await admitted(engine, await scheduled_run(engine, slot=SLOT + SIX_HOURS))
+    assert await finalized(engine, succeeded, None) == "succeeded"
+
+    handled = await asyncio.gather(pinger.after_run(succeeded.run_id), pinger.ping_pending())
+    assert hc.pings == ["fail", "success"]
+    assert handled[1] in (0, 2)  # the tick pinged both, or found nothing left
+    assert await watermark(engine) == succeeded.run_id
+
+
+async def test_a_lock_held_by_a_cancelled_task_is_taken_again_at_once(
+    engine: AsyncEngine, pinger: DeadmanPinger, migrated: PgServer
+) -> None:
+    """M7 (b): a task cancelled while it holds the dead-man lock gives it back: its dedicated connection
+    unlocks (or closes), so a fresh `_locked()` takes it within a second."""
+    assert DEADMAN_LOCK_KEY == 7261005
+    lock_engine = create_async_engine(engine.url, poolclass=NullPool)
+    holding = asyncio.Event()
+
+    async def holder() -> None:
+        async with deadman_lock(lock_engine):
+            holding.set()
+            await asyncio.Event().wait()  # until cancelled
+
+    try:
+        task = asyncio.create_task(holder())
+        async with asyncio.timeout(10):
+            await holding.wait()
+        assert pg_one(migrated, "app", _LOCK_HELD) == (True,)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with asyncio.timeout(1):  # one poll of `LOCK_POLL_S` at most, had it been held
+            async with pinger._locked():
+                assert pg_one(migrated, "app", _LOCK_HELD) == (True,)  # this time, the pinger's
+        assert pg_one(migrated, "app", _LOCK_HELD) == (False,)
+    finally:
+        await lock_engine.dispose()

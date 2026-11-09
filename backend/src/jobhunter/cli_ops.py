@@ -10,14 +10,20 @@ worker jobhunter ops …`), log to stderr, and print one JSON line on stdout:
   `{"sent": true}` (exit 0) or `{"sent": false, "error": "<code>"}` (exit 1): `not_configured` without a
   topic, else `NtfyError`'s code (`timeout`, `connect`, `invalid_request`, `http_<status>`).
 - `jobhunter ops deadman-sync [--show] [--interval-hours N]` brings the dead-man check in line with
-  `schedule_state` (`deadman.apply_check`) under the dead-man lock (`deadman.deadman_lock`, so no sync of
-  the worker runs meanwhile); when no database is reachable (before it exists), with the period of N hours
-  (1 to 168, `schedule_state`'s range; `cli._interval_hours`), enabled. With `--show` it prints the check as
-  read back,
-  `{"timeout_s", "grace_s", "paused"}` (exit 0). A failure prints `{"error": "<code>"}` (exit 1):
-  `not_configured` without both healthchecks secrets, `ping_url_form` for a ping URL that does not end in the
-  check's uuid, `no_period` without a database or N, else `DeadmanApiError`'s code. It records nothing in
-  the database: the worker's tick finds the check in line and stamps it at its next sync.
+  `schedule_state` (`deadman.apply_check`) under the dead-man lock (`deadman.deadman_lock`, so no sync of the
+  worker runs meanwhile). Only when no database server answered (fix round 1, M4: an `OSError`, or an error
+  without a SQLSTATE while no server accepts a connection on the configured host and port: refused, no such
+  host, a connect timeout) does it apply the period of N hours (1 to 168, `schedule_state`'s range;
+  `cli._interval_hours`), enabled. A server that answered with an error (a SQLSTATE, or a refusal while
+  connecting: the password, the role, the database, a grant) fails it with `database`, N or not, so a period
+  it was not asked for never replaces the schedule's. psycopg reports no SQLSTATE for any failure while
+  connecting, so a short TCP probe of the server's port (`_server_listens`) tells the two apart. With `--show`
+  it prints the check as read back and where its period came from, `{"timeout_s", "grace_s", "paused",
+  "source"}` with `source` `schedule_state` or `interval_hours` (exit 0). A failure prints `{"error":
+  "<code>"}` (exit 1): `not_configured` without both healthchecks secrets, `ping_url_form` for a ping URL that
+  does not end in the check's uuid, `database`, `no_period` without a database server or N, else
+  `DeadmanApiError`'s code. It records nothing in the database: the worker's tick finds the check in line and
+  stamps it at its next sync.
 
 Neither prints the topic URL, the ping URL, the check's uuid, the ntfy token or the API key, on any path
 (Q14): the outputs are codes, numbers and booleans, an unexpected error prints `{"error": "unexpected",
@@ -29,14 +35,16 @@ import argparse
 import asyncio
 import json
 import sys
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import asdict
-from typing import Final
+from typing import Final, Literal
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from jobhunter.config import AppConfig, startup_or_exit
-from jobhunter.db.session import make_null_engine
+from jobhunter.db.sql import pg_error
 from jobhunter.observability import deadman
 from jobhunter.observability.deadman import CheckState, DeadmanApiError, HealthchecksClient
 from jobhunter.observability.logging import configure_logging
@@ -45,6 +53,10 @@ from jobhunter.observability.ntfy import make_http_client as make_ntfy_http_clie
 from jobhunter.types import JSONValue
 
 TEST_ALERT: Final = DueAlert(0, "test", "warn", "Job Hunter test notification")
+DB_CONNECT_TIMEOUT_S: Final = 10  # psycopg's `connect_timeout`: a silent host is no server either
+SERVER_PROBE_TIMEOUT_S: Final = 3.0
+
+Source = Literal["schedule_state", "interval_hours"]
 
 Printed = dict[str, JSONValue]
 
@@ -72,14 +84,43 @@ async def notify_test(cfg: AppConfig) -> Printed:
     return {"sent": True}
 
 
-async def deadman_sync(cfg: AppConfig, *, hours: int | None) -> CheckState:
-    """`ops deadman-sync` (module docstring): the check as read back; `_Refused` or `DeadmanApiError` when it
-    failed."""
+async def _server_listens(host: str, port: int) -> bool:
+    """Whether a server accepts a TCP connection on `host`:`port` within `SERVER_PROBE_TIMEOUT_S`."""
+    try:
+        async with asyncio.timeout(SERVER_PROBE_TIMEOUT_S):
+            _, writer = await asyncio.open_connection(host, port)
+    except (OSError, TimeoutError):
+        return False
+    writer.close()
+    with suppress(OSError):
+        await writer.wait_closed()
+    return True
+
+
+async def _server_answered(cfg: AppConfig, error: Exception) -> bool:
+    """Whether the database error `error` came from a server that answered (module docstring, M4): a
+    SQLSTATE, or, for an error without one (psycopg gives none for a failure while connecting), a server
+    listening on the configured host and port. An `OSError` is no answer."""
+    if isinstance(error, OSError):
+        return False
+    if isinstance(error, DBAPIError) and pg_error(error).sqlstate is not None:
+        return True
+    return await _server_listens(cfg.db.host, cfg.db.port)
+
+
+async def deadman_sync(cfg: AppConfig, *, hours: int | None) -> tuple[CheckState, Source]:
+    """`ops deadman-sync` (module docstring): the check as read back and the source of the period applied;
+    `_Refused` or `DeadmanApiError` when it failed."""
     secrets = deadman.healthchecks_secrets(cfg)
     if secrets is None:
         raise _Refused("not_configured")
     ping_url, api_key = secrets
-    engine = make_null_engine(cfg.dsn("sqlalchemy"))
+    engine = create_async_engine(
+        cfg.dsn("sqlalchemy"),
+        poolclass=NullPool,
+        hide_parameters=True,
+        connect_args={"connect_timeout": DB_CONNECT_TIMEOUT_S},
+    )
     try:
         async with deadman.make_http_client(user_agent=cfg.http_user_agent) as http, AsyncExitStack() as held:
             try:
@@ -88,19 +129,24 @@ async def deadman_sync(cfg: AppConfig, *, hours: int | None) -> CheckState:
                 )
             except ValueError:
                 raise _Refused("ping_url_form") from None
-            schedule: tuple[int, bool] | None = None
+            no_server = False
             try:
                 await held.enter_async_context(deadman.deadman_lock(engine))
                 async with engine.connect() as conn:
                     schedule = await deadman.read_schedule(conn)
-            except (SQLAlchemyError, OSError):
-                schedule = None  # no database here, or none yet: the period given, if any
-            if schedule is None:
+            except (SQLAlchemyError, OSError) as error:
+                if await _server_answered(cfg, error):
+                    raise _Refused("database") from None
+                no_server = True
+            if no_server:  # no database server here, or none yet: the period given, enabled
                 if hours is None:
                     raise _Refused("no_period")
-                schedule = (hours * 3600, True)
+                check = await deadman.apply_check(client, interval_s=hours * 3600, enabled=True)
+                return check, "interval_hours"
+            if schedule is None:  # `migrate` creates the table and seeds its row together
+                raise _Refused("database")
             interval_s, enabled = schedule
-            return await deadman.apply_check(client, interval_s=interval_s, enabled=enabled)
+            return await deadman.apply_check(client, interval_s=interval_s, enabled=enabled), "schedule_state"
     finally:
         await engine.dispose()
 
@@ -111,10 +157,10 @@ async def _run(cfg: AppConfig, args: argparse.Namespace) -> tuple[Printed | None
         printed = await notify_test(cfg)
         return printed, printed.get("sent") is True
     try:
-        check = await deadman_sync(cfg, hours=args.interval_hours)
+        check, source = await deadman_sync(cfg, hours=args.interval_hours)
     except (_Refused, DeadmanApiError) as failed:
         return {"error": failed.code}, False
-    return (dict(asdict(check)) if args.show else None), True
+    return ({**asdict(check), "source": source} if args.show else None), True
 
 
 def run_ops_command(args: argparse.Namespace) -> int:

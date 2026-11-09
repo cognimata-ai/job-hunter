@@ -67,10 +67,13 @@ async def http() -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
-def client_on(http: httpx.AsyncClient, sleep: Callable[[float], Any] | None = None) -> HealthchecksClient:
-    if sleep is None:
+def client_on(http: httpx.AsyncClient, sleeps: "Sleeps | None" = None) -> HealthchecksClient:
+    """A client on `http`; with `sleeps`, its sleep and its monotonic clock are the fake ones."""
+    if sleeps is None:
         return HealthchecksClient(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY)
-    return HealthchecksClient(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=sleep)
+    return HealthchecksClient(
+        http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=sleeps, monotonic=sleeps.clock
+    )
 
 
 def test_grace_at_1h_4h_6h_24h_7d() -> None:
@@ -150,12 +153,39 @@ async def test_ping_tries_at_0_2_10_and_never_raises(
         assert await client.ping("success") is True
         assert success.call_count == tried + 2
 
+        # fix round 1, M6: a try that waits out its 10 s timeout delays the next one, never more: each try
+        # starts at its offset or when the one before it ended, whichever is later, so 0, 10 and 20 s
+        def slow(request: httpx.Request) -> httpx.Response:
+            tried_at.append(clock.now)
+            clock.now += 10.0  # the try's own timeout
+            raise httpx.ReadTimeout("timed out")
+
+        fail.side_effect = slow
+        clock.now, slept = 100.0, len(sleeps.requested)
+        del tried_at[:]
+        assert await client.ping("fail") is False
+        assert tried_at == [100.0, 110.0, 120.0] and sleeps.requested[slept:] == []
+
+        # a try that fails after 1 s: the next one still waits for its offset
+        def one_second(request: httpx.Request) -> httpx.Response:
+            tried_at.append(clock.now)
+            clock.now += 1.0
+            return httpx.Response(503)
+
+        fail.side_effect = one_second
+        clock.now = 200.0
+        del tried_at[:]
+        assert await client.ping("fail") is False
+        assert tried_at == [200.0, 202.0, 210.0] and sleeps.requested[slept:] == [1.0, 7.0]
+
     failures = [event for event in log_events() if event["event"] == "deadman_ping_failed"]
     assert [(e["kind"], e["tries"], e["error_class"]) for e in failures] == [
         ("success", 3, "http_503"),
         ("fail", 3, "ConnectError"),
         ("fail", 3, "ReadTimeout"),
         ("fail", 3, "RuntimeError"),
+        ("fail", 3, "ReadTimeout"),
+        ("fail", 3, "http_503"),
     ]
     rendered = json.dumps(log_events())
     assert CHECK_UUID not in rendered and "hc-ping" not in rendered  # never the URL or the uuid
@@ -199,6 +229,11 @@ async def test_update_check_sends_timeout_grace_and_the_api_key(http: httpx.Asyn
         (httpx.Response(200, text="not json"), "invalid_response"),
         (httpx.Response(200, json={"status": "up"}), "invalid_response"),  # no grace
         (httpx.Response(200, json=["up"]), "invalid_response"),
+        # fix round 1, M5: any other request error, and a body that is no check, take the failure path
+        (httpx.DecodingError(f"undecodable body from {CHECK_URL}"), "invalid_response"),  # a RequestError
+        (httpx.Response(200, json={"status": None, "grace": 3600}), "invalid_response"),
+        (httpx.Response(200, json={"status": "up", "grace": "1h"}), "invalid_response"),
+        (httpx.Response(200, content=b"\xff\xfe not utf-8"), "invalid_response"),
     ]
     for response, code in cases:
         with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:

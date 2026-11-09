@@ -11,7 +11,8 @@ on. Every secret is a low-entropy stand-in.
 
 import json
 import socket
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Final
 
@@ -34,6 +35,32 @@ def free_port() -> int:
         probe.bind(("127.0.0.1", 0))
         port: int = probe.getsockname()[1]
     return port
+
+
+@pytest.fixture
+def answering_port() -> Iterator[int]:
+    """A local port where a server answers every connection by closing it: a database server that refuses,
+    as one that refuses the password or the database does before a session (psycopg: no SQLSTATE)."""
+    server = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def serve() -> None:
+        server.settimeout(0.1)
+        while not stop.is_set():
+            try:
+                accepted, _ = server.accept()
+            except TimeoutError:
+                continue
+            accepted.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield int(server.getsockname()[1])
+    finally:
+        stop.set()
+        thread.join(5)
+        server.close()
 
 
 @pytest.fixture
@@ -130,9 +157,12 @@ def test_deadman_sync_show_prints_only_the_period(
         assert ran(capsys, "ops", "deadman-sync", "--show") == (1, {"error": "no_period"})
         assert router.calls.call_count == 0
 
-        # no database: the period of `--interval-hours`, applied, the paused check resumed by a ping
+        # no database server: the period of `--interval-hours`, applied, the paused check resumed by a ping
         printed = ran(capsys, "ops", "deadman-sync", "--show", "--interval-hours", "6")
-        assert printed == (0, {"timeout_s": 21_600, "grace_s": 5_400, "paused": False})
+        assert printed == (
+            0,
+            {"timeout_s": 21_600, "grace_s": 5_400, "paused": False, "source": "interval_hours"},
+        )
         assert check.updates == [{"timeout": 21_600, "grace": 5_400}] and check.pings == ["success"]
         assert all(check.api_keys_right)
 
@@ -156,3 +186,19 @@ def test_deadman_sync_show_prints_only_the_period(
         1,
         {"error": "ping_url_form"},
     )
+
+
+def test_a_database_server_that_answers_is_never_bypassed(
+    worker_env: Callable[..., None],
+    answering_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fix round 1, M4: `--interval-hours` stands in for `schedule_state` only when no server answered; a
+    server that answered with a refusal fails the command (`database`), and nothing goes to healthchecks."""
+    worker_env(healthchecks_ping_url=PING_URL, healthchecks_api_key=API_KEY)
+    monkeypatch.setenv("JOBHUNTER_DB_PORT", str(answering_port))
+    with fake_healthchecks() as (_, router):
+        for argv in (("--show",), ("--show", "--interval-hours", "6")):
+            assert ran(capsys, "ops", "deadman-sync", *argv) == (1, {"error": "database"})
+        assert router.calls.call_count == 0

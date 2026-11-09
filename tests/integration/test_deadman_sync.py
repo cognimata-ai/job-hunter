@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Final, cast
 
+import httpx
 import procrastinate
 import pytest
 import sqlalchemy as sa
@@ -77,6 +78,11 @@ async def no_wait(seconds: float) -> None:
     return None
 
 
+def client_of(http: httpx.AsyncClient) -> HealthchecksClient:
+    """The healthchecks client of the stand-in on `http`, whose pings never wait to retry."""
+    return HealthchecksClient(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=no_wait)
+
+
 @pytest.fixture
 def hc() -> Iterator[FakeCheck]:
     with fake_healthchecks() as (check, _):
@@ -93,8 +99,7 @@ async def pinger(
     engine: AsyncEngine, current_epoch: int, hc: FakeCheck, clock: Clock
 ) -> AsyncIterator[DeadmanPinger]:
     async with deadman.make_http_client(user_agent="JobHunter/test") as http:
-        client = HealthchecksClient(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=no_wait)
-        yield DeadmanPinger(engine, client, epoch=current_epoch, clock=clock)
+        yield DeadmanPinger(engine, client_of(http), epoch=current_epoch, clock=clock)
 
 
 async def save_schedule(engine: AsyncEngine, **schedule: Any) -> None:
@@ -367,3 +372,39 @@ async def test_without_secrets_nothing_is_sent(
 
 def _with_secrets(cfg: AppConfig, secrets: dict[str, bytes]) -> AppConfig:
     return dataclasses.replace(cfg, secrets=MappingProxyType(secrets))
+
+
+# --- Fix round 1 (review M5): an answer that is no check takes the failure path -----------------------------
+
+
+async def test_an_undecodable_or_malformed_answer_raises_update_failed_and_backs_off(
+    engine: AsyncEngine, current_epoch: int, clock: Clock
+) -> None:
+    """M5: an httpx request error that is neither a timeout nor a transport error (here a body that cannot be
+    decoded), and a body that holds no check, are `invalid_response`: the alert and the backoff, never a job
+    that fails on its own and is deferred again at the next tick."""
+    with fake_healthchecks() as (check, router):
+        async with deadman.make_http_client(user_agent="JobHunter/test") as http:
+            pinger = DeadmanPinger(engine, client_of(http), epoch=current_epoch, clock=clock)
+            answers: list[httpx.Response | Exception] = [
+                httpx.DecodingError("undecodable"),
+                httpx.Response(200, json={"status": "up", "grace": [3600]}),
+            ]
+            for occurrence, answer in enumerate(answers, start=1):
+                router.routes["read"].mock(side_effect=[answer])
+                assert await pinger.sync() is None
+                state = await deadman_state(engine)
+                minutes = 5 * 2 ** (occurrence - 1)
+                assert (state.last_error_code, state.next_try_at) == (
+                    "invalid_response",
+                    clock.now + timedelta(minutes=minutes),
+                )
+                [alert] = await update_failed(engine)
+                assert (alert.severity, alert.occurrences, alert.context, alert.resolved_at) == (
+                    "warn",
+                    occurrence,
+                    {"error_code": "invalid_response"},
+                    None,
+                )
+                clock.now = state.next_try_at
+    assert check.updates == [] and check.pauses == 0
