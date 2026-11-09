@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, NoReturn, cast
 
 import pytest
+from jobhunter.errors import WORKER_EPOCH, FencedOut
 from jobhunter.worker.main import exit_unless_lock_held
 
 from tests.support.clock import FakeClock
@@ -841,8 +842,10 @@ async def test_with_both_secrets_one_pinger_serves_the_run_ends_the_tick_and_the
 
     env = {"HEALTHCHECKS_API_URL": "https://healthchecks.test/api/v3"}
     world = World(monkeypatch, tmp_path, env=env, secrets=HC_SECRETS)
+    armed = fake_arming(monkeypatch, world)
     assert await worker_main(world.cfg) == 0
-    assert world.events == [*START, *TEARDOWN]
+    # step 8 arms its watermark after the source sync, before the start reconcilers and every loop
+    assert world.events == [*START[:-1], "deadman_arm", "reconcile_start", *TEARDOWN]
     [runtime, *_] = world.runtimes
     [deps] = world.deps
     assert isinstance(runtime, WorkerRuntime) and isinstance(runtime.deadman, DeadmanPinger)
@@ -861,6 +864,57 @@ async def test_with_both_secrets_one_pinger_serves_the_run_ends_the_tick_and_the
     assert client._http.headers["User-Agent"] == world.cfg.http_user_agent
     assert client._http.is_closed  # closed by the teardown
     assert logged(caplog, "deadman_disabled") == []
+    assert armed == [pinger]
+
+
+def fake_arming(monkeypatch, world: World, *, raises: Exception | None = None) -> list[Any]:
+    """`DeadmanPinger.arm` as step 8 calls it, on `world`'s fake engine: each pinger it armed, in the list,
+    and `deadman_arm` among the events; it raises `raises` when one is given."""
+    from jobhunter.observability.deadman import DeadmanPinger
+
+    armed: list[Any] = []
+
+    async def arm(pinger: Any) -> int | None:
+        world.events.append("deadman_arm")
+        armed.append(pinger)
+        if raises is not None:
+            raise raises
+        return None
+
+    monkeypatch.setattr(DeadmanPinger, "arm", arm)
+    return armed
+
+
+async def test_a_worker_without_a_pinger_arms_nothing(monkeypatch, tmp_path) -> None:
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    armed = fake_arming(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    assert armed == [] and world.events == [*START, *TEARDOWN]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code", "event"),
+    [
+        (FencedOut(owner=WORKER_EPOCH), 70, "worker_superseded_at_start"),  # a newer worker took over
+        (OSError("detail that must not be logged"), 1, "worker_failed"),  # the database failed
+    ],
+)
+async def test_an_arming_that_fails_takes_the_source_sync_s_failure_path(
+    monkeypatch, tmp_path, caplog, refusal: Exception, code: int, event: str
+) -> None:
+    """Ruling T5-2: the arming is fenced by this worker's epoch like the source sync beside it; a refusal ends
+    the start as the sync's does (exit 70), any other error fails it (exit 1), before any loop starts."""
+    from jobhunter.worker.main import worker_main
+
+    env = {"HEALTHCHECKS_API_URL": "https://healthchecks.test/api/v3"}
+    world = World(monkeypatch, tmp_path, env=env, secrets=HC_SECRETS)
+    fake_arming(monkeypatch, world, raises=refusal)
+    assert await worker_main(world.cfg) == code
+    assert world.events == [*START[:-1], "deadman_arm", *TEARDOWN]  # no start reconciler, no loop
+    assert len(logged(caplog, event)) == 1
+    assert "must not be logged" not in caplog.text
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(

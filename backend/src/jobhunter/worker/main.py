@@ -42,17 +42,20 @@
    clock, which the collection deps (the `finalize` node's fast path), the runtime (`run_collect`'s
    `_finalize`, `deadman_sync`) and every reconcile context (`deadman_ping`) carry; without it one
    `deadman_disabled` line, with its reason (`not_configured`, `ping_url_form`);
-8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
-   transaction of its own, fenced by this worker's epoch: a source without its secret is
-   `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
-   (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the metrics server. When the
-   fence refuses the epoch, a newer worker took over during this start (final review C2): the sync wrote
-   nothing, so this worker's stale view of the secrets cannot undo the newer worker's sync, and the start
-   ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs.
-   When the start reconcilers' cadence is fenced instead (a takeover that committed after the sync), the
-   cadence requests the graceful stop of a superseded worker (`runtime.request_shutdown`, reason
-   `epoch_superseded`, Ruling T24-a), and the start ends there too, before any loop runs, with that path's
-   exit 0;
+8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a transaction
+   of its own, fenced by this worker's epoch: a source without its secret is `disabled('missing_secret')` and
+   never planned, plan Deviation 6); then, when step 7 built a dead-man pinger, its watermark armed
+   (`DeadmanPinger.arm`, M5 Task 5, Ruling T5-2: a watermark never set skips the runs that ended before this
+   start, with no ping; under the dead-man lock, in a transaction fenced by this worker's epoch: no run of
+   this worker can end before step 10); then the start reconcilers (`stalled_jobs` releases the jobs of dead
+   workers) and, outside the test env, the metrics server. When the fence refuses the epoch, a newer worker
+   took over during this start (final review C2): the refused transaction (the sync's, or the arming's after a
+   sync the takeover followed) wrote nothing, so this worker's stale view of the secrets cannot undo the newer
+   worker's sync, and the start ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling
+   FR-i) before any loop runs; a database error in either fails the start (`worker_failed`, exit 1). When the
+   start reconcilers' cadence is fenced instead (a takeover that committed after the sync), the cadence
+   requests the graceful stop of a superseded worker (`runtime.request_shutdown`, reason `epoch_superseded`,
+   Ruling T24-a), and the start ends there too, before any loop runs, with that path's exit 0;
 9. SIGTERM and SIGINT handlers that request the shutdown (`runtime.request_shutdown`, the signal's name as
    the reason);
 10. the alert dispatcher's loop (`AlertDispatcher.run`) when step 7 built one, else one `ntfy_disabled` line;
@@ -400,20 +403,23 @@ class _WorkerProcess:
             deadman=pinger,
         )
 
-        # 8. The source instances synced with the secrets under this worker's epoch fence, the start
-        # reconcilers, the metrics server.
+        # 8. The source instances synced with the secrets under this worker's epoch fence, the dead-man's
+        # watermark armed, the start reconcilers, the metrics server.
         async def fenced(conn: AsyncConnection) -> None:
             await fence_epoch(conn, epoch)
 
         try:
             async with engine.begin() as conn:
                 await sync_instances(conn, cfg, guard=fenced)
+            if pinger is not None:  # M5 Task 5 (Ruling T5-2): no run of this worker has ended yet
+                await pinger.arm()
         except FencedOut as refused:
             if not refused.worker_superseded:
                 raise  # not this worker's own fence: the start failed (`worker_failed`, exit 1), F5 Minor 1
-            # A newer worker owns the work (`fence_epoch` logged both epochs) and the sync wrote nothing. No
-            # loop has started; the teardown follows (it closes what the start built), then the watchdog's
-            # superseded exit (Ruling FR-i). The restart stands by while that worker is healthy.
+            # A newer worker owns the work (`fence_epoch` logged both epochs) and the refused transaction (the
+            # sync's, or the arming's) wrote nothing. No loop has started; the teardown follows (it
+            # closes what the start built), then the watchdog's superseded exit (Ruling FR-i). The restart
+            # stands by while that worker is healthy.
             log.critical("worker_superseded_at_start", epoch=epoch, exit_code=WATCHDOG_EXIT_CODE)
             return WATCHDOG_EXIT_CODE
         start = ReconcileContext(

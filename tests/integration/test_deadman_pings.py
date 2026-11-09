@@ -6,21 +6,24 @@ its `/fail`; only a scheduled or catch-up run does, or a manual run whose window
 node (`finalize_from_graph`) and from `runs._finalize`; the `deadman_ping` reconciler (the tick) pings every
 run of `runs_to_ping` above the watermark `deadman_state.last_pinged_run_id`, so the ends no finalize writes
 (`resume_exhausted`, `orphaned_queue`) and a ping lost to a crash after the commit are sent, once. The
-watermark only moves forward, and only past a run it pinged (or passed over).
+watermark only moves forward, and only past a run it pinged (or passed over). A worker's start arms a
+watermark never set (Ruling T5-2): past the runs that ended before it, with no ping, so a database with
+history never replays it.
 
 respx serves healthchecks (`tests.support.healthchecks`; no network) and the pings' retry sleep waits for
 nothing. Every run is invented.
 """
 
 import dataclasses
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Any, Final
 
 import procrastinate
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes.finalize import finalize_from_graph
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, initial_state
@@ -246,3 +249,111 @@ async def test_the_watermark_never_moves_back(
             RunToPing(succeeded.run_id, "success"),
         ]
         assert await runs_to_ping(conn, after_run_id=succeeded.run_id) == []
+
+
+# --- Pre-review fix (Ruling T5-2): the watermark armed at the worker's start --------------------------------
+
+
+async def ended_history(engine: AsyncEngine) -> list[int]:
+    """Three pingable ends from before the dead-man was armed, oldest first: a failed one, two successes."""
+    failed = await scheduled_run(engine, slot=SLOT)
+    assert await runs.execute_run(engine, raising_graph(), failed, 1, epoch=1) == "started"
+    ended = [failed]
+    for hours in (6, 12):
+        owner = await admitted(engine, await scheduled_run(engine, slot=SLOT + timedelta(hours=hours)))
+        assert await finalized(engine, owner, None) == "succeeded"
+        ended.append(owner.run_id)
+    return ended
+
+
+def armed_events(log_events: Callable[[], list[dict[str, Any]]]) -> list[int]:
+    return [event["run_id"] for event in log_events() if event["event"] == "deadman_armed"]
+
+
+async def test_arming_skips_history_before_the_first_start(
+    engine: AsyncEngine,
+    queue_app: procrastinate.App,
+    pinger: DeadmanPinger,
+    hc: FakeCheck,
+    log_events: Callable[[], list[dict[str, Any]]],
+) -> None:
+    history = await ended_history(engine)
+    manual = await queued_run(engine)  # a manual end too: the newest run, whatever it pings
+    assert await finalized(engine, manual, None) == "succeeded"
+    assert await watermark(engine) is None
+    async with engine.connect() as conn:
+        assert [run.run_id for run in await runs_to_ping(conn, after_run_id=0)] == history
+
+    assert await pinger.arm() == manual.run_id  # the newest collection run
+    assert await watermark(engine) == manual.run_id and armed_events(log_events) == [manual.run_id]
+    assert await pinger.ping_pending() == 0
+    await tick(engine, queue_app, pinger, now=utcnow())
+    assert hc.pings == []  # the history replays no ping
+    assert await pinger.arm() is None  # once only: the watermark is set
+    assert armed_events(log_events) == [manual.run_id]
+
+    after = await admitted(engine, await scheduled_run(engine, slot=SLOT + timedelta(hours=18)))
+    assert await finalized(engine, after, pinger) == "succeeded"  # a run that ends after the arming pings
+    assert hc.pings == ["success"] and await watermark(engine) == after.run_id
+
+
+async def test_arming_keeps_a_set_watermark(
+    engine: AsyncEngine,
+    queue_app: procrastinate.App,
+    pinger: DeadmanPinger,
+    hc: FakeCheck,
+    log_events: Callable[[], list[dict[str, Any]]],
+) -> None:
+    first = await admitted(engine, await scheduled_run(engine, slot=SLOT))
+    assert await finalized(engine, first, pinger) == "succeeded"  # pinged: the watermark is set
+    assert hc.pings == ["success"] and await watermark(engine) == first.run_id
+    missed = await admitted(engine, await scheduled_run(engine, slot=SLOT + SIX_HOURS))
+    assert await finalized(engine, missed, None) == "succeeded"  # its ping lost to a crash
+
+    assert await pinger.arm() is None  # a restart arms nothing
+    assert await watermark(engine) == first.run_id and armed_events(log_events) == []
+    await tick(engine, queue_app, pinger, now=utcnow())  # the lost ping is still sent
+    assert hc.pings == ["success", "success"] and await watermark(engine) == missed.run_id
+
+
+async def test_arming_with_no_runs_leaves_null(
+    engine: AsyncEngine, pinger: DeadmanPinger, hc: FakeCheck, log_events: Callable[[], list[dict[str, Any]]]
+) -> None:
+    assert await pinger.arm() is None
+    assert await watermark(engine) is None and armed_events(log_events) == [] and hc.pings == []
+    # the first run of a fresh database pings: the NULL reads as 0
+    first = await admitted(engine, await scheduled_run(engine, slot=SLOT))
+    assert await finalized(engine, first, pinger) == "succeeded"
+    assert hc.pings == ["success"] and await watermark(engine) == first.run_id
+
+
+async def test_arming_leaves_a_run_in_flight_to_ping(
+    engine: AsyncEngine, pinger: DeadmanPinger, hc: FakeCheck
+) -> None:
+    """A run queued or running at the start (taken over by this worker) ends after it: the watermark stops
+    just below it, though a slot it skipped meanwhile has a newer id."""
+    history = await ended_history(engine)
+    in_flight = await admitted(engine, await scheduled_run(engine, slot=SLOT + timedelta(hours=18)))
+    slot = SLOT + timedelta(hours=24)
+    async with engine.begin() as conn:  # the next slot comes due while it runs: `skipped_overlap`, a newer id
+        await conn.execute(_SCHEDULE, {"anchor": slot, "cursor": slot - timedelta(hours=1)})
+        assert (await run_tick(conn, now=slot + timedelta(minutes=1), defer=defer_in_tx)).skipped_overlap
+
+    assert await pinger.arm() == in_flight.run_id - 1
+    assert await pinger.ping_pending() == 0 and hc.pings == []  # the history replays nothing
+    assert await finalized(engine, in_flight, pinger) == "succeeded"
+    assert hc.pings == ["success"] and await watermark(engine) == in_flight.run_id
+    assert history[-1] < in_flight.run_id
+
+
+async def test_a_superseded_worker_arms_nothing(
+    engine: AsyncEngine, current_epoch: int, hc: FakeCheck
+) -> None:
+    await ended_history(engine)
+    async with deadman.make_http_client(user_agent="JobHunter/test") as http:
+        client = HealthchecksClient(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=no_wait)
+        stale = DeadmanPinger(engine, client, epoch=current_epoch + 1)  # not the current epoch
+        with pytest.raises(FencedOut) as fenced:
+            await stale.arm()
+    assert fenced.value.worker_superseded
+    assert await watermark(engine) is None and hc.pings == []

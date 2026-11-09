@@ -928,3 +928,65 @@ def test_healthchecks_ping_url_form_comes_right_after_healthchecks_in_prod(tmp_p
     assert check_of("worker", prod, write_secrets(tmp_path / "s", **slug)) == "healthchecks_ping_url_form"
     no_key = {k: v for k, v in slug.items() if k != "healthchecks_api_key"}
     assert check_of("worker", prod, write_secrets(tmp_path / "t", **no_key)) == "healthchecks_in_prod"
+
+
+# --- M5 Task 5 pre-review fix (Ruling T5-3): where the API key goes -----------------------------------------
+
+UNSAFE_API_URLS = (
+    "http://healthchecks.example/api/v3",  # not https
+    "https:///api/v3",  # no host
+    "https://jh:jh@healthchecks.example/api/v3",  # user information
+    "https://jh@healthchecks.example/api/v3",  # a user alone
+    "https://healthchecks.example:0/api/v3",  # no such port
+    "https://healthchecks.example:70000/api/v3",
+    "https://healthchecks.example:abc/api/v3",  # httpx.InvalidURL
+    "healthchecks.example/api/v3",  # no scheme
+)
+
+
+@pytest.mark.parametrize("api_url", UNSAFE_API_URLS)
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_healthchecks_api_url_safe_refuses_an_unsafe_url_where_the_key_goes(
+    tmp_path: Path, api_url: str, env_name: str
+) -> None:
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_ENV": env_name,
+        "NTFY_TOPIC_URL": TOPIC_URL,
+        "HEALTHCHECKS_API_URL": api_url,
+    }
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS))
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(cfg)
+    assert (exc.value.check, exc.value.detail) == (
+        "healthchecks_api_url_safe",
+        "HEALTHCHECKS_API_URL must be an https URL with a host, a port from 1 to 65535 when one is given, "
+        "and no user information",
+    )
+    assert api_url not in str(exc.value) and "healthchecks.example" not in str(exc.value)  # never the URL
+
+
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_the_default_or_an_https_api_url_passes_and_without_the_key_nothing_is_checked(
+    tmp_path: Path, env_name: str
+) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
+    with_key = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS)
+    run_startup_assertions(load_config("worker", env, with_key))  # the default, healthchecks.io's v3 API
+    for api_url in ("https://healthchecks.example/api/v3", "https://healthchecks.example:8443/api/v3"):
+        run_startup_assertions(load_config("worker", {**env, "HEALTHCHECKS_API_URL": api_url}, with_key))
+    if env_name == "prod":
+        return  # a prod worker needs the key (`healthchecks_in_prod`)
+    no_key = write_secrets(tmp_path / "t", **WORKER_SECRETS)  # the API URL is unused: nothing to check
+    for api_url in UNSAFE_API_URLS:
+        run_startup_assertions(load_config("worker", {**env, "HEALTHCHECKS_API_URL": api_url}, no_key))
+
+
+def test_healthchecks_api_url_safe_comes_right_after_the_ping_url_form(tmp_path: Path) -> None:
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "HEALTHCHECKS_API_URL": "http://healthchecks.example/api/v3"}
+    slug = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": b"https://hc-ping.example/pingkeyxyz/collection"}
+    assert check_of("worker", prod, write_secrets(tmp_path / "s", **slug)) == "healthchecks_ping_url_form"
+    # a right ping URL, an http API URL and no topic: the API URL is refused before the topic is checked
+    assert check_of("worker", prod, write_secrets(tmp_path / "t", **PROD_WORKER_SECRETS)) == (
+        "healthchecks_api_url_safe"
+    )

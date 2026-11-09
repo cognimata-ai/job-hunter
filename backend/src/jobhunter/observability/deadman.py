@@ -37,6 +37,11 @@ alarms on the missing one).
 - `ping_pending()`, the durable path, pings every run of `runs_to_ping` above the watermark, in id order:
   the ends no finalize writes (`resume_exhausted`, `orphaned_queue`, O10) and a ping lost to a crash between a
   commit and its ping. The `deadman_ping` reconciler runs it at every tick; delete-everything shares it.
+- `arm()`, once at the worker's start (`worker.main` step 8, Ruling T5-2): a watermark never set (the seeded
+  NULL) is set, under the lock, in one fenced transaction, to the newest collection run, or to just below the
+  oldest one still `queued` or `running` (which ends after this start and pings then), sending no ping: an
+  upgraded or restored database never replays its history. Logged `deadman_armed` with that run id. A
+  watermark already set is left, and a database without a run keeps its NULL, which both paths read as 0.
 
 **The period sync** (`DeadmanPinger.sync`, the `deadman_sync` task, O2). The tick compares
 `schedule_state(interval_s, enabled)` with `deadman_state(applied_interval_s, applied_paused)` and, when they
@@ -132,6 +137,15 @@ _SYNC_FAILED: Final = q(
     "UPDATE deadman_state SET last_error_code = :code, next_try_at = :next_try_at WHERE id = 1"
 )
 _OCCURRENCES: Final = q("SELECT occurrences FROM alerts WHERE id = :id")
+# `arm`: a NULL watermark set to the newest collection run, but below the oldest still active (it pings when
+# it ends); no row is set without a run, and a set watermark is left (module docstring).
+_ARM: Final = q(
+    "UPDATE deadman_state SET last_pinged_run_id = armed.run_id FROM ("
+    "SELECT LEAST(max(id), min(id) FILTER (WHERE status IN ('queued', 'running')) - 1) AS run_id "
+    "FROM runs WHERE kind = 'collect') AS armed "
+    "WHERE deadman_state.id = 1 AND deadman_state.last_pinged_run_id IS NULL AND armed.run_id IS NOT NULL "
+    "RETURNING deadman_state.last_pinged_run_id"
+)
 
 log = get_logger("jobhunter.observability.deadman")
 
@@ -427,6 +441,19 @@ class DeadmanPinger:
         async with self._engine.begin() as conn:
             await self._fence(conn)
             await conn.execute(_ADVANCE, {"run_id": run.run_id})
+
+    async def arm(self) -> int | None:
+        """At the worker's start (module docstring): a NULL watermark set past the runs that ended before it,
+        under the lock, in one fenced transaction, with no ping; the run id it was set to, or `None` when it
+        was set already or there is no run. Raises `FencedOut` when the fence refuses this worker's epoch."""
+        async with self._locked():
+            async with self._engine.begin() as conn:
+                await self._fence(conn)
+                armed = (await conn.execute(_ARM)).scalar_one_or_none()
+        if armed is None:
+            return None
+        log.info("deadman_armed", run_id=int(armed))
+        return int(armed)
 
     async def ping_pending(self) -> int:
         """The durable path: every run of `runs_to_ping` above the watermark pinged and passed, in id order,

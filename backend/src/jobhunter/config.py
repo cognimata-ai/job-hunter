@@ -440,6 +440,22 @@ def _check_healthchecks_ping_url(cfg: AppConfig) -> None:
         )
 
 
+def _check_healthchecks_api_url(cfg: AppConfig) -> None:
+    """M5 Task 5 (Ruling T5-3), in every env: a worker with the `healthchecks_api_key` secret sends it to
+    `HEALTHCHECKS_API_URL`, so that URL must be https with a host and a usable port (`_is_https_url`, httpx's
+    parser) and carry no user information (`healthchecks_api_url_safe`). The detail names the variable and the
+    rule, never the URL."""
+    if not cfg.secrets.get("healthchecks_api_key"):
+        return
+    url = cfg.healthchecks_api_url
+    if not _is_https_url(url) or httpx.URL(url).userinfo:
+        raise StartupCheckFailed(
+            "healthchecks_api_url_safe",
+            "HEALTHCHECKS_API_URL must be an https URL with a host, a port from 1 to 65535 when one is "
+            "given, and no user information",
+        )
+
+
 def _check_ntfy_token(cfg: AppConfig) -> None:
     """Review M2: the `ntfy_token` secret, when set, is sent as `Authorization: Bearer <token>`, so it must be
     a header value: visible ASCII only, without spaces or control characters (`ntfy_token_header_safe`). The
@@ -497,15 +513,17 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     _check_key_material(cfg)
     _check_ntfy_token(cfg)
 
-    if cfg.env == "prod" and cfg.role == "worker":
+    prod_worker = cfg.env == "prod" and cfg.role == "worker"
+    if prod_worker:
         absent = [n for n in ("healthchecks_ping_url", "healthchecks_api_key") if not cfg.secrets.get(n)]
         if absent:
             raise StartupCheckFailed("healthchecks_in_prod", f"a prod worker needs {', '.join(absent)}")
         _check_healthchecks_ping_url(cfg)  # check 8's second half (M5 Task 5, O5): the uuid form
-        # Right after check 8 (M5 plan O4, Deviation 11): a prod worker pushes its alerts to this topic, over
-        # TLS.
-        if not _is_https_url(cfg.ntfy_topic_url):
-            raise StartupCheckFailed("ntfy_in_prod", "a prod worker needs an https NTFY_TOPIC_URL")
+    # Right after (M5 Task 5, Ruling T5-3), in every env: where the API key goes.
+    _check_healthchecks_api_url(cfg)
+    # Right after check 8 (M5 plan O4, Deviation 11): a prod worker pushes its alerts to this topic, over TLS.
+    if prod_worker and not _is_https_url(cfg.ntfy_topic_url):
+        raise StartupCheckFailed("ntfy_in_prod", "a prod worker needs an https NTFY_TOPIC_URL")
 
     if cfg.env == "prod" and (anthropic := [name for name in _ANTHROPIC_ENV_VARS if name in env]):
         raise StartupCheckFailed("anthropic_env_in_prod", f"{', '.join(anthropic)} must not be set in prod")
