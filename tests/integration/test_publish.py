@@ -36,6 +36,7 @@ from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import SimulatedCrash, no_fault, raising_at
+from tests.support.fences import insert_test_fence
 from tests.support.llm import FakeLLM, open_alerts
 from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import (
@@ -360,10 +361,7 @@ async def test_a_fenced_job_publishes_nothing_and_cancels_the_attempt(
     claimed = await claimed_target(engine)
     fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
     async with engine.begin() as conn:
-        await conn.execute(
-            sa.text("INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', ARRAY[:j], 1)"),
-            {"j": claimed.job_id},
-        )
+        await insert_test_fence(conn, kind="jobs", job_ids=[claimed.job_id])
     final = await invoke_subgraph(deps, claimed)
     assert final["outcome"] == "cancelled"
     assert [await count(engine, t) for t in ("llm_results", "result_evidence", "det_results")] == [0, 0, 0]

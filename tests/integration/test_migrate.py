@@ -6,15 +6,23 @@ from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.db.alembic_runner import code_head
-from jobhunter.db.migrate import MIGRATE_ORDER, apply_explicit_grants, run_migrate, run_migrate_async
+from alembic import command
+from jobhunter.db.alembic_runner import alembic_config, code_head
+from jobhunter.db.compat import chain_compat, record_compat
+from jobhunter.db.migrate import (
+    BACKUP_GRANT_TABLES,
+    MIGRATE_ORDER,
+    apply_explicit_grants,
+    run_migrate,
+    run_migrate_async,
+)
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.db.session import make_engine
 from jobhunter.graphs.checkpointer import setup_checkpointer
 from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v2
 from jobhunter.scoring.rubric import load_rubric
 
-from tests.support.pg import PgRole, PgServer, pg_one
+from tests.support.pg import PgRole, PgServer, pg_one, pg_rows
 
 pytestmark = pytest.mark.integration
 NOW = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
@@ -36,7 +44,7 @@ async def test_first_install_order_and_artifacts(fresh_pg_server, make_config) -
         "replay",
     ]
     assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
-    assert code_head() == "0009_m4_ui"
+    assert code_head() == "0010_m5_operations"
     for t in ("procrastinate_jobs", "checkpoints", "checkpoint_writes", "checkpoint_blobs"):
         assert one(fresh_pg_server, f"SELECT to_regclass('{t}') IS NOT NULL") == (True,)
     assert one(fresh_pg_server, "SELECT count(*) FROM procrastinate_jobs", role="app") == (0,)
@@ -109,6 +117,8 @@ async def test_seed_values(fresh_pg_server, make_config) -> None:
         datetime(2026, 10, 16, 10, tzinfo=UTC),
     )
     assert one(fresh_pg_server, "SELECT generation FROM ranking_state") == (0,)
+    # the dead-man state's single row, nothing applied yet (M5 Task 1; Task 5 syncs it)
+    assert one(fresh_pg_server, "SELECT * FROM deadman_state") == (1, *(None,) * 8)
 
 
 async def test_seed_hashes_are_the_content_hash_of_the_stored_payloads(fresh_pg_server, make_config) -> None:
@@ -362,21 +372,27 @@ def test_cli_migrate_installs_and_logs_json_without_the_password(fresh_pg_server
     assert one(fresh_pg_server, "SELECT count(*) FROM settings_versions") == (1,)
 
 
-async def test_grants_step_skips_absent_tables(migrated) -> None:
+async def test_grants_step_grants_on_every_backup_table_of_the_migrated_schema(migrated) -> None:
     from jobhunter.db.session import make_null_engine
 
     engine = make_null_engine(migrated.dsn("migrator", driver="sqlalchemy"))
     async with engine.begin() as conn:
-        assert await apply_explicit_grants(conn) == []
+        assert await apply_explicit_grants(conn) == list(BACKUP_GRANT_TABLES)  # 0010 creates all four
     await engine.dispose()
 
 
-async def test_grants_step_grants_the_backup_role_on_the_tables_that_exist(
-    fresh_pg_server, make_config
-) -> None:
+async def test_grants_step_skips_absent_tables_and_grants_on_the_tables_that_exist(fresh_pg_server) -> None:
     from jobhunter.db.session import make_null_engine
 
-    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
+    # The 0009 schema has none of the four tables: two stand-ins of the right names are created after it.
+    dsn = fresh_pg_server.dsn("migrator", driver="sqlalchemy")
+    await asyncio.to_thread(command.upgrade, alembic_config(dsn), "0009_m4_ui")
+    engine = make_null_engine(dsn)
+    try:
+        async with engine.begin() as conn:
+            assert await apply_explicit_grants(conn) == []
+    finally:
+        await engine.dispose()
     one(fresh_pg_server, "CREATE TABLE backup_sets (id int PRIMARY KEY)")
     one(fresh_pg_server, "CREATE TABLE manifest_shipments (id int PRIMARY KEY)")
     backup_privileges = (
@@ -394,6 +410,67 @@ async def test_grants_step_grants_the_backup_role_on_the_tables_that_exist(
     finally:
         await engine.dispose()
     assert one(fresh_pg_server, backup_privileges) == (True, True, False, True)
+
+
+# The ten revisions up to M5's first, base first.
+CHAIN_TO_M5 = [
+    "0001_m0_baseline",
+    "0002_m0_transition_matrix",
+    "0003_m0_transition_matrix_grants",
+    "0004_m0_totp_replay",
+    "0005_m1_collection",
+    "0006_m2_llm_profile_settings",
+    "0007_m2_draft_text_edits",
+    "0008_m3_scoring",
+    "0009_m4_ui",
+    "0010_m5_operations",
+]
+# Every recorded row with its row version: a write that changes nothing would still give a new `xmin`.
+COMPAT = (
+    "SELECT revision, compat_floor, destructive, recorded_at, CAST(xmin AS text) "
+    "FROM schema_compat ORDER BY 1"
+)
+
+
+async def test_migrate_records_schema_compat_for_the_whole_chain(migrated, make_config) -> None:
+    recorded = pg_rows(migrated, "migrator", COMPAT)
+    assert [row[:3] for row in recorded] == [
+        (i.revision, i.compat_floor, i.destructive) for i in chain_compat()
+    ]
+    assert [row[0] for row in recorded[: len(CHAIN_TO_M5)]] == CHAIN_TO_M5
+    assert [row[:3] for row in recorded[:9]] == [(r, r, False) for r in CHAIN_TO_M5[:9]]
+    assert recorded[9][:3] == ("0010_m5_operations", "0009_m4_ui", False)
+    await run_migrate_async(make_config("migrate"), now=NOW)  # a second migrate changes nothing
+    assert pg_rows(migrated, "migrator", COMPAT) == recorded
+
+
+async def test_record_compat_writes_only_what_changed(migrated) -> None:
+    from jobhunter.db.session import make_null_engine
+
+    engine = make_null_engine(migrated.dsn("migrator", driver="sqlalchemy"))
+    try:
+        async with engine.connect() as conn:
+            assert await record_compat(conn) == 0  # every row is as the chain says
+            await conn.execute(sa.text("DELETE FROM schema_compat WHERE revision = '0001_m0_baseline'"))
+            await conn.execute(
+                sa.text("UPDATE schema_compat SET destructive = true WHERE revision = '0010_m5_operations'")
+            )
+            # a revision this code does not know (a newer release's, after a rollback) is kept as it is
+            await conn.execute(
+                sa.text("INSERT INTO schema_compat VALUES ('0099_later', '0010_m5_operations', true, now())")
+            )
+            assert await record_compat(conn) == 2
+            rows = await conn.execute(
+                sa.text("SELECT revision, compat_floor, destructive FROM schema_compat")
+            )
+            recorded = {row.revision: (row.compat_floor, row.destructive) for row in rows}
+            assert recorded == {
+                **{i.revision: (i.compat_floor, i.destructive) for i in chain_compat()},
+                "0099_later": ("0010_m5_operations", True),
+            }
+            await conn.rollback()
+    finally:
+        await engine.dispose()
 
 
 async def test_checkpointer_setup_is_idempotent(migrated) -> None:

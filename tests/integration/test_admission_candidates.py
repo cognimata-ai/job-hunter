@@ -52,6 +52,7 @@ from jobhunter.scoring.cycles import CycleRow
 from jobhunter.sources.instances import instance_for_company
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.m3 import active_ids, insert_cycle, insert_id
 from tests.support.scoring import (
     PendingTarget,
@@ -75,9 +76,6 @@ _IN_GROUP: Final = sa.text("UPDATE jobs SET duplicate_group_id = :g WHERE id = :
 _POSTING: Final = sa.text(
     "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, availability, "
     "availability_changed_at) VALUES (:instance, :native, :job, now(), now(), 'active', now())"
-)
-_FENCE: Final = sa.text(
-    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1)"
 )
 _PROFILE_VERSION: Final = sa.text("SELECT profile_version_id FROM llm_tuples WHERE id = :t")
 _CYCLE_SIZE: Final = sa.text(
@@ -383,7 +381,7 @@ async def test_an_exhausted_backed_off_or_fenced_target_is_in_no_candidate_set(e
         TargetSpec(lane="score_now", charged_attempts=4),
     )
     async with engine.begin() as conn:
-        await conn.execute(_FENCE, {"jobs": [fenced.job_id]})
+        await insert_test_fence(conn, kind="jobs", job_ids=[fenced.job_id])
     sets = await candidate_sets(engine, ok.llm_tuple_id, now=now)
     assert sets.similarity == [ok.target_id]
     assert sets.oldest == ids([ok, now_ok])

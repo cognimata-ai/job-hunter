@@ -366,8 +366,9 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, rubric v1 and v2 and prompt-schema versions 1 and 2, the three single
-    rows, `sources` and the default source instances.
+    """Write the default settings chain, rubric v1 and v2 and prompt-schema versions 1 and 2, the four single
+    rows (`active_config`, `schedule_state`, `ranking_state` and M5's `deadman_state`, all NULL but its id),
+    `sources` and the default source instances.
 
     Idempotent and never an overwrite: a NULL rubric or prompt-schema pointer is set (to the shipped rubric v2
     and prompt-schema version 2), a set one is never changed (a shipped version activates through Settings
@@ -375,7 +376,7 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     Settings version 1 is frozen once stored: the derived rows (scope, model policy, execution config,
     evaluation policy) and the version are created from the packaged defaults only when version 1 does not
     exist yet. Afterwards a release that edits `settings_v1.json`
-    changes nothing here, and the three single rows below are created, when absent, from the STORED version 1
+    changes nothing here, and the single rows below are created, when absent, from the STORED version 1
     and the pointers it holds (`settings_versions` carries all four: scope, model policy, execution config and
     evaluation policy), never from the file. So a second call with another `now` changes nothing. The one
     exception is the transition matrix, which is code-derived and replaced on every call
@@ -438,6 +439,8 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     )
 
     await conn.execute(q("INSERT INTO ranking_state (id, generation) VALUES (1, 0) ON CONFLICT DO NOTHING"))
+    # The dead-man switch's applied state (M5): nothing applied yet, every column NULL until it syncs
+    await conn.execute(q("INSERT INTO deadman_state (id) VALUES (1) ON CONFLICT DO NOTHING"))
 
     await conn.execute(q(_INSERT_SOURCES), [asdict(source) for source in SOURCES])
     await conn.execute(q(DEFAULT_INSTANCES_SQL))

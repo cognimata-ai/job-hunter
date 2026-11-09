@@ -16,7 +16,7 @@ import psycopg
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from jobhunter.db.alembic_runner import alembic_config, code_head
+from jobhunter.db.alembic_runner import alembic_config
 from jobhunter.db.sql import q
 from jobhunter.geo.gazetteer import distance_km
 from jobhunter.types import JSONValue
@@ -81,10 +81,10 @@ _KIND_CHECK: Final = (
 )
 
 
-def test_0009_follows_0008_and_is_the_head() -> None:
+def test_0009_follows_0008() -> None:
+    # No longer the head since M5's 0010 (`test_migrate.py` pins the head)
     module = importlib.import_module(f"jobhunter.db.migrations.versions.{M4_SCHEMA}")
     assert (module.revision, module.down_revision) == (M4_SCHEMA, M3_SCHEMA)
-    assert code_head() == M4_SCHEMA
 
 
 def test_0009_creates_the_indexes_and_the_functions(migrated: PgServer) -> None:

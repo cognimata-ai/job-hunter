@@ -35,6 +35,7 @@ from jobhunter.llm.spend_ledger import (
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import ctx
+from tests.support.fences import insert_test_fence
 from tests.support.llm import (
     USAGE,
     budget_rows,
@@ -686,7 +687,7 @@ async def test_a_global_purge_fence_refuses_reservations_and_dispatch_markers(en
     t = utcnow()
     res = await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
     async with engine.begin() as conn:
-        await conn.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)"))
+        await insert_test_fence(conn, kind="global")
     with pytest.raises(FencedOut) as fenced:
         await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
     assert fenced.value.owner == "purge_fence"

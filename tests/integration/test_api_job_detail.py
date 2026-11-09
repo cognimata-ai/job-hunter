@@ -26,6 +26,7 @@ from jobhunter.db.sql import q
 from jobhunter.jobs import detail as detail_module
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.job_detail import (
     LEVELS,
     Note,
@@ -964,7 +965,7 @@ async def test_a_synthetic_or_unknown_job_is_404_without_survivor(
     async with engine.begin() as c:
         synthetic = (await insert_job(c, synthetic_eval=True)).job_id
         fenced = (await insert_job(c)).job_id
-        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [fenced], "manifest_id": 1})
+        await insert_test_fence(c, kind="jobs", job_ids=[fenced])
         live = (await insert_job(c)).job_id
     unknown = live + 1_000_000
     for job_id in (unknown, synthetic, fenced):

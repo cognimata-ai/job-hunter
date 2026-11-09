@@ -13,16 +13,13 @@ from jobhunter.worker.runs import finalize_run
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import STEPSTONE_1, make_deps, pending_item, queued_run, resolved
+from tests.support.fences import FenceKind, insert_test_fence
 
 pytestmark = pytest.mark.integration
 
 ITEM = sa.text(
     "SELECT disposition, reason_code, normalized IS NOT NULL AS kept, observation_id FROM raw_items "
     "WHERE id = :i"
-)
-FENCE = sa.text(
-    "INSERT INTO purge_fences (kind, source_id, job_ids, manifest_id) "
-    "VALUES (:kind, :source, CAST(:jobs AS bigint[]), 1) RETURNING id"
 )
 RELEASE = sa.text("UPDATE purge_fences SET released_at = now() WHERE id = :f")
 
@@ -43,12 +40,10 @@ async def item_row(engine: AsyncEngine, raw_item_id: int) -> tuple[Any, ...]:
 
 
 async def fence(
-    engine: AsyncEngine, kind: str, *, source: str | None = None, jobs: tuple[int, ...] = ()
+    engine: AsyncEngine, kind: FenceKind, *, source: str | None = None, jobs: tuple[int, ...] = ()
 ) -> int:
     async with engine.begin() as c:
-        return int(
-            (await c.execute(FENCE, {"kind": kind, "source": source, "jobs": list(jobs)})).scalar_one()
-        )
+        return await insert_test_fence(c, kind=kind, source_id=source, job_ids=jobs)
 
 
 JOBS_OF_NATIVE = sa.text(

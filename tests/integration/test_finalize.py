@@ -52,6 +52,7 @@ from tests.support.collect import (
     source_cell,
     supersede,
 )
+from tests.support.fences import insert_test_fence
 from tests.support.m2 import insert_profile_chain
 from tests.support.pg import pg_rows
 from tests.support.quota import insert_window, jsearch_window, seeded_run_settings
@@ -280,7 +281,7 @@ async def test_partial_and_invariant_failures(
     # (e) a `deferred('job_fenced')` item does not fail I1: a board job fenced, its posting sighted again
     async with engine.begin() as c:
         job = (await c.execute(BOARD_JOB, {"s": DEFAULT_BOARD[0], "k": DEFAULT_BOARD[1]})).scalar_one()
-        await c.execute(FENCE_JOB, {"jobs": [job]})
+        await insert_test_fence(c, kind="jobs", job_ids=[job])
     rid = await run_to_the_end(engine, collect_deps)
     status, reason, report = await run_end(engine, rid)
     assert report["sources"][await board_key(engine)]["items"].get("deferred") == 1
@@ -302,9 +303,6 @@ BREACH = sa.text(
 BOARD_JOB = sa.text(
     "SELECT p.job_id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
     "WHERE i.source_id = :s AND i.instance_key = :k ORDER BY p.id LIMIT 1"
-)
-FENCE_JOB = sa.text(
-    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1)"
 )
 
 
@@ -455,7 +453,7 @@ async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, 
     assert await resolved(engine, owner, first) == "linked"
     async with engine.begin() as c:
         job = (await c.execute(sa.text("SELECT job_id FROM postings WHERE native_id = 'H'"))).scalar_one()
-        await c.execute(FENCE_JOB, {"jobs": [job]})
+        await insert_test_fence(c, kind="jobs", job_ids=[job])
     again = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
     assert await resolved(engine, owner, again) == "deferred"
     async with engine.connect() as c:

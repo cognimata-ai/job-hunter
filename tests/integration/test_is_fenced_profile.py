@@ -1,13 +1,10 @@
 import pytest
 import sqlalchemy as sa
 
+from tests.support.fences import insert_test_fence
 from tests.support.m2 import insert_profile_chain
 
 pytestmark = pytest.mark.integration
-
-FENCE = (
-    "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) VALUES ('profile', :p, 1) RETURNING id"
-)
 
 
 async def test_a_profile_fence_fences_the_tuple_of_its_version_and_no_other(engine) -> None:
@@ -23,7 +20,7 @@ async def test_a_profile_fence_fences_the_tuple_of_its_version_and_no_other(engi
         # no fence: nothing is fenced, with or without a tuple
         assert [await fenced(5, t) for t in tuples] == [False, False, False, False]
 
-        fence = (await c.execute(sa.text(FENCE), {"p": first.profile_version_id})).scalar_one()
+        fence = await insert_test_fence(c, kind="profile", profile_version_id=first.profile_version_id)
         assert [await fenced(5, t) for t in tuples] == [True, False, False, False]
         # the fence is about the tuple, whatever job is asked about
         assert [await fenced(6, t) for t in tuples] == [True, False, False, False]
@@ -31,7 +28,7 @@ async def test_a_profile_fence_fences_the_tuple_of_its_version_and_no_other(engi
         assert (await c.execute(sa.text("SELECT is_fenced(5)"))).scalar_one() is False
 
         # a second fence on the other version fences the other tuple too
-        other = (await c.execute(sa.text(FENCE), {"p": second.profile_version_id})).scalar_one()
+        other = await insert_test_fence(c, kind="profile", profile_version_id=second.profile_version_id)
         assert [await fenced(5, t) for t in tuples] == [True, True, False, False]
 
         # a released fence fences nothing
@@ -44,14 +41,12 @@ async def test_a_profile_fence_fences_the_tuple_of_its_version_and_no_other(engi
 async def test_the_other_branches_still_fence_with_the_profile_branch_in_place(engine) -> None:
     async with engine.connect() as c:
         chain = await insert_profile_chain(c)
-        await c.execute(
-            sa.text("INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', '{5}', 1)")
-        )
+        await insert_test_fence(c, kind="jobs", job_ids=[5])
         row = await c.execute(
             sa.text("SELECT is_fenced(5, :t), is_fenced(6, :t), is_fenced(5), is_fenced(6)"),
             {"t": chain.llm_tuple_id},
         )
         assert tuple(row.one()) == (True, False, True, False)
-        await c.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 2)"))
+        await insert_test_fence(c, kind="global")
         row = await c.execute(sa.text("SELECT is_fenced(6, :t), is_fenced(6)"), {"t": chain.llm_tuple_id})
         assert tuple(row.one()) == (True, True)

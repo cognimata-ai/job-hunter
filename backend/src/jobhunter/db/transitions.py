@@ -510,7 +510,9 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                 }
             ),
         ),
-        # §7.5. The `purged` status (items removed, §20.2) has no edge in this milestone.
+        # §7.5. `purged` (items removed, §20.2) is M5's profile purge (Task 14): from every state, with the
+        # items set to NULL in the same update (`set_={"items": None}`; a `ready` proposal keeps its items
+        # until it leaves `ready`).
         "query_proposals": TransitionSpec(
             table="query_proposals",
             state_col="status",
@@ -518,7 +520,15 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
             changed_at=MappingProxyType({}),
             owner_cols=frozenset(),
             clear_on_exit=MappingProxyType({}),
-            allowed=frozenset({("running", "ready"), ("running", "failed")}),
+            allowed=frozenset(
+                {
+                    ("running", "ready"),
+                    ("running", "failed"),
+                    ("running", "purged"),
+                    ("ready", "purged"),
+                    ("failed", "purged"),
+                }
+            ),
             settable=frozenset({"items", "llm_call_id"}),
         ),
         # §7.13. §7.16 has no `eval_runs` machine either: a run is `running` until it finishes or fails.
@@ -698,6 +708,71 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
             clear_on_exit=MappingProxyType({}),
             allowed=frozenset(("awaiting", result) for result in _ITEM_RESULTS),
             settable=frozenset({"llm_call_id", "stop_reason"}),
+        ),
+        # §7.14 (M5). A manifest's file is written and its deletes run (`executing`), it is complete with
+        # the file's hash, then shipped with the shipment that holds it; the §7.14 CHECKs pair each state
+        # with its columns. No owner columns: the purge holds its operation's claim.
+        "deletion_manifests": TransitionSpec(
+            table="deletion_manifests",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({"completed": "completed_at", "shipped": "shipped_at"}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("executing", "completed"), ("completed", "shipped")}),
+            settable=frozenset({"file_sha256", "scope", "shipment_id", "replay_log"}),
+        ),
+        # §7.14 (M5, D9). An export is built (`running`, one at a time: `exports_one_running`), then served
+        # until it expires; a purge removes it in either state. No changed-at column.
+        "exports": TransitionSpec(
+            table="exports",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("running", "ready"),
+                    ("running", "failed"),
+                    ("running", "purged"),
+                    ("ready", "expired"),
+                    ("ready", "purged"),
+                }
+            ),
+            settable=frozenset({"storage_path", "sha256", "size_bytes", "purge_generation"}),
+        ),
+        # §7.14, §19.5 (M5). A backup set and a prune or restore-test run are `running` until they end; the
+        # error is the reason.
+        "backup_sets": TransitionSpec(
+            table="backup_sets",
+            state_col="status",
+            reason_col="error",
+            changed_at=MappingProxyType(dict.fromkeys(("succeeded", "failed"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "succeeded"), ("running", "failed")}),
+            settable=frozenset(
+                {
+                    "restic_snapshot_id",
+                    "dump_sha256",
+                    "dump_bytes",
+                    "db_snapshot_at",
+                    "manifest_count",
+                    "row_counts",
+                    "cv_file_count",
+                }
+            ),
+        ),
+        "backup_runs": TransitionSpec(
+            table="backup_runs",
+            state_col="status",
+            reason_col="error",
+            changed_at=MappingProxyType(dict.fromkeys(("succeeded", "failed"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "succeeded"), ("running", "failed")}),
+            settable=frozenset({"report"}),
         ),
     }
 )

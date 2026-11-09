@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 
 import psycopg
@@ -6,6 +7,7 @@ import sqlalchemy as sa
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import TRUNCATED_TABLES, reset_database
 from tests.support.m2 import (
     ProfileChain,
@@ -348,6 +350,8 @@ KEPT = {
     "ranking_state",
     "sources",
     "transition_matrix",
+    "deadman_state",  # restored row by row (M5)
+    "schema_compat",  # migrate's record of the chain (M5)
 }
 
 
@@ -357,6 +361,8 @@ def test_reset_truncates_no_configuration_path(migrated) -> None:
     table the reset keeps, so a later foreign key cannot bring the cascade back silently."""
     edges = pg_rows(migrated, "migrator", REFERENCES)
     assert ("llm_calls", "score_targets") in edges  # the M3 foreign keys are in the graph
+    assert ("purge_fences", "deletion_manifests") in edges  # and the M5 ones
+    assert ("purged_batch_items", "batch_submissions") in edges
     closure, frontier = set(TRUNCATED_TABLES), set(TRUNCATED_TABLES)
     while frontier:
         frontier = {str(child) for child, parent in edges if parent in frontier} - closure
@@ -365,3 +371,72 @@ def test_reset_truncates_no_configuration_path(migrated) -> None:
     removed = {"jobs", "job_revisions", "duplicate_groups", "operations", "embeddings", "job_tombstones"}
     assert sorted(removed & closure) == []  # the six tables `_TRUNCATE` no longer names
     assert "score_targets" not in closure
+    assert set(M5_TABLES) <= closure and "batch_submissions" not in closure
+
+
+# The tables of M5 that hold rows a test writes (manifests, shipments, backups, exports, purged batch items).
+M5_TABLES = (
+    "deletion_manifests",
+    "manifest_shipments",
+    "manifest_shipment_items",
+    "backup_sets",
+    "backup_runs",
+    "exports",
+    "purged_batch_items",
+)
+M5_COUNTS = " UNION ALL ".join(
+    f"SELECT '{table}', count(*) FROM {table}"  # noqa: S608 (constant names)
+    for table in M5_TABLES
+)
+DEADMAN = "SELECT * FROM deadman_state"
+SEEDED_DEADMAN = [(1, *(None,) * 8)]
+COMPAT = "SELECT revision, compat_floor, destructive, recorded_at FROM schema_compat ORDER BY revision"
+
+
+async def test_reset_empties_the_m5_tables_and_restores_deadman_state(engine, migrated) -> None:
+    compat = pg_rows(migrated, "migrator", COMPAT)
+    assert compat and pg_rows(migrated, "migrator", DEADMAN) == SEEDED_DEADMAN
+    async with engine.begin() as c:
+        chain = await insert_profile_chain(c)
+        submission = await insert_submission(
+            c, chain.llm_tuple_id, await insert_bulk_operation(c, chain.llm_tuple_id)
+        )
+        fence = await insert_test_fence(c, kind="global")
+        manifest = (
+            await c.execute(sa.text("SELECT manifest_id FROM purge_fences WHERE id = :f"), {"f": fence})
+        ).scalar_one()
+        shipment = await insert_id(c, "manifest_shipments", {"restic_snapshot_id": "snap"})
+        await insert_row(
+            c,
+            "manifest_shipment_items",
+            {"shipment_id": shipment, "manifest_uuid": uuid.uuid4(), "file_sha256": b"\x00"},
+        )
+        backup_set = await insert_id(c, "backup_sets", {"status": "running"})
+        await insert_row(
+            c, "backup_runs", {"kind": "restore_test", "backup_set_id": backup_set, "status": "running"}
+        )
+        await insert_row(c, "exports", {"status": "running", "expires_at": NOW})
+        await insert_row(
+            c,
+            "purged_batch_items",
+            {"submission_id": submission, "custom_id": "t1_a1", "manifest_id": manifest},
+        )
+        await c.execute(
+            sa.text(
+                "UPDATE deadman_state SET applied_interval_s = 3600, applied_timeout_s = 60, "
+                "applied_grace_s = 300, applied_paused = false, last_pinged_run_id = 1, synced_at = now(), "
+                "last_error_code = 'http_503', next_try_at = now()"
+            )
+        )
+    assert [table for table, count in pg_rows(migrated, "migrator", M5_COUNTS) if count == 0] == []
+    assert pg_rows(migrated, "migrator", DEADMAN) != SEEDED_DEADMAN
+
+    reset_database(migrated)
+    assert [table for table, count in pg_rows(migrated, "migrator", M5_COUNTS) if count != 0] == []
+    assert pg_rows(migrated, "migrator", DEADMAN) == SEEDED_DEADMAN
+    assert pg_rows(migrated, "migrator", COMPAT) == compat  # migrate's record stays as it was
+
+    # a reset also gives back a row a test deleted
+    pg_rows(migrated, "migrator", "DELETE FROM deadman_state")
+    reset_database(migrated)
+    assert pg_rows(migrated, "migrator", DEADMAN) == SEEDED_DEADMAN

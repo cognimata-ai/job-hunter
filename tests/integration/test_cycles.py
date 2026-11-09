@@ -44,6 +44,7 @@ from jobhunter.worker.tick import tick_score
 from procrastinate.job_context import JobContext
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.logs import logged
 from tests.support.m3 import insert_attempt, insert_cycle, insert_id
@@ -295,11 +296,8 @@ async def test_a_lone_fenced_or_exhausted_pending_target_starts_no_cycle(
     (pending,) = await insert_targets(engine, 1, lane=lane)
     await set_bucket(engine, "1.400000", now)
     if unscorable == "fenced":  # a jobs purge fence over the target's job
-        await execute(
-            engine,
-            "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', ARRAY[:j]::bigint[], 1)",
-            j=pending.job_id,
-        )
+        async with engine.begin() as conn:
+            await insert_test_fence(conn, kind="jobs", job_ids=[pending.job_id])
     else:  # every charged attempt spent
         await execute(
             engine, "UPDATE score_targets SET charged_attempts = 4 WHERE id = :t", t=pending.target_id
@@ -406,7 +404,8 @@ async def exhaust_headroom(engine: AsyncEngine, now: datetime) -> None:
 
 
 async def fence_globally(engine: AsyncEngine, now: datetime) -> None:
-    await execute(engine, "INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)")
+    async with engine.begin() as conn:
+        await insert_test_fence(conn, kind="global")
 
 
 async def bound_violated(engine: AsyncEngine, now: datetime) -> None:

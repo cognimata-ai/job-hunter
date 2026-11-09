@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.batches import make_due
 from tests.support.faults import SimulatedCrash, no_fault, raising_at
+from tests.support.fences import insert_test_fence
 from tests.support.settings import generation
 from tests.support.sources import StoredPage
 
@@ -61,9 +62,6 @@ JOBS_OF: Final = sa.text(
 )
 PENDING_OF: Final = sa.text(
     "SELECT id FROM raw_items WHERE raw_response_id = :r AND disposition = 'pending' ORDER BY id"
-)
-GLOBAL_FENCE: Final = sa.text(
-    "INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1) RETURNING id"
 )
 RELEASE_FENCE: Final = sa.text("UPDATE purge_fences SET released_at = now() WHERE id = :f")
 
@@ -173,7 +171,7 @@ async def test_an_active_global_fence_requeues_with_purge_in_progress(
     ids = (await parsed_page(engine, arbeitnow_adapter, stored_arbeitnow_page))[:2]
     await rejected_by_an_old_parser(engine, ids)
     async with engine.begin() as c:
-        fence = int((await c.execute(GLOBAL_FENCE)).scalar_one())
+        fence = await insert_test_fence(c, kind="global")
     operation_id = await requested(engine, ids)
     started = utcnow()
 
@@ -202,7 +200,7 @@ async def test_an_active_global_fence_requeues_with_purge_in_progress(
     async def fence_after_the_replay(point: str) -> None:
         if point == replay.AFTER_REPLAY_COMMIT:
             async with engine.begin() as c:
-                fences.append(int((await c.execute(GLOBAL_FENCE)).scalar_one()))
+                fences.append(await insert_test_fence(c, kind="global"))
 
     monkeypatch.setattr(replay, "afault_point", fence_after_the_replay)
     await make_due(engine)

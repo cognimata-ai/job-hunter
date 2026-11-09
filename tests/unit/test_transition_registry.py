@@ -251,8 +251,9 @@ def test_m2_machines() -> None:
         "ended_at",
     }
 
+    # M2's two edges; M5 adds the purge's three (`test_m5_machines`)
     proposals = TRANSITIONS["query_proposals"]
-    assert proposals.allowed == {("running", "ready"), ("running", "failed")}
+    assert {("running", "ready"), ("running", "failed")} <= proposals.allowed
     assert proposals.state_col == "status"
     assert proposals.settable == {"items", "llm_call_id"}
 
@@ -483,6 +484,63 @@ def test_m3_machines() -> None:
     assert items.owner_cols == frozenset()
     assert items.clear_on_exit == {}
     assert items.settable == {"llm_call_id", "stop_reason"}
+
+
+def test_m5_machines() -> None:
+    # §7.14: a manifest is written, then its file shipped; no owner and no reason column
+    manifests = TRANSITIONS["deletion_manifests"]
+    assert manifests.allowed == {("executing", "completed"), ("completed", "shipped")}
+    assert (manifests.state_col, manifests.reason_col) == ("status", None)
+    assert manifests.changed_at == {"completed": "completed_at", "shipped": "shipped_at"}
+    assert (manifests.owner_cols, manifests.clear_on_exit) == (frozenset(), {})
+    assert manifests.settable == {"file_sha256", "scope", "shipment_id", "replay_log"}
+
+    # D9: an export is built (`running`), then served until it expires or a purge removes it
+    exports = TRANSITIONS["exports"]
+    assert exports.allowed == {
+        ("running", "ready"),
+        ("running", "failed"),
+        ("running", "purged"),
+        ("ready", "expired"),
+        ("ready", "purged"),
+    }
+    assert (exports.state_col, exports.reason_col, exports.changed_at) == ("status", None, {})
+    assert (exports.owner_cols, exports.clear_on_exit) == (frozenset(), {})
+    assert exports.settable == {"storage_path", "sha256", "size_bytes", "purge_generation"}
+
+    # §19.5: a backup set, and a prune or restore-test run, each `running` until it ends; its error the reason
+    for table, settable in (
+        (
+            "backup_sets",
+            {
+                "restic_snapshot_id",
+                "dump_sha256",
+                "dump_bytes",
+                "db_snapshot_at",
+                "manifest_count",
+                "row_counts",
+                "cv_file_count",
+            },
+        ),
+        ("backup_runs", {"report"}),
+    ):
+        spec = TRANSITIONS[table]
+        assert spec.allowed == {("running", "succeeded"), ("running", "failed")}, table
+        assert (spec.state_col, spec.reason_col) == ("status", "error"), table
+        assert spec.changed_at == {"succeeded": "finished_at", "failed": "finished_at"}, table
+        assert (spec.owner_cols, spec.clear_on_exit) == (frozenset(), {}), table
+        assert spec.settable == settable, table
+
+    # §7.5's `purged` (Task 14's profile purge): from every state, the items nulled in the same update
+    proposals = TRANSITIONS["query_proposals"]
+    assert proposals.allowed == {
+        ("running", "ready"),
+        ("running", "failed"),
+        ("running", "purged"),
+        ("ready", "purged"),
+        ("failed", "purged"),
+    }
+    assert "items" in proposals.settable and proposals.changed_at == {}
 
 
 class RecordingConnection:

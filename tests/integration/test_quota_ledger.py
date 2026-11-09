@@ -16,6 +16,7 @@ from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import ctx, planned_request, queued_run, request_sent
+from tests.support.fences import insert_test_fence
 from tests.support.logs import logged
 from tests.support.quota import SETTINGS, account, insert_window, jsearch_window
 
@@ -288,7 +289,7 @@ async def test_a_live_owners_reservation_is_kept_and_a_global_purge_fence_refuse
     assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app)) == 0
     assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=r.entry_id) == ("reserved",)
     async with engine.begin() as c:
-        await c.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)"))
+        await insert_test_fence(c, kind="global")
     async with engine.begin() as c:
         with pytest.raises(FencedOut):
             await ledger.mark_dispatched(c, r.entry_id, owner)

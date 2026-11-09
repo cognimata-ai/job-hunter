@@ -1,6 +1,8 @@
 import psycopg
 import pytest
+from psycopg.rows import TupleRow
 
+from tests.support.fences import TEST_MANIFEST_SQL
 from tests.support.pg import PgRole, PgServer, ensure_config_rows, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -29,7 +31,9 @@ M0_TABLES = {
     "purge_fences",
     "alembic_version",
 }
-LATER = {"deletion_manifests"}  # sources, postings: M1; llm_tuples, profile_versions: M2; score_cycles: M3
+# The tables of later milestones the M0 schema must not have: none left since M5's migration 0010 created the
+# last, `deletion_manifests` (sources, postings: M1; llm_tuples, profile_versions: M2; score_cycles: M3).
+LATER: set[str] = set()
 
 
 def rows(server: PgServer, statement: str, role: PgRole = "migrator") -> list[tuple[object, ...]]:
@@ -150,14 +154,27 @@ def test_constraints_reject(migrated: PgServer, statements: list[str], sqlstate:
         c.rollback()
 
 
+def manifest(c: psycopg.Connection[TupleRow], kind: str) -> int:
+    """A test manifest of `kind` (`TEST_MANIFEST_SQL`, its `:kind` bound the psycopg way); its id."""
+    row = c.execute(TEST_MANIFEST_SQL.replace(":kind", "%(kind)s"), {"kind": kind}).fetchone()
+    assert row is not None
+    return int(str(row[0]))
+
+
 def test_is_fenced_global_and_jobs(migrated: PgServer) -> None:
     with psycopg.connect(migrated.dsn("migrator")) as c:
         assert c.execute("SELECT is_fenced(5)").fetchone() == (False,)
-        c.execute("INSERT INTO purge_fences (kind,job_ids,manifest_id) VALUES ('jobs','{5}',1)")
+        c.execute(
+            "INSERT INTO purge_fences (kind,job_ids,manifest_id) VALUES ('jobs','{5}',%s)",
+            (manifest(c, "job_tombstone"),),
+        )
         assert c.execute("SELECT is_fenced(5), is_fenced(6)").fetchone() == (True, False)
         c.execute("UPDATE purge_fences SET released_at = now()")
         assert c.execute("SELECT is_fenced(5)").fetchone() == (False,)
-        c.execute("INSERT INTO purge_fences (kind,manifest_id) VALUES ('global',2)")
+        c.execute(
+            "INSERT INTO purge_fences (kind,manifest_id) VALUES ('global',%s)",
+            (manifest(c, "delete_everything"),),
+        )
         assert c.execute("SELECT is_fenced(6, 9)").fetchone() == (True,)
         c.rollback()
 

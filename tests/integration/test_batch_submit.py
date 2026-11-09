@@ -46,6 +46,7 @@ from tests.support.batches import (
     submission_rows,
 )
 from tests.support.faults import PausePoint, no_fault, raising_at
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.llm import FakeLLM, open_alerts
 from tests.support.profile import OpRunner
@@ -305,7 +306,7 @@ async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothi
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)
     async with engine.begin() as conn:
-        await conn.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)"))
+        await insert_test_fence(conn, kind="global")
     pause.resume()
     await asyncio.wait_for(running, 120)
     (sub,) = await submission_rows(engine)

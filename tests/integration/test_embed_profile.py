@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.collect import ctx
 from tests.support.embedder import QUERY_PREFIX, FakeEmbedder, fake_vector
 from tests.support.faults import PausePoint, SimulatedCrash
+from tests.support.fences import insert_test_fence
 from tests.support.m2 import ProfileChain, insert_embedding, insert_profile_chain
 from tests.support.pg import blocked_or_done
 from tests.support.procs import await_until
@@ -171,17 +172,9 @@ async def purge(engine: AsyncEngine, how: Purge, version_id: int) -> str:
                 )
                 return "purged"
             case "profile_fence":
-                await conn.execute(
-                    sa.text(
-                        "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) "
-                        "VALUES ('profile', :p, 1)"
-                    ),
-                    {"p": version_id},
-                )
+                await insert_test_fence(conn, kind="profile", profile_version_id=version_id)
             case "global_fence":
-                await conn.execute(
-                    sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)")
-                )
+                await insert_test_fence(conn, kind="global")
     return "fenced"
 
 
@@ -548,12 +541,7 @@ async def test_the_reconciler_skips_a_purged_or_fenced_active_version(
     chain = await make_version(engine)
     await activate(engine, chain)
     async with engine.begin() as conn:
-        await conn.execute(
-            sa.text(
-                "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) VALUES ('profile', :p, 1)"
-            ),
-            {"p": chain.profile_version_id},
-        )
+        await insert_test_fence(conn, kind="profile", profile_version_id=chain.profile_version_id)
     assert await vectors.reconcile_profile_vectors(context) == 0
     async with engine.begin() as conn:
         await conn.execute(sa.text("UPDATE purge_fences SET released_at = now()"))
@@ -627,18 +615,9 @@ async def test_a_fence_on_another_version_and_a_released_fence_skip_nothing(engi
     chain = await make_version(engine)
     other = await make_version(engine, 2)
     async with engine.begin() as conn:
-        await conn.execute(
-            sa.text(
-                "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) VALUES ('profile', :p, 1)"
-            ),
-            {"p": other.profile_version_id},
-        )
-        await conn.execute(
-            sa.text(
-                "INSERT INTO purge_fences (kind, profile_version_id, manifest_id, released_at) "
-                "VALUES ('profile', :p, 2, now())"
-            ),
-            {"p": chain.profile_version_id},
+        await insert_test_fence(conn, kind="profile", profile_version_id=other.profile_version_id)
+        await insert_test_fence(
+            conn, kind="profile", profile_version_id=chain.profile_version_id, released=True
         )
     op_id = await request(engine, chain.profile_version_id)
     await runner.run_one(op_id)

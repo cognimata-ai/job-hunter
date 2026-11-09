@@ -22,6 +22,7 @@ from tests.support.collect import (
     resolved,
 )
 from tests.support.faults import PausePoint
+from tests.support.fences import insert_test_fence
 from tests.support.groups import BERLIN
 from tests.support.m3 import insert_job
 from tests.support.pg import PgServer, lock_wait_details
@@ -414,13 +415,7 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
     )
 
     async with engine.begin() as c:
-        await c.execute(
-            sa.text(
-                "INSERT INTO purge_fences (kind, job_ids, manifest_id) "
-                "VALUES ('jobs', ARRAY[:j]::bigint[], 1)"
-            ),
-            {"j": jobs["D"]},
-        )
+        await insert_test_fence(c, kind="jobs", job_ids=[jobs["D"]])
     with pytest.raises(FencedOut):
         async with engine.begin() as c:
             await merge_jobs(

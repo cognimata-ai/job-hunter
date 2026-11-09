@@ -38,6 +38,7 @@ from jobhunter.scoring.det_results import det_facts_from_inputs
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.jobs_list import (
     BERLIN,
     Card,
@@ -48,7 +49,7 @@ from tests.support.jobs_list import (
     seed_cards,
 )
 from tests.support.m2 import insert_profile_chain
-from tests.support.m3 import Job, insert_golden_case, insert_id
+from tests.support.m3 import Job, insert_golden_case
 from tests.support.pg import PgServer, config_for, remove_pg_server, start_pg_server
 
 pytestmark = pytest.mark.integration
@@ -290,7 +291,7 @@ async def test_merged_synthetic_fenced_unscored_and_stale_jobs_are_no_candidates
     await execute(engine, "UPDATE jobs SET merged_into_job_id = :live WHERE id = :j", live=live, j=merged)
     await execute(engine, "UPDATE jobs SET synthetic_eval = true WHERE id = :j", j=synthetic)
     async with engine.begin() as c:
-        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [fenced], "manifest_id": 1})
+        await insert_test_fence(c, kind="jobs", job_ids=[fenced])
     # a new current revision without a target: the published score is the old revision's
     await execute(
         engine,
@@ -322,15 +323,15 @@ async def test_an_open_fence_of_another_job_leaves_every_other_candidate(
 ) -> None:
     first, second, elsewhere = await seed_cards(engine, [scored("50.00"), scored("50.00"), Card()])
     async with engine.begin() as c:
-        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [elsewhere], "manifest_id": 1})
+        await insert_test_fence(c, kind="jobs", job_ids=[elsewhere])
     assert ids(await queue(logged_in_client, limit=50)) == [second, first]
     async with engine.begin() as c:
-        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [second], "manifest_id": 2})
+        await insert_test_fence(c, kind="jobs", job_ids=[second])
     assert ids(await queue(logged_in_client, limit=50)) == [first]
     await execute(engine, "UPDATE purge_fences SET released_at = now()")  # released fences fence nothing
     assert ids(await queue(logged_in_client, limit=50)) == [second, first]
     async with engine.begin() as c:
-        await insert_id(c, "purge_fences", {"kind": "global", "manifest_id": 3})
+        await insert_test_fence(c, kind="global")
     assert (await queue(logged_in_client, limit=50))["items"] == []
 
 
