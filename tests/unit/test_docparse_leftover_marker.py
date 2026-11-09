@@ -17,9 +17,11 @@ from jobhunter.worker import reconcilers
 import docparse.worker as worker
 
 REPO: Final = Path(__file__).resolve().parents[2]
-# `main()` as compose runs it, with an entry of the root that its sweep cannot remove.
+# `main()` as compose runs it, with an entry of the root that its sweep cannot remove, under a umask that
+# would leave a new file 0600: only its `fchmod` makes the marker 0660.
 FAILING_SWEEP: Final = """
-import errno
+import errno, os
+os.umask(0o077)
 from docparse import worker
 def refuse(dir_fd, name):
     if name == "stuck":
@@ -65,3 +67,17 @@ def test_a_clean_sweep_removes_the_marker(tmp_path: Path) -> None:
     stop.set()  # the start sweep only: no job is served
     worker.serve(tmp_path, stop=stop)
     assert not marker.exists()
+
+
+def test_clear_leftover_marker_removes_the_marker_itself_and_nothing_else(tmp_path: Path) -> None:
+    marker = tmp_path / worker.LEFTOVER_MARKER
+    marker.touch(mode=0o660)
+    (tmp_path / "job-1").mkdir()
+    worker.clear_leftover_marker(tmp_path)
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["job-1"]
+    worker.clear_leftover_marker(tmp_path)  # none: nothing to do, no error
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"")
+    marker.symlink_to(target)  # a symlink of that name is removed, never its target
+    worker.clear_leftover_marker(tmp_path)
+    assert not marker.is_symlink() and target.exists()

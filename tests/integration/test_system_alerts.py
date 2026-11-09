@@ -18,6 +18,8 @@ job closes. Every datum is invented.
 """
 
 import copy
+import errno
+import os
 import shutil
 import socket
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -45,14 +47,14 @@ from jobhunter.embeddings import (
 from jobhunter.errors import FencedOut
 from jobhunter.llm.fake import BatchScript
 from jobhunter.observability.alerts import raise_alert
-from jobhunter.observability.metrics import REGISTRY, refresh_table_bytes
+from jobhunter.observability.metrics import ALERTS_OPEN, REGISTRY, refresh_table_bytes
 from jobhunter.scoring import eval_runner, golden
 from jobhunter.worker import reconcilers as r
 from jobhunter.worker import tasks
 from jobhunter.worker.runtime import ShutdownState
 from jobhunter.worker.tasks import defer_in_tx
 from procrastinate.job_context import JobContext
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.batches import (
     PUBLISHED_BODY,
@@ -72,6 +74,7 @@ from tests.support.eval import (
 from tests.support.faults import no_fault
 from tests.support.llm import FakeLLM, score_profile
 from tests.support.logs import logged
+from tests.support.pg import PgServer, pg_one
 from tests.support.profile import OpRunner
 from tests.support.scoring import activate_score_tuple, activate_test_policy
 from tests.support.validation import synthetic_ad
@@ -259,13 +262,27 @@ async def test_an_unreadable_disk_neither_raises_nor_resolves(
 # ---- system.table_growth -----------------------------------------------------------------------------------
 
 
+QUEUED: Final = 40
+_QUEUE_JOBS: Final = (
+    "INSERT INTO procrastinate_jobs (queue_name, task_name) "
+    "SELECT 'aux', 'test:noop' FROM generate_series(1, %s)"
+)
+
+
 async def test_table_growth_is_info_per_table(
-    engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App, monkeypatch: pytest.MonkeyPatch
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    migrated: PgServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert (r.QUEUE_ROWS_LIMIT, r.TABLE_BYTES_LIMIT) == (1_000_000, 10_000_000_000)  # §17.6's 1M rows, 10 GB
-    default_rows, default_bytes = r.QUEUE_ROWS_LIMIT, r.TABLE_BYTES_LIMIT
+    default_bytes = r.TABLE_BYTES_LIMIT
 
-    monkeypatch.setattr(r, "QUEUE_ROWS_LIMIT", -1)  # the queue's row estimate, whatever it is, is above it
+    # the queue's row estimate is the planner's (`pg_class.reltuples`), which ANALYZE sets: 40 queued jobs
+    pg_one(migrated, "superuser", _QUEUE_JOBS, QUEUED)
+    pg_one(migrated, "superuser", "ANALYZE procrastinate_jobs")
+    monkeypatch.setattr(r, "QUEUE_ROWS_LIMIT", QUEUED - 1)
     await refresh(engine, queue_app)
     [queue] = await alerts(engine, GROWTH)
     assert (queue.severity, queue.dedup_key, queue.resolved_at) == (
@@ -273,10 +290,12 @@ async def test_table_growth_is_info_per_table(
         f"{GROWTH}:table:procrastinate_jobs",
         None,
     )
-    assert queue.context["table"] == "procrastinate_jobs" and queue.context["rows"] >= 0
-    monkeypatch.setattr(r, "QUEUE_ROWS_LIMIT", default_rows)
+    assert queue.context == {"table": "procrastinate_jobs", "rows": QUEUED}  # read from the queue table
+    monkeypatch.setattr(r, "QUEUE_ROWS_LIMIT", QUEUED)  # at the limit, not above it: resolved
     await refresh(engine, queue_app)
     assert open_keys(await alerts(engine, GROWTH)) == set()
+    await refresh(engine, queue_app)  # and not raised again
+    assert len(await alerts(engine, GROWTH)) == 1
 
     async with engine.connect() as conn:
         sizes = await refresh_table_bytes(conn)
@@ -379,11 +398,93 @@ async def test_a_superseded_worker_writes_no_system_alert(
         embedder=embedder,
         cfg=cfg,
     )
+    async with engine.begin() as conn:  # one open alert the gauge must count
+        await raise_alert(conn, code=CHECKSUM, severity="critical", subject="embedder", message="mismatch")
+    ALERTS_OPEN.labels(severity="critical").set(99)  # stale, until a refresh
     with pytest.raises(FencedOut) as fenced:
         await r.metrics_refresh(superseded)
     assert fenced.value.worker_superseded
-    for code in (DISK, CHECKSUM, LEFTOVER):
+    for code in (DISK, LEFTOVER):
         assert await alerts(engine, code) == []
+    [alert] = await alerts(engine, CHECKSUM)
+    assert alert.occurrences == 1  # not counted again
+    assert open_by_severity("critical") == 1  # the gauge, refreshed before the fenced writes
+
+
+async def test_an_unreadable_marker_leaves_the_other_checks_and_the_gauge_whole(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    cfg: AppConfig,
+    disk: Disk,
+    embedder: EmbedderClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ruling T3-4 (I1): a marker probe that fails otherwise than "not found" (here `EACCES` on the parse
+    root) is logged and judges neither way; the disk, the checksum, the table growth and the gauge go on."""
+    async with engine.begin() as conn:  # docparse failed earlier
+        await raise_alert(conn, code=LEFTOVER, severity="warn", subject="docparse", message="leftover")
+    [before] = await alerts(engine, LEFTOVER)
+    real_lstat = os.lstat
+
+    def refusing(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == r.DOCPARSE_LEFTOVER_MARKER:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", refusing)
+    disk.used = 900
+    monkeypatch.setattr(embedder, "health", answering(False))
+    monkeypatch.setattr(r, "TABLE_BYTES_LIMIT", 0)  # every table is above it
+    await refresh(engine, queue_app, cfg=cfg, embedder=embedder)
+    assert open_keys(await alerts(engine, DISK)) == {f"{DISK}:disk"}
+    assert open_keys(await alerts(engine, CHECKSUM)) == {f"{CHECKSUM}:embedder"}
+    growth = open_keys(await alerts(engine, GROWTH))
+    assert f"{GROWTH}:table:alerts" in growth
+    assert await alerts(engine, LEFTOVER) == [before]  # exactly as it was: neither counted nor resolved
+    [event] = logged(caplog, "docparse_marker_unreadable")
+    assert event["error_class"] == "PermissionError"
+    # the gauge counts this pass's alerts: the disk and the checksum, the leftover, one per table
+    assert (open_by_severity("critical"), open_by_severity("warn"), open_by_severity("info")) == (
+        2,
+        1,
+        len(growth),
+    )
+
+
+async def test_a_check_whose_writes_fail_leaves_the_others_and_fails_after_the_commit(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    cfg: AppConfig,
+    disk: Disk,
+    embedder: EmbedderClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ruling T3-4 (I1): each check writes in a savepoint of its own. A database error in one (here the
+    disk's) rolls back that check only; the others commit, the gauge counts them, and the reconciler raises
+    the error after the commit, so `run_reconcilers` records `reconciler.failed`."""
+
+    async def failing(conn: AsyncConnection, used: float) -> None:
+        await conn.execute(sa.text("SELECT 1 / 0"))
+
+    monkeypatch.setattr(r, "_disk_pressure", failing)
+    disk.used = 950
+    monkeypatch.setattr(embedder, "health", answering(False))
+    (cfg.parse_jobs_dir / r.DOCPARSE_LEFTOVER_MARKER).touch()
+    ctx = r.ReconcileContext(
+        engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1, embedder=embedder, cfg=cfg
+    )
+    with pytest.raises(sa.exc.DBAPIError):
+        await r.metrics_refresh(ctx)
+    assert await alerts(engine, DISK) == []
+    assert open_keys(await alerts(engine, CHECKSUM)) == {f"{CHECKSUM}:embedder"}  # committed
+    assert open_keys(await alerts(engine, LEFTOVER)) == {f"{LEFTOVER}:docparse"}
+    assert (open_by_severity("critical"), open_by_severity("warn")) == (1, 1)
+    [event] = logged(caplog, "system_alert_write_failed")
+    assert (event["check"], event["error_class"]) == ("disk", "DataError")
 
 
 # ---- scoring.canary_drift ----------------------------------------------------------------------------------

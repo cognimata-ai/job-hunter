@@ -4,7 +4,8 @@
 - `db`: a connection and `SELECT 1` within `DB_TIMEOUT_S`. When that fails, nothing else of the database is
   probed.
 - `migrations`: `alembic_version` holds exactly the code head.
-- `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old.
+- `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old
+  (`heartbeats.heartbeat_fresh` over `heartbeats.HEARTBEAT_AGE_SQL`, which the api's heartbeat watch shares).
 - `embedder` (Task 22): the embedder's `/health` within `embeddings.HEALTH_TIMEOUT_S` is `ok`, with its
   checksum verified (`EmbedderClient.health`: an embedder this code can use). It runs beside the database's
   probes, so one slow component does not add to the other's time, and it is reported after them. A caller
@@ -66,7 +67,7 @@ from jobhunter import __version__
 from jobhunter.api.models import DecimalOut, usd_micro
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
-from jobhunter.heartbeats import HEARTBEAT_STALE_S
+from jobhunter.heartbeats import HEARTBEAT_AGE_SQL, heartbeat_fresh
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, BudgetRow
 from jobhunter.llm.spend_ledger import read_month_or_new
@@ -87,14 +88,12 @@ DB_TIMEOUT_S: Final = 2.0
 # The client-side bound of the schema probes together; each one also has the server-side statement timeout.
 PROBES_TIMEOUT_S: Final = 2 * DB_TIMEOUT_S
 PROBE_STATEMENT_TIMEOUT: Final = "2s"
-HEARTBEAT_STALE: Final = timedelta(seconds=HEARTBEAT_STALE_S)
 
 _PING: Final = q("SELECT 1")
 # `is_local`: for this transaction only, so the pooled connection gets its default back with the rollback.
 _SET_STATEMENT_TIMEOUT: Final = q("SELECT set_config('statement_timeout', :timeout, true)")
 _MIGRATION_VERSIONS: Final = q("SELECT version_num FROM alembic_version")
-# The database clock, which also wrote `heartbeat_at`: the verdict `jobhunter worker-health` reaches too.
-_HEARTBEAT_AGE: Final = q("SELECT now() - heartbeat_at FROM worker_heartbeat WHERE id = 1")
+_HEARTBEAT_AGE: Final = q(HEARTBEAT_AGE_SQL)
 
 log = get_logger("jobhunter.observability.health")
 
@@ -153,10 +152,12 @@ async def _schema_probes(conn: AsyncConnection, code_head: str) -> list[Readines
         _log_failed("migrations", reason="no_revision" if not versions else "revision_mismatch")
         failing.append("migrations")
 
+    # The database clock, which also wrote `heartbeat_at`: the verdict `jobhunter worker-health` reaches too,
+    # and the api's heartbeat watch (`heartbeats.heartbeat_fresh`, the one rule).
     heartbeat = await _rows(conn, "worker_heartbeat", _HEARTBEAT_AGE)
     if heartbeat is None:
         failing.append("worker_heartbeat")
-    elif not heartbeat or heartbeat[0][0] > HEARTBEAT_STALE:
+    elif not heartbeat or not heartbeat_fresh(heartbeat[0][0]):
         _log_failed("worker_heartbeat", reason="no_heartbeat" if not heartbeat else "stale")
         failing.append("worker_heartbeat")
 

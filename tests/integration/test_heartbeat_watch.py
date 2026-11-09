@@ -13,6 +13,7 @@ from typing import Any, Final
 import pytest
 import sqlalchemy as sa
 from jobhunter.api import app as app_module
+from jobhunter.heartbeats import HEARTBEAT_STALE, heartbeat_fresh
 from jobhunter.observability import heartbeat_watch as hw
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -39,6 +40,15 @@ async def beat(engine: AsyncEngine, age: timedelta) -> None:
     """The worker's last heartbeat `age` ago, on the database clock."""
     async with engine.begin() as conn:
         await conn.execute(_BEAT, {"age": age})
+
+
+def test_the_watch_runs_every_30_s_after_a_120_s_grace_on_the_60_s_rule() -> None:
+    assert (hw.HEARTBEAT_WATCH_INTERVAL_S, hw.START_GRACE_S) == (30.0, 120.0)  # the brief's values
+    assert HEARTBEAT_STALE == timedelta(seconds=60)  # readiness's rule, shared (`heartbeats`)
+    assert heartbeat_fresh(timedelta(seconds=60)) and not heartbeat_fresh(
+        timedelta(seconds=60, microseconds=1)
+    )
+    assert not heartbeat_fresh(None)  # no heartbeat at all
 
 
 async def test_a_stale_heartbeat_raises_after_the_start_grace(
