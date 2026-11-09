@@ -388,6 +388,7 @@ class _WorkerProcess:
             epoch=epoch,
             embedder=embedder,
             on_superseded=lambda: request_shutdown(shutdown, reason=EPOCH_SUPERSEDED),
+            cfg=cfg,
         )
         await run_reconcilers(start, "start")
         if shutdown.requested.is_set():

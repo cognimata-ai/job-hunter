@@ -13,7 +13,10 @@
 - `raise_alerts(conn, …)`: after the run's `completed`, `eval.gate_failed` (warn) for a production golden
   run that failed, its candidate the subject, and `scoring.canary_drift` (warn) for each canary of a canary
   run more than 8 points from its first score under its key (`calibration.canary_drift`), its case the
-  subject.
+  subject; the alert of every other canary the run scored is resolved, its next canary being within bounds
+  (L5673, M5 Task 3, O-ops O17). A scored canary always has a baseline here, since the run counts as
+  `completed` (a first run under a key is its own), so a scored canary that did not drift lies within bounds;
+  one with a failed repetition and no scored one is judged neither way.
 - `start_canary_run(conn, …)`: the `canary_daily` task's work, a canary run of the active configuration
   under `active_config FOR SHARE` when a tuple is active and an active canary exists, and nothing otherwise.
 
@@ -28,7 +31,7 @@ from typing import TYPE_CHECKING, Final, get_args
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import calibration
 from jobhunter.settings.validate import GateState, run_gate_cases
@@ -77,6 +80,11 @@ _SIMILARITY_CUTOFF: Final = q(
 CUTOFF_WINDOW: Final = timedelta(days=7)
 GATE_FAILED_ALERT: Final = "eval.gate_failed"
 CANARY_DRIFT_ALERT: Final = "scoring.canary_drift"
+# The canaries a canary run scored (a numeric score in at least one repetition).
+_SCORED_CANARIES: Final = q(
+    "SELECT DISTINCT c.golden_case_id FROM eval_case_results c JOIN eval_runs r ON r.id = c.eval_run_id "
+    "WHERE c.eval_run_id = :r AND r.kind = 'canary' AND c.score_mid IS NOT NULL ORDER BY c.golden_case_id"
+)
 
 
 async def run_cases(conn: AsyncConnection, eval_run_id: int) -> list[RunCase]:
@@ -152,7 +160,7 @@ async def raise_alerts(
 ) -> None:
     """Run `eval_run_id`'s alerts, in its terminal transaction: `eval.gate_failed` for a gated golden run that
     failed (L5618; a forced-critic run is a diagnostic, L4612), `scoring.canary_drift` for each drifted canary
-    of a canary run (L4632). Ids and numbers only."""
+    of a canary run (L4632), resolved for each other canary it scored (L5673). Ids and numbers only."""
     if kind == "golden" and route == "production" and calibrated.passed is False:
         c = candidate
         failed = calibrated.metrics.get("failed_gates")
@@ -167,7 +175,8 @@ async def raise_alerts(
             context={"eval_run_id": eval_run_id, "failed_gates": list(names)},
         )
     if kind == "canary":
-        for drift in await calibration.canary_drift(conn, eval_run_id=eval_run_id):
+        drifts = await calibration.canary_drift(conn, eval_run_id=eval_run_id)
+        for drift in drifts:
             await raise_alert(
                 conn,
                 code=CANARY_DRIFT_ALERT,
@@ -189,6 +198,10 @@ async def raise_alerts(
                 golden_case_id=drift.golden_case_id,
                 delta=str(drift.delta),
             )
+        drifted = {drift.golden_case_id for drift in drifts}
+        for case_id in (await conn.execute(_SCORED_CANARIES, {"r": eval_run_id})).scalars().all():
+            if int(case_id) not in drifted:  # its next canary lies within bounds
+                await resolve_alert(conn, code=CANARY_DRIFT_ALERT, subject=str(case_id))
 
 
 # ---- the canary start --------------------------------------------------------------------------------------

@@ -463,9 +463,20 @@ async def test_the_lifespan_builds_the_state_from_the_environment(
 
     from jobhunter.api.app import create_app
     from jobhunter.config import ENV_PREFIXES
+    from jobhunter.observability import heartbeat_watch
 
     from tests.support.pg import server_env
 
+    # M5 Task 3: the lifespan's heartbeat watch runs a pass at its start, on a connection of the same pool
+    watched = asyncio.Event()
+    real_pass = heartbeat_watch.heartbeat_watch_pass
+
+    async def first_pass(*args: Any, **kwargs: Any) -> str:
+        verdict = await real_pass(*args, **kwargs)
+        watched.set()
+        return verdict
+
+    monkeypatch.setattr(heartbeat_watch, "heartbeat_watch_pass", first_pass)
     for name in [name for name in os.environ if name.startswith(ENV_PREFIXES)]:
         monkeypatch.delenv(name)
     env = server_env(migrated, "api", embedder_url=fake_embedder.base_url, JOBHUNTER_LOG_LEVEL="WARNING")
@@ -484,6 +495,7 @@ async def test_the_lifespan_builds_the_state_from_the_environment(
     try:
         assert logging.getLogger().level == logging.WARNING  # ruling T14-b
         engine = app.api.state.engine
+        await asyncio.wait_for(watched.wait(), 10)  # its connection is back in the pool: readiness reuses it
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="https://testserver"
         ) as c:

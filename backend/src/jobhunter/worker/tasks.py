@@ -124,8 +124,9 @@ async def _admitted(rt: "WorkerRuntime", task: TaskName) -> bool:
 
 
 def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
-    """The context of a cadence a task body runs: the runtime's engine, task app, epoch and embedder, this
-    module's deferrer, `now`, and the stop of a superseded worker (`_stop_when_superseded`)."""
+    """The context of a cadence a task body runs: the runtime's engine, task app, epoch, embedder and
+    configuration, this module's deferrer, `now`, and the stop of a superseded worker
+    (`_stop_when_superseded`)."""
     # Imported here: `reconcilers` imports this module (`Deferrer`, `release_stalled_jobs`).
     from jobhunter.worker.reconcilers import ReconcileContext
 
@@ -137,6 +138,7 @@ def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
         epoch=rt.epoch,
         embedder=rt.embedder,
         on_superseded=_stop_when_superseded(rt),
+        cfg=rt.cfg,
     )
 
 

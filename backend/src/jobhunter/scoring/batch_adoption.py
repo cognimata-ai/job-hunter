@@ -18,7 +18,8 @@ before anything is decided, so the listing's order decides nothing, and a candid
 alone names exactly our `custom_id` set and no other intersects it partially: the adoption transaction
 (`active_config FOR SHARE`, the owner `FOR UPDATE` under `state IN ('submit_ambiguous', 'released')` without a
 provider id) adopts its id and moves the submission to `ended` (a released one keeps `released_at`, outside
-the singleton; a recorded cancel stays a record: an ended batch has nothing to cancel, Codex r7 B3), then its
+the singleton; a recorded cancel stays a record: an ended batch has nothing to cancel, Codex r7 B3) and
+resolves its `batch.submit_ambiguous_unresolved`, its batch found (L5679, M5 Task 3, O-ops O17), then its
 results are processed and completed by the poll's own path in the same pass (every item of a released
 submission is `ignored_fenced`; the follow-on fires for a `submit_ambiguous` origin only). A candidate whose
 ids intersect ours partially, or more than one equal to ours, raises `batch.custom_id_anomaly` (with how many
@@ -56,7 +57,7 @@ from jobhunter.llm.batches import (
     BatchesClient,
     BatchSummary,
 )
-from jobhunter.observability.alerts import open_alert
+from jobhunter.observability.alerts import open_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.batch_results import custom_id_anomaly, items_of, process_results
@@ -178,8 +179,9 @@ async def _custom_ids(client: BatchesClient, provider_batch_id: str) -> frozense
 async def _adopt(
     engine: AsyncEngine, submission_id: int, candidate: BatchSummary, *, now: datetime, epoch: int
 ) -> bool:
-    """The adoption transaction (module docstring): the candidate's id adopted and the submission `ended`
-    (a released one keeps `released_at`, outside the singleton); whether it adopted now."""
+    """The adoption transaction (module docstring): the candidate's id adopted, the submission `ended` (a
+    released one keeps `released_at`, outside the singleton) and its unresolved alert resolved; whether it
+    adopted now."""
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         await cycles.lock_active_scoring(conn)
@@ -199,6 +201,7 @@ async def _adopt(
             },
         )
         await conn.execute(_FORGET_UNREAD, {"s": submission_id})  # this pass read every candidate
+        await resolve_alert(conn, code=batches.UNRESOLVED_ALERT, subject=str(submission_id))  # found
     log.warning(
         "batch_adopted",
         submission_id=submission_id,

@@ -141,6 +141,8 @@
     "dedup.ambiguous_grouping",
     "dedup.field_conflict",
     "dedup.identity_conflict",
+    "docparse.leftover",
+    "embedder.checksum_mismatch",
     "embedder.unavailable",
     "eval.gate_failed",
     "llm.auth_failed",
@@ -182,7 +184,10 @@
     "source.auth_failed",
     "source.breaker_open",
     "source.contract_broken",
-    "source.not_found"
+    "source.not_found",
+    "system.disk_pressure",
+    "system.table_growth",
+    "worker.heartbeat_stale"
   ],
   "banner": [
     "applying_settings",

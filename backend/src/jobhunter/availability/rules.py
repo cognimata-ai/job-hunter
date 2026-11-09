@@ -17,6 +17,9 @@ produced (or to none, for an item that failed normalisation).
 **`recompute_job_availability`** reuses `merge.derive_from_postings`, the one place a job's availability is
 derived: the best state of its postings by `JOB_ORDER`, `jobs.availability_changed_at := now()` when it
 changes. It returns whether a list column changed; the caller bumps the ranking once, as its last statement.
+A job whose availability changes to `closed` (every posting closed: an ATS snapshot's absence) has its
+`dedup.ambiguous_grouping` alert resolved: the choice between its groups no longer matters (M5 Task 3,
+O-ops O17, M1 Carry-forward 11; a tombstoned job's is the purge's).
 
 **Locks.** `lock_posting_jobs` takes the jobs of a set of postings, with their duplicate-group co-members, in
 ONE ordered `FOR UPDATE` statement (`merge.lock_jobs`, Ruling T18-c), in a savepoint per round: the postings'
@@ -50,7 +53,9 @@ from jobhunter.db.guards import Guard
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
+from jobhunter.dedup.representative import AMBIGUOUS_GROUPING
 from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation
+from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import load_run_settings
 from jobhunter.worker.epoch import fence_epoch
@@ -103,6 +108,7 @@ _LOCK_STALE: Final = q(
     "ORDER BY id FOR UPDATE"
 )
 _ACTIVE_SETTINGS: Final = q("SELECT settings_version_id FROM active_config WHERE id = 1")
+_JOB_AVAILABILITY: Final = q("SELECT availability FROM jobs WHERE id = :job")
 
 log = get_logger("jobhunter.availability.rules")
 
@@ -156,9 +162,15 @@ async def apply_membership(conn: AsyncConnection, posting_id: int, *, taken_at: 
 
 async def recompute_job_availability(conn: AsyncConnection, job_id: int) -> bool:
     """The job's availability from its postings (`merge.derive_from_postings`: the best by `JOB_ORDER`,
-    `availability_changed_at` set when it changes), in the caller's transaction, which holds the job row.
-    `True` when it (or the job's first sighting) changed: the caller then bumps the ranking, last."""
-    return (await merge.derive_from_postings(conn, job_id)).changed
+    `availability_changed_at` set when it changes), in the caller's transaction, which holds the job row; a
+    job that closed has its `dedup.ambiguous_grouping` alert resolved (module docstring). `True` when it (or
+    the job's first sighting) changed: the caller then bumps the ranking, last."""
+    derived = await merge.derive_from_postings(conn, job_id)
+    if derived.availability_changed:
+        availability = (await conn.execute(_JOB_AVAILABILITY, {"job": job_id})).scalar_one()
+        if availability == "closed":
+            await resolve_alert(conn, code=AMBIGUOUS_GROUPING, subject=f"job:{job_id}")
+    return derived.changed
 
 
 async def _read_and_lock(conn: AsyncConnection, posting_ids: list[int]) -> frozenset[int] | None:

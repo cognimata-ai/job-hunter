@@ -431,6 +431,7 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
         epoch=3,
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
@@ -503,6 +504,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
         epoch=current_epoch,  # the daily cadence's own fence admits it
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(FencedOut) as fenced:  # the job fails, after the daily cadence ran
@@ -566,6 +568,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
         epoch=current_epoch,
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(RuntimeError):
@@ -589,13 +592,14 @@ async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_recon
     reconcilers.reconciler("probe", "heavy")(probe)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     embedder = object()  # the runtime's client, whatever it is: handed on as is
+    cfg = object()  # the runtime's configuration, as is (M5 Task 3: `metrics_refresh` reads its paths)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=3, embedder=embedder, shutdown=ShutdownState()
+        engine=engine, queue=queue_app, epoch=3, embedder=embedder, shutdown=ShutdownState(), cfg=cfg
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.reconcile_heavy(context, timestamp=0)
     [ctx] = seen
-    assert ctx.embedder is embedder
+    assert ctx.embedder is embedder and ctx.cfg is cfg
     assert ctx.engine is engine and ctx.queue is queue_app and ctx.defer is defer_in_tx
     assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
 
@@ -675,7 +679,7 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
     stale = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState(), cfg=None
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": stale})), timestamp=0)
     assert await runs(engine) == [] and await stored_cursor(engine) == A
