@@ -43,7 +43,7 @@ pytestmark = pytest.mark.integration
 
 TOPIC: Final = "https://ntfy.test/jh-alerts-4f2a9c"
 ORIGIN: Final = "https://jobs.example.test"
-TOKEN: Final = "tk_test_0123456789abcdef"
+TOKEN: Final = "tk-test-token"  # a low-entropy stand-in: no secret scanner reads it as a key
 T0: Final = datetime(2026, 11, 9, 12, tzinfo=UTC)
 NOTHING: Final = DispatchReport(sent=0, failed_alert_id=None, paused_until=None)
 
@@ -509,3 +509,93 @@ async def test_the_loop_runs_its_passes_survives_a_failing_one_and_stops_on_its_
     stopped.set()
     await rig.dispatcher.run(stopped)
     assert len(calls) == 2
+
+
+# --- Fix round 1 (Ruling T4-4) ------------------------------------------------------------------------------
+
+
+async def test_an_escalation_during_the_push_is_not_stamped_over(
+    engine: AsyncEngine,
+    rig: Rig,
+    topic: respx.Route,
+    monkeypatch: pytest.MonkeyPatch,
+    log_events: Callable[[], list[dict[str, Any]]],
+) -> None:
+    """Review M1: the stamp holds only at the severity pushed. An escalation between the pass's read and the
+    stamp (Ruling T2-1: `last_notified_at` cleared) stays unstamped, and the next pass pushes it at once."""
+    stale = await raised(engine, "backup.stale", "warn", subject="backup", message="backup older than 36 h")
+    real = ntfy.deliver
+
+    async def escalated_on_the_wire(client: NtfyClient, alert: ntfy.DueAlert, *, sleep: ntfy.Sleep) -> None:
+        await real(client, alert, sleep=sleep)  # the warn is pushed...
+        async with engine.begin() as conn:  # ...and the alert escalates before its stamp
+            await raise_alert(
+                conn,
+                code="backup.stale",
+                severity="critical",
+                subject="backup",
+                message="backup older than 72 h",
+            )
+
+    monkeypatch.setattr(ntfy, "deliver", escalated_on_the_wire)
+    assert await rig.dispatcher.pass_once() == DispatchReport(sent=1, failed_alert_id=None, paused_until=None)
+    after = await row(engine, stale)
+    assert (after.severity, after.last_notified_at) == ("critical", None)  # not stamped over
+    [event] = events_named(log_events, "alert_pushed")
+    assert (event["alert_id"], event["severity"], event["stamped"]) == (stale, "warn", False)
+
+    monkeypatch.setattr(ntfy, "deliver", real)
+    assert await rig.dispatcher.pass_once() == DispatchReport(sent=1, failed_alert_id=None, paused_until=None)
+    request = topic.calls.last.request
+    assert (request.headers["Priority"], request.content) == ("5", b"backup older than 72 h")
+    assert (await row(engine, stale)).last_notified_at == T0
+    assert await rig.dispatcher.pass_once() == NOTHING
+
+
+async def test_a_push_that_cannot_be_built_takes_the_outage_path(
+    engine: AsyncEngine, rig: Rig, topic: respx.Route
+) -> None:
+    """Review M2: a token that is no header value fails each try as `invalid_request`, so the alert counts the
+    failure, `notify.delivery_failed` is raised in-app and the dispatcher pauses, as for any outage."""
+    dispatcher = rig.other(
+        engine, token="tök-token"
+    )  # the startup check refuses it; this is defence in depth
+    alert = await raised(engine, "run.failed", "critical")
+    report = await dispatcher.pass_once()
+    assert report == DispatchReport(sent=0, failed_alert_id=alert, paused_until=T0 + ntfy.PAUSE_FIRST)
+    assert topic.call_count == 0 and rig.sleeps.requested == [5.0, 30.0, 120.0]
+    assert (await row(engine, alert)).notify_failures == 1
+    [failed] = await delivery_failed(engine)
+    assert (failed.resolved_at, failed.context) == (
+        None,
+        {"alert_id": alert, "error_code": "invalid_request"},
+    )
+
+
+async def test_the_loop_stops_at_once_when_its_event_is_set_between_passes(
+    engine: AsyncEngine, rig: Rig, topic: respx.Route, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review M5: between passes the loop waits on its stop event, not for the whole interval."""
+    assert ntfy.DISPATCH_INTERVAL_S == 30.0  # the real interval, not patched here
+    await raised(engine, "run.failed", "critical")
+    stop, passed = asyncio.Event(), asyncio.Event()
+    real = rig.dispatcher.pass_once
+    reports: list[DispatchReport] = []
+
+    async def observed() -> DispatchReport:
+        report = await real()
+        reports.append(report)
+        passed.set()
+        return report
+
+    monkeypatch.setattr(rig.dispatcher, "pass_once", observed)
+    loop = asyncio.create_task(rig.dispatcher.run(stop))
+    async with asyncio.timeout(10):
+        await passed.wait()  # the first pass returned: the loop now waits for the next one
+    await asyncio.sleep(0)
+    assert not loop.done()
+    stop.set()
+    async with asyncio.timeout(1):  # far under the 30 s interval
+        await loop
+    assert reports == [DispatchReport(sent=1, failed_alert_id=None, paused_until=None)]
+    assert pushed(topic) == ["run.failed s"]

@@ -638,7 +638,7 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
 
 NTFY_TOPIC = "https://ntfy.test/jh-alerts-4f2a9c"
 NTFY_ENV = {"NTFY_TOPIC_URL": NTFY_TOPIC, "JOBHUNTER_PUBLIC_ORIGIN": "https://jobs.example.test"}
-NTFY_TOKEN = "tk_test_0123456789abcdef"
+NTFY_TOKEN = "tk-test-token"  # a low-entropy stand-in: no secret scanner reads it as a key
 
 
 def fake_dispatchers(
@@ -767,14 +767,25 @@ async def test_a_dispatcher_that_ends_by_itself_requests_the_stop_of_a_supersede
 async def test_a_dispatcher_that_does_not_stop_is_cancelled_within_its_bound(
     monkeypatch, tmp_path, caplog
 ) -> None:
-    """Mid-pass (a backoff sleep or a push) the loop does not see its stop event: the teardown cancels it
-    once `DISPATCHER_STOP_S` is spent, and goes on."""
+    """Mid-pass (a backoff sleep or a push) the loop does not see its stop event: the teardown waits at most
+    `DISPATCHER_STOP_S`, 1 s of the stop's deadline (Ruling T4-4), then cancels it, and the rest of the
+    teardown runs. The wait the step is given is recorded; the test then waits 10 ms of it, not the second."""
     from jobhunter.worker import main
+    from jobhunter.worker.shutdown import TEARDOWN_S
 
-    monkeypatch.setattr(main, "DISPATCHER_STOP_S", 0.01)
+    assert main.DISPATCHER_STOP_S == 1.0 and main.DISPATCHER_STOP_S < TEARDOWN_S
+    given: list[float] = []
+    real = main._WorkerProcess._stop_dispatcher
+
+    async def recorded(process: Any, timeout_s: float, deadline: Any) -> None:
+        given.append(timeout_s)
+        await real(process, min(timeout_s, 0.01), deadline)
+
+    monkeypatch.setattr(main._WorkerProcess, "_stop_dispatcher", recorded)
     world = World(monkeypatch, tmp_path, env=NTFY_ENV)
     fake_dispatchers(monkeypatch, world, stops=False)
     assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 0
+    assert given == [main.DISPATCHER_STOP_S]  # the full stop budget is left: the bound is the 1 s
     assert world.events == [*START, "dispatcher_run", "dispatcher_cancelled", *TEARDOWN]
     assert logged(caplog, "worker_teardown_failed") == []
 

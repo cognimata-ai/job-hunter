@@ -11,13 +11,16 @@ Ruling T2-1) has neither `last_notified_at` nor `acknowledged_at`, so it is due 
 plays no part. The threshold is read at every pass, so a change applies at the next one.
 
 **A push** (`NtfyClient.publish`) is `POST <topic URL>` with the alert's message as its UTF-8 body (a message
-holds no PII: §7.14) and the headers of `ntfy_headers`, all ASCII: `Title: Job Hunter - <code>` (an ASCII
-hyphen, O3), `Priority` 5 or 3 (`catalogue.push_priority`), `Tags: <severity>`, `Click: <public
-origin>/settings#alerts` (O22a), and `Authorization: Bearer <ntfy_token>` only when that secret is set. It
-waits at most `SEND_TIMEOUT_S` and follows no redirect. A non-2xx answer raises `NtfyError("http_<status>")`,
-a timeout `NtfyError("timeout")`, and any other transport failure (no connection, or one lost before the
-answer) `NtfyError("connect")`. `deliver` makes four tries, `NTFY_RETRY_DELAYS_S` (5, 30 and 120 s) apart
-(§17.6: "retries 3 times").
+holds no PII: §7.14), cut to ntfy's limit of `MAX_BODY_BYTES` (`bounded_body`, Ruling T4-4), and the headers
+of `ntfy_headers`, all ASCII: `Title: Job Hunter - <code>` (an ASCII hyphen, O3), `Priority` 5 or 3
+(`catalogue.push_priority`), `Tags: <severity>`, `Click: <public origin>/settings#alerts` (O22a), and
+`Authorization: Bearer <ntfy_token>` only when that secret is set. Its client takes no proxy or certificates
+from the environment, waits at most `SEND_TIMEOUT_S` and follows no redirect. A non-2xx answer raises
+`NtfyError("http_<status>")`, a timeout `NtfyError("timeout")`, a request that cannot be built or sent as it
+stands (an invalid topic URL, a token that is no header value) `NtfyError("invalid_request")`, and any other
+transport failure (no connection, or one lost before the answer) `NtfyError("connect")`: each takes the
+outage path below. `deliver` makes four tries, `NTFY_RETRY_DELAYS_S` (5, 30 and 120 s) apart (§17.6:
+"retries 3 times").
 
 **A pass** (`AlertDispatcher.pass_once`, Deviation 5):
 1. While the dispatcher is paused it does nothing.
@@ -25,9 +28,11 @@ answer) `NtfyError("connect")`. `deliver` makes four tries, `NTFY_RETRY_DELAYS_S
    (Ruling T21-c) pushes nothing.
 3. It delivers them in turn, outside any transaction. Each delivered push is stamped `last_notified_at` (the
    clock then) in a transaction that starts with the fence and also resolves `notify.delivery_failed`
-   (subject `ntfy`); the pause goes back to `PAUSE_FIRST`. A worker superseded meanwhile stamps nothing, so
-   the newer worker pushes that alert again, as it does after a crash between a push and its stamp: a push is
-   delivered at least once.
+   (subject `ntfy`); the pause goes back to `PAUSE_FIRST`. The stamp holds only while the alert still has the
+   severity that was pushed: one that escalated meanwhile (Ruling T2-1 cleared its `last_notified_at`) stays
+   unstamped and is pushed at its new severity at the next pass. A worker superseded meanwhile stamps
+   nothing, so the newer worker pushes that alert again, as it does after a crash between a push and its
+   stamp: a push is delivered at least once.
 4. The first alert whose four tries all fail ends the pass. One fenced transaction counts one more
    `notify_failures` on its row and raises `notify.delivery_failed` (subject `ntfy`, warn, in-app only), a
    repeat of the open one when one is open. The dispatcher then pauses for `PAUSE_FIRST`, and for twice as
@@ -76,6 +81,9 @@ RENOTIFY_AFTER: Final[Mapping[PushSeverity, timedelta]] = MappingProxyType(
 PAUSE_FIRST: Final = timedelta(minutes=5)
 PAUSE_MAX: Final = timedelta(minutes=60)
 SEND_TIMEOUT_S: Final = 10.0
+# ntfy's message limit: a longer body is cut at a character boundary and ends with `TRUNCATION_MARK`.
+MAX_BODY_BYTES: Final = 4096
+TRUNCATION_MARK: Final = "\N{HORIZONTAL ELLIPSIS}"
 DELIVERY_FAILED: Final = "notify.delivery_failed"
 DELIVERY_FAILED_SUBJECT: Final = "ntfy"
 
@@ -97,7 +105,8 @@ _DUE: Final = q(
     "OR (severity = 'critical' AND last_notified_at < :critical_before)) "
     "ORDER BY severity = 'critical' DESC, first_at, id LIMIT :limit"
 )
-_STAMP: Final = q("UPDATE alerts SET last_notified_at = :at WHERE id = :id")
+# Only at the severity that was pushed: an escalation since the read stays due (Ruling T4-4, review M1).
+_STAMP: Final = q("UPDATE alerts SET last_notified_at = :at WHERE id = :id AND severity = :severity")
 _COUNT_FAILURE: Final = q("UPDATE alerts SET notify_failures = notify_failures + 1 WHERE id = :id")
 
 log = get_logger("jobhunter.observability.ntfy")
@@ -155,10 +164,23 @@ def ntfy_headers(alert: DueAlert, *, public_origin: str, token: str | None) -> d
     return headers
 
 
+def bounded_body(message: str) -> bytes:
+    """`message` as UTF-8, at most `MAX_BODY_BYTES`: a longer one is cut at a character boundary and ends with
+    `TRUNCATION_MARK`, within the limit."""
+    body = message.encode("utf-8")
+    if len(body) <= MAX_BODY_BYTES:
+        return body
+    mark = TRUNCATION_MARK.encode("utf-8")
+    # A character cut in two at the end decodes to nothing ("ignore"); the rest is valid UTF-8 already.
+    head = body[: MAX_BODY_BYTES - len(mark)].decode("utf-8", errors="ignore")
+    return head.encode("utf-8") + mark
+
+
 def make_http_client(*, user_agent: str) -> httpx.AsyncClient:
-    """The HTTP client of an `NtfyClient`: `SEND_TIMEOUT_S`, the `User-Agent`, no redirects."""
+    """The HTTP client of an `NtfyClient`: `SEND_TIMEOUT_S`, the `User-Agent`, no redirects, and no proxy or
+    certificates from the environment (as the embedder's and the gateway's clients)."""
     return httpx.AsyncClient(
-        timeout=SEND_TIMEOUT_S, headers={"User-Agent": user_agent}, follow_redirects=False
+        timeout=SEND_TIMEOUT_S, headers={"User-Agent": user_agent}, follow_redirects=False, trust_env=False
     )
 
 
@@ -179,13 +201,16 @@ class NtfyClient:
         try:
             response = await self._http.post(
                 self._topic_url,
-                content=alert.message.encode("utf-8"),
+                content=bounded_body(alert.message),
                 headers=headers,
                 timeout=SEND_TIMEOUT_S,
                 follow_redirects=False,
             )
         except httpx.TimeoutException:
             raise NtfyError("timeout") from None  # not chained: httpx's errors can name the URL
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol, httpx.LocalProtocolError, UnicodeEncodeError):
+            # The request cannot be built or sent as it stands: the topic URL, or a header value (the token).
+            raise NtfyError("invalid_request") from None
         except httpx.TransportError:
             raise NtfyError("connect") from None
         if not response.is_success:
@@ -265,13 +290,15 @@ class AlertDispatcher:
         return DispatchReport(sent=sent, failed_alert_id=None, paused_until=None)
 
     async def _delivered(self, alert: DueAlert) -> None:
-        """Stamp `alert`'s push and resolve `notify.delivery_failed`, under the fence; end the backoff."""
+        """Stamp `alert`'s push unless it escalated meanwhile, and resolve `notify.delivery_failed`, under
+        the fence; end the backoff."""
+        params = {"id": alert.id, "at": self._clock(), "severity": alert.severity}
         async with self._engine.begin() as conn:
             await fence_epoch(conn, self._epoch)
-            await conn.execute(_STAMP, {"id": alert.id, "at": self._clock()})
+            stamped = (await conn.execute(_STAMP, params)).rowcount == 1
             recovered = await resolve_alert(conn, code=DELIVERY_FAILED, subject=DELIVERY_FAILED_SUBJECT)
         self._pause = PAUSE_FIRST
-        log.info("alert_pushed", alert_id=alert.id, code=alert.code, severity=alert.severity)
+        log.info("alert_pushed", alert_id=alert.id, code=alert.code, severity=alert.severity, stamped=stamped)
         if recovered:
             log.info("ntfy_delivery_recovered", alert_id=alert.id)
 

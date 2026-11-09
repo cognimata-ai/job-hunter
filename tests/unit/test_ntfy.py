@@ -18,7 +18,7 @@ from jobhunter.observability.ntfy import DueAlert, NtfyClient, NtfyError, delive
 
 TOPIC: Final = "https://ntfy.test/jh-alerts-4f2a9c"
 ORIGIN: Final = "https://jobs.example.test"
-TOKEN: Final = "tk_test_0123456789abcdef"
+TOKEN: Final = "tk-test-token"  # a low-entropy stand-in: no secret scanner reads it as a key
 
 
 def due(
@@ -137,6 +137,7 @@ async def test_four_tries_with_backoff_5_30_120() -> None:
         (httpx.Response(413), "http_413"),
         (httpx.Response(500), "http_500"),
         (httpx.Response(302, headers={"Location": "https://elsewhere.test/"}), "http_302"),  # no redirects
+        (httpx.LocalProtocolError("illegal header value"), "invalid_request"),  # refused before it is sent
     ],
 )
 async def test_ntfy_error_codes(outcome: Exception | httpx.Response, code: str) -> None:
@@ -162,3 +163,63 @@ async def test_the_http_client_follows_no_redirect_and_sends_the_user_agent() ->
     async with ntfy.make_http_client(user_agent="JobHunter/1.0 (test)") as http:
         assert http.follow_redirects is False and http.headers["User-Agent"] == "JobHunter/1.0 (test)"
         assert http.timeout == httpx.Timeout(10.0)
+        # review M3: no proxy or CA from the environment (`HTTPS_PROXY`, `SSL_CERT_FILE`, ...)
+        assert http.trust_env is False
+
+
+# --- Fix round 1 (Ruling T4-4) ------------------------------------------------------------------------------
+
+
+async def published_body(message: str) -> bytes:
+    """The body `publish` sends for `message`."""
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post(TOPIC).mock(return_value=httpx.Response(200))
+        async with httpx.AsyncClient() as http:
+            await NtfyClient(http, topic_url=TOPIC, token=None, public_origin=ORIGIN).publish(
+                due(message=message)
+            )
+    [call] = route.calls
+    body: bytes = call.request.content
+    return body
+
+
+async def test_a_body_over_4096_bytes_is_cut_at_a_character_boundary_and_marked() -> None:
+    assert ntfy.MAX_BODY_BYTES == 4096  # ntfy's message limit
+    message = "Prüfung 😀 " * 400  # 1, 2 and 4-byte characters: 5,600 bytes
+    assert len(message.encode("utf-8")) > 4096
+    body = await published_body(message)
+    text = body.decode("utf-8")  # valid UTF-8: no character was cut in two
+    assert len(body) <= 4096 and len(body) > 4096 - 4  # as much as fits beside the mark
+    assert text.endswith("\N{HORIZONTAL ELLIPSIS}") and message.startswith(
+        text.removesuffix("\N{HORIZONTAL ELLIPSIS}")
+    )
+    # wherever the limit falls inside a 4-byte character, the cut lands before it
+    for pad in range(4):
+        cut = ntfy.bounded_body("x" * pad + "😀" * 1100)
+        assert len(cut) <= 4096 and cut.decode("utf-8").endswith("😀\N{HORIZONTAL ELLIPSIS}")
+
+
+@pytest.mark.parametrize("message", ["run failed: 3 sources", "ä" * 2048, "x" * 4096])
+async def test_a_body_within_4096_bytes_is_sent_unchanged(message: str) -> None:
+    assert await published_body(message) == message.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("topic", "token"),
+    [
+        ("https://ntfy.example:abc/jh-alerts", None),  # httpx.InvalidURL: no port
+        ("https://[::1/jh-alerts", None),  # httpx.InvalidURL: a broken IPv6 literal
+        (TOPIC, "tök-token"),  # UnicodeEncodeError: no header value
+    ],
+)
+async def test_a_request_that_cannot_be_built_is_an_ntfy_error(topic: str, token: str | None) -> None:
+    """Review M2: such a push fails as any other (`invalid_request`), so the dispatcher's outage path runs,
+    rather than a pass that raises something else. Nothing reaches the network (respx refuses any URL)."""
+    with respx.mock(assert_all_called=False) as router:
+        route = router.post(TOPIC).mock(return_value=httpx.Response(200))
+        async with httpx.AsyncClient() as http:
+            client = NtfyClient(http, topic_url=topic, token=token, public_origin=ORIGIN)
+            with pytest.raises(NtfyError) as refused:
+                await client.publish(due())
+    assert refused.value.code == "invalid_request" and route.call_count == 0
+    assert topic not in str(refused.value) and (token is None or token not in str(refused.value))

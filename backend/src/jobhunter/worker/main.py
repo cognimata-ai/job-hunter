@@ -55,9 +55,9 @@
     (`EPOCH_SUPERSEDED`, Ruling T24-a);
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
 12. the teardown: the alert dispatcher stopped first (its stop event set, then cancelled once
-    `DISPATCHER_STOP_S` is spent: mid-pass, in a backoff sleep or a push, it does not see the event; an alert
-    pushed but not yet stamped is pushed again by the next worker), the live executions cancelled, then the
-    gateway's tries still in flight settled (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled
+    `DISPATCHER_STOP_S`, 1 s, is spent: mid-pass, in a backoff sleep or a push, it does not see the event; an
+    alert pushed but not yet stamped is pushed again by the next worker), the live executions cancelled, then
+    the gateway's tries still in flight settled (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled
     execution can end before its streams have settled `ambiguous`, because a graph does not wait for a
     cancelled node's task; M3 Task 28), the watchdog stopped, the saver, the task app, the source clients,
     the dispatcher's, the embedder's and the gateway's HTTP clients and the engine closed, and the lock
@@ -162,8 +162,10 @@ QUEUE_POOL_MAX_SIZE: Final = 4
 # stop); each also takes at most what is left of the stop's deadline. `TRIES_SETTLE_S` is what the teardown
 # waits for the gateway's tries still in flight to settle (`LLMGateway.settle_in_flight`).
 EXECUTIONS_CANCEL_S: Final = 30.0
-# How long the teardown waits for the alert dispatcher's loop to see its stop event before cancelling it (M5).
-DISPATCHER_STOP_S: Final = 5.0
+# How long the teardown waits for the alert dispatcher's loop to see its stop event before cancelling it (M5,
+# Ruling T4-4): at most 1 s of the teardown's `TEARDOWN_S` floor; a push cancelled before its stamp is sent
+# again.
+DISPATCHER_STOP_S: Final = 1.0
 TRIES_SETTLE_S: Final = 10.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
@@ -455,7 +457,8 @@ class _WorkerProcess:
             return None
         if cfg.public_origin is None:  # the startup assertions require it of a worker (Ruling T18-i)
             raise ValueError("the ntfy click link needs JOBHUNTER_PUBLIC_ORIGIN")
-        token = cfg.secrets.get("ntfy_token", b"").decode("utf-8").strip() or None
+        # ASCII: `ntfy_token_header_safe` checked it at startup.
+        token = cfg.secrets.get("ntfy_token", b"").decode("ascii", errors="replace").strip() or None
         http_client = self.ntfy_http = make_ntfy_http_client(user_agent=cfg.http_user_agent)
         client = NtfyClient(
             http_client, topic_url=cfg.ntfy_topic_url, token=token, public_origin=cfg.public_origin
@@ -469,14 +472,15 @@ class _WorkerProcess:
         if not self.dispatch_stop.is_set():
             request_shutdown(shutdown, reason=EPOCH_SUPERSEDED)
 
-    async def _stop_dispatcher(self, deadline: StopDeadline) -> None:
-        """Set the dispatcher loop's stop event and wait up to `DISPATCHER_STOP_S` for it to end; then cancel
-        it, and wait for the cancel within what is left of the stop (`TimeoutError` when it outlives it)."""
+    async def _stop_dispatcher(self, timeout_s: float, deadline: StopDeadline) -> None:
+        """Set the dispatcher loop's stop event and wait up to `timeout_s` (`DISPATCHER_STOP_S` of the stop's
+        deadline) for it to end; then cancel it, and wait for the cancel within what is left of the stop
+        (`TimeoutError` when it outlives it)."""
         self.dispatch_stop.set()
         task = self.dispatching
         if task is None:
             return
-        _, pending = await asyncio.wait({task}, timeout=deadline.remaining(DISPATCHER_STOP_S))
+        _, pending = await asyncio.wait({task}, timeout=timeout_s)
         if pending:
             task.cancel()
             _, pending = await asyncio.wait({task}, timeout=deadline.remaining())
@@ -539,7 +543,8 @@ class _WorkerProcess:
         """
         deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
-            ("dispatcher", lambda: self._stop_dispatcher(deadline)),  # first: nothing pushes past this point
+            # first: nothing pushes past this point
+            ("dispatcher", lambda: self._stop_dispatcher(deadline.remaining(DISPATCHER_STOP_S), deadline)),
             ("executions", lambda: EXECUTIONS.cancel_all(timeout_s=deadline.remaining(EXECUTIONS_CANCEL_S))),
             ("llm_tries", lambda: self._settle_tries(deadline.remaining(TRIES_SETTLE_S))),
             ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),

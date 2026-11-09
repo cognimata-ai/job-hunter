@@ -27,6 +27,8 @@ from types import MappingProxyType
 from typing import Final, Literal, cast, get_args
 from urllib.parse import quote, urlsplit
 
+import httpx
+
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
 from jobhunter.secret_names import SECRET_NAMES
@@ -398,15 +400,27 @@ def _is_serialised_origin(origin: str) -> bool:
 
 
 def _is_https_url(url: str | None) -> bool:
-    """`url` is an `https` URL with a host (`ntfy_in_prod`)."""
+    """`url` is an `https` URL with a host and a usable port (`ntfy_in_prod`), read by httpx's own parser, the
+    one the alert dispatcher's client uses: what this accepts, a push can be built from (review M2)."""
     if url is None:
         return False
     try:
-        parts = urlsplit(url)
-        host = parts.hostname
-    except ValueError:  # a malformed IPv6 literal or port
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:  # a malformed IPv6 literal or port, among others
         return False
-    return parts.scheme == "https" and bool(host)
+    port_ok = parsed.port is None or 1 <= parsed.port <= 65535
+    return parsed.scheme == "https" and bool(parsed.host) and port_ok
+
+
+def _check_ntfy_token(cfg: AppConfig) -> None:
+    """Review M2: the `ntfy_token` secret, when set, is sent as `Authorization: Bearer <token>`, so it must be
+    a header value: visible ASCII only, without spaces or control characters (`ntfy_token_header_safe`). The
+    detail names the secret, never its value."""
+    token = cfg.secrets.get("ntfy_token", b"").strip()
+    if token and not all(0x21 <= byte <= 0x7E for byte in token):
+        raise StartupCheckFailed(
+            "ntfy_token_header_safe", "ntfy_token must be visible ASCII, without spaces or control characters"
+        )
 
 
 def _check_public_origin(cfg: AppConfig) -> None:
@@ -453,6 +467,7 @@ def run_startup_assertions(cfg: AppConfig) -> None:
             raise StartupCheckFailed("langsmith_config", f"tracing needs a correct {', '.join(wrong)}")
 
     _check_key_material(cfg)
+    _check_ntfy_token(cfg)
 
     if cfg.env == "prod" and cfg.role == "worker":
         absent = [n for n in ("healthchecks_ping_url", "healthchecks_api_key") if not cfg.secrets.get(n)]

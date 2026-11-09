@@ -771,8 +771,13 @@ def test_ntfy_topic_url_and_healthchecks_api_url_are_loaded(tmp_path: Path) -> N
         ("https:///jh-alerts", False),  # no host
         ("ntfy.example/jh-alerts", False),  # no scheme
         ("https://[::1/jh-alerts", False),  # not a URL at all
+        # fix round 1 (review M2): read as httpx reads it, so what passes, a push can be built from
+        ("https://ntfy.example:abc/jh-alerts", False),  # httpx.InvalidURL
+        ("https://ntfy.example:70000/jh-alerts", False),  # no such port
+        ("https://ntfy.example:0/jh-alerts", False),
         (TOPIC_URL, True),
         ("https://ntfy.example:8443/jh-alerts", True),
+        ("HTTPS://ntfy.example/jh-alerts", True),  # httpx lower-cases the scheme
     ],
 )
 def test_ntfy_in_prod_requires_an_https_topic(tmp_path: Path, topic: str | None, passes: bool) -> None:
@@ -836,3 +841,38 @@ def test_the_topic_url_is_masked_in_logs(tmp_path: Path, monkeypatch: pytest.Mon
     event = json.loads(line)
     assert (event["url"], event["nested"]) == ("[SECRET]", {"error": "refused [SECRET]/json"})
     assert topic not in line
+
+
+# --- Fix round 1 (review M2): the ntfy token is sent as a header value -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "tök-token".encode(),  # not ASCII
+        b"tk test token",  # a space
+        b"tk-test\x01token",  # a control character
+        b"tk-test\r\nX-Injected: 1",  # a header line of its own
+        b"tk-test-token\x7f",  # DEL
+    ],
+)
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_the_ntfy_token_must_be_a_header_value(tmp_path: Path, token: bytes, env_name: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS, ntfy_token=token)
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, secrets))
+    assert (exc.value.check, exc.value.detail) == (
+        "ntfy_token_header_safe",
+        "ntfy_token must be visible ASCII, without spaces or control characters",
+    )
+    assert token.decode("utf-8", errors="replace").strip() not in str(exc.value)  # never the value
+
+
+@pytest.mark.parametrize("token", [b"tk-test-token", b"tk-test-token\n", b"  tk-test-token  ", b"\n"])
+def test_a_visible_ascii_ntfy_token_or_none_passes(tmp_path: Path, token: bytes) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS, ntfy_token=token)
+    run_startup_assertions(
+        load_config("worker", env, secrets)
+    )  # outer whitespace is stripped, as by the worker
