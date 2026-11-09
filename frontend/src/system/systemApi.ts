@@ -247,13 +247,20 @@ export function useAckAlert(): UseMutationResult<AcknowledgedOut, ProblemError, 
 }
 
 /** Resolve an alert the user resolves (`POST /api/alerts/{id}/resolve`, not keyed: a repeat answers the resolved
- * alert): the alerts' tabs read again too. */
+ * alert): the alerts' tabs read again too. They are read again after a 404 (the alert is gone) or a 409
+ * `not_manual` (the alert resolves itself) as well, since either says the row shown is out of date; the refusal
+ * itself is the caller's to show. */
 export function useResolveAlert(): UseMutationResult<AlertOut, ProblemError, number> {
   const refresh = useRefresh(ALERTS_KEY);
   return useMutation({
     mutationFn: (alertId: number) => apiSend<AlertOut>(`/api/alerts/${String(alertId)}/resolve`, { method: "POST" }),
     meta: OWN,
     onSuccess: refresh,
+    onError: (error) => {
+      if (isProblem(error, "not_found") || isProblem(error, "conflict_state")) {
+        refresh();
+      }
+    },
   });
 }
 

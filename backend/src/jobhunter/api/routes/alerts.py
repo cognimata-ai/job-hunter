@@ -11,17 +11,19 @@ each alert also has its delivery state (`last_notified_at`, `notify_failures`) a
 
 `POST /api/alerts/{id}/ack` → 200 `{id, acknowledged_at}`: `alerts.acknowledge_alert` in one transaction, a
 plain `UPDATE` of the alert row (no `Idempotency-Key`: §14.1 L4963 does not list it, and a repeat changes
-nothing). The alert stays open; its first acknowledgement is kept, so a repeat answers the same time. An
-acknowledged `llm.reservation_bound_violated` or `llm.auth_failed` no longer pauses the score lane
-(`scoring.cycles.pause_reason`), so the next cycle starts; the first is also resolved by its acknowledgement
-(`catalogue.RESOLVE_ON_ACK`), so a repeat finds it resolved. A resolved or unknown alert is 404 `not_found`.
+nothing). The alert stays open, unless its code is resolved by its acknowledgement (below); its first
+acknowledgement is kept, so a repeat answers the same time. An acknowledged `llm.reservation_bound_violated`
+or `llm.auth_failed` no longer pauses the score lane (`scoring.cycles.pause_reason`), so the next cycle
+starts; the first is also resolved by its acknowledgement (`catalogue.RESOLVE_ON_ACK`), so a repeat finds it
+resolved. A resolved or unknown alert is 404 `not_found`.
 `alert_acknowledged` is logged with the id after the commit.
 
 `POST /api/alerts/{id}/resolve` → 200 `AlertOut`: `lists.resolve_manual` in one transaction, the user's
 resolution of an alert whose code does not resolve itself (`catalogue.is_manual`). Not keyed, as the
 acknowledgement: an alert resolved already is answered as it is. An alert whose code resolves itself is 409
-`conflict_state` with `detail = "not_manual"`; an unknown one is 404 `not_found`. `alert_resolved` is logged
-with the id after the commit.
+`conflict_state` with `detail = "not_manual"`, whatever its status; an unknown one is 404 `not_found`.
+`alert_resolved` is logged with the id after the commit, only by the call that resolved the alert (the alert's
+`resolved_at` is this call's time); a repeat, which resolves nothing, logs nothing.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.alerts.utcnow`.
@@ -115,7 +117,8 @@ async def list_alerts(
 async def acknowledge(
     alert_id: AlertId, engine: Annotated[AsyncEngine, Depends(get_engine)]
 ) -> AcknowledgedOut:
-    """Acknowledge an open alert; it stays open (200)."""
+    """Acknowledge an open alert (200). It stays open, unless its code is resolved by its acknowledgement
+    (`llm.reservation_bound_violated`): then it is resolved too, and its next occurrence opens a new alert."""
     async with engine.begin() as conn:
         acknowledged_at = await acknowledge_alert(conn, alert_id, now=utcnow())
     if acknowledged_at is None:
@@ -136,12 +139,14 @@ async def acknowledge(
 )
 async def resolve(alert_id: AlertId, engine: Annotated[AsyncEngine, Depends(get_engine)]) -> AlertOut:
     """Resolve an alert that does not resolve itself (200); one resolved already is answered as it is."""
+    now = utcnow()
     try:
         async with engine.begin() as conn:
-            alert = await lists.resolve_manual(conn, alert_id, now=utcnow())
+            alert = await lists.resolve_manual(conn, alert_id, now=now)
     except LookupError as exc:
         if (problem := domain_problem(exc)) is None:
             raise
         raise problem from None
-    log.info("alert_resolved", alert_id=alert_id)
+    if alert.resolved_at == now:  # resolved by this call: a repeat answers the earlier resolution's time
+        log.info("alert_resolved", alert_id=alert_id)
     return alert

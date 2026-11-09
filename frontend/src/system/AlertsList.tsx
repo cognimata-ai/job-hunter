@@ -3,10 +3,12 @@
 // An alert shows by its code (`alert.<code>`, the code itself for one the catalogue lacks; never the server's
 // message), with its severity, when it was first and last seen, and how often, and its delivery (plan M5 Task 2):
 // "Notified <time>" once it was pushed, "Delivery failed n×" once a push of it failed for good. [Acknowledge] on
-// an open alert sends `POST /api/alerts/{id}/ack`; the alert stays open on the server but leaves the open tab,
-// since every tab and the header's status are read again. [Resolve] on an unresolved alert the user resolves
-// (`manual`: its code does not resolve itself) asks first, then sends `POST /api/alerts/{id}/resolve`, and every
-// tab is read again.
+// an open alert sends `POST /api/alerts/{id}/ack`; the alert leaves the open tab, since every tab and the header's
+// status are read again. On the server it stays open, unless its code is resolved by its acknowledgement
+// (`llm.reservation_bound_violated`), which then shows under Resolved. [Resolve] on an unresolved alert the user
+// resolves (`manual`: its code does not resolve itself) asks first, then sends `POST /api/alerts/{id}/resolve`,
+// and every tab is read again; a refusal (404, 409 `not_manual`) shows in the row, and the tabs are read again
+// too.
 import * as Tabs from "@radix-ui/react-tabs";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

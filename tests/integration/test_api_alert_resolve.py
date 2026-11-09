@@ -3,11 +3,14 @@ Task 2, O-ops O6, O22d, M4 Carry-forward 4).
 
 `POST /api/alerts/{id}/resolve` → 200 `AlertOut` (`lists.resolve_manual`): an alert whose code does not
 resolve itself (§17.6 "manual", or a code the catalogue lacks) is resolved at the request's time; one that
-resolves itself is 409 `conflict_state` with `detail = "not_manual"` and stays open; an unknown id is 404; an
-alert resolved already is answered as it is. `GET /api/alerts` shows each alert's `last_notified_at`,
-`notify_failures` and `manual`. Every datum is invented.
+resolves itself is 409 `conflict_state` with `detail = "not_manual"` and stays open, and so is one resolved
+already (the code decides, whatever the status); an unknown id is 404; a manual alert resolved already is
+answered as it is. An acknowledged manual alert is resolved with its acknowledgement kept. `alert_resolved`
+is logged once, by the call that resolved the alert, never by a repeat. `GET /api/alerts` shows each alert's
+`last_notified_at`, `notify_failures` and `manual`. Every datum is invented.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -15,9 +18,11 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.api.routes import alerts as alerts_route
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.observability.alerts import acknowledge_alert, raise_alert, resolve_alert
 from jobhunter.observability.catalogue import Severity
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.support.logs import logged
 
 pytestmark = pytest.mark.integration
 
@@ -73,6 +78,34 @@ async def test_resolve_an_auto_resolving_alert_409_not_manual(
     assert await resolved_at(engine, alert_id) is None
 
 
+async def test_an_auto_resolving_alert_resolved_already_is_409_not_manual(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    alert_id = await alert(engine, "run.failed", subject="run:9")
+    async with engine.begin() as conn:
+        assert await resolve_alert(conn, code="run.failed", subject="run:9")
+    resolved = await resolved_at(engine, alert_id)
+    r = await logged_in_client.post(f"/api/alerts/{alert_id}/resolve")
+    assert r.status_code == 409, r.text
+    assert (r.json()["code"], r.json()["detail"]) == ("conflict_state", "not_manual")
+    assert await resolved_at(engine, alert_id) == resolved  # untouched
+
+
+async def test_resolve_an_acknowledged_manual_alert_keeps_its_acknowledgement(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    alert_id = await alert(engine, "eval.gate_failed", severity="warn")
+    acked = NOW - timedelta(hours=1)
+    async with engine.begin() as conn:
+        assert await acknowledge_alert(conn, alert_id, now=acked) == acked
+    r = await logged_in_client.post(f"/api/alerts/{alert_id}/resolve")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "resolved"
+    assert (at(body["acknowledged_at"]), at(body["resolved_at"])) == (acked, NOW)
+    assert await resolved_at(engine, alert_id) == NOW
+
+
 async def test_resolve_unknown_404(logged_in_client: httpx.AsyncClient) -> None:
     r = await logged_in_client.post(f"/api/alerts/{10**12}/resolve")
     assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text
@@ -81,8 +114,12 @@ async def test_resolve_unknown_404(logged_in_client: httpx.AsyncClient) -> None:
 
 
 async def test_resolve_is_idempotent(
-    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     alert_id = await alert(engine, "operation.failed", severity="warn")
     first = await logged_in_client.post(f"/api/alerts/{alert_id}/resolve")
     assert first.status_code == 200, first.text
@@ -90,6 +127,8 @@ async def test_resolve_is_idempotent(
     again = await logged_in_client.post(f"/api/alerts/{alert_id}/resolve")
     assert (again.status_code, again.json()) == (200, first.json())  # the first resolution is kept
     assert await resolved_at(engine, alert_id) == NOW
+    # one resolution, so one line: the repeat resolved nothing
+    assert [event["alert_id"] for event in logged(caplog, "alert_resolved")] == [alert_id]
 
 
 async def test_alert_out_has_delivery_fields(

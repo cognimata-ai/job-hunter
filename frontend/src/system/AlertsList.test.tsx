@@ -2,7 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import en from "../i18n/en.json";
-import { alertRow, fakeApi, json, requestsTo, statusOut } from "../test/api";
+import { alertRow, fakeApi, json, problem, requestsTo, statusOut } from "../test/api";
 import { renderInProviders } from "../test/app";
 import { AlertsList } from "./AlertsList";
 import { STATUS_KEY } from "./api";
@@ -136,6 +136,50 @@ describe("AlertsList", () => {
 
     await user.click(screen.getByRole("tab", { name: en["alert_status.resolved"] }));
     expect(await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).toBeTruthy();
+  });
+
+  it("a not_manual refusal of Resolve shows in the row and the list is read again", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [alertRow()];
+    api.routes.set("POST /api/alerts/3/resolve", () => {
+      api.alerts = [alertRow({ manual: false })]; // the server resolves it itself after all
+      return problem(409, "conflict_state", { detail: "not_manual" });
+    });
+    const user = userEvent.setup();
+    renderInProviders(<AlertsList />);
+    const row = (await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).closest("li") as HTMLElement;
+    await user.click(within(row).getByRole("button", { name: en["alerts.resolve"] }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["alerts.resolve"] }));
+
+    const refusal = await within(row).findByRole("alert");
+    expect(within(refusal).getByText("not_manual").tagName).toBe("CODE");
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/alerts").filter((r) => r.search.get("status") === "open")).toHaveLength(2);
+    });
+    // read again: the alert is not the user's to resolve, so its Resolve goes; the refusal stays shown
+    await waitFor(() => {
+      expect(within(row).queryByRole("button", { name: en["alerts.resolve"] })).toBeNull();
+    });
+    expect(within(row).getByRole("alert")).toBe(refusal);
+    expect(screen.queryByText(en["alerts.resolved"])).toBeNull();
+  });
+
+  it("a not_found answer to Resolve shows in the row and the list is read again", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [alertRow()];
+    api.routes.set("POST /api/alerts/3/resolve", () => problem(404, "not_found"));
+    const user = userEvent.setup();
+    renderInProviders(<AlertsList />);
+    const row = (await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).closest("li") as HTMLElement;
+    await user.click(within(row).getByRole("button", { name: en["alerts.resolve"] }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["alerts.resolve"] }));
+
+    const refusal = await within(row).findByRole("alert");
+    expect(refusal.textContent).toContain(en["problem.not_found"]);
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/alerts").filter((r) => r.search.get("status") === "open")).toHaveLength(2);
+    });
+    expect(screen.queryByText(en["alerts.resolved"])).toBeNull();
   });
 
   it("shows delivery failures", async () => {

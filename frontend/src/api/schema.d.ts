@@ -35,7 +35,8 @@ export interface paths {
         put?: never;
         /**
          * Acknowledge
-         * @description Acknowledge an open alert; it stays open (200).
+         * @description Acknowledge an open alert (200). It stays open, unless its code is resolved by its acknowledgement
+         *     (`llm.reservation_bound_violated`): then it is resolved too, and its next occurrence opens a new alert.
          */
         post: operations["acknowledge_api_alerts__alert_id__ack_post"];
         delete?: never;
