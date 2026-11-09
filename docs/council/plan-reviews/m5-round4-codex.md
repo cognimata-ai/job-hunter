@@ -1,0 +1,28 @@
+**Verdict: REJECT**
+
+I read the review brief, round-3 review and response including its sweep fixes, revised plan, relevant specification sections, research digests, author brief and M4 conventions. I checked task interfaces against HEAD `9824267` and used in-memory probes for settlement behavior and identity advancement. No network, Docker or sub-agents were used; no `.secrets/`, `.fixtures-raw/`, keys or credentials were read; nothing changed.
+
+**Round-3 findings — disposition**
+
+| # | Finding | Resolved? |
+|---|---|---|
+| 1 | Transaction guard breaks group-write responses | **Yes.** Enforced read-only snapshots suspend the guard, with route coverage (P:290, P:302). |
+| 2 | Source-purge timestamp postcondition cannot pass | **Yes.** `admitted_at` and the later quiescence cutoff are distinguished; admission effects are checked against their actual timestamp (P:333, P:486, P:488). |
+| 3 | Deleted calls strand online spend entries | **Yes.** Purges settle reserved/dispatched entries before deleting calls and handle late settlement without the call (P:385–387, P:484, P:505). Retained, redacted calls expose a separate issue below. |
+| 4 | Identity advancement misses an uncalled sequence at equality | **Yes.** Advancement uses the next allocatable value, including `is_called`, with equality tests (P:670, P:673). |
+| 5 | Rotation drill invokes hardcoded production configuration | **Yes.** The script accepts compose and secret-directory arguments; the drill supplies its test configuration (P:772–775). |
+| 6 | Exhausted export operation permanently blocks subsequent exports | **Yes.** Waiting preserves attempts, has a deadline, and failure hooks plus retention terminate stranded export rows (P:292, P:526–532). |
+
+**New findings**
+
+1. **MAJOR — Late settlement can restore content after a profile purge redacts it.** P:385, P:464–465; S:6462–6473; `backend/src/jobhunter/worker/operations.py:605`; `backend/src/jobhunter/llm/gateway.py:1362`; `backend/src/jobhunter/llm/spend_ledger.py:1558`, `:1596` — Cancelling `propose_queries` changes operation ownership but does not synchronously stop its coroutine. A provider response arriving after profile-purge completion still settles through the gateway’s independent transaction. Settlement does not check the operation owner or purged profile and writes `output_json` back into the retained call row. The round-3 settlement fix handles **deleted** calls only. Consequently, profile-derived content can reappear after successful redaction. — Serialize settlement with redaction and persist a condition that prevents content storage after purge while preserving billing settlement. Cover every associated proposal attempt, including an unpublished call. Test a response released after purge completion and assert that output remains NULL.
+
+2. **MAJOR — Recreated purge operations lose the request needed to compute their manifest.** P:336, P:341, P:407–413, P:418, P:504–505; S:6255, S:6267 — Admission stores an empty manifest scope and puts the request in the operation payload. The reconciler creates replacement operations with only `manifest_id`, although `compute` requires the request. Before the manifest file exists, a replacement cannot reconstruct its intended deletion. A golden-case purge is particularly clear: it has no fence carrying the case ID. Delete-everything can also remove another purge’s operation while retaining its executing manifest, destroying that request entirely. The replacement then fails, leaving an executing manifest that blocks exports. — Persist the IDs needed for reconstruction in durable admission metadata that survives operation deletion, and use it consistently for reconciliation and pending-retry replay. Test cancellation before manifest creation followed by successful replacement execution, including the delete-everything interaction.
+
+3. **MAJOR — Migration replay cannot remove files from the actual exports volume.** P:337, P:339, P:414, P:417, P:710; S:5987, S:6059, S:6252 — Export deletion requires unlinking files on the exports volume, but migrate receives only manifests and CV storage. Restore also lacks the exports mount. After a crash between manifest recording and export cleanup, migration replay therefore cannot remove an existing archive from the shared volume. Checking its private `/data/exports` directory can falsely report the file absent while the archive remains. Additionally, Task 25 names the kind’s `execute`, whereas live export cleanup is a separate step after that call. — Explicitly execute export cleanup during replay and mount the real exports volume read-write wherever live replay runs. Give scratch restore tests an isolated exports root. Add a crash/restart test that verifies the archive disappears from the shared volume before completion.
+
+4. **MAJOR — Restore leaves exports marked ready without restoring their archives.** P:551, P:688, P:729–732; S:6507 — Backup captures the database, CV files and manifests, but excludes export archives. Restore neither restores those archives nor invalidates their database rows. A backup containing an unexpired `ready` export therefore restores that status without its file; both verification phases can pass, but download returns 500 because the row remains `ready`. This requires no concurrent purge or exceptional failure. — Specify an export recovery policy: either back up and restore the encrypted archives or explicitly invalidate unavailable exports after initial snapshot verification, with the corresponding documented status and download response. Test backup and fresh restore with an unexpired ready export.
+
+### Challenges to rulings
+
+None.
