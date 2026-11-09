@@ -15,7 +15,7 @@ from typing import Any, Final
 import httpx
 import pytest
 from jobhunter.llm import spend_ledger
-from jobhunter.scoring import batches, targets
+from jobhunter.scoring import batches, similarity, targets
 
 from tests.support.profile import SYNTHETIC_PROFILE
 from tests.support.smoke_stack import AD_TEXT, CONTENT, KEY, M2_CHECK_NAMES, TOKEN, Database, Stack
@@ -85,6 +85,9 @@ def test_the_copied_predicates_are_the_score_lanes(smoke) -> None:
     assert smoke.ELIGIBLE_SQL == batches.ELIGIBLE_SQL
     assert smoke.COUNTED == spend_ledger._COUNTED
     assert smoke.COUNTED in smoke.COUNTERS_CLEAN and smoke.RETAINED_JOB_SQL in smoke.TARGETS_CREATED
+    # Check 9 counts a missing similarity only where the `awaiting_embedding` pass would set one.
+    assert f"s.state NOT IN {smoke.UNFILLED_STATES}" in similarity._FILL.text
+    assert f"t.state NOT IN {smoke.UNFILLED_STATES}" in smoke.TARGETS_CREATED
 
 
 def test_the_golden_seed_runs_in_the_worker_container_on_both_overlays(smoke, monkeypatch) -> None:
