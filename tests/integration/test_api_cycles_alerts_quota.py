@@ -195,6 +195,10 @@ async def test_alert_statuses_open_acknowledged_resolved(
         "acknowledged_at": None,
         "resolved_at": None,
         "status": "open",
+        # never pushed; `run.partial` resolves itself (plan M5 Task 2)
+        "last_notified_at": None,
+        "notify_failures": 0,
+        "manual": False,
     }
     assert body["items"][2]["acknowledged_at"] == iso(acked_at)
     assert all(item["resolved_at"] is not None for item in body["items"][:2])

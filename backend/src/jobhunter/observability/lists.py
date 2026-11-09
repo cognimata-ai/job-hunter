@@ -2,8 +2,8 @@
 them (spec §14.2 L5034-5038, L5047, §17.3, §17.6, §7.8; plan M4 Task 10, D5, D27).
 
 Every function reads on the caller's connection, which the route opens as one read snapshot
-(`db.snapshot.read_snapshot`): none writes or locks anything. Every statement is static SQL, every value a
-bound parameter.
+(`db.snapshot.read_snapshot`): none writes or locks anything, but `resolve_manual`, the user's resolution of
+an alert, which runs in the route's transaction. Every statement is static SQL, every value a bound parameter.
 
 - `runs_page(conn, *, after, status, limit)`: up to `limit` runs by `(queued_at, id)` descending (the index
   `runs_recent`), after the keyset position `after` (the last run of the page before), only those in `status`
@@ -24,7 +24,13 @@ bound parameter.
   is set (acknowledged or not), else `acknowledged` once `acknowledged_at` is, else `open`. The `status`
   filter is applied to that derived value in the same statement, so a page is cut after the filter and the
   keyset holds under it. The alert's `context` is returned as stored: alerts carry ids, counts and codes, no
-  content.
+  content. Each also has its delivery state (M5 Task 2, O-ops O22d): `last_notified_at`, when the alert
+  dispatcher last pushed it, and `notify_failures`, how often a push of it failed for good; and `manual`,
+  whether the user resolves it (`catalogue.is_manual`: its code does not resolve itself).
+- `resolve_manual(conn, alert_id, *, now)` (M5 Task 2, O-ops O6): resolves the alert at `now` and returns it.
+  An id that names no alert raises `AlertMissing` (a `LookupError`: 404 `not_found`); an alert whose code
+  resolves itself is refused (409 `conflict_state`, `detail = "not_manual"`), whatever its status; an alert
+  resolved already is returned as it is, its `resolved_at` kept.
 - `quota_summary(conn)`: for every provider (`health.QUOTA_PROVIDERS`), its current window as
   `windows.current_snapshot` reads it, with the sums of the window's ledger entries: `used`, the counted
   usage `ledger.used_units` counts (`ledger.COUNTED_USAGE_SQL`); `reserved`, the units of entries in
@@ -34,15 +40,17 @@ bound parameter.
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, JsonValue
+from sqlalchemy import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
+from jobhunter.errors import Refusal
 from jobhunter.graphs.collect.nodes.finalize import PARTIAL_CAUSES, PartialCause
-from jobhunter.observability.alerts import Severity
+from jobhunter.observability.catalogue import Severity, is_manual
 from jobhunter.observability.health import QUOTA_PROVIDERS, RUN_COLUMNS, RunOut, RunStatus
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
@@ -54,6 +62,8 @@ CycleStatus = Literal["running", "completed", "failed"]
 AlertStatus = Literal["open", "acknowledged", "resolved"]
 
 UNKNOWN_PARTIAL_CAUSE: Final = "run_report_unknown_partial_cause"
+# The `detail` of the 409 that refuses to resolve an alert whose code resolves itself.
+NOT_MANUAL: Final = "not_manual"
 _CAUSES: Final[Mapping[str, PartialCause]] = {cause: cause for cause in PARTIAL_CAUSES}
 
 log = get_logger("jobhunter.observability.lists")
@@ -105,7 +115,9 @@ class ScoreCyclesPageOut(BaseModel):
 
 class AlertOut(BaseModel):
     """An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
-    else `open`. A client shows it by its `code`; `message` is an untranslated fallback."""
+    else `open`. A client shows it by its `code`; `message` is an untranslated fallback. `last_notified_at` is
+    when it was last pushed (null while it never was), `notify_failures` how often its push failed for good;
+    `manual` says whether the user resolves it, since its code does not resolve itself."""
 
     id: int
     code: str
@@ -118,11 +130,22 @@ class AlertOut(BaseModel):
     acknowledged_at: UtcDatetime | None
     resolved_at: UtcDatetime | None
     status: AlertStatus
+    last_notified_at: UtcDatetime | None
+    notify_failures: int
+    manual: bool
 
 
 class AlertsPageOut(BaseModel):
     items: list[AlertOut]
     next_cursor: str | None
+
+
+class AlertMissing(LookupError):
+    """No alert has the id (its message names the id only)."""
+
+    def __init__(self, alert_id: int) -> None:
+        super().__init__(f"alerts {alert_id}: no such alert")
+        self.alert_id = alert_id
 
 
 class QuotaDetailOut(BaseModel):
@@ -156,15 +179,23 @@ _CYCLES: Final = q(
     "admitted, spent_usd, report, started_at, finished_at FROM score_cycles "
     "WHERE (CAST(:after AS bigint) IS NULL OR id < CAST(:after AS bigint)) ORDER BY id DESC LIMIT :limit"
 )
-_ALERTS: Final = q(
-    "/* lists.alerts */ SELECT a.id, a.code, a.severity, a.message, a.context, a.first_at, a.last_at, "
-    "a.occurrences, a.acknowledged_at, a.resolved_at, s.status FROM alerts a "
+# An alert's columns and its derived status, as `AlertOut` has them (but `manual`, which its code decides).
+_ALERT_FROM: Final = (
+    "SELECT a.id, a.code, a.severity, a.message, a.context, a.first_at, a.last_at, a.occurrences, "
+    "a.acknowledged_at, a.resolved_at, s.status, a.last_notified_at, a.notify_failures FROM alerts a "
     "CROSS JOIN LATERAL (SELECT CASE WHEN a.resolved_at IS NOT NULL THEN 'resolved' "
-    "WHEN a.acknowledged_at IS NOT NULL THEN 'acknowledged' ELSE 'open' END AS status) s "
+    "WHEN a.acknowledged_at IS NOT NULL THEN 'acknowledged' ELSE 'open' END AS status) s"
+)
+_ALERTS: Final = q(
+    f"/* lists.alerts */ {_ALERT_FROM} "
     "WHERE (CAST(:after AS bigint) IS NULL OR a.id < CAST(:after AS bigint)) "
     "AND (CAST(:status AS text) IS NULL OR s.status = CAST(:status AS text)) "
     "ORDER BY a.id DESC LIMIT :limit"
 )
+_ALERT: Final = q(f"/* lists.alert */ {_ALERT_FROM} WHERE a.id = :id")
+_ALERT_CODE: Final = q("SELECT code FROM alerts WHERE id = :id")
+# A concurrent resolution wins: its `resolved_at` is kept.
+_RESOLVE_MANUAL: Final = q("UPDATE alerts SET resolved_at = :now WHERE id = :id AND resolved_at IS NULL")
 # The current windows' entries, by `quota_ledger_window (provider, window_start, state)`.
 _LEDGER_SUMS: Final = q(
     "/* lists.quota */ SELECT provider, "  # noqa: S608 (constants)
@@ -216,12 +247,30 @@ async def score_cycles_page(
     return [ScoreCycleOut.model_validate(row, from_attributes=True) for row in rows]
 
 
+def _alert_out(row: Row[Any]) -> AlertOut:
+    return AlertOut.model_validate({**row._mapping, "manual": is_manual(row.code)})
+
+
 async def alerts_page(
     conn: AsyncConnection, *, after_id: int | None, status: AlertStatus | None, limit: int
 ) -> list[AlertOut]:
     """Up to `limit` alerts after `after_id`, of `status` when it is given (module docstring)."""
     rows = await conn.execute(_ALERTS, {"after": after_id, "status": status, "limit": limit})
-    return [AlertOut.model_validate(row, from_attributes=True) for row in rows]
+    return [_alert_out(row) for row in rows]
+
+
+async def resolve_manual(conn: AsyncConnection, alert_id: int, *, now: datetime) -> AlertOut:
+    """Resolve the alert `alert_id` at `now` and return it (module docstring): `AlertMissing` for no such
+    alert, a 409 `not_manual` refusal for one whose code resolves itself, one resolved already as it is."""
+    code = (await conn.execute(_ALERT_CODE, {"id": alert_id})).scalar_one_or_none()
+    if code is None:
+        raise AlertMissing(alert_id)
+    if not is_manual(code):
+        raise Refusal(
+            409, "conflict_state", "This alert resolves itself when its condition clears", detail=NOT_MANUAL
+        )
+    await conn.execute(_RESOLVE_MANUAL, {"id": alert_id, "now": now})
+    return _alert_out((await conn.execute(_ALERT, {"id": alert_id})).one())
 
 
 async def quota_summary(conn: AsyncConnection) -> dict[Provider, QuotaDetailOut | None]:

@@ -1,6 +1,6 @@
 // The System section's data (spec §14.2, §15.7, §17.5; plan M4 Task 31, resolutions d and e): Needs attention and
-// its actions, the run history, the score cycles, the alerts and their acknowledgement, the golden set and its
-// flags, and the detailed health.
+// its actions, the run history, the score cycles, the alerts with their acknowledgement and resolution, the golden
+// set and its flags, and the detailed health.
 //
 // - **The lists** are keyset-paged (`{items, next_cursor}`, §14.3): the first page is read when the list shows,
 //   Load more reads the next one. A refused cursor (400 `invalid_cursor`, a cursor of an older key) starts the list
@@ -10,7 +10,7 @@
 //   (and the health, whose figures they move); a refusal is the caller's to show at its item. Of these routes the
 //   batch release and the target retry take an `Idempotency-Key` (§14.1; `api/routes/targets.py`: "Each route
 //   needs an `Idempotency-Key`"), each keyed per action (`useKeyedMutation`); the replay, the resolve, the closure,
-//   the acknowledgement and the retry-apply are not keyed.
+//   the acknowledgement and the retry-apply are not keyed, nor is an alert's resolution (plan M5 Task 2).
 // - **The golden set's writes** read the set again, and the golden runs' gate, which counts its active cases.
 //
 // Each write tells its own failure (`meta.ownToast`): its item shows the problem, so no transient toast is raised
@@ -241,6 +241,17 @@ export function useAckAlert(): UseMutationResult<AcknowledgedOut, ProblemError, 
   const refresh = useRefresh(ALERTS_KEY);
   return useMutation({
     mutationFn: (alertId: number) => apiSend<AcknowledgedOut>(`/api/alerts/${String(alertId)}/ack`, { method: "POST" }),
+    meta: OWN,
+    onSuccess: refresh,
+  });
+}
+
+/** Resolve an alert the user resolves (`POST /api/alerts/{id}/resolve`, not keyed: a repeat answers the resolved
+ * alert): the alerts' tabs read again too. */
+export function useResolveAlert(): UseMutationResult<AlertOut, ProblemError, number> {
+  const refresh = useRefresh(ALERTS_KEY);
+  return useMutation({
+    mutationFn: (alertId: number) => apiSend<AlertOut>(`/api/alerts/${String(alertId)}/resolve`, { method: "POST" }),
     meta: OWN,
     onSuccess: refresh,
   });

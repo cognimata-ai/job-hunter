@@ -850,7 +850,8 @@ export function cyclesPage(items: ScoreCycleOut[] = [], next_cursor: string | nu
   return { items, next_cursor };
 }
 
-/** An open warning: the provider reports less remaining quota than the ledger counts. */
+/** An open warning the user resolves (manual), never pushed yet: the provider reports less remaining quota than
+ * the ledger counts. */
 export function alertRow(overrides: Partial<AlertOut> = {}): AlertOut {
   return {
     id: 3,
@@ -864,6 +865,9 @@ export function alertRow(overrides: Partial<AlertOut> = {}): AlertOut {
     acknowledged_at: null,
     resolved_at: null,
     status: "open",
+    last_notified_at: null,
+    notify_failures: 0,
+    manual: true,
     ...overrides,
   };
 }

@@ -73,4 +73,92 @@ describe("AlertsList", () => {
       expect(requestsTo(api, "GET /api/alerts").filter((r) => r.search.get("status") === "open")).toHaveLength(2);
     });
   });
+
+  it("shows Resolve only for manual alerts", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [
+      alertRow(),
+      alertRow({ id: 4, code: "run.failed", severity: "critical", manual: false }),
+      alertRow({ id: 2, code: "operation.failed", status: "acknowledged", acknowledged_at: "2026-11-03T06:40:00Z" }),
+      alertRow({ id: 1, code: "llm.model_mismatch", status: "resolved", resolved_at: "2026-11-03T06:50:00Z" }),
+    ];
+    const user = userEvent.setup();
+    renderInProviders(<AlertsList />);
+    const resolveIn = (row: HTMLElement) => within(row).queryByRole("button", { name: en["alerts.resolve"] });
+
+    const manual = (await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).closest("li") as HTMLElement;
+    const auto = within(panel()).getByText(en["alert.run.failed"]).closest("li") as HTMLElement;
+    expect(resolveIn(manual)).toBeTruthy();
+    expect(resolveIn(auto)).toBeNull(); // it resolves itself
+    expect(within(auto).getByRole("button", { name: en["alerts.ack"] })).toBeTruthy();
+
+    // an acknowledged manual alert is still open on the server: it can be resolved
+    await user.click(screen.getByRole("tab", { name: en["alert_status.acknowledged"] }));
+    const acknowledged = (await within(panel()).findByText(en["alert.operation.failed"])).closest("li") as HTMLElement;
+    expect(resolveIn(acknowledged)).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: en["alert_status.resolved"] }));
+    const resolved = (await within(panel()).findByText(en["alert.llm.model_mismatch"])).closest("li") as HTMLElement;
+    expect(resolveIn(resolved)).toBeNull();
+  });
+
+  it("resolve asks for confirmation and refreshes the list", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [alertRow()];
+    api.routes.set("POST /api/alerts/3/resolve", () => {
+      const resolved = alertRow({ status: "resolved", resolved_at: "2026-11-03T07:00:00Z" });
+      api.alerts = [resolved];
+      return json(resolved);
+    });
+    const user = userEvent.setup();
+    const app = renderInProviders(<AlertsList />);
+    app.queryClient.setQueryData(STATUS_KEY, statusOut());
+    const row = (await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).closest("li") as HTMLElement;
+
+    // Cancel sends nothing
+    await user.click(within(row).getByRole("button", { name: en["alerts.resolve"] }));
+    const asked = screen.getByRole("alertdialog", { name: en["alerts.resolve_title"] });
+    expect(asked.textContent).toContain(en["alert.quota.unaccounted_usage"]);
+    await user.click(within(asked).getByRole("button", { name: en["action.cancel"] }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(requestsTo(api, "POST /api/alerts/3/resolve")).toHaveLength(0);
+
+    await user.click(within(row).getByRole("button", { name: en["alerts.resolve"] }));
+    const dialog = screen.getByRole("alertdialog", { name: en["alerts.resolve_title"] });
+    await user.click(within(dialog).getByRole("button", { name: en["alerts.resolve"] }));
+    await waitFor(() => {
+      expect(requestsTo(api, "POST /api/alerts/3/resolve")).toHaveLength(1);
+    });
+    expect(requestsTo(api, "POST /api/alerts/3/resolve")[0]?.headers.get("Idempotency-Key")).toBeNull();
+    expect(await screen.findByText(en["alerts.resolved"])).toBeTruthy();
+    expect(await within(panel()).findByText(en["alerts.empty_open"])).toBeTruthy();
+    expect(app.queryClient.getQueryState(STATUS_KEY)?.isInvalidated).toBe(true);
+
+    await user.click(screen.getByRole("tab", { name: en["alert_status.resolved"] }));
+    expect(await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).toBeTruthy();
+  });
+
+  it("shows delivery failures", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [
+      alertRow({ id: 5, code: "quota.limit_breach", severity: "critical", last_notified_at: "2026-11-03T05:45:00Z" }),
+      alertRow({ id: 4, code: "run.failed", severity: "critical", manual: false, notify_failures: 3 }),
+      alertRow({ id: 6, code: "operation.failed", last_notified_at: "2026-11-03T05:50:00Z", notify_failures: 1 }),
+      alertRow(),
+    ];
+    renderInProviders(<AlertsList />);
+    const rowOf = (code: string) => within(panel()).getByText(en[`alert.${code}` as keyof typeof en]).closest("li") as HTMLElement;
+    await within(panel()).findByText(en["alert.quota.limit_breach"]);
+
+    expect(rowOf("quota.limit_breach").textContent).toContain("Notified 3 Nov, 06:45");
+    expect(rowOf("quota.limit_breach").textContent).not.toContain("Delivery failed");
+    expect(rowOf("run.failed").textContent).toContain("Delivery failed 3×");
+    expect(rowOf("run.failed").textContent).not.toContain("Notified");
+    // pushed once, and a push of it failed for good another time: both
+    expect(rowOf("operation.failed").textContent).toContain("Notified 3 Nov, 06:50 · Delivery failed 1×");
+    // not pushed yet, and nothing failed: no delivery state
+    const quiet = rowOf("quota.unaccounted_usage").textContent;
+    expect(quiet).not.toContain("Notified");
+    expect(quiet).not.toContain("Delivery failed");
+  });
 });

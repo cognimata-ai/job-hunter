@@ -44,6 +44,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alerts/{alert_id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve
+         * @description Resolve an alert that does not resolve itself (200); one resolved already is answered as it is.
+         */
+        post: operations["resolve_api_alerts__alert_id__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/ats-snapshots/{snapshot_id}/acknowledge": {
         parameters: {
             query?: never;
@@ -1603,7 +1623,9 @@ export interface components {
         /**
          * AlertOut
          * @description An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
-         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback.
+         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback. `last_notified_at` is
+         *     when it was last pushed (null while it never was), `notify_failures` how often its push failed for good;
+         *     `manual` says whether the user resolves it, since its code does not resolve itself.
          */
         AlertOut: {
             /** Acknowledged At */
@@ -1626,8 +1648,14 @@ export interface components {
              * Format: date-time
              */
             last_at: string;
+            /** Last Notified At */
+            last_notified_at: string | null;
+            /** Manual */
+            manual: boolean;
             /** Message */
             message: string;
+            /** Notify Failures */
+            notify_failures: number;
             /** Occurrences */
             occurrences: number;
             /** Resolved At */
@@ -5519,6 +5547,83 @@ export interface operations {
             };
             /** @description No open alert with this id: it does not exist or is resolved (`not_found`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    resolve_api_alerts__alert_id__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an alert */
+                alert_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No alert with this id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The alert resolves itself when its condition clears (`not_manual`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

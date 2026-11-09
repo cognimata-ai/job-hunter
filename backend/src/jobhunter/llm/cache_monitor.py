@@ -26,7 +26,8 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.observability.alerts import Severity, raise_alert, resolve_alert
+from jobhunter.observability.alerts import raise_alert, resolve_alert
+from jobhunter.observability.catalogue import Severity
 from jobhunter.observability.metrics import LLM_CACHE_READ_RATIO
 from jobhunter.types import JSONValue
 

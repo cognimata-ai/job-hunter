@@ -46,8 +46,8 @@ from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.normalize.titles import SENIORITY_LADDER
-from jobhunter.observability import alerts as observability_alerts
 from jobhunter.observability import attention, health
+from jobhunter.observability import catalogue as alert_catalogue
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus, CycleStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
@@ -515,7 +515,7 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "cycle_trigger": lambda: literal_values(CycleTrigger),
     "cycle_status": lambda: literal_values(CycleStatus),
     "golden_source": lambda: literal_values(CaseSource),
-    "alert_severity": lambda: literal_values(observability_alerts.Severity),
+    "alert_severity": lambda: literal_values(alert_catalogue.Severity),
     "readiness": lambda: literal_values(health.ReadinessCode),
     "run_age_state": lambda: literal_values(health.RunAgeState),
     "queue": lambda: set(QUEUES),
