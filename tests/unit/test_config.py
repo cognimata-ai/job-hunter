@@ -38,6 +38,8 @@ BASE_ENV = {
     "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
 }
 API_SECRETS = {"session_secret": b64(32, b"s"), "data_key": b64(32, b"d"), "db_app": b"pw"}
+# M5 Task 5 (O5): a prod worker's ping URL ends in the check's uuid; a low-entropy stand-in.
+HC_PING_URL = "https://hc-ping.example/00000000-0000-4000-8000-000000000001"
 WORKER_SECRETS = {"data_key": b64(32), "db_app": b"pw"}
 
 
@@ -340,7 +342,7 @@ def test_tracing_with_all_langsmith_requirements_met_passes(
 
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:
-    hc = {"healthchecks_ping_url": b"https://hc.example/ping/x", "healthchecks_api_key": b"k"}
+    hc = {"healthchecks_ping_url": HC_PING_URL.encode(), "healthchecks_api_key": b"k"}
     env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": "https://ntfy.example/jh-topic"}
     cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS, **hc))
     run_startup_assertions(cfg)
@@ -740,7 +742,7 @@ def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: st
 TOPIC_URL = "https://ntfy.example/jh-alerts-4f2a9c"
 PROD_WORKER_SECRETS = {
     **WORKER_SECRETS,
-    "healthchecks_ping_url": b"https://hc.example/ping/x",
+    "healthchecks_ping_url": HC_PING_URL.encode(),  # the uuid form (M5 Task 5, O5)
     "healthchecks_api_key": b"k",
 }
 
@@ -876,3 +878,53 @@ def test_a_visible_ascii_ntfy_token_or_none_passes(tmp_path: Path, token: bytes)
     run_startup_assertions(
         load_config("worker", env, secrets)
     )  # outer whitespace is stripped, as by the worker
+
+
+# --- M5 Task 5: the ping URL's form (O5) --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ping_url", "passes"),
+    [
+        (HC_PING_URL, True),
+        ("https://hc-ping.example:8443/ping/00000000-0000-4000-8000-000000000001", True),  # self-hosted
+        ("https://hc-ping.example/pingkeyxyz/collection", False),  # the slug form: no uuid to manage
+        ("https://hc-ping.example/00000000-0000-4000-8000-000000000001/fail", False),
+        ("http://hc-ping.example/00000000-0000-4000-8000-000000000001", False),  # not https
+        ("hc-ping.example/00000000-0000-4000-8000-000000000001", False),  # no scheme
+        ("https://[::1/00000000-0000-4000-8000-000000000001", False),  # not a URL at all
+    ],
+)
+def test_healthchecks_ping_url_form_refuses_a_slug_url_in_prod(
+    tmp_path: Path, ping_url: str, passes: bool
+) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": ping_url.encode()}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **secrets))
+    if passes:
+        run_startup_assertions(cfg)
+        return
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(cfg)
+    assert (exc.value.check, exc.value.detail) == (
+        "healthchecks_ping_url_form",
+        "healthchecks_ping_url must be an https URL that ends in the check's uuid",
+    )
+    assert ping_url not in str(exc.value) and "hc-ping" not in str(
+        exc.value
+    )  # the secret's name, never its value
+    # outside prod a worker starts with it (and without a dead-man: `observability.deadman`)
+    for env_name in ("dev", "test"):
+        other = load_config(
+            "worker", {**env, "JOBHUNTER_ENV": env_name}, write_secrets(tmp_path / "t", **secrets)
+        )
+        run_startup_assertions(other)
+
+
+def test_healthchecks_ping_url_form_comes_right_after_healthchecks_in_prod(tmp_path: Path) -> None:
+    """Part of §16.8 check 8 (O5): after the presence of both secrets, before `ntfy_in_prod`."""
+    slug = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": b"https://hc-ping.example/pingkeyxyz/collection"}
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod"}  # no NTFY_TOPIC_URL either
+    assert check_of("worker", prod, write_secrets(tmp_path / "s", **slug)) == "healthchecks_ping_url_form"
+    no_key = {k: v for k, v in slug.items() if k != "healthchecks_api_key"}
+    assert check_of("worker", prod, write_secrets(tmp_path / "t", **no_key)) == "healthchecks_in_prod"

@@ -94,6 +94,8 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
     from langgraph.types import Durability
 
+    from jobhunter.observability.deadman import DeadmanPinger
+
 # These thresholds compare times the database wrote (`heartbeat_at`, `queued_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
 # one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
@@ -686,12 +688,15 @@ async def _finalize(
     status: FinalStatus,
     reason: str | None,
     report: Mapping[str, JSONValue],
+    deadman: "DeadmanPinger | None" = None,
 ) -> None:
     """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it, a
     `failed_invariant` one `run.failed_invariant` (both critical, subject `run:<id>`).
 
     `FencedOut` is caught outside the transaction, which wrote nothing; the run's new owner records the
-    outcome. The run metrics are observed only once the transaction has committed (ruling T12-e).
+    outcome. The run metrics are observed only once the transaction has committed (ruling T12-e), and then
+    the dead-man's fast path runs (`deadman.after_run`, M5 Task 5: it never raises; the tick pings what it
+    misses).
     """
     try:
         async with engine.begin() as conn:
@@ -710,6 +715,8 @@ async def _finalize(
         return
     observe_run_ends([RunEnd(status=status, duration_s=duration)])
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
+    if deadman is not None:
+        await deadman.after_run(owner.run_id)
 
 
 # The report of a run the outcome reducer failed (§17.2 I7): its invariant result, no other section.
@@ -725,7 +732,9 @@ async def _redefer(engine: AsyncEngine, run_id: int, attempt_no: int) -> None:
     log.info("run_redeferred", run_id=run_id, attempt_no=attempt_no, deduplicated=job_id is None)
 
 
-async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception | None) -> None:
+async def _settle_raised(
+    engine: AsyncEngine, owner: RunOwner, error: Exception | None, *, deadman: "DeadmanPinger | None"
+) -> None:
     """The `raised` outcome of `owner`'s graph (see `execute_run`, step 3)."""
     async with engine.connect() as conn:
         completion = await run_completion(conn, owner.run_id, owner.attempt_no)
@@ -747,13 +756,18 @@ async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception 
             "run_outcome_conflict", run_id=owner.run_id, attempt_no=owner.attempt_no, work_id=error.work_id
         )
         await _finalize(
-            engine, owner, status="failed_invariant", reason="I7", report=_OUTCOME_CONFLICT_REPORT
+            engine,
+            owner,
+            status="failed_invariant",
+            reason="I7",
+            report=_OUTCOME_CONFLICT_REPORT,
+            deadman=deadman,
         )
     else:
         log.error(
             "run_graph_failed", run_id=owner.run_id, attempt_no=owner.attempt_no, error_class=error_class
         )
-        await _finalize(engine, owner, status="failed", reason="bug", report={})
+        await _finalize(engine, owner, status="failed", reason="bug", report={}, deadman=deadman)
 
 
 async def execute_run(
@@ -765,6 +779,7 @@ async def execute_run(
     epoch: int,
     heartbeat_period_s: float = 30.0,
     on_superseded: Callable[[], None] = lambda: None,
+    deadman: "DeadmanPinger | None" = None,
 ) -> Admission:
     """Admit and run attempt `attempt_no` of run `run_id` (the `run_collect` task body); its admission.
 
@@ -800,6 +815,9 @@ async def execute_run(
 
     The caller's own cancellation propagates (the graph is cancelled and awaited first) and nothing is
     written: the run's next owner (the stale-run reconciler or the takeover sweep) records the outcome.
+
+    `deadman` (M5 Task 5, the runtime's pinger) is handed to every end written here (`_finalize`), whose fast
+    path pings after the commit; the graph's own `finalize` node has the same pinger in its `CollectDeps`.
     """
     key: ExecKey = ("run", run_id)
     live = EXECUTIONS.get(key)
@@ -837,12 +855,19 @@ async def execute_run(
             case "lost":
                 await _observe_unobserved_end(engine, admitted)
             case "raised":
-                await _settle_raised(engine, admitted, outcome.error)
+                await _settle_raised(engine, admitted, outcome.error, deadman=deadman)
             case "returned":
                 async with engine.connect() as conn:
                     completion = await run_completion(conn, run_id, attempt_no)
                 if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
-                    await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+                    await _finalize(
+                        engine,
+                        admitted,
+                        status="succeeded",
+                        reason=None,
+                        report={"noop": True},
+                        deadman=deadman,
+                    )
     finally:
         _GRAPH_OBSERVED.discard((run_id, attempt_no))
     return admission

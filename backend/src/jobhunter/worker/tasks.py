@@ -1,6 +1,6 @@
 """The procrastinate app, the task blueprint and deferring inside the caller's transaction (spec §3.3.2).
 
-`blueprint` declares the nine tasks. `make_queue_app` builds the process's *task app* (the blueprint under
+`blueprint` declares the ten tasks. `make_queue_app` builds the process's *task app* (the blueprint under
 the namespace `jh`, so a task is named `jh:<name>`) on a psycopg pool; `defer_in_tx` inserts a job through the
 caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back with the caller's own writes
 (spike V1). Correctness never rests on it: every mutation that needs follow-up work also leaves a durable
@@ -12,7 +12,10 @@ worker epoch fenced that pass out, final review C2; a pass that raises does not 
 L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
 `aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`, on the
 runtime's one Batches client), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with
-the queueing lock of its name (`eval_calibration.start_canary_run`, Ruling P33), and M3 Task 11's
+the queueing lock of its name (`eval_calibration.start_canary_run`, Ruling P33), M5 Task 5's periodic
+`deadman_sync` (`23 4 * * *`, and deferred by the tick's `deadman_ping` reconciler) on `aux` with the queueing
+lock of its name (`observability.deadman.DeadmanPinger.sync`, nothing without the runtime's pinger), and M3
+Task 11's
 `score_cycle(trigger)` on the `score` queue under the lock `score` (`graphs.score.graph.execute_cycle`: one
 cycle, created by its first transaction, never resumed; its job is failed, never retried, when it stalls:
 `NO_STALL_RETRY`). Task 27 registers and pins the four. Each of the three periodic M3 tasks does nothing once
@@ -75,6 +78,7 @@ TaskName = Literal[
     "batch_poll",
     "batch_reconcile_ambiguous",
     "canary_daily",
+    "deadman_sync",
 ]
 # The tasks whose stalled job is failed outright, never retried (`_release_one`, Codex r1 #17; M2
 # Carry-forward I4): a retried `score_cycle` would find its cycle still `running` and start nothing until the
@@ -124,8 +128,8 @@ async def _admitted(rt: "WorkerRuntime", task: TaskName) -> bool:
 
 
 def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
-    """The context of a cadence a task body runs: the runtime's engine, task app, epoch, embedder and
-    configuration, this module's deferrer, `now`, and the stop of a superseded worker
+    """The context of a cadence a task body runs: the runtime's engine, task app, epoch, embedder,
+    configuration and dead-man pinger, this module's deferrer, `now`, and the stop of a superseded worker
     (`_stop_when_superseded`)."""
     # Imported here: `reconcilers` imports this module (`Deferrer`, `release_stalled_jobs`).
     from jobhunter.worker.reconcilers import ReconcileContext
@@ -139,6 +143,7 @@ def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
         embedder=rt.embedder,
         on_superseded=_stop_when_superseded(rt),
         cfg=rt.cfg,
+        deadman=rt.deadman,
     )
 
 
@@ -156,6 +161,7 @@ async def run_collect(context: JobContext, run_id: int, attempt_no: int) -> None
         attempt_no,
         epoch=rt.epoch,
         on_superseded=_stop_when_superseded(rt),
+        deadman=rt.deadman,
     )
 
 
@@ -348,6 +354,27 @@ async def canary_daily(context: JobContext, timestamp: int) -> None:
             await eval_calibration.start_canary_run(
                 conn, transport="fake" if rt.cfg.fake_llm else "live", now=utcnow(), defer=defer_in_tx
             )
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
+
+
+# M5 Task 5 (O-ops Q7, O2): the dead-man check's period sync on `aux`, daily and whenever the tick finds the
+# check's period out of step with the schedule (`observability.deadman.deadman_ping` defers it with the same
+# queueing lock), one waiting job.
+@blueprint.periodic(cron="23 4 * * *")
+@blueprint.task(name="deadman_sync", queue="aux", queueing_lock="deadman_sync", pass_context=True)
+async def deadman_sync(context: JobContext, timestamp: int) -> None:
+    """The check read back and brought in line with `schedule_state` under the dead-man lock
+    (`DeadmanPinger.sync`: a failure is recorded, raised as `deadman.update_failed` and backed off, and the
+    job still succeeds); nothing without a pinger (no healthchecks secrets). A superseded worker's writes
+    nothing and stops it (Ruling T24-a)."""
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    if rt.deadman is None:
+        return
+    try:
+        await rt.deadman.sync()
     except FencedOut as fenced:
         if not fenced.worker_superseded:
             raise  # not this worker's own fence: a failure of the job

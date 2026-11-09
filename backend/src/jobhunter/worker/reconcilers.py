@@ -83,8 +83,10 @@ from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, release_stalled_jobs
 
 if TYPE_CHECKING:
-    # Only for the annotations: `embeddings` imports this module to register its reconciler.
+    # Only for the annotations: `embeddings` and `observability.deadman` import this module to register their
+    # reconcilers.
     from jobhunter.embeddings import EmbedderClient, EmbedderHealth
+    from jobhunter.observability.deadman import DeadmanPinger
 
 Cadence = Literal["start", "tick", "heavy", "daily"]
 
@@ -121,7 +123,10 @@ class ReconcileContext:
     paths; `None` where there is none).
 
     `on_superseded` is what `run_reconcilers` calls once a fence refused `epoch`: the worker requests its own
-    graceful stop there (Ruling T24-a; the task bodies and the start pass it, `None` does nothing)."""
+    graceful stop there (Ruling T24-a; the task bodies and the start pass it, `None` does nothing).
+
+    `deadman` (M5 Task 5) is the process's dead-man pinger, which the `deadman_ping` reconciler runs; `None`
+    without the healthchecks secrets (and where there is none)."""
 
     engine: AsyncEngine
     queue: procrastinate.App
@@ -131,6 +136,7 @@ class ReconcileContext:
     embedder: "EmbedderClient | None" = None
     on_superseded: Callable[[], None] | None = None
     cfg: AppConfig | None = None
+    deadman: "DeadmanPinger | None" = None
 
 
 ReconcilerFn = Callable[[ReconcileContext], Awaitable[int]]

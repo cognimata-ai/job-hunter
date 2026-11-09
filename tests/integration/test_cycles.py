@@ -667,6 +667,7 @@ async def test_the_tick_task_requests_a_periodic_cycle_after_its_tick(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime})), timestamp=0)
     async with engine.connect() as conn:

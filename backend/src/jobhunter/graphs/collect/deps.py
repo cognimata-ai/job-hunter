@@ -3,7 +3,8 @@
 `CollectDeps` is made once per worker process (`worker.main`, Task 24) and shared by every run: one
 `RateLimiter` for the process (§5.2), the adapter of each source instance (`adapters`), the injected clock and
 sleep, and `admission_stopped`, which the shutdown sets so that no new request starts (§3.3.5). `embedder` is
-the process's embedder client (Task 22), `None` in tests of nodes that embed nothing.
+the process's embedder client (Task 22), `None` in tests of nodes that embed nothing. `deadman` is the
+process's dead-man pinger (M5 Task 5), `None` without the healthchecks secrets.
 
 `FetchContext` holds the §9.2 semaphores the fetch nodes hold around a traversal: one per source (JSearch 1,
 SerpApi 1, Adzuna 1, Arbeitnow 1) and one per ATS host (`host`: 2 slots, `ATS_HOST_LIMIT`, made on first use,
@@ -16,7 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -24,6 +25,10 @@ from jobhunter.embeddings import EmbedderClient
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.ratelimit import ATS_HOST_LIMIT, RateLimiter
+
+if TYPE_CHECKING:
+    # Only for the annotation: the pinger's module registers a worker reconciler.
+    from jobhunter.observability.deadman import DeadmanPinger
 
 # The fetch concurrency of each source (§9.2 node 2): its semaphore's slots.
 SOURCE_CONCURRENCY: Final[Mapping[str, int]] = MappingProxyType(
@@ -60,3 +65,6 @@ class CollectDeps:
     admission_stopped: Callable[[], bool]
     limiter: RateLimiter
     fetch_ctx: FetchContext
+    # M5 Task 5: the process's dead-man pinger, whose fast path the `finalize` node runs after the run-ending
+    # commit; `None` without the healthchecks secrets (and in tests of nodes that end no run).
+    deadman: "DeadmanPinger | None" = None

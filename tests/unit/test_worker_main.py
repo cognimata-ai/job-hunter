@@ -2,7 +2,7 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
 from jobhunter.worker.main import exit_unless_lock_held
@@ -790,6 +790,79 @@ async def test_a_dispatcher_that_does_not_stop_is_cancelled_within_its_bound(
     assert logged(caplog, "worker_teardown_failed") == []
 
 
+# --- M5 Task 5: one dead-man pinger for the run ends, the tick and the sync, when both secrets are set ------
+
+HC_PING_URL = "https://hc-ping.test/00000000-0000-4000-8000-000000000001"  # low-entropy stand-ins
+HC_SECRETS = {"healthchecks_ping_url": f"{HC_PING_URL}\n", "healthchecks_api_key": "hc-test-key\n"}
+
+
+@pytest.mark.parametrize(
+    ("secrets", "reason"),
+    [
+        ({}, "not_configured"),
+        ({"healthchecks_ping_url": HC_SECRETS["healthchecks_ping_url"]}, "not_configured"),
+        ({"healthchecks_api_key": HC_SECRETS["healthchecks_api_key"]}, "not_configured"),
+        (
+            {**HC_SECRETS, "healthchecks_ping_url": "https://hc-ping.test/pingkeyxyz/collection"},
+            "ping_url_form",
+        ),
+    ],
+)
+async def test_without_both_healthchecks_secrets_no_pinger_is_built_and_deadman_disabled_is_logged_once(
+    monkeypatch, tmp_path, caplog, secrets: dict[str, str], reason: str
+) -> None:
+    """O-ops Q8: dev and test have no dead-man, and say so once at start (a slug ping URL, which a prod
+    worker's startup refuses, is no dead-man either outside prod)."""
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, secrets=secrets)
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [*START, *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    [deps] = world.deps
+    assert isinstance(runtime, WorkerRuntime) and isinstance(deps, CollectDeps)
+    assert runtime.deadman is None and deps.deadman is None
+    assert [cast(Any, ctx).deadman for ctx in world.contexts] == [None]  # the start cadence's
+    [event] = logged(caplog, "deadman_disabled")
+    assert (event["level"], event["reason"]) == ("info", reason)
+    assert "hc-ping" not in caplog.text and "hc-test-key" not in caplog.text
+
+
+async def test_with_both_secrets_one_pinger_serves_the_run_ends_the_tick_and_the_sync(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.clock import utcnow
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    env = {"HEALTHCHECKS_API_URL": "https://healthchecks.test/api/v3"}
+    world = World(monkeypatch, tmp_path, env=env, secrets=HC_SECRETS)
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [*START, *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    [deps] = world.deps
+    assert isinstance(runtime, WorkerRuntime) and isinstance(runtime.deadman, DeadmanPinger)
+    assert isinstance(deps, CollectDeps)
+    pinger = runtime.deadman
+    # the graph's `finalize` node, `run_collect`'s `_finalize`, the reconcilers and `deadman_sync` share it
+    assert deps.deadman is pinger and [cast(Any, ctx).deadman for ctx in world.contexts] == [pinger]
+    assert (pinger._engine, pinger._epoch, pinger._clock) == (runtime.engine, 3, utcnow)
+    client = pinger._client
+    assert isinstance(client, HealthchecksClient)
+    assert (client._ping_url, client._api_url, client._api_key) == (
+        HC_PING_URL,
+        "https://healthchecks.test/api/v3",
+        "hc-test-key",
+    )
+    assert client._http.headers["User-Agent"] == world.cfg.http_user_agent
+    assert client._http.is_closed  # closed by the teardown
+    assert logged(caplog, "deadman_disabled") == []
+
+
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(
     monkeypatch, tmp_path, caplog
 ) -> None:
@@ -908,6 +981,8 @@ M3_RECONCILERS = {
     "scoring_drift": ["heavy"],
     "batch_submissions": ["tick"],
 }
+# M5 Task 5: the dead-man switch's durable path, registered by `observability.deadman` (O-ops Q6, O10).
+M5_RECONCILERS = {"deadman_ping": ["tick"]}
 # The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
 # the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
 # import in `test_the_registering_modules_list_every_m3_module`).
@@ -928,7 +1003,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     """The final pin of M3 (Task 27; M2 fix round 1, Minor 5, made it a fresh interpreter): one that imports
     ONLY `worker.main._REGISTERING_MODULES` (step 4, before the takeover; never `worker.main` itself, whose
     imports would register most of it anyway) holds exactly:
-    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set);
+    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set),
+      and M5's `deadman_ping` (Task 5, `observability.deadman`);
     - the five takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, Task
       16's `batch_submissions`), each run in a fenced transaction of its own since Task 27;
     - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
@@ -949,7 +1025,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS},
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS, **M5_RECONCILERS},
         "sweeps": ["batch_submissions", "operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",

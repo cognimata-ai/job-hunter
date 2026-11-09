@@ -390,6 +390,7 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
@@ -432,6 +433,7 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
         embedder=None,
         shutdown=ShutdownState(),
         cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
@@ -505,6 +507,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
         embedder=None,
         shutdown=ShutdownState(),
         cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(FencedOut) as fenced:  # the job fails, after the daily cadence ran
@@ -532,6 +535,7 @@ async def test_a_fence_of_another_owner_fails_the_tick_and_never_stops_the_worke
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     with pytest.raises(FencedOut):
         await tasks.tick(
@@ -569,6 +573,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(RuntimeError):
@@ -594,7 +599,13 @@ async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_recon
     embedder = object()  # the runtime's client, whatever it is: handed on as is
     cfg = object()  # the runtime's configuration, as is (M5 Task 3: `metrics_refresh` reads its paths)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=3, embedder=embedder, shutdown=ShutdownState(), cfg=cfg
+        engine=engine,
+        queue=queue_app,
+        epoch=3,
+        embedder=embedder,
+        shutdown=ShutdownState(),
+        cfg=cfg,
+        deadman=None,
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.reconcile_heavy(context, timestamp=0)
@@ -624,6 +635,7 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
@@ -679,7 +691,13 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
     stale = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState(), cfg=None
+        engine=engine,
+        queue=queue_app,
+        epoch=current_epoch,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=None,
+        deadman=None,
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": stale})), timestamp=0)
     assert await runs(engine) == [] and await stored_cursor(engine) == A
@@ -695,6 +713,7 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
     assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)

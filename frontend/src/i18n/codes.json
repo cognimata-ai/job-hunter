@@ -138,6 +138,7 @@
     "batch.submit_ambiguous_unresolved",
     "coverage.gap_abandoned",
     "coverage.too_broad",
+    "deadman.update_failed",
     "dedup.ambiguous_grouping",
     "dedup.field_conflict",
     "dedup.identity_conflict",

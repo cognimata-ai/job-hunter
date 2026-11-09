@@ -89,6 +89,11 @@ _ORIGIN_DEFAULT_PORTS: Final = MappingProxyType({"http": 80, "https": 443})
 # that makes a browser read the whole host as an IPv4 address (decimal or hex).
 _ORIGIN_HOST_NAME: Final = re.compile(r"[a-z0-9.-]+")
 _IPV4_LAST_LABEL: Final = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# M5 Task 5 (O5): the uuid of a healthchecks check, the last path segment of its ping URL in the uuid form
+# (`https://hc-ping.com/<uuid>`); the slug form (`/<ping-key>/<slug>`) names no check the API can manage.
+_CHECK_UUID: Final = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
 
 ALL_SECRETS: Final = SECRET_NAMES
 
@@ -412,6 +417,29 @@ def _is_https_url(url: str | None) -> bool:
     return parsed.scheme == "https" and bool(parsed.host) and port_ok
 
 
+def ping_url_uuid(ping_url: str) -> str | None:
+    """The check's uuid, lower-cased: the last path segment of `ping_url` (read by httpx's parser, the one the
+    dead-man's client uses) when it is a uuid; `None` for any other URL, the slug form among them (O5)."""
+    try:
+        path = httpx.URL(ping_url).path
+    except httpx.InvalidURL:
+        return None
+    segment = path.rpartition("/")[2]
+    return segment.lower() if _CHECK_UUID.fullmatch(segment) else None
+
+
+def _check_healthchecks_ping_url(cfg: AppConfig) -> None:
+    """M5 Task 5 (O5), part of §16.8 check 8 (`healthchecks_ping_url_form`): a prod worker's
+    `healthchecks_ping_url` is an https URL that ends in the check's uuid, which the period sync's Management
+    API calls name. The detail names the secret, never its value."""
+    ping_url = cfg.secrets.get("healthchecks_ping_url", b"").decode("utf-8", errors="replace").strip()
+    if not (_is_https_url(ping_url) and ping_url_uuid(ping_url) is not None):
+        raise StartupCheckFailed(
+            "healthchecks_ping_url_form",
+            "healthchecks_ping_url must be an https URL that ends in the check's uuid",
+        )
+
+
 def _check_ntfy_token(cfg: AppConfig) -> None:
     """Review M2: the `ntfy_token` secret, when set, is sent as `Authorization: Bearer <token>`, so it must be
     a header value: visible ASCII only, without spaces or control characters (`ntfy_token_header_safe`). The
@@ -473,7 +501,9 @@ def run_startup_assertions(cfg: AppConfig) -> None:
         absent = [n for n in ("healthchecks_ping_url", "healthchecks_api_key") if not cfg.secrets.get(n)]
         if absent:
             raise StartupCheckFailed("healthchecks_in_prod", f"a prod worker needs {', '.join(absent)}")
-        # Right after it (M5 plan O4, Deviation 11): a prod worker pushes its alerts to this topic, over TLS.
+        _check_healthchecks_ping_url(cfg)  # check 8's second half (M5 Task 5, O5): the uuid form
+        # Right after check 8 (M5 plan O4, Deviation 11): a prod worker pushes its alerts to this topic, over
+        # TLS.
         if not _is_https_url(cfg.ntfy_topic_url):
             raise StartupCheckFailed("ntfy_in_prod", "a prod worker needs an https NTFY_TOPIC_URL")
 

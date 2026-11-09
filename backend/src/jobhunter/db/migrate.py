@@ -57,6 +57,7 @@ _MANIFEST_NOOP_REASON: Final = "manifest_stream_arrives_in_M5"
 #   7261003  migrate (one key, session lock)
 #   7261004  duplicate grouping's company lock: the two-key form `(7261004, hashtext(company_key))`, a
 #            transaction lock (`dedup.groups.COMPANY_LOCK_NAMESPACE`, plan Deviation 46)
+#   7261005  dead-man switch (one key, session lock; `observability.deadman.DEADMAN_LOCK_KEY`, M5 Task 5)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 

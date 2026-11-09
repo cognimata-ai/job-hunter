@@ -60,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_golden_commands(commands)
     _add_eval_commands(commands)
+    _add_ops_commands(commands)
     return parser
 
 
@@ -141,6 +142,42 @@ def _add_eval_commands(commands: "argparse._SubParsersAction[argparse.ArgumentPa
     transport = run.add_mutually_exclusive_group(required=True)
     transport.add_argument("--live", action="store_true", help="the run is requested on the Anthropic API")
     transport.add_argument("--fake", action="store_true", help="the run is requested on the fake transport")
+
+
+def _interval_hours(text: str) -> int:
+    """`ops deadman-sync --interval-hours`: whole hours within `schedule_state`'s range, 1 to 168 (§3.4)."""
+    try:
+        hours = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("a whole number of hours") from None
+    if not 1 <= hours <= 168:
+        raise argparse.ArgumentTypeError("from 1 to 168 hours")
+    return hours
+
+
+def _add_ops_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    ops = commands.add_parser(
+        "ops",
+        help="the deployment's checks of ntfy and healthchecks (V15), as the worker; never print a secret",
+    )
+    ops_commands = ops.add_subparsers(dest="ops_command", required=True)
+    ops_commands.add_parser(
+        "notify-test",
+        help='push one test notification to NTFY_TOPIC_URL; print {"sent": true} or the error code',
+    )
+    sync = ops_commands.add_parser(
+        "deadman-sync",
+        help="apply the schedule's period to the dead-man check (healthchecks), under its lock",
+    )
+    sync.add_argument(
+        "--show", action="store_true", help="print the check's timeout, grace and pause as read back"
+    )
+    sync.add_argument(
+        "--interval-hours",
+        type=_interval_hours,
+        metavar="N",
+        help="the period to apply when no database is reachable (before it exists), 1 to 168",
+    )
 
 
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -248,6 +285,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_golden import run_eval_command
 
         return run_eval_command(args)
+    if args.command == "ops":
+        # Imported here: the ops commands need httpx, the database layer and the worker's dead-man module.
+        from jobhunter.cli_ops import run_ops_command
+
+        return run_ops_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

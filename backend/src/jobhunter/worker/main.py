@@ -35,7 +35,13 @@
    `profile_vectors` reconcilers and the `embed_profile` handler (through `OperationDeps`) share. Last, when
    `NTFY_TOPIC_URL` is set (M5 Task 4), the alert dispatcher (`observability.ntfy.AlertDispatcher`) on an
    `NtfyClient` of its own (its HTTP client, the topic, the `ntfy_token` secret when set, the public origin),
-   the engine, this worker's epoch, the clock and `asyncio.sleep`, which the runtime carries;
+   the engine, this worker's epoch, the clock and `asyncio.sleep`, which the runtime carries. Before the
+   collection deps, when both healthchecks secrets are set and the ping URL ends in the check's uuid (M5 Task
+   5), the dead-man pinger (`observability.deadman.DeadmanPinger`) on a `HealthchecksClient` of its own (its
+   HTTP client, the ping URL, `HEALTHCHECKS_API_URL`, the API key), the engine, this worker's epoch and the
+   clock, which the collection deps (the `finalize` node's fast path), the runtime (`run_collect`'s
+   `_finalize`, `deadman_sync`) and every reconcile context (`deadman_ping`) carry; without it one
+   `deadman_disabled` line, with its reason (`not_configured`, `ping_url_form`);
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
    transaction of its own, fenced by this worker's epoch: a source without its secret is
    `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
@@ -60,10 +66,10 @@
     the gateway's tries still in flight settled (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled
     execution can end before its streams have settled `ambiguous`, because a graph does not wait for a
     cancelled node's task; M3 Task 28), the watchdog stopped, the saver, the task app, the source clients,
-    the dispatcher's, the embedder's and the gateway's HTTP clients and the engine closed, and the lock
-    session closed last, which releases the lock; then `worker_shutdown_complete`. Each of its waits takes at
-    most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in
-    `shutdown.STOP_BUDGET_S`.
+    the dispatcher's, the dead-man's, the embedder's and the gateway's HTTP clients and the engine closed, and
+    the lock session closed last, which releases the lock; then `worker_shutdown_complete`. Each of its waits
+    takes at most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits
+    in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -133,6 +139,8 @@ from jobhunter.graphs.score.graph import build_score_graphs
 from jobhunter.llm import transport as llm_transport
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
+from jobhunter.observability import deadman
+from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
@@ -206,6 +214,8 @@ _REGISTERING_MODULES: Final = (
     # start imports them before the takeover with the rest of the score lane
     "jobhunter.scoring.golden",
     "jobhunter.llm.batches",
+    # M5 Task 5: the `deadman_ping` reconciler (O-ops Q6, O10)
+    "jobhunter.observability.deadman",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -273,6 +283,8 @@ class _WorkerProcess:
         self.ntfy_http: httpx.AsyncClient | None = None
         self.dispatching: asyncio.Task[None] | None = None
         self.dispatch_stop = asyncio.Event()
+        # M5 Task 5: the dead-man pinger's HTTP client (step 7), closed at teardown.
+        self.deadman_http: httpx.AsyncClient | None = None
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -343,6 +355,7 @@ class _WorkerProcess:
         def adapter_of(instance: InstanceRow) -> SourceAdapter:
             return build_adapter(instance, cfg, clients)
 
+        pinger = self._deadman_pinger(engine, epoch)
         deps = CollectDeps(
             engine=engine,
             adapters=adapter_of,
@@ -352,6 +365,7 @@ class _WorkerProcess:
             admission_stopped=lambda: shutdown.admission_stopped,
             limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
             fetch_ctx=FetchContext(),
+            deadman=pinger,
         )
         operation_deps = OperationDeps(
             cfg=cfg,
@@ -383,6 +397,7 @@ class _WorkerProcess:
             score_deps=score_deps,
             batches_client=batches_client,
             dispatcher=dispatcher,
+            deadman=pinger,
         )
 
         # 8. The source instances synced with the secrets under this worker's epoch fence, the start
@@ -410,6 +425,7 @@ class _WorkerProcess:
             embedder=embedder,
             on_superseded=lambda: request_shutdown(shutdown, reason=EPOCH_SUPERSEDED),
             cfg=cfg,
+            deadman=pinger,
         )
         await run_reconcilers(start, "start")
         if shutdown.requested.is_set():
@@ -465,6 +481,26 @@ class _WorkerProcess:
         )
         return AlertDispatcher(engine, client, epoch=epoch, clock=utcnow, sleep=asyncio.sleep)
 
+    def _deadman_pinger(self, engine: AsyncEngine, epoch: int) -> DeadmanPinger | None:
+        """Step 7's dead-man pinger when both healthchecks secrets are set and the ping URL ends in the
+        check's uuid, else `None` after one `deadman_disabled` line (module docstring; O-ops Q8)."""
+        cfg = self.cfg
+        secrets = deadman.healthchecks_secrets(cfg)
+        if secrets is None:
+            log.info("deadman_disabled", reason="not_configured")
+            return None
+        ping_url, api_key = secrets
+        try:
+            deadman.check_uuid(ping_url)  # a prod worker's startup refuses another form (O5)
+        except ValueError:
+            log.info("deadman_disabled", reason="ping_url_form")
+            return None
+        http_client = self.deadman_http = deadman.make_http_client(user_agent=cfg.http_user_agent)
+        client = HealthchecksClient(
+            http_client, ping_url=ping_url, api_url=cfg.healthchecks_api_url, api_key=api_key
+        )
+        return DeadmanPinger(engine, client, epoch=epoch, clock=utcnow)
+
     async def _dispatch(self, dispatcher: AlertDispatcher, shutdown: ShutdownState) -> None:
         """The alert dispatcher's loop until the teardown stops it. A loop that ends before its stop event is
         set was refused by its epoch fence: this worker was superseded, so it requests its own stop."""
@@ -492,6 +528,10 @@ class _WorkerProcess:
     async def _close_ntfy(self) -> None:
         if self.ntfy_http is not None:
             await self.ntfy_http.aclose()
+
+    async def _close_deadman(self) -> None:
+        if self.deadman_http is not None:
+            await self.deadman_http.aclose()
 
     async def _stop_watchdog(self, timeout_s: float) -> None:
         if self.watchdog is not None:
@@ -552,6 +592,7 @@ class _WorkerProcess:
             ("queue", lambda: _within(deadline, self._close_queue())),
             ("clients", lambda: _within(deadline, self._close_clients())),
             ("ntfy", lambda: _within(deadline, self._close_ntfy())),
+            ("deadman", lambda: _within(deadline, self._close_deadman())),
             ("embedder", lambda: _within(deadline, self._close_embedder())),
             ("llm", lambda: _within(deadline, self._close_llm())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),

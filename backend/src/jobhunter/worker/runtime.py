@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from jobhunter.graphs.score.graph import ScoreGraphs
     from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.observability.deadman import DeadmanPinger
     from jobhunter.observability.ntfy import AlertDispatcher
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -105,3 +106,7 @@ class WorkerRuntime:
     # M5 (Task 4): the alert dispatcher `worker_main` runs beside the queue loops when `NTFY_TOPIC_URL` is
     # set; `None` without it (and for the runtimes tests build without one).
     dispatcher: "AlertDispatcher | None" = None
+    # M5 (Task 5): the dead-man pinger, when both healthchecks secrets are set (`None` without them, and for
+    # the runtimes tests build without one): `run_collect`'s `_finalize`, the reconcilers' `deadman_ping` and
+    # `deadman_sync` use it, as the collection graph's `finalize` node does through its `CollectDeps`.
+    deadman: "DeadmanPinger | None" = None
