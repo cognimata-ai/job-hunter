@@ -2,9 +2,10 @@
 O7, Q12, Q13).
 
 - `raise_alert` on an open alert with a higher severity (`info < warn < critical`) escalates it: the row takes
-  the new severity, message and context, and its `last_notified_at` is cleared, so the dispatcher pushes the
-  escalation at once; `occurrences` and `last_at` move as for any repeat. A lower or equal severity never
-  changes the row but for those two.
+  the new severity, message and context, and its `last_notified_at` and `acknowledged_at` are cleared, so the
+  dispatcher pushes the escalation at once (the user acknowledged the lower severity, not this one;
+  controller ruling T2-1); `occurrences` and `last_at` move as for any repeat. A lower or equal severity never
+  changes the row but for those two: an acknowledgement stays.
 - `acknowledge_alert` resolves `llm.reservation_bound_violated` (§17.6: "manual acknowledgement"): its pause
   ends, and its next occurrence opens a new row, which pauses the score lane again and is pushed again. Any
   other alert stays open when acknowledged.
@@ -108,6 +109,35 @@ async def test_a_lower_severity_raise_never_deescalates(engine: AsyncEngine) -> 
         assert after.last_notified_at == NOTIFIED  # not pushed again
         assert after.occurrences == n
         assert after.last_at > before.last_at
+
+
+async def acknowledged(engine: AsyncEngine, alert_id: int) -> None:
+    async with engine.begin() as conn:
+        assert await acknowledge_alert(conn, alert_id, now=NOW) == NOW
+
+
+async def test_an_escalation_clears_the_acknowledgement(engine: AsyncEngine) -> None:
+    warn = await raise_(engine, "warn", "backup older than 36 h", {"age_h": 40})
+    await notified(engine, warn)
+    await acknowledged(engine, warn)
+    assert (await raise_(engine, "critical", "backup older than 72 h", {"age_h": 80})) == warn
+    after = await row(engine, warn)
+    assert after.severity == "critical"
+    assert (after.acknowledged_at, after.last_notified_at, after.resolved_at) == (None, None, None)
+    assert after.occurrences == 2
+
+
+async def test_a_lower_or_equal_severity_raise_keeps_the_acknowledgement(engine: AsyncEngine) -> None:
+    critical = await raise_(engine, "critical", "disk at 90 %", {"used_pct": 91}, code="system.disk_pressure")
+    await notified(engine, critical)
+    await acknowledged(engine, critical)
+    repeats: tuple[Severity, ...] = ("warn", "critical")  # lower, equal
+    for n, severity in enumerate(repeats, start=2):
+        repeat = await raise_(engine, severity, f"repeat {n}", {"used_pct": 85}, code="system.disk_pressure")
+        assert repeat == critical
+        after = await row(engine, critical)
+        assert (after.severity, after.acknowledged_at, after.last_notified_at) == ("critical", NOW, NOTIFIED)
+        assert after.occurrences == n
 
 
 async def test_ack_resolves_a_reservation_bound_violation_and_its_next_occurrence_reopens_and_pauses(

@@ -4,9 +4,11 @@ An alert is identified by `code` and `subject` (`dedup_key = "<code>:<subject>"`
 it again counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial index
 `alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows. A repeat with a
 higher severity escalates the open alert (M5 Task 2, O-ops O7; `catalogue.SEVERITIES` ranks them): it takes
-the new severity, message and context, and its `last_notified_at` is cleared so that the alert dispatcher
-pushes the escalation at once; a lower or equal severity changes nothing but the count. The severities and
-what each code does are `observability.catalogue`'s.
+the new severity, message and context, and its `last_notified_at` and `acknowledged_at` are cleared so that
+the alert dispatcher, which pushes unacknowledged alerts only (§17.6 L5632), pushes the escalation at once:
+the user acknowledged the lower severity, not this one (controller ruling T2-1). A lower or equal severity
+changes nothing but the count; an acknowledgement stays. The severities and what each code does are
+`observability.catalogue`'s.
 
 `open_alert` opens one only when none is open, and counts no occurrence of an open one: for a state that a
 later check finds still true, not a new occurrence of it (a start that finds a key still missing).
@@ -51,7 +53,8 @@ _RAISE = q(
     f"severity = CASE WHEN {_ESCALATES} THEN EXCLUDED.severity ELSE alerts.severity END, "
     f"message = CASE WHEN {_ESCALATES} THEN EXCLUDED.message ELSE alerts.message END, "
     f"context = CASE WHEN {_ESCALATES} THEN EXCLUDED.context ELSE alerts.context END, "
-    f"last_notified_at = CASE WHEN {_ESCALATES} THEN NULL ELSE alerts.last_notified_at END "
+    f"last_notified_at = CASE WHEN {_ESCALATES} THEN NULL ELSE alerts.last_notified_at END, "
+    f"acknowledged_at = CASE WHEN {_ESCALATES} THEN NULL ELSE alerts.acknowledged_at END "
     "RETURNING id",
     jsonb=["context"],
 )
@@ -107,9 +110,10 @@ async def raise_alert(
     """Open the alert `code`/`subject`, or count one more occurrence of the open one; returns its id.
 
     A repeat counts in `occurrences` and `last_at`. One with a higher `severity` than the open alert's
-    escalates it: the alert takes this `severity`, `message` and `context`, and `last_notified_at` is cleared,
-    so it is pushed again at once; otherwise the open alert's severity, message and context stay. It never
-    de-escalates. `message` and `context` carry no PII (ids and counts only).
+    escalates it: the alert takes this `severity`, `message` and `context`, and `last_notified_at` and
+    `acknowledged_at` are cleared, so it is unacknowledged again and pushed at once; otherwise the open
+    alert's severity, message, context, notification and acknowledgement stay. It never de-escalates.
+    `message` and `context` carry no PII (ids and counts only).
     """
     result = await conn.execute(
         _RAISE,
