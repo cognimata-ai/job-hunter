@@ -118,7 +118,12 @@ the other transaction committed.
 closed`, §7.16.2; `availability_changed_at := now()` when it changes) and its postings' first and last
 sighting; a `posted_at_effective` beyond a lowered `first_seen_at` is capped to it (the CHECK of §7.9),
 and the recompute that follows selects it again. It is the one place a job's availability is derived:
-`availability.rules.recompute_job_availability` (the snapshot effects and the stale sweep) reuses it.
+`availability.rules.recompute_job_availability` (the snapshot effects and the stale sweep) reuses it. So a
+job whose availability changes to `closed` here, by whatever path (a snapshot's absence, an unmerge that
+takes the open postings back, identity resolution), has its `dedup.ambiguous_grouping` alert (subject
+`job:<id>`) resolved in the caller's transaction, after the job row and before the caller's ranking bump:
+the choice between its groups no longer matters (M5 Task 3, O-ops O17, M1 Carry-forward 11, ruling T3-3; a
+tombstoned job's is the purge's).
 
 Every timestamp written is the database's `now()`, the clock domain of `runs.started_at` (carry 3; Task 17
 ruling T17-a; Ruling T18-b: no function here takes a caller clock; the `now` the target functions take is the
@@ -137,6 +142,7 @@ from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup import revisions
+from jobhunter.dedup.representative import AMBIGUOUS_GROUPING
 from jobhunter.dedup.revisions import FIELD_CONFLICT_ALERT, RecomputeResult
 from jobhunter.dedup.user_actions import (
     MergeEvent,
@@ -193,7 +199,7 @@ _DERIVE: Final = q(
     "ELSE least(j.posted_at_effective, p.first_seen) END "
     "FROM p, old WHERE j.id = :job AND p.best IS NOT NULL "
     "RETURNING old.availability IS DISTINCT FROM j.availability AS availability_changed, "
-    "old.first_seen_at IS DISTINCT FROM j.first_seen_at AS first_seen_changed"
+    "old.first_seen_at IS DISTINCT FROM j.first_seen_at AS first_seen_changed, j.availability"
 )
 _OWNED_KEYS: Final = q(
     "SELECT key_ns, key_value, exclusive FROM ad_keys WHERE job_id = :job ORDER BY key_ns, key_value"
@@ -322,10 +328,12 @@ async def fenced_jobs(conn: AsyncConnection, job_ids: Iterable[int]) -> list[int
 
 async def derive_from_postings(conn: AsyncConnection, job_id: int) -> Derived:
     """The job's availability and seen bounds from its postings (module docstring); nothing for a job
-    without a posting."""
+    without a posting. A job that closed has its `dedup.ambiguous_grouping` alert resolved."""
     row = (await conn.execute(_DERIVE, {"job": job_id, "order": list(AVAILABILITY_ORDER)})).first()
     if row is None:
         return Derived(False, False)
+    if row.availability_changed and row.availability == "closed":
+        await resolve_alert(conn, code=AMBIGUOUS_GROUPING, subject=f"job:{job_id}")
     return Derived(bool(row.availability_changed), bool(row.first_seen_changed))
 
 

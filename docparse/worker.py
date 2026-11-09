@@ -115,7 +115,9 @@ LEFTOVER_AFTER_S: Final = 120.0
 PROTOCOL_FILES: Final = frozenset({*INPUT_NAMES.values(), REQUEST, f"{REQUEST}.tmp", CLAIMED, TEXT, RESULT})
 IDLE_SWEEP_S: Final = 60.0
 SWEEP_FAILED_EXIT: Final = 70  # EX_SOFTWARE: compose restarts the container
-# Written in the root before that exit; the worker reads the same name (`worker.reconcilers`).
+# Written in the root before that exit; the worker's half of the protocol repeats the name
+# (`jobhunter.profile.parse_client.LEFTOVER_MARKER`), keeps the marker through its start's cleanup and
+# reads it.
 LEFTOVER_MARKER: Final = ".docparse-leftover"
 # No symlink is followed and a FIFO is never waited on (a parse chooses what lies in the root).
 _MARKER_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC

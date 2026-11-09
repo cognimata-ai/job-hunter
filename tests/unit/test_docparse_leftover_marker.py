@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 from typing import Final
 
+from jobhunter.profile import parse_client
 from jobhunter.worker import reconcilers
 
 import docparse.worker as worker
@@ -31,7 +32,10 @@ worker.main()
 
 
 def test_the_worker_reads_the_name_docparse_writes() -> None:
-    assert worker.LEFTOVER_MARKER == reconcilers.DOCPARSE_LEFTOVER_MARKER == ".docparse-leftover"
+    # docparse is a package of its own (the app image does not contain it), so the backend repeats the name
+    # once, in its half of the file protocol; the reconciler reads it from there
+    assert worker.LEFTOVER_MARKER == parse_client.LEFTOVER_MARKER == ".docparse-leftover"
+    assert reconcilers.DOCPARSE_LEFTOVER_MARKER is parse_client.LEFTOVER_MARKER
 
 
 def test_a_failed_sweep_writes_the_marker_before_exit_70(tmp_path: Path) -> None:

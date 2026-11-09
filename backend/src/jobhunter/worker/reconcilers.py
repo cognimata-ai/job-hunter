@@ -69,6 +69,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
+from jobhunter.profile import parse_client
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, release_stalled_jobs
@@ -86,7 +87,7 @@ DISK_WARN_RATIO: Final = 0.80
 DISK_CRITICAL_RATIO: Final = 0.90
 QUEUE_ROWS_LIMIT: Final = 1_000_000
 TABLE_BYTES_LIMIT: Final = 10_000_000_000  # §17.6's "10 GB"
-DOCPARSE_LEFTOVER_MARKER: Final = ".docparse-leftover"  # `docparse.worker.LEFTOVER_MARKER`
+DOCPARSE_LEFTOVER_MARKER: Final = parse_client.LEFTOVER_MARKER  # the worker's half of the file protocol
 DISK_PRESSURE_ALERT: Final = "system.disk_pressure"
 TABLE_GROWTH_ALERT: Final = "system.table_growth"
 CHECKSUM_MISMATCH_ALERT: Final = "embedder.checksum_mismatch"

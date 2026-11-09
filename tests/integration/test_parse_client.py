@@ -386,6 +386,17 @@ def test_cleanup_leftovers_removes_every_stale_job_directory(tmp_path) -> None:
     assert root.is_dir() and list(root.iterdir()) == []
 
 
+def test_cleanup_leftovers_keeps_docparses_leftover_marker(tmp_path) -> None:
+    """M5 Task 3 (ruling T3-2): the marker is docparse's alone, written before its exit 70 and removed after
+    its clean start sweep; a worker's start keeps it, so `docparse.leftover` stays open while docparse
+    fails."""
+    root = parse_root(tmp_path)
+    stale_job(root, "a", {"input.pdf": b"%PDF-1.4", "request.json": b"{}"})
+    (root / worker.LEFTOVER_MARKER).write_bytes(b"")
+    assert ParseClient(root).cleanup_leftovers() == 1  # the job, not the marker
+    assert [entry.name for entry in root.iterdir()] == [worker.LEFTOVER_MARKER]
+
+
 def test_cleanup_leftovers_on_a_missing_root_removes_nothing(tmp_path) -> None:
     assert ParseClient(tmp_path / "missing").cleanup_leftovers() == 0
     assert not (tmp_path / "missing").exists()

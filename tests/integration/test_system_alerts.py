@@ -32,7 +32,9 @@ import sqlalchemy as sa
 from jobhunter.availability.rules import recompute_job_availability
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.db import ranking
 from jobhunter.db.transitions import transition
+from jobhunter.dedup.merge import merge_jobs, unmerge
 from jobhunter.embeddings import (
     EMBEDDING_MODEL_ID,
     NO_HEALTH,
@@ -58,6 +60,7 @@ from tests.support.batches import (
     reconcile_ambiguous_once,
     submission_rows,
 )
+from tests.support.collect import pending_item, queued_run, resolved
 from tests.support.eval import (
     CaseRef,
     eval_deps,
@@ -492,6 +495,19 @@ async def test_adoption_resolves_submit_ambiguous_unresolved(
 # ---- dedup.ambiguous_grouping ------------------------------------------------------------------------------
 
 
+_JOB_OF_POSTING: Final = sa.text("SELECT job_id FROM postings WHERE id = :p")
+_POSTING_OF_ITEM: Final = sa.text(
+    "SELECT o.posting_id, p.job_id FROM posting_observations o JOIN postings p ON p.id = o.posting_id "
+    "WHERE o.raw_item_id = :i"
+)
+_JOB_AVAILABILITY: Final = sa.text("SELECT availability FROM jobs WHERE id = :j")
+
+
+async def job_availability(engine: AsyncEngine, job_id: int) -> str:
+    async with engine.connect() as conn:
+        return str((await conn.execute(_JOB_AVAILABILITY, {"j": job_id})).scalar_one())
+
+
 async def test_closing_a_job_resolves_ambiguous_grouping(
     engine: AsyncEngine, current_epoch: int, posting_factory: Any
 ) -> None:
@@ -509,11 +525,7 @@ async def test_closing_a_job_resolves_ambiguous_grouping(
     }
     async with engine.begin() as conn:
         jobs = {
-            name: int(
-                (
-                    await conn.execute(sa.text("SELECT job_id FROM postings WHERE id = :p"), {"p": p})
-                ).scalar_one()
-            )
+            name: int((await conn.execute(_JOB_OF_POSTING, {"p": p})).scalar_one())
             for name, p in postings.items()
         }
         for job in jobs.values():  # each joined the best of several groups
@@ -526,3 +538,38 @@ async def test_closing_a_job_resolves_ambiguous_grouping(
     by_key = {a.dedup_key: a for a in await alerts(engine, GROUPING)}
     assert by_key[f"{GROUPING}:job:{jobs['closing']}"].resolved_at is not None
     assert by_key[f"{GROUPING}:job:{jobs['fading']}"].resolved_at is None  # a stale job's choice still stands
+
+
+async def test_an_unmerge_that_closes_a_job_resolves_ambiguous_grouping(
+    engine: AsyncEngine, current_epoch: int
+) -> None:
+    """The dedup path (ruling T3-3): an unmerge takes the merged posting back, and the job whose own posting
+    is closed closes with it, its availability derived where every path derives it
+    (`merge.derive_from_postings`)."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=8)
+    found: list[tuple[int, int]] = []
+    for hours, native_id in enumerate(("UA", "UB")):  # two JSearch postings, each its own job
+        item = await pending_item(
+            engine, owner, "jsearch", {"native_id": native_id}, fetched_at=at + timedelta(hours=hours)
+        )
+        assert await resolved(engine, owner, item) == "linked"
+        async with engine.connect() as conn:
+            found.append(tuple((await conn.execute(_POSTING_OF_ITEM, {"i": item})).one()))
+    (closing_posting, into), (_, from_) = found
+    async with engine.begin() as conn:  # the job's own posting closes
+        await transition(conn, "postings", closing_posting, ["active"], "closed", reason="ats_absent")
+        assert await recompute_job_availability(conn, into) is True
+    async with engine.begin() as conn:
+        event = await merge_jobs(
+            conn, from_job_id=from_, into_job_id=into, kind="user_confirmed_merge", evidence={}
+        )
+        await ranking.bump(conn)
+    assert await job_availability(engine, into) == "active"  # the merged posting is active
+    async with engine.begin() as conn:  # the job then joined the best of several groups
+        await raise_alert(conn, code=GROUPING, severity="info", subject=f"job:{into}", message="ambiguous")
+    async with engine.begin() as conn:
+        await unmerge(conn, event)  # its own, closed posting alone again
+    assert await job_availability(engine, into) == "closed"
+    [alert] = await alerts(engine, GROUPING)
+    assert (alert.dedup_key, alert.resolved_at is not None) == (f"{GROUPING}:job:{into}", True)

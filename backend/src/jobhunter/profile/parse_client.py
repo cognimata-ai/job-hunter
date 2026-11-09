@@ -18,7 +18,10 @@ alone, so a decrypted CV never reaches a disk.
 - `cleanup_leftovers()` removes every entry under the root at worker start: what a crashed worker left. A
   missing root removes nothing and returns 0. docparse sweeps the root too, and it can remove what a
   compromised parse left that this uid cannot (`docparse.worker.sweep`, final review FR-11); it keeps a
-  job's protocol files for longer than this client waits for the job.
+  job's protocol files for longer than this client waits for the job. One entry is docparse's alone and
+  stays: `LEFTOVER_MARKER`, which docparse writes before it exits after a sweep that failed and removes
+  after a clean start sweep; while it is there, the worker's `metrics_refresh` raises `docparse.leftover`
+  (M5 Task 3, ruling T3-2), so a worker's restart never resolves that alert while docparse still fails.
 
 **docparse is the sandbox of hostile documents**, and anything its parser child runs can write anything in
 the job directory. Its answer is read as untrusted: every file goes through the job directory's own file
@@ -64,6 +67,8 @@ INPUT_NAMES: Final[dict[str, str]] = {
 REQUEST: Final = "request.json"
 TEXT: Final = "text.txt"
 RESULT: Final = "result.json"
+# docparse's marker in the root (`docparse.worker.LEFTOVER_MARKER`; module docstring): never this client's.
+LEFTOVER_MARKER: Final = ".docparse-leftover"
 DIR_MODE: Final = 0o770
 FILE_MODE: Final = 0o660
 # A result is six short fields; the text is UTF-8, at most four bytes a character.
@@ -253,13 +258,16 @@ class ParseClient:
             _remove(job_dir)
 
     def cleanup_leftovers(self) -> int:
-        """Remove every entry under the root (run at worker start, before any job); the number removed."""
+        """Remove every entry under the root but docparse's `LEFTOVER_MARKER` (run at worker start, before any
+        job); the number removed."""
         try:
             entries = list(self.root.iterdir())
         except FileNotFoundError:
             return 0
         removed = 0
         for entry in entries:
+            if entry.name == LEFTOVER_MARKER:
+                continue  # docparse's own, read by `metrics_refresh` (module docstring)
             try:
                 if entry.is_dir() and not entry.is_symlink():
                     shutil.rmtree(entry)
