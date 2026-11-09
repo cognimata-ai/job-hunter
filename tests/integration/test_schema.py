@@ -2,7 +2,7 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from tests.support.fences import TEST_MANIFEST_SQL
+from tests.support.fences import TEST_MANIFEST_PSYCOPG_SQL
 from tests.support.pg import PgRole, PgServer, ensure_config_rows, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -155,10 +155,10 @@ def test_constraints_reject(migrated: PgServer, statements: list[str], sqlstate:
 
 
 def manifest(c: psycopg.Connection[TupleRow], kind: str) -> int:
-    """A test manifest of `kind` (`TEST_MANIFEST_SQL`, its `:kind` bound the psycopg way); its id."""
-    row = c.execute(TEST_MANIFEST_SQL.replace(":kind", "%(kind)s"), {"kind": kind}).fetchone()
+    """A test manifest of `kind` (`TEST_MANIFEST_PSYCOPG_SQL`); its id."""
+    row = c.execute(TEST_MANIFEST_PSYCOPG_SQL, {"kind": kind}).fetchone()
     assert row is not None
-    return int(str(row[0]))
+    return int(row[0])
 
 
 def test_is_fenced_global_and_jobs(migrated: PgServer) -> None:

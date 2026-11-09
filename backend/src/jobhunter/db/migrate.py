@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.alembic_runner import upgrade_head
-from jobhunter.db.compat import record_compat
+from jobhunter.db.compat import chain_compat, record_compat
 from jobhunter.db.seed import seed_defaults
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
@@ -96,10 +96,12 @@ async def _run_step(step: MigrateStep, cfg: AppConfig, engine: AsyncEngine, now:
         case "reconstruct_and_advance" | "advance_again" | "replay":
             log.info("migrate_step_noop", step=step, reason=_MANIFEST_NOOP_REASON)
         case "alembic":
+            # The rollback compatibility floors of the chain (M5): validated before the schema moves, so a
+            # mis-declared floor fails here, and recorded once the schema is at the head
+            chain = chain_compat()
             await asyncio.to_thread(upgrade_head, cfg.dsn("sqlalchemy"))
-            # The rollback compatibility floors of the chain, recorded once the schema is at the head (M5)
             async with engine.begin() as conn:
-                log.info("migrate_compat_recorded", written=await record_compat(conn))
+                log.info("migrate_compat_recorded", written=await record_compat(conn, chain=chain))
         case "grants":
             async with engine.begin() as conn:
                 log.info("migrate_grants", granted=await apply_explicit_grants(conn))

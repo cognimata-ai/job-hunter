@@ -53,7 +53,7 @@ def test_0010_floor_is_0009() -> None:
     )
 
 
-def fake(revision: str, down_revision: str | None, **declared: object) -> ModuleType:
+def fake(revision: str, down_revision: str | tuple[str, ...] | None, **declared: object) -> ModuleType:
     """A migration module of `revision` after `down_revision`, with the `declared` attributes."""
     module = ModuleType(f"fake_{revision}")
     vars(module).update(revision=revision, down_revision=down_revision, **declared)
@@ -64,14 +64,18 @@ def test_a_fake_chain_reads_the_declarations_and_their_defaults() -> None:
     modules = [
         fake("a", None),
         fake("b", "a", compat_floor="a", destructive=False),
-        fake("c", "b", compat_floor="c", destructive=True),
-        fake("d", "c", compat_floor="a", destructive=False),  # a floor further back than the last revision
+        fake("c", "b", compat_floor="a"),  # a floor further back than its parent revision, as far as b's
+        fake("d", "c", compat_floor="d", destructive=True),  # destructive: its own floor
+        fake("e", "d", compat_floor="d"),  # no further back than the destructive revision
+        fake("f", "e"),
     ]
     assert compat_of(modules) == (
         CompatInfo("a", "a", False),
         CompatInfo("b", "a", False),
-        CompatInfo("c", "c", True),
-        CompatInfo("d", "a", False),
+        CompatInfo("c", "a", False),
+        CompatInfo("d", "d", True),
+        CompatInfo("e", "d", False),
+        CompatInfo("f", "f", False),
     )
 
 
@@ -93,6 +97,35 @@ def test_a_fake_chain_reads_the_declarations_and_their_defaults() -> None:
         # declarations of the wrong type
         ([fake("a", None), fake("b", "a", compat_floor=9)], "b: compat_floor must be a str"),
         ([fake("a", None), fake("b", "a", destructive="no")], "b: destructive must be a bool"),
+        # a destructive revision whose floor is older than itself: older code reads what it removed
+        (
+            [fake("a", None), fake("b", "a", compat_floor="a", destructive=True)],
+            "b: destructive, so its compat_floor must be 'b', not 'a'",
+        ),
+        # a floor older than its parent's: it reaches past the parent's destructive change
+        (
+            [
+                fake("a", None),
+                fake("b", "a", compat_floor="b", destructive=True),
+                fake("c", "b", compat_floor="a"),
+            ],
+            "c: compat_floor 'a' is older than the floor 'b' of its parent 'b'",
+        ),
+        # the same, with no destructive flag: floors only move forward along the chain
+        (
+            [fake("a", None), fake("b", "a"), fake("c", "b", compat_floor="a")],
+            "c: compat_floor 'a' is older than the floor 'b' of its parent 'b'",
+        ),
+        # a merge: the floor must be at or after the floor of every parent
+        (
+            [
+                fake("a", None),
+                fake("x", "a", compat_floor="a"),
+                fake("y", "a", compat_floor="y", destructive=True),
+                fake("m", ("x", "y"), compat_floor="x"),
+            ],
+            "m: compat_floor 'x' is older than the floor 'y' of its parent 'y'",
+        ),
     ],
 )
 def test_a_floor_outside_the_chain_raises(modules: list[ModuleType], message: str) -> None:

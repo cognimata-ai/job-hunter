@@ -6,6 +6,7 @@ the backup role's grants, and the exact downgrade.
 """
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
@@ -15,13 +16,16 @@ import sqlalchemy as sa
 from alembic import command
 from jobhunter.auth import throttle
 from jobhunter.db.alembic_runner import alembic_config
+from jobhunter.db.migrate import run_migrate_async
+from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import FOREIGN_KEY_VIOLATION, UNIQUE_VIOLATION, PgErrorInfo, pg_error
 from jobhunter.db.transitions import transition
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.fences import MANIFEST_KIND, insert_test_fence, insert_test_manifest
+from tests.support.fixtures import ConfigFactory
 from tests.support.m2 import insert_profile_chain, insert_proposal
-from tests.support.m3 import insert_bulk_operation, insert_id, insert_submission
+from tests.support.m3 import insert_bulk_operation, insert_id, insert_row, insert_submission
 from tests.support.pg import PgServer, pg_one, pg_rows
 from tests.support.schema import refused, refused_check
 
@@ -30,6 +34,7 @@ M4_SCHEMA: Final = "0009_m4_ui"
 M5_SCHEMA: Final = "0010_m5_operations"
 TZ: Final = "timestamp with time zone"
 NOW: Final = datetime(2026, 11, 9, 10, 0, tzinfo=UTC)
+OBJECT_NOT_IN_PREREQUISITE_STATE: Final = "55000"  # the 0010 downgrade's refusal
 
 # Every column as (name, type, NOT NULL, default, identity: 'a' ALWAYS, 'd' BY DEFAULT, '' none), by name.
 _COLUMNS: Final = (
@@ -122,6 +127,74 @@ TABLES: Final = {
         ("recorded_at", TZ, True, "now()", ""),
         ("revision", "text", True, None, ""),
     ],
+}
+# The CHECK, primary-key and unique constraints of each table, as PostgreSQL renders §7.14 and the brief (the
+# foreign keys are `FOREIGN_KEYS`). The spec leaves the CHECKs unnamed, so these are PostgreSQL's names.
+_OWN_CONSTRAINTS: Final = (
+    "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+    "WHERE conrelid = CAST(%s AS regclass) AND contype IN ('c', 'p', 'u') ORDER BY conname"
+)
+CONSTRAINTS: Final = {
+    "deletion_manifests": [
+        (
+            "deletion_manifests_check",
+            "CHECK (((status = 'executing'::text) OR "
+            "((completed_at IS NOT NULL) AND (file_sha256 IS NOT NULL))))",
+        ),
+        (
+            "deletion_manifests_check1",
+            "CHECK (((status = 'shipped'::text) = ((shipped_at IS NOT NULL) AND (shipment_id IS NOT NULL))))",
+        ),
+        (
+            "deletion_manifests_kind_check",
+            "CHECK ((kind = ANY (ARRAY['delete_everything'::text, 'source_purge'::text, "
+            "'profile_purge'::text, 'retention_purge'::text, 'job_tombstone'::text, "
+            "'golden_case_delete'::text])))",
+        ),
+        ("deletion_manifests_manifest_uuid_key", "UNIQUE (manifest_uuid)"),
+        ("deletion_manifests_pkey", "PRIMARY KEY (id)"),
+        (
+            "deletion_manifests_status_check",
+            "CHECK ((status = ANY (ARRAY['executing'::text, 'completed'::text, 'shipped'::text])))",
+        ),
+    ],
+    "manifest_shipments": [("manifest_shipments_pkey", "PRIMARY KEY (id)")],
+    "manifest_shipment_items": [("manifest_shipment_items_pkey", "PRIMARY KEY (shipment_id, manifest_uuid)")],
+    "backup_sets": [
+        (
+            "backup_sets_check",
+            "CHECK (((status <> 'succeeded'::text) OR ((restic_snapshot_id IS NOT NULL) AND "
+            "(dump_sha256 IS NOT NULL) AND (db_snapshot_at IS NOT NULL) AND (row_counts IS NOT NULL))))",
+        ),
+        ("backup_sets_pkey", "PRIMARY KEY (id)"),
+        (
+            "backup_sets_status_check",
+            "CHECK ((status = ANY (ARRAY['running'::text, 'succeeded'::text, 'failed'::text])))",
+        ),
+    ],
+    "backup_runs": [
+        ("backup_runs_kind_check", "CHECK ((kind = ANY (ARRAY['prune'::text, 'restore_test'::text])))"),
+        ("backup_runs_pkey", "PRIMARY KEY (id)"),
+        (
+            "backup_runs_status_check",
+            "CHECK ((status = ANY (ARRAY['running'::text, 'succeeded'::text, 'failed'::text])))",
+        ),
+    ],
+    "exports": [
+        ("exports_pkey", "PRIMARY KEY (id)"),
+        ("exports_size_bytes_check", "CHECK ((size_bytes >= 0))"),
+        (
+            "exports_status_check",
+            "CHECK ((status = ANY (ARRAY['running'::text, 'ready'::text, 'failed'::text, 'expired'::text, "
+            "'purged'::text])))",
+        ),
+    ],
+    "purged_batch_items": [("purged_batch_items_pkey", "PRIMARY KEY (submission_id, custom_id)")],
+    "deadman_state": [
+        ("deadman_state_id_check", "CHECK ((id = 1))"),
+        ("deadman_state_pkey", "PRIMARY KEY (id)"),
+    ],
+    "schema_compat": [("schema_compat_pkey", "PRIMARY KEY (revision)")],
 }
 # The columns 0010 adds to tables of earlier milestones.
 ADDED_COLUMNS: Final = {
@@ -226,6 +299,9 @@ async def test_the_m5_tables_match_the_spec_ddl(fresh_pg_server: PgServer) -> No
 
     for table, columns in TABLES.items():
         assert pg_rows(server, "migrator", _COLUMNS, table) == columns, table
+    assert CONSTRAINTS.keys() == TABLES.keys()
+    for table, constraints in CONSTRAINTS.items():
+        assert pg_rows(server, "migrator", _OWN_CONSTRAINTS, table) == constraints, table
     for table, column in ADDED_COLUMNS.items():
         assert column in pg_rows(server, "migrator", _COLUMNS, table), table
     assert pg_rows(server, "migrator", _INDEXES, list(INDEXES)) == sorted(INDEXES.items())
@@ -306,6 +382,12 @@ async def test_the_m5_tables_match_the_spec_ddl(fresh_pg_server: PgServer) -> No
         "INSERT INTO exports (status, expires_at, size_bytes) VALUES ('ready', now(), -1)",
         "size_bytes >= 0",
     )
+    # the dead-man state is a single row: id 1, and no other
+    refused_by_check(server, "deadman_state", "INSERT INTO deadman_state (id) VALUES (2)", "id = 1")
+    pg_one(server, "migrator", "INSERT INTO deadman_state (id) VALUES (1)")
+    with pytest.raises(psycopg.Error) as second:
+        pg_one(server, "migrator", "INSERT INTO deadman_state (id) VALUES (1)")
+    assert (second.value.sqlstate, second.value.diag.constraint_name) == ("23505", "deadman_state_pkey")
 
 
 async def test_purge_fences_manifest_fk_is_enforced(engine: AsyncEngine) -> None:
@@ -694,7 +776,71 @@ async def test_downgrade_to_0009_and_upgrade_again(fresh_pg_server: PgServer) ->
         "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
         "VALUES (gen_random_uuid(), 'source_purge', 'executing')",
     )
-    with pytest.raises(sa.exc.DBAPIError, match="deletion_manifests holds rows"):
+    with pytest.raises(sa.exc.DBAPIError, match="deletion_manifests holds rows") as bad:
         await downgrade(server, M4_SCHEMA)
+    assert pg_error(bad.value).sqlstate == OBJECT_NOT_IN_PREREQUISITE_STATE
     assert catalogue(server) == at_0010
     assert pg_one(server, "migrator", "SELECT count(*) FROM deletion_manifests") == (1,)
+
+
+# The tables whose rows are records, in the order the downgrade's guard checks them: a refusal names the first
+# that holds a row.
+RECORD_TABLES: Final = (
+    "purged_batch_items",
+    "exports",
+    "backup_runs",
+    "backup_sets",
+    "manifest_shipment_items",
+    "deletion_manifests",
+    "manifest_shipments",
+)
+
+
+async def test_the_downgrade_is_refused_while_any_record_table_holds_a_row(
+    fresh_pg_server: PgServer, make_config: ConfigFactory
+) -> None:
+    """One row in each of the seven record tables. Each downgrade is refused (55000) naming the first table of
+    the guard's order that still holds a row, and changes nothing; that table is then emptied, so every table
+    is in turn the one that refuses. With all seven empty the downgrade goes through, although
+    `deadman_state` and `schema_compat` (derived state) still hold their rows."""
+    server = fresh_pg_server
+    await run_migrate_async(make_config("migrate", server), now=NOW)  # the seeded rows a profile chain needs
+    engine = make_null_engine(server.dsn("migrator", driver="sqlalchemy"))
+    try:
+        async with engine.begin() as c:
+            chain = await insert_profile_chain(c)
+            bulk = await insert_bulk_operation(c, chain.llm_tuple_id)
+            submission = await insert_submission(c, chain.llm_tuple_id, bulk)
+            manifest = await insert_test_manifest(c, kind="source_purge")
+            await insert_row(
+                c,
+                "purged_batch_items",
+                {"submission_id": submission, "custom_id": "t1_a1", "manifest_id": manifest},
+            )
+            await insert_row(c, "exports", {"status": "ready", "expires_at": NOW})
+            backup_set = await insert_id(c, "backup_sets", {"status": "running"})
+            await insert_row(
+                c, "backup_runs", {"kind": "prune", "backup_set_id": backup_set, "status": "running"}
+            )
+            shipment = await insert_id(c, "manifest_shipments", {"restic_snapshot_id": "snap"})
+            await insert_row(
+                c,
+                "manifest_shipment_items",
+                {"shipment_id": shipment, "manifest_uuid": uuid.uuid4(), "file_sha256": b"\x00"},
+            )
+    finally:
+        await engine.dispose()
+    at_0010 = catalogue(server)
+
+    for table in RECORD_TABLES:
+        with pytest.raises(sa.exc.DBAPIError) as bad:
+            await downgrade(server, M4_SCHEMA)
+        assert pg_error(bad.value).sqlstate == OBJECT_NOT_IN_PREREQUISITE_STATE, table
+        assert f"refused: {table} holds rows" in str(bad.value), table
+        assert catalogue(server) == at_0010, table
+        pg_one(server, "migrator", f"DELETE FROM {table}")  # noqa: S608 (a constant name)
+
+    derived = "SELECT (SELECT count(*) FROM deadman_state), (SELECT count(*) > 0 FROM schema_compat)"
+    assert pg_one(server, "migrator", derived) == (1, True)
+    await downgrade(server, M4_SCHEMA)
+    assert pg_one(server, "migrator", "SELECT version_num FROM alembic_version") == (M4_SCHEMA,)

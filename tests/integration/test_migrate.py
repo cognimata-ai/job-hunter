@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from datetime import UTC, datetime
+from types import ModuleType
 
 import pytest
 import sqlalchemy as sa
@@ -339,6 +340,26 @@ async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
     # The steps after the failed one did not start.
     assert [e["step"] for e in logs if e["event"] == "migrate_step"] == list(MIGRATE_ORDER[:2])
     assert one(migrated, ADVISORY_LOCKS) == (0,)  # and the lock was released
+
+
+async def test_a_mis_declared_floor_fails_before_the_schema_moves(migrated, make_config, monkeypatch) -> None:
+    import jobhunter.db.compat as compat_module
+    import jobhunter.db.migrate as migrate_module
+    from structlog.testing import capture_logs
+
+    # a chain whose one revision names a floor outside it
+    misdeclared = ModuleType("fake_misdeclared")
+    vars(misdeclared).update(revision="b", down_revision=None, compat_floor="a")
+    monkeypatch.setattr(compat_module, "chain_modules", lambda: [misdeclared])
+    upgrades: list[str] = []  # a marker per call, never the DSN (it holds the password)
+    monkeypatch.setattr(migrate_module, "upgrade_head", lambda dsn: upgrades.append("upgrade_head"))
+    recorded = pg_rows(migrated, "migrator", COMPAT)
+    with capture_logs() as logs, pytest.raises(ValueError, match="b: compat_floor 'a'"):
+        await run_migrate_async(make_config("migrate"), now=NOW)
+    assert upgrades == []  # Alembic never ran
+    (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
+    assert (failed["step"], failed["error_type"]) == ("alembic", "ValueError")
+    assert pg_rows(migrated, "migrator", COMPAT) == recorded
 
 
 async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_config) -> None:

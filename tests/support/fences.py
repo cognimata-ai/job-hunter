@@ -5,7 +5,7 @@ names a manifest that exists. `insert_test_fence` writes one of the kind of purg
 `executing` as a purge's manifest is while its fence stands, and then the fence:
 
 - `TEST_MANIFEST_SQL`: the manifest insert, with a `:kind` bind and returning the id; the synchronous schema
-  tests run it on their own connections;
+  tests run it on their own connections, in its psycopg form `TEST_MANIFEST_PSYCOPG_SQL` (`%(kind)s`);
 - `insert_test_manifest(conn, *, kind)`: that insert on an async connection; the manifest's id;
 - `insert_test_fence(conn, *, kind, source_id, profile_version_id, job_ids, released)`: a manifest of the
   matching kind (`delete_everything`, `source_purge`, `profile_purge`, `job_tombstone`), then the fence over
@@ -26,6 +26,11 @@ FenceKind = Literal["global", "source", "profile", "jobs"]
 TEST_MANIFEST_SQL: Final = (
     "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
     "VALUES (gen_random_uuid(), :kind, 'executing') RETURNING id"
+)
+# The same insert with psycopg's named placeholder, for a plain psycopg connection.
+TEST_MANIFEST_PSYCOPG_SQL: Final = (
+    "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
+    "VALUES (gen_random_uuid(), %(kind)s, 'executing') RETURNING id"
 )
 # The manifest kind of the purge that raises each kind of fence (§7.14, §19.5).
 MANIFEST_KIND: Final[Mapping[FenceKind, str]] = MappingProxyType(

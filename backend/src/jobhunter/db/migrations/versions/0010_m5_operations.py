@@ -43,8 +43,11 @@ No view changes (Ruling T1-a: 0008 keeps reading `views.sql`) and no INSERT.
 
 The compatibility floor is 0009 and the upgrade is not destructive: it only adds tables, columns, indexes,
 triggers and a foreign key that the rows of M0-M4 satisfy (no code before M5 writes a purge fence), so M4's
-code runs on this schema. The downgrade is exact. It is refused while a table it would drop holds a row, a
-manifest above all: dropping one would lose the record of a purge, so the database stays at 0010.
+code runs on this schema. The downgrade is exact. It is refused (SQLSTATE 55000) while one of the seven
+record tables holds a row (purged_batch_items, exports, backup_runs, backup_sets, manifest_shipment_items,
+deletion_manifests, manifest_shipments), a manifest above all: dropping one would lose the record of a purge,
+so the database stays at 0010. deadman_state (its seeded row) and schema_compat (`migrate`'s record) hold
+derived state and are dropped whatever they hold.
 """
 
 # ruff: noqa: E501  (the DDL is copied from the spec; its long lines stay as they are)

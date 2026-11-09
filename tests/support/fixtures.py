@@ -213,12 +213,10 @@ ON CONFLICT (id) DO UPDATE SET
   anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
-# The dead-man state as `seed_defaults` wrote it (M5): the single row, nothing applied (every column NULL).
-_DEADMAN_RESET: Final = """\
-INSERT INTO deadman_state (id) VALUES (1)
-ON CONFLICT (id) DO UPDATE SET
-  applied_interval_s = NULL, applied_timeout_s = NULL, applied_grace_s = NULL, applied_paused = NULL,
-  last_pinged_run_id = NULL, synced_at = NULL, last_error_code = NULL, next_try_at = NULL"""
+# The dead-man state as `seed_defaults` wrote it (M5): the row deleted and inserted again as the seed inserts
+# it, so every other column takes its default (NULL today), whatever columns a later task adds. No foreign key
+# references the table.
+_DEADMAN_RESET: Final = ("DELETE FROM deadman_state", "INSERT INTO deadman_state (id) VALUES (1)")
 # Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the shipped
 # rubric v2 (M3 Task 3) and the shipped prompt-schema version 2 (M3 Task 4; `_SEEDED_ROWS` fails the reset
 # when one is missing), and the pointers a profile or a scope apply sets left NULL (the pending scope, the
@@ -345,8 +343,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
     and the M1 tables they reference deleted (`_M3_DELETE`); `active_config` as the seed wrote it
     (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the shipped
     prompt-schema version 2, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
-    (`_M2_DELETE`); the schedule and the dead-man state reset (`_DEADMAN_RESET`: its row, every other column
-    NULL); then the settings versions after 1, the scope versions no settings
+    (`_M2_DELETE`); the schedule and the dead-man state reset (`_DEADMAN_RESET`: its row inserted again as
+    the seed inserts it); then the settings versions after 1, the scope versions no settings
     version uses, the model policies, execution configs and evaluation policies that no settings version or
     `active_config` names, the rubric rows other than the shipped v1 and v2 and the prompt-schema rows other
     than the two shipped versions that `active_config` does not name deleted, and the ranking generation set
@@ -385,7 +383,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         )
         slot = latest_slot_at_or_before(anchor, interval_s, db_now[0])
         conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
-        conn.execute(_DEADMAN_RESET)
+        for statement in _DEADMAN_RESET:
+            conn.execute(statement)
         for statement in _CONFIGURATION_RESET:
             conn.execute(statement, seeded if "%(" in statement else None)
 
