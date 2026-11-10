@@ -937,6 +937,15 @@ export function healthOut(overrides: Partial<SystemHealthOut> = {}): SystemHealt
     },
     embedder: { ok: true, model_id: "embedder-model@abc/fp32", checksum_ok: true },
     langsmith: null,
+    backups: {
+      latest_set: { id: 12, status: "succeeded", finished_at: "2026-11-10T01:40:00Z", age_s: 30_000 },
+      backup_age_state: "ok",
+      latest_shipment: { id: 4, shipped_at: "2026-11-10T02:12:00Z", manifests: 3 },
+      unshipped_manifests: 0,
+      oldest_unshipped_completed_at: null,
+      latest_restore_test: { id: 3, status: "succeeded", finished_at: "2026-11-01T03:00:00Z", age_s: 777_600 },
+      restore_test_age_state: "ok",
+    },
     ...overrides,
   };
 }

@@ -1144,8 +1144,9 @@ M3_RECONCILERS = {
     "scoring_drift": ["heavy"],
     "batch_submissions": ["tick"],
 }
-# M5 Task 5: the dead-man switch's durable path, registered by `observability.deadman` (O-ops Q6, O10).
-M5_RECONCILERS = {"deadman_ping": ["tick"]}
+# M5 Task 5: the dead-man switch's durable path, registered by `observability.deadman` (O-ops Q6, O10); M5
+# Task 7: the backup alerts and age gauge, registered by `observability.backup_health` (O1, Deviation 12).
+M5_RECONCILERS = {"deadman_ping": ["tick"], "backup_health": ["heavy"]}
 # The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
 # the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
 # import in `test_the_registering_modules_list_every_m3_module`).

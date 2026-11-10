@@ -159,6 +159,17 @@ CLAIM_RECLAIMS = Counter(
     registry=REGISTRY,
 )
 
+# The backup age (§17.5, M5 Task 7): the worker's heavy `backup_health` reconciler sets it, outside `dev`, on
+# the age reference of the `backup.stale` alert (`observability.backup_health.backup_age_s`). NaN until it is
+# measured, and in a process that never measures it (the api, a dev worker): an unset gauge would read 0, a
+# backup just made.
+BACKUP_AGE = Gauge(
+    "jobhunter_backup_age_seconds",
+    "Seconds since the newest succeeded backup set finished, or since install before one (NaN: unknown).",
+    registry=REGISTRY,
+)
+BACKUP_AGE.set(float("nan"))
+
 
 def start_metrics_server(port: int) -> None:
     """Serve `REGISTRY` over HTTP on `port` from a daemon thread."""

@@ -1716,6 +1716,57 @@ export interface components {
             unscorable_groups: components["schemas"]["UnscorableGroupsSectionOut"];
         };
         /**
+         * BackupRunOut
+         * @description A backup set or a restore test: its status, when it finished and its age in seconds (both null while it
+         *     runs).
+         */
+        BackupRunOut: {
+            /** Age S */
+            age_s: number | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "succeeded" | "failed";
+        };
+        /**
+         * BackupStateOut
+         * @description The backups, the offsite manifests and the restore tests. Ages are seconds at the time of the request.
+         *
+         *     - `latest_set`: the newest backup set, whatever its status; `null` before the first.
+         *     - `backup_age_state`: the age of the newest succeeded set: `warn` past 36 hours, `critical` past 72;
+         *       before the first one, `grace` until 48 hours after install, then measured from install.
+         *     - `latest_shipment`: the newest manifest shipment and the number of manifests it shipped.
+         *     - `unshipped_manifests`: the deletion manifests completed and not shipped yet;
+         *       `oldest_unshipped_completed_at` is when the oldest of them completed.
+         *     - `latest_restore_test`: the newest restore test, whatever its status.
+         *     - `restore_test_age_state`: the age of the newest succeeded restore test: `warn` past 35 days, `none`
+         *       without one.
+         */
+        BackupStateOut: {
+            /**
+             * Backup Age State
+             * @enum {string}
+             */
+            backup_age_state: "ok" | "warn" | "critical" | "grace";
+            latest_restore_test: components["schemas"]["BackupRunOut"] | null;
+            latest_set: components["schemas"]["BackupRunOut"] | null;
+            latest_shipment: components["schemas"]["ManifestShipmentOut"] | null;
+            /** Oldest Unshipped Completed At */
+            oldest_unshipped_completed_at: string | null;
+            /**
+             * Restore Test Age State
+             * @enum {string}
+             */
+            restore_test_age_state: "ok" | "warn" | "none";
+            /** Unshipped Manifests */
+            unshipped_manifests: number;
+        };
+        /**
          * BannerOut
          * @description A banner: a client shows it by its `code`, with `params` (JSON values; instants as ISO 8601 UTC
          *     strings).
@@ -3241,6 +3292,21 @@ export interface components {
             totp?: string | null;
             /** Username */
             username: string;
+        };
+        /**
+         * ManifestShipmentOut
+         * @description A shipment of deletion manifests to the offsite repository, and how many manifests it shipped.
+         */
+        ManifestShipmentOut: {
+            /** Id */
+            id: number;
+            /** Manifests */
+            manifests: number;
+            /**
+             * Shipped At
+             * Format: date-time
+             */
+            shipped_at: string;
         };
         /**
          * MassDisappearanceOut
@@ -5041,11 +5107,14 @@ export interface components {
          *     - `scoring`: the score lane.
          *     - `table_bytes`: the size of every table of the `public` schema, in bytes.
          *     - `embedder`: the embedder's health as the readiness check read it.
-         *     - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when the
-         *       worker's heartbeat goes stale.
+         *     - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when
+         *       the worker's heartbeat goes stale.
+         *     - `backups`: the backups, the offsite manifests and the restore tests, with the age states of the
+         *       backups and of the restore tests.
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
+            backups: components["schemas"]["BackupStateOut"];
             /** Database Bytes */
             database_bytes: number;
             disk: components["schemas"]["DiskUsage"];

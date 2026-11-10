@@ -28,12 +28,14 @@ gave no usable answer, `unusable` for another model or dimension). Never an exce
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), each provider's quota
 window at `now` (`quota_health`, the header status's view), the LLM spend of the month (`llm_spend`, plan
 Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions, the
-embedder's health (with its model id) as the readiness check read it and the LangSmith tracing state the
+embedder's health (with its model id) as the readiness check read it, the LangSmith tracing state the
 last worker published at its start (`tracing_state`, M5 Task 6, Q17: the api has no LangSmith configuration
-of its own; `null` until a worker published one, and kept when its heartbeat goes stale). Run ages are
-reported, never readiness gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs` and the
-run lists (`observability.lists`); every select of one either names `RUN_COLUMNS`, its fields, or fills a
-`worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks too.
+of its own; `null` until a worker published one, and kept when its heartbeat goes stale) and the backups, the
+offsite manifests and the restore tests (`backup_health.backup_state`, M5 Task 7, in every env). Run and
+backup ages are reported, never readiness gates. `RunOut` is the api's view of a run row, shared with
+`POST /api/runs` and the run lists (`observability.lists`); every select of one either names `RUN_COLUMNS`,
+its fields, or fills a `worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks
+too.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
 save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
@@ -66,7 +68,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
-from jobhunter.api.models import DecimalOut, usd_micro
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
 from jobhunter.heartbeats import HEARTBEAT_AGE_SQL, heartbeat_fresh
@@ -74,6 +75,7 @@ from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, BudgetRow
 from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability.alerts import refresh_alert_gauge
+from jobhunter.observability.backup_health import BackupStateOut, backup_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.quota.dryrun import live_windows
@@ -82,6 +84,7 @@ from jobhunter.quota.windows import Provider, Window, WindowState
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.cycles import PauseReason
+from jobhunter.wire import DecimalOut, usd_micro
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]
@@ -506,7 +509,7 @@ async def tracing_state(conn: AsyncConnection) -> TracingStateOut | None:
 
 
 # Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes`,
-# `tracing_state` and the caller's readiness report (`EmbedderOut`).
+# `tracing_state`, `backup_health.backup_state` and the caller's readiness report (`EmbedderOut`).
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -523,6 +526,8 @@ class SystemHealthOut(BaseModel):
     - `embedder`: the embedder's health as the readiness check read it.
     - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when
       the worker's heartbeat goes stale.
+    - `backups`: the backups, the offsite manifests and the restore tests, with the age states of the
+      backups and of the restore tests.
     """
 
     ready: ReadyState
@@ -542,6 +547,7 @@ class SystemHealthOut(BaseModel):
     versions: Versions
     embedder: EmbedderOut
     langsmith: TracingStateOut | None
+    backups: BackupStateOut
 
 
 @dataclass(frozen=True)
@@ -652,4 +658,5 @@ async def system_health(
         versions=_versions(),
         embedder=EmbedderOut(ok=embedder.ok, model_id=embedder.model_id, checksum_ok=embedder.checksum_ok),
         langsmith=await tracing_state(conn),
+        backups=await backup_state(conn, now=now),
     )

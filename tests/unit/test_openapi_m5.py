@@ -72,3 +72,26 @@ def test_the_system_health_names_the_published_tracing_state(document: dict[str,
     assert set(state["required"]) == {"tracing", "region"}
     assert state["properties"]["tracing"]["type"] == "boolean"
     assert state["properties"]["region"]["anyOf"] == [{"const": "eu", "type": "string"}, {"type": "null"}]
+
+
+def test_the_system_health_names_the_backups(document: dict[str, Any]) -> None:
+    """M5 (§17.5): `backups` is required, with its seven fields, the latest set and restore test nullable."""
+    schemas = document["components"]["schemas"]
+    health = schemas["SystemHealthOut"]
+    assert "backups" in health["required"]
+    assert health["properties"]["backups"] == {"$ref": "#/components/schemas/BackupStateOut"}
+    backups = schemas["BackupStateOut"]
+    assert set(backups["required"]) == {
+        "latest_set",
+        "backup_age_state",
+        "latest_shipment",
+        "unshipped_manifests",
+        "oldest_unshipped_completed_at",
+        "latest_restore_test",
+        "restore_test_age_state",
+    }
+    run = {"$ref": "#/components/schemas/BackupRunOut"}
+    assert backups["properties"]["latest_set"]["anyOf"] == [run, {"type": "null"}]
+    assert backups["properties"]["latest_restore_test"]["anyOf"] == [run, {"type": "null"}]
+    assert backups["properties"]["backup_age_state"]["enum"] == ["ok", "warn", "critical", "grace"]
+    assert backups["properties"]["restore_test_age_state"]["enum"] == ["ok", "warn", "none"]

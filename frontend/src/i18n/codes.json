@@ -130,6 +130,9 @@
     "ats.mass_disappearance",
     "auth.lockout",
     "auth.totp_key_mismatch",
+    "backup.failed",
+    "backup.restore_test_failed",
+    "backup.stale",
     "batch.custom_id_anomaly",
     "batch.item_unprocessable",
     "batch.items_missing",
@@ -653,6 +656,17 @@
   "run_age_state": [
     "critical",
     "grace",
+    "none",
+    "ok",
+    "warn"
+  ],
+  "backup_age_state": [
+    "critical",
+    "grace",
+    "ok",
+    "warn"
+  ],
+  "restore_test_age_state": [
     "none",
     "ok",
     "warn"

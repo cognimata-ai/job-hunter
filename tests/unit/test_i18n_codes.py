@@ -46,7 +46,7 @@ from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.normalize.titles import SENIORITY_LADDER
-from jobhunter.observability import attention, health
+from jobhunter.observability import attention, backup_health, health
 from jobhunter.observability import catalogue as alert_catalogue
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus, CycleStatus
@@ -199,6 +199,10 @@ DYNAMIC_SITES: Final[dict[tuple[str, str], Callable[[], set[str]]]] = {
     ("jobhunter.llm.cache_monitor", "write_alerts"): lambda: constructor_codes(
         "jobhunter.llm.cache_monitor", "CacheAlert"
     ),
+    # `for failure in _FAILURES`: a failed backup set's, a failed restore test's (plan M5 Task 7)
+    ("jobhunter.observability.backup_health", "_judge_failures"): lambda: {
+        failure.code for failure in backup_health._FAILURES
+    },
 }
 
 
@@ -518,6 +522,9 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "alert_severity": lambda: literal_values(alert_catalogue.Severity),
     "readiness": lambda: literal_values(health.ReadinessCode),
     "run_age_state": lambda: literal_values(health.RunAgeState),
+    # the health panel's backup and restore-test age states (plan M5 Task 7)
+    "backup_age_state": lambda: literal_values(backup_health.BackupAgeState),
+    "restore_test_age_state": lambda: literal_values(backup_health.RestoreTestAgeState),
     "queue": lambda: set(QUEUES),
     "queue_status": lambda: {status.value for status in QueueJobStatus},
     "ui_language": lambda: literal_values(settings_model.Display.model_fields["ui_language"].annotation),
@@ -575,6 +582,8 @@ SYSTEM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
     "pause": lambda: literal_values(attention.PausedReason),
     "group_unscorable": lambda: literal_values(attention.UnscorableReason),
     "instance_health": lambda: literal_values(attention.BrokenHealth),
+    # a backup set's and a restore test's status in the health panel (plan M5 Task 7)
+    "run_status": lambda: literal_values(backup_health.BackupStatus),
 }
 
 
