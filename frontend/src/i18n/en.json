@@ -1552,6 +1552,7 @@
   "health.tracing_on": "On",
   "health.tracing_on_region": "On ({{region}})",
   "health.tracing_off": "Off",
+  "tracing_region.eu": "EU",
   "health.runs": "Runs",
   "health.last_run": "Last run",
   "health.last_run_value": "#{{id}} · {{status}} · {{age}} ago",

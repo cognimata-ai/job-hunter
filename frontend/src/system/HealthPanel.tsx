@@ -6,7 +6,7 @@
 // the versions. Ages and sizes use `Intl.NumberFormat`'s units (`useUnits`); versions and the embedder's model id
 // are shown verbatim in `<code>`, as are the table names (identifiers). Every closed set goes through its
 // namespace: `readiness`, `run_status` (a backup set's and a restore test's status too), `run_age_state`,
-// `backup_age_state`, `restore_test_age_state`, `queue`, `queue_status`, `pause`, `window_state`,
+// `backup_age_state`, `restore_test_age_state`, `tracing_region`, `queue`, `queue_status`, `pause`, `window_state`,
 // `alert_severity`. A `warn` or `critical` age state, and a failed set or restore test, take their tone.
 import type { TFunction } from "i18next";
 import { type ReactNode, useId } from "react";
@@ -72,12 +72,14 @@ function stateTone(state: string): Tone | undefined {
   return state === "critical" ? "critical" : state === "warn" ? "warn" : undefined;
 }
 
-/** The tracing state the worker published: off until it published one. */
-function tracing(t: TFunction, state: SystemHealthOut["langsmith"]): string {
+/** The tracing state the worker published: off until it published one; its region through `tracing_region`. */
+function tracing(t: TFunction, serverText: ReturnType<typeof useServerText>, state: SystemHealthOut["langsmith"]): string {
   if (state === null || !state.tracing) {
     return t("health.tracing_off");
   }
-  return state.region === null ? t("health.tracing_on") : t("health.tracing_on_region", { region: state.region.toUpperCase() });
+  return state.region === null
+    ? t("health.tracing_on")
+    : t("health.tracing_on_region", { region: serverText("tracing_region", state.region) });
 }
 
 function BackupsGroup({ backups }: { backups: Backups }) {
@@ -154,7 +156,7 @@ function Health({ health }: { health: SystemHealthOut }) {
         <Entry term={t("health.embedder_model")}>
           {embedder.model_id === null ? t("value.none") : <code className={styles.code}>{embedder.model_id}</code>}
         </Entry>
-        <Entry term={t("health.tracing")}>{tracing(t, health.langsmith)}</Entry>
+        <Entry term={t("health.tracing")}>{tracing(t, serverText, health.langsmith)}</Entry>
       </Group>
 
       <Group title={t("health.runs")}>

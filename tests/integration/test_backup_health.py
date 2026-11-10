@@ -27,14 +27,15 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.transitions import TRANSITIONS
 from jobhunter.errors import FencedOut
+from jobhunter.observability import backup_health
 from jobhunter.observability.backup_health import (
     BACKUP_CRITICAL_AFTER,
     BACKUP_INSTALL_GRACE,
     BACKUP_WARN_AFTER,
     RESTORE_TEST_WARN_AFTER,
+    BackupAge,
     BackupStatus,
     backup_age_s,
-    backup_age_state,
     backup_state,
 )
 from jobhunter.observability.metrics import BACKUP_AGE, REGISTRY
@@ -42,7 +43,7 @@ from jobhunter.worker import reconcilers
 from jobhunter.worker.main import _REGISTERING_MODULES
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx, task_app
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.backups import backup_run, backup_set
 
@@ -94,6 +95,11 @@ def gauge() -> float | None:
     return REGISTRY.get_sample_value("jobhunter_backup_age_seconds")
 
 
+def unknown(value: float | None) -> bool:
+    """Whether the gauge reads NaN: no age to report."""
+    return value is not None and math.isnan(value)
+
+
 def test_the_thresholds_and_the_worker_s_module() -> None:
     assert BACKUP_WARN_AFTER == timedelta(hours=36)
     assert BACKUP_CRITICAL_AFTER == timedelta(hours=72)
@@ -110,7 +116,7 @@ async def test_a_failed_set_raises_backup_failed_until_a_later_success(
     engine, current_epoch, queue_app
 ) -> None:
     now = utcnow()
-    healed = await backup_set(engine, "failed", now - timedelta(hours=4))
+    await backup_set(engine, "failed", now - timedelta(hours=4))  # healed by the success after it
     await backup_set(engine, "succeeded", now - timedelta(hours=3))
     first = await backup_set(engine, "failed", now - timedelta(hours=2))
     assert await judge(engine, now) == 1
@@ -119,7 +125,6 @@ async def test_a_failed_set_raises_backup_failed_until_a_later_success(
     assert raised.dedup_key == f"{FAILED}:set:{first}"
     assert (raised.severity, raised.context) == ("critical", {"backup_set_id": first})
     assert raised.message == f"backup set {first} failed"
-    assert f"set:{healed}" not in raised.dedup_key
 
     # a later pass finds the same failure: no new occurrence of it
     assert await judge(engine, now) == 0
@@ -203,15 +208,43 @@ async def test_no_set_within_48h_of_install_is_grace(engine, current_epoch, queu
     assert warn.severity == "warn"
     assert warn.context == {"age_s": int((past_grace - installed).total_seconds())}
     assert await age_state(engine, past_grace) == "warn"
-    past_critical = installed + BACKUP_CRITICAL_AFTER + SECOND
+    # exactly 72 h after install is still warn: critical is past it, as with a set
+    at_critical = installed + BACKUP_CRITICAL_AFTER
+    await judge(engine, at_critical)
+    [still] = await alerts(engine, STALE)
+    assert (still.id, still.severity, still.resolved_at) == (warn.id, "warn", None)
+    assert await age_state(engine, at_critical) == "warn"
+    past_critical = at_critical + SECOND
     await judge(engine, past_critical)
     [critical] = await alerts(engine, STALE)
     assert (critical.id, critical.severity) == (warn.id, "critical")
     assert await age_state(engine, past_critical) == "critical"
 
-    # without an install anchor either, it is grace: nothing to measure from
-    for late in (timedelta(0), BACKUP_CRITICAL_AFTER * 10):
-        assert backup_age_state(installed + late, last_success_at=None, installed_at=None) == "grace"
+
+async def test_no_install_anchor_and_no_set_is_grace_with_an_unknown_age(
+    engine, current_epoch, queue_app, monkeypatch
+) -> None:
+    """A database without a settings version has no install anchor: with no set either there is nothing to
+    measure from, so nothing is raised and the age is unknown. Migrate always seeds settings version 1, so the
+    read of the anchor is made to find none; the sets are read from the database."""
+    read = backup_health.read_backup_age
+
+    async def unseeded(conn: AsyncConnection) -> BackupAge:
+        return BackupAge(last_success_at=(await read(conn)).last_success_at, installed_at=None)
+
+    monkeypatch.setattr(backup_health, "read_backup_age", unseeded)
+    late = await installed_at(engine) + BACKUP_CRITICAL_AFTER * 10
+    BACKUP_AGE.set(-1.0)
+    assert await judge(engine, late) == 0
+    assert await alerts(engine, STALE) == []
+    assert unknown(gauge())
+    assert await age_state(engine, late) == "grace"
+    # a failed set is still no backup: its own alert, and still nothing to measure the age from
+    failed = await backup_set(engine, "failed", late)
+    assert await judge(engine, late) == 1
+    assert await open_keys(engine, FAILED) == {f"{FAILED}:set:{failed}"}
+    assert await alerts(engine, STALE) == []
+    assert unknown(gauge())
 
 
 async def test_a_failed_restore_test_raises_and_a_later_success_resolves(

@@ -131,7 +131,8 @@ describe("HealthPanel", () => {
 
   it("shows tracing on (EU)", async () => {
     await shown(healthOut({ langsmith: { tracing: true, region: "eu" } }));
-    expect(value(en["health.readiness"], en["health.tracing"])).toBe("On (EU)");
+    // the region through its namespace, as every closed set of the panel
+    expect(value(en["health.readiness"], en["health.tracing"])).toBe(`On (${en["tracing_region.eu"]})`);
     await shown(healthOut({ langsmith: { tracing: true, region: null } }));
     expect(value(en["health.readiness"], en["health.tracing"])).toBe(en["health.tracing_on"]);
     // off as the worker published it, and before any worker published its state

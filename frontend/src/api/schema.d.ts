@@ -1177,8 +1177,10 @@ export interface paths {
         };
         /**
          * Get System Health
-         * @description Readiness, run ages and their state, queue depths, the score lane, open alerts, disk and table sizes,
-         *     versions, and the embedder's health and model id.
+         * @description Readiness, run ages and their state, the latest backup set and the backup age state, the latest offsite
+         *     manifest shipment and the manifests not shipped yet, the latest restore test and its age state, queue
+         *     depths, the score lane, open alerts, disk and table sizes, versions, the embedder's health and model id,
+         *     and the LangSmith tracing state the worker published.
          */
         get: operations["get_system_health_api_system_health_get"];
         put?: never;

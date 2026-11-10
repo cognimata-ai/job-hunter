@@ -494,12 +494,16 @@ async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool
     )
 
 
+# The LangSmith regions a worker can trace to (§17.8: the EU endpoint only); the SPA shows each by its code.
+TracingRegion = Literal["eu"]
+
+
 class TracingStateOut(BaseModel):
     """The tracing state the worker published at its start: whether it sends traces to LangSmith (inputs and
     outputs hidden), and the region it sends them to (`eu`; `null` when it does not trace)."""
 
     tracing: bool
-    region: Literal["eu"] | None
+    region: TracingRegion | None
 
 
 async def tracing_state(conn: AsyncConnection) -> TracingStateOut | None:

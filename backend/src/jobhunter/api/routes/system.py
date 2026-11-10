@@ -3,7 +3,8 @@ manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), needs attention and
 items (§14.2 L5040-5042; plan M4 Task 12); and `/api/ats-snapshots`' acknowledgement (L5044), for a
 logged-in session.
 
-- `GET /api/system/health`: readiness, runs, queues, the score lane, alerts, sizes and versions.
+- `GET /api/system/health`: readiness, runs, the backups, offsite manifests and restore tests, queues, the
+  score lane, alerts, sizes, versions and the LangSmith tracing state.
 - `GET /api/system/quota` → per provider its current window with the window's counted usage, its reserved,
   ambiguous and adjustment units and its bucket, `null` without a current window
   (`observability.lists.quota_summary`), in one read snapshot (`db.snapshot.read_snapshot`).
@@ -145,8 +146,10 @@ async def get_system_health(
     embedder: Annotated[EmbedderClient, Depends(get_embedder)],
     cfg: Annotated[AppConfig, Depends(get_config)],
 ) -> SystemHealthOut:
-    """Readiness, run ages and their state, queue depths, the score lane, open alerts, disk and table sizes,
-    versions, and the embedder's health and model id."""
+    """Readiness, run ages and their state, the latest backup set and the backup age state, the latest offsite
+    manifest shipment and the manifests not shipped yet, the latest restore test and its age state, queue
+    depths, the score lane, open alerts, disk and table sizes, versions, the embedder's health and model id,
+    and the LangSmith tracing state the worker published."""
     now = utcnow()
     # Readiness first, on a connection it returns before this route takes one: one pool connection at a time.
     readiness = await check_readiness(engine, code_head=code_head, now=now, embedder=embedder)

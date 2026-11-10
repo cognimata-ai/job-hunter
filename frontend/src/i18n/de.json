@@ -1552,6 +1552,7 @@
   "health.tracing_on": "Ein",
   "health.tracing_on_region": "Ein ({{region}})",
   "health.tracing_off": "Aus",
+  "tracing_region.eu": "EU",
   "health.runs": "Läufe",
   "health.last_run": "Letzter Lauf",
   "health.last_run_value": "#{{id}} · {{status}} · vor {{age}}",

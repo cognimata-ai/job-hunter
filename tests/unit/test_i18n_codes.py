@@ -525,6 +525,8 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     # the health panel's backup and restore-test age states (plan M5 Task 7)
     "backup_age_state": lambda: literal_values(backup_health.BackupAgeState),
     "restore_test_age_state": lambda: literal_values(backup_health.RestoreTestAgeState),
+    # the region of the worker's tracing state (plan M5 Task 7, fix round 1)
+    "tracing_region": lambda: literal_values(health.TracingRegion),
     "queue": lambda: set(QUEUES),
     "queue_status": lambda: {status.value for status in QueueJobStatus},
     "ui_language": lambda: literal_values(settings_model.Display.model_fields["ui_language"].annotation),

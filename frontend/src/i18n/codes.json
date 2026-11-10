@@ -671,6 +671,9 @@
     "ok",
     "warn"
   ],
+  "tracing_region": [
+    "eu"
+  ],
   "queue": [
     "aux",
     "collect",
