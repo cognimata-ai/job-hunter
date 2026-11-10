@@ -3599,7 +3599,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
+            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "delete_everything_in_progress" | "internal";
             /**
              * Detail
              * @default null
@@ -6185,7 +6185,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The job is not a member of the group (`not_found`) */
+            /** @description The job is not a member of the group, or it is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6284,7 +6284,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The group is not active or the job is not its member (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The group is not active or the job is not its member (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7212,7 +7212,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The job has no published score of the active tuple to label (`conflict_state`) */
+            /** @description The job has no published score of the active tuple to label (`conflict_state`), or it is being purged (`conflict_state`, `purge_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7376,7 +7376,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No target of the active tuple for the job (`not_found`) */
+            /** @description No target of the active tuple for the job, or the job is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10251,7 +10251,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No such target (`not_found`) */
+            /** @description No such target, or its job is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;

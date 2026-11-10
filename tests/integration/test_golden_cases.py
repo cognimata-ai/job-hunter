@@ -23,10 +23,10 @@ from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.errors import Problem
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import content_hash
 from jobhunter.embeddings import _COUNT_AWAITING, _NEXT_BATCH, _NO_TIME_BOUND, _START
+from jobhunter.errors import Refusal
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import filters, golden
 from jobhunter.scoring.eval_fixtures import adversarial_dir
@@ -137,7 +137,7 @@ async def test_with_no_profile_active_there_is_no_score_to_label(engine: AsyncEn
         await conn.execute(
             sa.text("UPDATE active_config SET profile_version_id = NULL, llm_tuple_id = NULL WHERE id = 1")
         )
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, scored.job.job_id)
     assert (refused.value.status, refused.value.code) == (409, "conflict_state")
     async with engine.connect() as conn:
@@ -149,7 +149,7 @@ async def test_feedback_without_a_published_result_is_conflict_state(engine: Asy
     async with engine.begin() as conn:
         await activate_score_tuple(conn)
         job = await insert_job(conn)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, job.job_id)
     assert (refused.value.status, refused.value.code) == (409, "conflict_state")
     async with engine.connect() as conn:
@@ -161,7 +161,7 @@ async def test_feedback_without_a_published_result_is_conflict_state(engine: Asy
 async def test_an_unstorable_comment_is_refused_before_any_write(engine: AsyncEngine, comment: str) -> None:
     async with engine.begin() as conn:
         scored = await scored_job(conn)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, scored.job.job_id, comment=comment)
     assert (refused.value.status, refused.value.code) == (422, "validation_failed")
 
@@ -232,7 +232,7 @@ async def test_set_flags_allows_two_canaries_and_refuses_a_third(engine: AsyncEn
         made = await golden.set_flags(conn, second.id, active=None, is_canary=True, now=NOW + HOUR)
     assert (made.id, made.is_canary, made.active) == (second.id, True, True)
     assert (await one(engine, _CASE, second.id)).updated_at == NOW + HOUR  # the caller's clock (item 7)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         async with engine.begin() as conn:
             await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)
     assert (refused.value.status, refused.value.code) == (422, "validation_failed")
@@ -243,7 +243,7 @@ async def test_set_flags_allows_two_canaries_and_refuses_a_third(engine: AsyncEn
         assert (again.is_canary, again.active) == (True, False)
         await golden.set_flags(conn, first.id, active=None, is_canary=False, now=NOW)
         assert (await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)).is_canary
-    with pytest.raises(Problem) as missing:
+    with pytest.raises(Refusal) as missing:
         async with engine.begin() as conn:
             await golden.set_flags(conn, 10**12, active=True, is_canary=None, now=NOW)
     assert missing.value.status == 404

@@ -44,6 +44,7 @@
   "problem.budget_exhausted": "Budget aufgebraucht",
   "problem.conflict_state": "Im aktuellen Zustand nicht möglich",
   "problem.csrf_failed": "Anfrage von der CSRF-Prüfung blockiert",
+  "problem.delete_everything_in_progress": "Löschung aller Daten läuft",
   "problem.eval_gate_failed": "Evaluationsprüfung nicht bestanden",
   "problem.filtered_requires_force": "Diese Anzeige ist ausgefiltert – Bewertung nur mit Bestätigung",
   "problem.idempotency_in_progress": "Dieselbe Anfrage läuft noch",

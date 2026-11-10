@@ -16,7 +16,8 @@ from typing import Final, Literal
 
 from jobhunter.types import JSONValue
 
-# The problem codes of §14.4, and the login's `totp_required` (§15.2) (`api.errors.ProblemCode` is this type).
+# The problem codes of §14.4, the login's `totp_required` (§15.2) and delete-everything's admission stop
+# (`delete_everything_in_progress`, M5 Task 8: `db.fence_guard`) (`api.errors.ProblemCode` is this type).
 ErrorCode = Literal[
     "unauthenticated",
     "totp_required",
@@ -36,6 +37,7 @@ ErrorCode = Literal[
     "idempotency_in_progress",
     "eval_gate_failed",
     "profile_purge_in_progress",
+    "delete_everything_in_progress",
     "internal",
 ]
 # The members a problem document writes itself (`api.errors.problem_body`): no `extra` may replace them, of a

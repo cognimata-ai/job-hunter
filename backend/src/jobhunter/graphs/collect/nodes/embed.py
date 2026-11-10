@@ -2,9 +2,11 @@
 
 The node runs `embeddings.embed_awaiting` over every revision `awaiting_embedding` (not only the run's: the
 backlog of an earlier outage goes first, oldest first), with the run's owner row as each batch's post-I/O
-guard (`ledger.lock_run_owner`: a superseded attempt raises `FencedOut` before it commits a vector) and the
-fault point `collect.embed.between_batches` after each batch (crash case C7). Its update's counters:
-`revisions_embedded`, `revisions_truncated` (flagged by the service at 1,024 tokens) and
+guard (`ledger.lock_run_owner`: a superseded attempt raises `FencedOut` before it commits a vector), taken
+after the batch's job rows (`guard_step="owner"`, step 5 of the lock schedule after step 4), and the fault
+point `collect.embed.between_batches` after each batch (crash case C7). A revision whose job is under a purge
+fence gets no vector (§20.2, M5 Task 8): it stays awaiting, and counts in `revisions_awaiting`. Its update's
+counters: `revisions_embedded`, `revisions_truncated` (flagged by the service at 1,024 tokens) and
 `revisions_awaiting`, the revisions still awaiting when it ended, which make the run `partial` (§7.16.4, I6;
 Task 23 decides the status).
 
@@ -76,7 +78,7 @@ def make_embed(deps: CollectDeps) -> Node:
 
         try:
             report = await embeddings.embed_awaiting(
-                deps.engine, client, guard=guard, fault=BETWEEN_BATCHES, stop=stop
+                deps.engine, client, guard=guard, guard_step="owner", fault=BETWEEN_BATCHES, stop=stop
             )
         except EmbedderError as err:
             await raise_unavailable(err.kind, owner.run_id)

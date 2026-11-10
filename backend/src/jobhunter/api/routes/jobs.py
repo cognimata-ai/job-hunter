@@ -36,7 +36,9 @@ order, a location id that is no gazetteer id, a NUL), is 422 `validation_failed`
 - `PUT /api/jobs/{job_id}/actions` (`jobs.actions.ActionsIn`) → `jobs.actions.ActionsOut{job, members}`
   (`jobs.actions.put_actions`, Task 7, B11) in one transaction at the request's time: the user's actions on
   the job, and with `apply_to_group` its group members' `saved`, `applied` and `hidden`; 404 as below for a
-  job without a detail (a merge that held the job meanwhile included); 422 for a body `ActionsIn` refuses.
+  job without a detail (a merge that held the job meanwhile included); 409 `conflict_state` with `detail =
+  "purge_in_progress"` for a group write with a member under a purge fence (M5 Task 8); 422 for a body
+  `ActionsIn` refuses.
   No `Idempotency-Key` (§14.1 keys none of these routes): a repeated write leaves the same values, only
   `updated_at` and the ranking generation move.
 

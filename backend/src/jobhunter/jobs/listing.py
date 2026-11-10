@@ -7,8 +7,9 @@ page's walk until it holds `limit + 1` rows, and returns the first `limit`, the 
 of the active tuple and scope; `card_set` is the same cards under the same filters as SQL to aggregate over
 (the facets of M4 Task 5), and `display_timezone` the active settings' zone of a `custom` window (B31).
 
-**Cards** (B2). A card is an unmerged job with a current revision, not a synthetic golden-case job, whose
-current revision has no target of the active tuple in `deferred_duplicate`. A group card is its
+**Cards** (B2). A card is an unmerged job with a current revision, not a synthetic golden-case job, not under
+a purge fence (§20.2, M5 Task 8, D21: `jobs._sql.NOT_FENCED`, as its detail answers 404), whose current
+revision has no target of the active tuple in `deferred_duplicate`. A group card is its
 representative's row. Each card has one score row: `t` the active-tuple target of its current revision, `r`
 the result `t` published, `d` the current instance of `r` under the active scope, `h` its hard-filter result
 under that scope and `u` the user's actions on it (no row: unseen).
@@ -273,7 +274,7 @@ def _rendered(terms: Sequence[tuple[str, ...]], alias: str) -> str:
 def _filter(q: JobsQuery, window: tuple[datetime | None, datetime | None], active: Active) -> _Filter:
     """Every predicate of `q` over a card's score row (`j`, `t`, `r`, `d`, `h`, `u`), module docstring."""
     terms, binds = _row_terms(q, window)
-    conjuncts: list[str] = []
+    conjuncts: list[str] = [_sql.NOT_FENCED]  # a fenced job is no card (module docstring)
     if terms and active.llm_tuple_id is None:  # no tuple, no deferred member
         conjuncts.append(_rendered(terms, "j"))
     elif terms:

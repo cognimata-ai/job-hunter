@@ -19,6 +19,11 @@ title), the company key of its company and its ad language. A title, company or 
 material revision, so these never drift from the case; a fact neither holds (the provider's structured
 seniority) is unknown, which every hard filter passes (positive evidence only).
 
+**Refusals** are `jobhunter.errors.Refusal`s (M4 Carry-forward 3): domain code never raises the api's
+`Problem`. A user's write that meets a job under a purge fence (`record_feedback`, and `set_flags` activating
+a case) is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (`privacy.fences`, §20.2, M5
+Task 8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced.
+
 Nothing here logs content: ids, labels, sources and counts only.
 """
 
@@ -32,15 +37,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.api.errors import Problem
 from jobhunter.db.seed import content_hash, ensure_hashed
 from jobhunter.db.sql import q
-from jobhunter.errors import DomainError
+from jobhunter.errors import DomainError, Refusal
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.language import detect_language
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import fenced_jobs, lock_unfenced_jobs, purge_in_progress
 from jobhunter.profile.contacts import strip_contacts
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.det_results import det_facts_from_inputs, det_inputs
@@ -253,15 +258,15 @@ def snapshot_sources(snapshot: JSONValue) -> list[str]:
     return sorted(found)
 
 
-def _comment_problem(comment: str | None) -> Problem | None:
+def _comment_refusal(comment: str | None) -> Refusal | None:
     if comment is None:
         return None
     if len(comment) > COMMENT_MAX_CHARS:
-        return Problem(
+        return Refusal(
             422, "validation_failed", "Invalid comment", detail="A comment has at most 2,000 characters."
         )
     if (why := unstorable(comment)) is not None:
-        return Problem(422, "validation_failed", "Invalid comment", detail=why)
+        return Refusal(422, "validation_failed", "Invalid comment", detail=why)
     return None
 
 
@@ -277,24 +282,27 @@ async def record_feedback(
     """Record a label or a "wrong score" of job `job_id` in the caller's transaction (§14.2 L4977, §11.13
     L4610; Deviation 21).
 
-    Lock order: `active_config FOR SHARE`, then the job `FOR SHARE`. The job's current published result of the
-    active tuple and its instance under the active scope (`current_scores`) are snapshotted into
-    `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's ids, the scope and the instance), and the
-    golden case of (revision, the tuple's profile) is upserted with the active scope, the instance's
-    `det_inputs` as its frozen snapshot and their source ids, `source = 'week1'` for a label and `'feedback'`
-    for a "wrong score" (an update keeps the case's source). No published result is a 409 `conflict_state`
-    (so is every job with no profile active: `active_config` holds a profile exactly when it holds a tuple,
-    and `current_scores` reads the active tuple's targets);
-    a comment longer than 2,000 characters or holding a NUL or a lone surrogate a 422, both before any
-    write."""
-    if (problem := _comment_problem(comment)) is not None:
-        raise problem
+    Lock order: `active_config FOR SHARE`, then the job `FOR SHARE`, whose purge fences are checked next: a
+    fenced job is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (module docstring). The
+    job's current published result of the active tuple and its instance under the active scope
+    (`current_scores`) are snapshotted into `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's
+    ids, the scope and the instance), and the golden case of (revision, the tuple's profile) is upserted with
+    the active scope, the instance's `det_inputs` as its frozen snapshot and their source ids,
+    `source = 'week1'` for a label and `'feedback'` for a "wrong score" (an update keeps the case's source).
+    No published result is a 409 `conflict_state` (so is every job with no profile active: `active_config`
+    holds a profile exactly when it holds a tuple, and `current_scores` reads the active tuple's targets); a
+    comment longer than 2,000 characters or holding a NUL or a lone surrogate a 422, both before any write."""
+    if (refusal := _comment_refusal(comment)) is not None:
+        raise refusal
     pointers = (await conn.execute(_LOCK_CONFIG)).one()
     if (await conn.execute(_LOCK_JOB, {"j": job_id})).first() is None:
-        raise Problem(404, "not_found", "Job not found")
+        raise Refusal(404, "not_found", "Job not found")
+    if await fenced_jobs(conn, [job_id]):
+        log.info("golden_feedback_refused", job_id=job_id, reason="purge_in_progress")
+        raise purge_in_progress()
     row = (await conn.execute(_CURRENT, {"j": job_id})).first()
     if row is None or row.llm_result_id is None or row.det_result_id is None:
-        raise Problem(
+        raise Refusal(
             409, "conflict_state", "No score to label", detail="The job has no published score to label yet."
         )
     snapshot: dict[str, JSONValue] = {
@@ -415,6 +423,10 @@ _LIST: Final = q(
 )
 _ONE: Final = q(f"SELECT {_CASE_COLUMNS} WHERE g.id = :i")
 _LOCK_CASE: Final = q("SELECT active, is_canary FROM golden_cases WHERE id = :i FOR UPDATE")
+# The job of a case's revision (a plain read: `set_flags` then takes the job's row `FOR SHARE`).
+_CASE_JOB: Final = q(
+    "SELECT r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id WHERE g.id = :i"
+)
 # A running eval run includes the case (`delete_case_unless_running`): it has a call naming the case, or its
 # kind selects it (a golden run every active case, a canary run every active canary; `eval_runner`'s list).
 _IN_RUNNING_RUN: Final = q(
@@ -482,7 +494,7 @@ async def delete_case_unless_running(conn: AsyncConnection, case_id: int) -> boo
     params = {"i": case_id, "active": case.active, "canary": case.is_canary}
     if (await conn.execute(_IN_RUNNING_RUN, params)).scalar_one():
         log.info("golden_case_delete_refused", golden_case_id=case_id, reason="eval_run_running")
-        raise Problem(
+        raise Refusal(
             409,
             "conflict_state",
             "The golden case is part of a running eval run",
@@ -499,12 +511,22 @@ async def set_flags(
 
     At most `MAX_CANARIES` cases are canaries (L4632): making a third one a canary is a 422
     `validation_failed`; the check and the write are serialised by an advisory transaction lock, so two
-    concurrent requests cannot both pass it. An unknown case is a 404."""
+    concurrent requests cannot both pass it. An unknown case is a 404. Activating a case (`active=True`)
+    first takes its job's row `FOR SHARE` (step 4 of the lock schedule) and refuses a job under a purge fence,
+    or one gone, with 409 `conflict_state`, `detail = "purge_in_progress"` (module docstring); a case
+    deactivated or made a canary is not activated, so neither is refused."""
+    if active:
+        job_id = (await conn.execute(_CASE_JOB, {"i": case_id})).scalar_one_or_none()
+        if job_id is None:
+            raise Refusal(404, "not_found", "Golden case not found")
+        if not await lock_unfenced_jobs(conn, [int(job_id)]):
+            log.info("golden_case_activation_refused", golden_case_id=case_id, reason="purge_in_progress")
+            raise purge_in_progress()
     if is_canary:
         await conn.execute(_CANARY_LOCK, {"namespace": CANARY_LOCK_NAMESPACE})
         others = int((await conn.execute(_OTHER_CANARIES, {"i": case_id})).scalar_one())
         if others >= MAX_CANARIES:
-            raise Problem(
+            raise Refusal(
                 422,
                 "validation_failed",
                 "Too many canaries",
@@ -513,7 +535,7 @@ async def set_flags(
     params = {"i": case_id, "active": active, "canary": is_canary, "now": now}
     updated = await conn.execute(_SET_FLAGS, params)
     if updated.first() is None:
-        raise Problem(404, "not_found", "Golden case not found")
+        raise Refusal(404, "not_found", "Golden case not found")
     log.info("golden_case_flags_set", golden_case_id=case_id, active=active, is_canary=is_canary)
     return _case((await conn.execute(_ONE, {"i": case_id})).one())
 

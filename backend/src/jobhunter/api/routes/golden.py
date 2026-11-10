@@ -5,7 +5,8 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
 - `POST /api/jobs/{job_id}/feedback` (`{kind: label | wrong_score, label: good | ok | poor, comment?}`) → 201
   `{feedback_id, golden_case_id}`: `golden.record_feedback` (`active_config FOR SHARE`, then the job `FOR
   SHARE`), the score snapshot and the golden case of (revision, profile) upserted with the active scope. 409
-  `conflict_state` without a published result of the active tuple, 404 `not_found` for no such job. The
+  `conflict_state` without a published result of the active tuple, or with `detail = "purge_in_progress"`
+  for a job under a purge fence (M5 Task 8), 404 `not_found` for no such job. The
   comment is at most 2,000 characters and holds no NUL and no lone surrogate (422 at the model's edge,
   `models.clean_text`; M2 Deviation 44).
 - `GET /api/golden-cases?cursor&limit&active` → `{items, next_cursor}`: the cases by id ascending,
@@ -16,7 +17,8 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
   list's one statement; `profile_version` the version's number).
 - `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
-  canary is 422 `validation_failed` (L4632), an unknown case 404.
+  canary is 422 `validation_failed` (L4632), an unknown case 404, activating a case whose job is under a
+  purge fence 409 `conflict_state` with `detail = "purge_in_progress"` (M5 Task 8).
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
   deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
 - `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
@@ -136,7 +138,8 @@ _NOT_FOUND: Final[dict[int | str, dict[str, Any]]] = {
     responses={
         404: {"description": "No such job (`not_found`)"},
         409: {
-            "description": "The job has no published score of the active tuple to label (`conflict_state`)"
+            "description": "The job has no published score of the active tuple to label (`conflict_state`), "
+            "or it is being purged (`conflict_state`, `purge_in_progress`)"
         },
         422: {
             "description": "Invalid body: a comment over 2,000 characters or holding a NUL or a lone "

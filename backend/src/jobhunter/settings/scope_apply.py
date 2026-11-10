@@ -54,7 +54,10 @@ incomplete_results`); `progress` is `{"done", "total", "det_done", "det_total"}`
    row, then a current instance for the pending scope of every result of the page that lacks one whose hash
    and algorithm version are current (`det_results.recompute_stale_instances`: `stale_of`, then
    `recompute_instance`, the result rows `FOR UPDATE` in id order), and `set_progress` last; after the commit
-   the same fault point. They go on until a page holds fewer than `DET_BATCH` results.
+   the same fault point. They go on until a page holds fewer than `DET_BATCH` results. A result whose job is
+   under a purge fence for the tuple, or gone since the page was read, is skipped (the job rows' fences are
+   checked right after their lock, `privacy.fences.lock_unfenced_jobs`; §20.2, M5 Task 8): the purge deletes
+   its results, or the `det_completeness` reconciler writes its instance once the fence is released.
    Right before each final transaction, the fault point `scope_apply.before_final` (`BEFORE_FINAL_POINT`).
 2. **The final transaction** (§13.4 step 3), in the §9.1 order: `active_config FOR UPDATE`, then the owner
    row (`lock_operation_owner`), then a fresh read of the pending pointer and the active tuple:
@@ -65,7 +68,8 @@ incomplete_results`); `progress` is `{"done", "total", "det_done", "det_total"}`
      here and never ends obsolete under it;
    - `incomplete_jobs(conn, sid) > 0`, or, with an active tuple, `incomplete_results(conn, …) > 0` (a
      published result of the **currently** active tuple without a current instance for the pending scope
-     whose hash and algorithm version are current, L4915): the transaction rolls back and the precompute
+     whose hash and algorithm version are current, L4915; not one of a job under a purge fence, which the
+     precompute skips, so a fence never holds the flip back): the transaction rolls back and the precompute
      runs again, at most `FINAL_CHECK_ROUNDS` times (the result half is O(N) in the tuple's published
      results: their pages, their jobs' facts and sources and a hash each, measured at about 0.7-1 s per
      10,000 results under this `FOR UPDATE`, Ruling T15-b; no stored hash column); a check that fails after
@@ -125,6 +129,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import fenced_jobs, lock_unfenced_jobs
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
 from jobhunter.scoring import det_results, targets
 from jobhunter.scoring.det_results import ScopeRow
@@ -252,7 +257,8 @@ async def _scope_row(conn: AsyncConnection, scope_version_id: int) -> ScopeRow:
 async def incomplete_results(conn: AsyncConnection, *, scope_version_id: int, llm_tuple_id: int) -> int:
     """How many published results of the tuple lack a current `det_results` instance for the scope whose
     `det_inputs_hash` is that of their job's current det-facts and whose algorithm version is current
-    (`det_results.stale_of`, page by page of `DET_BATCH`): no limit, no lock."""
+    (`det_results.stale_of`, page by page of `DET_BATCH`), those of a job under a purge fence for the tuple
+    left out (the precompute skips them, module docstring): no limit, no lock."""
     scope = await _scope_row(conn, scope_version_id)
     scope_part = det_results.scope_inputs(scope.settings)  # once per check (Review Minor 4)
     stale, after = 0, 0
@@ -260,7 +266,9 @@ async def incomplete_results(conn: AsyncConnection, *, scope_version_id: int, ll
         page = await det_results.published_page(
             conn, llm_tuple_id=llm_tuple_id, scope_version_id=scope_version_id, after=after, limit=DET_BATCH
         )
-        stale += len((await det_results.stale_of(conn, page, scope, scope_part=scope_part)).results)
+        found = (await det_results.stale_of(conn, page, scope, scope_part=scope_part)).results
+        fenced = await fenced_jobs(conn, {item.job_id for item in found}, llm_tuple_id=llm_tuple_id)
+        stale += sum(1 for item in found if item.job_id not in fenced)
         if len(page) < DET_BATCH:
             return stale
         after = page[-1].llm_result_id
@@ -372,10 +380,14 @@ async def _det_chunks(ctx: OperationContext, sid: int, scope: ScopeSettings, pro
             )
             if not page:
                 return
-            await targets.lock_jobs(conn, [item.job_id for item in page])  # step 4, before the results
+            # step 4, before the results, then the fences: a fenced or vanished job's results are skipped
+            unfenced = await lock_unfenced_jobs(
+                conn, [item.job_id for item in page], llm_tuple_id=int(tuple_id)
+            )
             await lock_operation_owner(conn, claim)  # step 5
             # step 10: the stale results in id order, with the facts `stale_of` read
-            written = await det_results.recompute_stale_instances(conn, page, row, scope_part=scope_part)
+            writable = [item for item in page if item.job_id in unfenced]
+            written = await det_results.recompute_stale_instances(conn, writable, row, scope_part=scope_part)
             recomputed = len(written)
             await set_progress(conn, claim, progress.add_det(recomputed))  # the last statement
         await afault_point(AFTER_CHUNK_POINT)

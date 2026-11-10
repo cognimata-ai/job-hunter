@@ -44,6 +44,7 @@
   "problem.budget_exhausted": "Budget exhausted",
   "problem.conflict_state": "Not possible in the current state",
   "problem.csrf_failed": "Request blocked by the CSRF check",
+  "problem.delete_everything_in_progress": "Deletion of all data in progress",
   "problem.eval_gate_failed": "Evaluation gate not passed",
   "problem.filtered_requires_force": "This ad is filtered out — scoring it needs a confirmation",
   "problem.idempotency_in_progress": "The same request is still running",

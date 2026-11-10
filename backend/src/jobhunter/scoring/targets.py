@@ -69,9 +69,11 @@ the first sweep; the expiry and exhaustion sweeps then take those ids (`held`) a
 nothing more. A target that becomes a candidate after the pre-lock waits for the next cycle.
 
 **The user's moves**, in the API's transaction (`active_config FOR SHARE`, step 2; the route's idempotency
-row, step 3; then the target row `FOR UPDATE`, step 10; `ranking_state` last; never the month row, so none of
-them can wait on `budget_release`, which holds the month row and skips a target row another transaction
-holds: Codex r1 #19, #20):
+row, step 3; then the job row `FOR SHARE`, step 4, and its purge fences; then the target row `FOR UPDATE`,
+step 10; `ranking_state` last; never the month row, so none of them can wait on `budget_release`, which holds
+the month row and skips a target row another transaction holds: Codex r1 #19, #20). A job under a purge
+fence for the target's tuple, or one gone, is `not_found`, as the job's detail answers it (§20.2, M5 Task 8:
+`privacy.fences.lock_unfenced_jobs`), and nothing is written:
 - `score_now(conn, *, job_id, force, now, defer) -> ScoreNow | ScoreNowRefused` (§9.6.4): the job's
   current-revision target of the active tuple (`not_found` without one). `pending | budget_deferred |
   expired_unscored | deferred_duplicate` → `pending` with `override = 'score_now'`; `refused | failed_*` take
@@ -247,6 +249,7 @@ from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import lock_unfenced_jobs
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import cycles, filters, similarity
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
@@ -812,6 +815,8 @@ _JOB_TARGET: Final = q(
     "FOR UPDATE OF t"
 )
 _TARGET: Final = q("SELECT id, state, state_reason FROM score_targets WHERE id = :t FOR UPDATE")
+# The job and tuple of a target, read before its job row is locked (a target never changes either).
+_TARGET_JOB: Final = q("SELECT job_id, llm_tuple_id FROM score_targets WHERE id = :t")
 _MEMBER: Final = q(
     "SELECT job_id FROM duplicate_group_members WHERE group_id = :g AND job_id = :j FOR UPDATE"
 )
@@ -879,7 +884,8 @@ async def score_now(
     config = await cycles.scoring_config(conn)  # step 2
     tuple_id = config.active.llm_tuple_id
     row = None
-    if tuple_id is not None:
+    # step 4: a fenced job (or one gone) has no target here, as it has no detail
+    if tuple_id is not None and await lock_unfenced_jobs(conn, [job_id], llm_tuple_id=tuple_id):
         row = (await conn.execute(_JOB_TARGET, {"job": job_id, "tuple": tuple_id})).first()
     if row is None:
         return _refused("not_found", "score_now", job_id=job_id)
@@ -903,6 +909,11 @@ async def retry(
 ) -> ScoreNow | ScoreNowRefused:
     """The user's Retry of a `refused` or `failed_*` target (L2880; module docstring)."""
     await cycles.lock_active_scoring(conn)  # step 2
+    owner = (await conn.execute(_TARGET_JOB, {"t": target_id})).first()
+    if owner is None or not await lock_unfenced_jobs(  # step 4: a fenced job's target is not found
+        conn, [int(owner.job_id)], llm_tuple_id=int(owner.llm_tuple_id)
+    ):
+        return _refused("not_found", "retry", target_id=target_id)
     row = (await conn.execute(_TARGET, {"t": target_id})).first()
     if row is None:
         return _refused("not_found", "retry", target_id=target_id)
@@ -918,6 +929,8 @@ async def score_individually(
 ) -> IndividualMember | ScoreNowRefused:
     """§8.7's Score individually of the group member `job_id` (module docstring, Controller ruling T13-b)."""
     active = await cycles.lock_active_scoring(conn)  # step 2
+    if not await lock_unfenced_jobs(conn, [job_id], llm_tuple_id=active.llm_tuple_id):  # step 4
+        return _refused("not_found", "score_individually", group_id=group_id, job_id=job_id)
     if (await conn.execute(_MEMBER, {"g": group_id, "j": job_id})).first() is None:
         return _refused("not_found", "score_individually", group_id=group_id, job_id=job_id)
     await conn.execute(_FLAG_MEMBER, {"g": group_id, "j": job_id})  # with or without a target (L3271)

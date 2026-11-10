@@ -2,6 +2,9 @@
 
 `create_app()` builds the FastAPI app, its routers, exception handlers, per-session rate limiter
 (`SessionRateLimiter`) and Argon2 admission gate (`argon2_gate.Argon2Gate`), and wraps it in `EdgeMiddleware`.
+The app's engine, the lifespan's or an injected one, gets the write guard of delete-everything's `global`
+fence (`db.fence_guard.install_fence_guard`, M5 Task 8): every transaction a guarded request begins on it
+reads the fence first (the edge sets the guard; `api.edge`, step 4). No route checks that fence itself.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
 (`startup_or_exit("api")`, then the task app, the log level, the engine, the code head, the embedder client
 and, outside the test env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the
@@ -80,6 +83,7 @@ from jobhunter.api.static import SpaFiles
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
+from jobhunter.db.fence_guard import install_fence_guard
 from jobhunter.db.session import make_engine
 from jobhunter.embeddings import EmbedderClient, make_http_client
 from jobhunter.observability.heartbeat_watch import watch_heartbeat
@@ -171,6 +175,7 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
     queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: from the config the lifespan loads
     configure_logging(cfg.log_level)  # ruling T14-b
     engine = make_engine(cfg, pool_size=ENGINE_POOL_SIZE)
+    install_fence_guard(engine)
     embedder_http: httpx.AsyncClient | None = None
     watch: asyncio.Task[None] | None = None
     stop_watch = asyncio.Event()
@@ -271,6 +276,7 @@ def create_app(
     api.state.gazetteer = None  # loaded by the first `/api/geo/places` request (`deps.get_gazetteer`)
     api.state.gazetteer_lock = asyncio.Lock()
     if cfg is not None and engine is not None:
+        install_fence_guard(engine)
         api.state.cfg = cfg
         api.state.engine = engine
         api.state.code_head = code_head()

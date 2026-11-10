@@ -139,6 +139,7 @@ from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation, Tra
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
+from jobhunter.privacy.fences import purge_in_progress
 from jobhunter.quota import ledger
 from jobhunter.scoring import filters
 from jobhunter.scoring.targets import DENIED
@@ -881,12 +882,18 @@ async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> Non
     move under the configuration they were read with. Its last statement bumps the ranking.
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for a group that is not
-    active or a job that is not its member, and `CoMemberChanged` for a group whose members changed
-    while they were locked, having written nothing."""
+    active or a job that is not its member, `CoMemberChanged` for a group whose members changed while they
+    were locked, and the refusal `privacy.fences.purge_in_progress()` (409 `conflict_state`, `detail =
+    "purge_in_progress"`) when one of the group's members, the one split off or another (the split writes a
+    decision against each and may re-elect), is under a purge fence (§20.2, M5 Task 8), having written
+    nothing."""
     await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
     group, member_ids, _ = await _lock_group(conn, group_id, (job_id,))
     if job_id not in member_ids:
         raise InvariantViolation(f"job {job_id} is not a member of duplicate group {group_id}")
+    if fenced := await merge.fenced_jobs(conn, member_ids):  # the members' rows are held: their fences now
+        log.warning("split_refused_fenced", group_id=group_id, job_ids=fenced)
+        raise purge_in_progress()
     for other in member_ids:
         if other != job_id:
             await merge.decide_different(conn, job_id, other, source="user_split")

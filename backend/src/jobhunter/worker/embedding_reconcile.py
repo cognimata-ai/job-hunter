@@ -6,20 +6,22 @@ It runs only while the embedder is healthy and **no run is `running`** (ruling T
 node embeds the backlog itself, oldest first, so the two never compete for one batch). Its first transaction
 proves the worker epoch (`fence_epoch`) and reads whether a run is running; a pass that skips logs
 `awaiting_embedding_skipped` with its `reason`. It embeds the revisions awaiting for more than
-`AWAITING_GRACE` (`embeddings.embed_awaiting`), fenced by the worker epoch, at most `RECONCILE_LIMIT` (32, two
-batches) per pass. `reconcile_heavy` runs on the `tick` queue, whose one worker the minute tick shares, so one
-pass holds that queue for about 1 min at the measured 0.57 docs/s, and for at most twice
-`embeddings.BATCH_TIMEOUT_S` (4 min) when the embedder is slow. A run that starts during a pass can overlap it
-by that one pass.
+`AWAITING_GRACE` (`embeddings.embed_awaiting`), fenced by the worker epoch (`guard_step="epoch"`: the first
+statement of each batch's transaction, before the job rows), at most `RECONCILE_LIMIT` (32, two batches) per
+pass; a revision whose job is under a purge fence is skipped and stays awaiting (§20.2, M5 Task 8).
+`reconcile_heavy` runs on the `tick` queue, whose one worker the minute tick shares, so one pass holds that
+queue for about 1 min at the measured 0.57 docs/s, and for at most twice `embeddings.BATCH_TIMEOUT_S` (4 min)
+when the embedder is slow. A run that starts during a pass can overlap it by that one pass.
 
 After the embeddings are written it sets the similarity of the active tuple's targets that have none
 (`similarity.fill_missing_similarity`, at most `SIMILARITY_LIMIT` per pass: those whose revision is embedded
-and whose tuple's profile has vectors, a revision embedded by this pass or earlier), in one transaction in
-the lock schedule's order: `fence_epoch` (step 1), `active_config FOR SHARE` (step 2), the targets `FOR UPDATE
-SKIP LOCKED` (other domain rows); then, when the embedder answered, `embedder.unavailable` resolved once no
-revision awaits at all ("embedder healthy and backlog cleared", §17.6); and last, when a similarity was set
-(the unscored section ranks by it, §7.1 L1255), the ranking bump (`ranking_state`, the last lock). Ids and
-counts only reach a log line.
+and whose tuple's profile has vectors, a revision embedded by this pass or earlier), in one transaction in the
+lock schedule's order: `fence_epoch` (step 1), `active_config FOR SHARE` (step 2), the candidates' job rows
+`FOR SHARE` and their purge fences (step 4: the target of a fenced job gets none, §20.2, M5 Task 8), the
+targets `FOR UPDATE SKIP LOCKED` (other domain rows); then, when the embedder answered, `embedder.unavailable`
+resolved once no revision awaits at all ("embedder healthy and backlog cleared", §17.6); and last, when a
+similarity was set (the unscored section ranks by it, §7.1 L1255), the ranking bump (`ranking_state`, the last
+lock). Ids and counts only reach a log line.
 """
 
 from datetime import timedelta
@@ -110,7 +112,12 @@ async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
         log.info("awaiting_embedding_skipped", reason="embedder_unhealthy", checksum_ok=health.checksum_ok)
         return 0
     report = await embed_awaiting(
-        ctx.engine, client, guard=fenced, limit=RECONCILE_LIMIT, created_before=ctx.now - AWAITING_GRACE
+        ctx.engine,
+        client,
+        guard=fenced,
+        guard_step="epoch",
+        limit=RECONCILE_LIMIT,
+        created_before=ctx.now - AWAITING_GRACE,
     )
     await _after_embedding(ctx, report)
     return report.embedded

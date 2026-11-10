@@ -3,6 +3,7 @@
     "budget_exhausted",
     "conflict_state",
     "csrf_failed",
+    "delete_everything_in_progress",
     "eval_gate_failed",
     "filtered_requires_force",
     "idempotency_in_progress",
@@ -671,9 +672,6 @@
     "ok",
     "warn"
   ],
-  "tracing_region": [
-    "eu"
-  ],
   "queue": [
     "aux",
     "collect",
@@ -688,6 +686,9 @@
     "failed",
     "succeeded",
     "todo"
+  ],
+  "tracing_region": [
+    "eu"
   ],
   "ui_language": [
     "de",

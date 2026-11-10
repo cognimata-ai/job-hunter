@@ -10,7 +10,17 @@ itself. For each HTTP request it:
 2. sets `X-Request-Id` and `SECURITY_HEADERS` on every `http.response.start`;
 3. refuses a state-changing `/api` request that fails the CSRF check (§14.1, §16.5) with its own 403
    `csrf_failed` problem, before the app sees it (`csrf_failure`);
-4. bounds the request body at `MAX_BODY_BYTES` (1 MiB) before the app sees it, so no JSON is parsed past
+4. stops new work while delete-everything's `global` purge fence stands (§20.2, §20.4; M5 Task 8, P3, D15):
+   a state-changing `/api` request that `fence_exempt` does not exempt (the login, the logout, the purge
+   retry and every route under `/api/privacy/`, matched by method and path, since no route is matched yet
+   and so no template is known) is answered with its own 409 `delete_everything_in_progress` problem while
+   the fence is active (one read on the edge's engine, before the app sees the request and before its body
+   is read; logged `global_fence_refused` at info). Otherwise the edge sets `db.fence_guard.WRITE_GUARD` for
+   the rest of the request, so each transaction the request begins reads the fence first and a fence
+   committed after the edge's read refuses it, and resets it once the app returned: an in-process client
+   runs the app in its own task, where a value left set would guard its later transactions. Without an
+   engine (the state is not set yet) nothing is read and nothing is guarded;
+5. bounds the request body at `MAX_BODY_BYTES` (1 MiB) before the app sees it, so no JSON is parsed past
    it (final review FR-4): a declared `Content-Length` over the limit is refused before any byte is read, and
    a body without a trustworthy one (chunked, or not a number) is counted as it streams and refused as soon as
    it passes the limit, without reading further. Either is a 413 `upload_rejected` with `too_large` on `body`
@@ -19,8 +29,8 @@ itself. For each HTTP request it:
    The routes in `OWN_BODY_LIMITS` read their bodies themselves under their own limits (`profile.upload`:
    the multipart CV upload up to 10 MiB while it streams, the paste under its own 1 MiB cap with its own
    field), so the edge reads nothing of theirs;
-5. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
-6. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
+6. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
+7. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
    `api.unhandled_exception` alert. When a response has already started, the inner handler rendered it and
    persisted the alert (or a body failed mid-stream), so the edge only logs.
 
@@ -28,6 +38,7 @@ Nothing propagates to the server: uvicorn would log the exception with its trace
 must never reach a log line. This module is a task boundary (ruff `BLE001` is allowed here).
 """
 
+import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Final, Literal
@@ -42,10 +53,13 @@ from jobhunter.api.errors import (
     Problem,
     internal_problem,
     persist_unhandled_alert,
+    problem_of,
     problem_response,
     request_instance,
 )
 from jobhunter.config import AppConfig
+from jobhunter.db.fence_guard import WRITE_GUARD, delete_everything_in_progress
+from jobhunter.db.guards import global_fence_active
 from jobhunter.ids import uuid7
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import HTTP_REQUESTS
@@ -74,8 +88,14 @@ UNMATCHED_ROUTE: Final = "unmatched"
 STATE_CHANGING_METHODS: Final = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 CSRF_HEADER: Final = "X-JH-Request"
 LOGIN_PATH: Final = "/api/auth/login"
+# What a `global` purge fence lets through (module docstring, step 4): the logout, the login, every route
+# under `PRIVACY_PREFIX`, and the retry of a failed purge (`PURGE_RETRY`, the only recovery of a failed
+# delete-everything, whose fence stays), matched against the whole path with ASCII digits only.
+LOGOUT_PATH: Final = "/api/auth/logout"
+PRIVACY_PREFIX: Final = "/api/privacy/"
+PURGE_RETRY: Final = re.compile(r"/api/system/purges/[0-9]+/retry")
 CsrfFailure = Literal["origin_missing", "origin_mismatch", "header_missing"]
-# The body ceiling of every request (module docstring, step 4), and the routes that read their own bodies
+# The body ceiling of every request (module docstring, step 5), and the routes that read their own bodies
 # under their own limits (`profile.upload.MAX_UPLOAD_BYTES` and `PASTE_BODY_MAX_BYTES`).
 MAX_BODY_BYTES: Final = 2**20
 OWN_BODY_LIMITS: Final = frozenset({("POST", "/api/profile/cv"), ("POST", "/api/profile/cv-text")})
@@ -101,6 +121,28 @@ def _header_values(scope: Scope, name: bytes) -> list[str]:
     return [value.decode("latin-1") for key, value in scope.get("headers", []) if key == name]
 
 
+def _state_changing_api(scope: Scope) -> bool:
+    """A POST, PUT, PATCH or DELETE under `/api`: what the CSRF check and the fence's stop apply to."""
+    path = str(scope.get("path", ""))
+    return scope.get("method") in STATE_CHANGING_METHODS and (path == "/api" or path.startswith("/api/"))
+
+
+def fence_exempt(method: str, path: str) -> bool:
+    """Whether a state-changing `/api` request goes on while delete-everything's `global` fence stands
+    (module docstring, step 4): `POST` of the login, the logout or a purge's retry, or any method under
+    `/api/privacy/`. Matched on `scope["path"]`, before routing."""
+    if path.startswith(PRIVACY_PREFIX):
+        return True
+    return method == "POST" and (path in (LOGIN_PATH, LOGOUT_PATH) or PURGE_RETRY.fullmatch(path) is not None)
+
+
+def fence_guarded(scope: Scope) -> bool:
+    """Whether the request of `scope` is stopped by the `global` fence and guarded (module docstring, step 4):
+    a state-changing `/api` request that `fence_exempt` does not exempt."""
+    method, path = str(scope.get("method", "")), str(scope.get("path", ""))
+    return _state_changing_api(scope) and not fence_exempt(method, path)
+
+
 def csrf_failure(scope: Scope, public_origin: str | None) -> CsrfFailure | None:
     """Why the request of `scope` fails the CSRF check, or `None` when it passes or is not subject to it.
 
@@ -108,11 +150,9 @@ def csrf_failure(scope: Scope, public_origin: str | None) -> CsrfFailure | None:
     `public_origin` exactly (scheme, host and port, as browsers send it); without a configured origin every
     such request fails. `X-JH-Request: 1` is also required, except on the login.
     """
-    if scope.get("method") not in STATE_CHANGING_METHODS:
+    if not _state_changing_api(scope):
         return None
     path = str(scope.get("path", ""))
-    if path != "/api" and not path.startswith("/api/"):
-        return None
     origins = _header_values(scope, b"origin")
     if not origins:
         return "origin_missing"
@@ -125,6 +165,12 @@ def csrf_failure(scope: Scope, public_origin: str | None) -> CsrfFailure | None:
 
 def _csrf_problem() -> Problem:
     return Problem(403, "csrf_failed", "Cross-site request refused")
+
+
+async def _global_fence(engine: AsyncEngine) -> bool:
+    """Whether delete-everything's `global` fence stands: one read, on a connection of its own."""
+    async with engine.connect() as conn:  # rolled back when the block ends
+        return await global_fence_active(conn)
 
 
 def _too_large_problem() -> Problem:
@@ -147,7 +193,7 @@ def _declared_length(scope: Scope) -> int | None:
 
 async def bounded_body(scope: Scope, receive: Receive) -> Receive | None:
     """The request's body read to its end within `MAX_BODY_BYTES`, as a `receive` that gives its messages
-    again and then the server's own; `None` when the body is over the limit (module docstring, step 4). A
+    again and then the server's own; `None` when the body is over the limit (module docstring, step 5). A
     disconnect ends the reading and is given on as it came."""
     declared = _declared_length(scope)
     if declared is not None and declared > MAX_BODY_BYTES:
@@ -182,7 +228,8 @@ class EdgeMiddleware:
     ) -> None:
         self.app = app
         # Both return `None` until the app state is set (the lifespan, or `create_app` with injected state).
-        # `config` serves the CSRF check (Task 16); `engine` the alert of the last-resort 500.
+        # `config` serves the CSRF check (Task 16); `engine` the global fence's read (M5 Task 8) and the
+        # alert of the last-resort 500.
         self._config = config
         self._engine = engine
 
@@ -211,22 +258,29 @@ class EdgeMiddleware:
             try:
                 cfg = self._config()
                 failure = csrf_failure(scope, None if cfg is None else cfg.public_origin)
+                engine = self._engine()
+                fenced_engine = engine if engine is not None and fence_guarded(scope) else None
                 if failure is not None:
                     log.warning("csrf_rejected", reason=failure)
                     response = problem_response(
                         _csrf_problem(), instance=request_instance(scope), request_id=request_id
                     )
                     await response(scope, receive, send_with_edge_headers)
-                elif (scope.get("method"), scope.get("path")) in OWN_BODY_LIMITS:
-                    await self.app(scope, receive, send_with_edge_headers)
-                elif (bounded := await bounded_body(scope, receive)) is not None:
-                    await self.app(scope, bounded, send_with_edge_headers)
-                else:
-                    log.info("request_body_too_large", method=scope.get("method"), limit_bytes=MAX_BODY_BYTES)
+                elif fenced_engine is not None and await _global_fence(fenced_engine):
+                    log.info("global_fence_refused", method=scope.get("method"))
                     response = problem_response(
-                        _too_large_problem(), instance=request_instance(scope), request_id=request_id
+                        problem_of(delete_everything_in_progress()),
+                        instance=request_instance(scope),
+                        request_id=request_id,
                     )
                     await response(scope, receive, send_with_edge_headers)
+                else:
+                    token = None if fenced_engine is None else WRITE_GUARD.set(True)
+                    try:
+                        await self._admitted(scope, receive, send_with_edge_headers, request_id=request_id)
+                    finally:
+                        if token is not None:
+                            WRITE_GUARD.reset(token)
             except Exception as exc:
                 await self._last_resort(
                     scope,
@@ -239,6 +293,20 @@ class EdgeMiddleware:
             finally:
                 if status is not None:
                     HTTP_REQUESTS.labels(route=route_label(scope), status=str(status)).inc()
+
+    async def _admitted(self, scope: Scope, receive: Receive, send: Send, *, request_id: str) -> None:
+        """A request the CSRF check and the fence let through: its body bounded (module docstring, step 5),
+        then the app."""
+        if (scope.get("method"), scope.get("path")) in OWN_BODY_LIMITS:
+            await self.app(scope, receive, send)
+        elif (bounded := await bounded_body(scope, receive)) is not None:
+            await self.app(scope, bounded, send)
+        else:
+            log.info("request_body_too_large", method=scope.get("method"), limit_bytes=MAX_BODY_BYTES)
+            response = problem_response(
+                _too_large_problem(), instance=request_instance(scope), request_id=request_id
+            )
+            await response(scope, receive, send)
 
     async def _last_resort(
         self, scope: Scope, receive: Receive, send: Send, exc: Exception, *, request_id: str, started: bool

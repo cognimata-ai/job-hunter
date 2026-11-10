@@ -28,17 +28,23 @@ usable by this code: a 200 with status `ok`, the checksum verified, `EMBEDDING_M
 413 and no revision stays awaiting for its length. The service flags its own 1,024-token truncation.
 
 **`embed_awaiting`** embeds the revisions `awaiting_embedding`, oldest first (`created_at`, then `id`), in
-batches of `BATCH`, as passages. Per batch: one `/v1/embed` call (its duration observed in `EMBED_SECONDS`
-with its outcome: `ok`, the `EmbedderError` kind, or `error`, failed and timed-out calls included), the fault
-point `collect.embed.after_http`, then one transaction that **first** runs `guard(conn)`, the
-post-I/O ownership check (the node: the run's owner row, `ledger.lock_run_owner`; the reconciler: the worker
-epoch, `fence_epoch`). `FencedOut` propagates and the attempt is lost, so no vector of a superseded owner is
-committed. Then each vector is upserted (`upsert_embedding`: two revisions with one text share one row) and
-its revision marked `embedded` if it still awaits (`mark_embedded`: one embedded meanwhile is left alone,
-and its text's row is the one the other caller wrote, or one `retention_daily` removes unreferenced, §7.10).
-The transaction locks no job row, so the guard is its first lock (§3.3.3). `unavailable` stops the loop and
-the rest stays awaiting; any other `EmbedderError` propagates, with nothing of its batch written. `stop` is
-asked before each batch (the node's deadline and the worker's shutdown).
+batches of `BATCH`, as passages, those of a job under a purge fence left out (§20.2, M5 Task 8; an
+uncorrelated "no fence is open" first, `privacy.fences.NO_OPEN_FENCE_SQL`, so no row pays for `is_fenced`
+while no fence stands). Per batch: one `/v1/embed` call (its duration observed in `EMBED_SECONDS` with its
+outcome: `ok`, the `EmbedderError` kind, or `error`, failed and timed-out calls included), the fault point
+`collect.embed.after_http`, then one transaction in the lock schedule's order (§3.3.3): the batch's job rows
+`FOR SHARE` in id order (step 4) and their purge fences (`privacy.fences.lock_unfenced_jobs`), with
+`guard(conn)`, the post-I/O ownership check, at its step: `guard_step="owner"` (the node: the run's owner row,
+`ledger.lock_run_owner`, step 5) after the job rows, `guard_step="epoch"` (the reconciler: the worker epoch,
+`fence_epoch`, step 1) before them. `FencedOut` propagates and the attempt is lost, so no vector of a
+superseded owner is committed. Then each vector of a revision whose job is held and unfenced is upserted
+(`upsert_embedding`: two revisions with one text share one row) and its revision marked `embedded` if it still
+awaits (`mark_embedded`: one embedded meanwhile is left alone, and its text's row is the one the other caller
+wrote, or one `retention_daily` removes unreferenced, §7.10). The vector of a revision whose job a fence took
+meanwhile, or which a purge deleted since the selection, is dropped: no `embeddings` row is written for its
+text, and the revision stays awaiting (or is gone). `unavailable` stops the loop and the rest stays awaiting;
+any other `EmbedderError` propagates, with nothing of its batch written. `stop` is asked before each batch
+(the node's deadline and the worker's shutdown).
 
 **In flight.** The service embeds one batch at a time (Task 21), about 28 s for a batch of 16 on the V7 CPU,
 so a fourth queued batch would pass `BATCH_TIMEOUT_S`. Each caller runs one sequential loop, one batch in
@@ -69,6 +75,7 @@ from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import EMBED_SECONDS
+from jobhunter.privacy.fences import NO_OPEN_FENCE_SQL, lock_unfenced_jobs
 from jobhunter.types import JSONValue
 
 EMBEDDING_MODEL_ID: Final = "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp32"
@@ -89,6 +96,9 @@ ALERT_SUBJECT: Final = "embedder"
 
 EmbedderErrorKind = Literal["unavailable", "bad_response", "checksum"]
 InputKind = Literal["query", "passage"]
+# Where a batch's guard runs in its transaction (module docstring): the worker epoch first (step 1), or the
+# owner row after the job rows (step 5).
+GuardStep = Literal["epoch", "owner"]
 # Every `outcome` of `EMBED_SECONDS`: `ok`, an `EmbedderError` kind, `error` (anything else). Each series is
 # created at import, so it is exported at 0 before the first batch (ledger L364).
 EMBED_OUTCOMES: Final = ("ok", *get_args(EmbedderErrorKind), "error")
@@ -339,9 +349,10 @@ NOT_SYNTHETIC_REVISION_SQL: Final = (
     "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = r.job_id AND j.synthetic_eval)"
 )
 _NEXT_BATCH: Final = q(
-    "SELECT r.id, r.created_at, r.llm_input FROM job_revisions r "  # noqa: S608 (a constant fragment)
+    "SELECT r.id, r.job_id, r.created_at, r.llm_input FROM job_revisions r "  # noqa: S608 (constants)
     "WHERE r.embedding_status = 'awaiting_embedding' AND r.created_at < :before "
     f"AND (r.created_at, r.id) > (:after_at, :after_id) AND {NOT_SYNTHETIC_REVISION_SQL} "
+    f"AND ({NO_OPEN_FENCE_SQL} OR NOT is_fenced(r.job_id)) "
     "ORDER BY r.created_at, r.id LIMIT :n"
 )
 _COUNT_AWAITING: Final = q(
@@ -359,13 +370,25 @@ async def count_awaiting(conn: AsyncConnection, *, created_before: datetime | No
 
 
 async def _write_batch(
-    engine: AsyncEngine, guard: Guard, rows: Sequence[Any], texts: Sequence[str], out: Sequence[Embedded]
+    engine: AsyncEngine,
+    guard: Guard,
+    guard_step: GuardStep,
+    rows: Sequence[Any],
+    texts: Sequence[str],
+    out: Sequence[Embedded],
 ) -> tuple[int, int]:
-    """The batch's transaction: the guard first, then the upserts and the marks; (embedded, truncated)."""
+    """The batch's transaction (module docstring): the guard at its step around the job rows and their fences,
+    then the upserts and the marks of the unfenced jobs' revisions; (embedded, truncated)."""
     embedded = truncated = 0
     async with engine.begin() as conn:
-        await guard(conn)
+        if guard_step == "epoch":
+            await guard(conn)  # step 1
+        unfenced = await lock_unfenced_jobs(conn, [int(row.job_id) for row in rows])  # step 4
+        if guard_step == "owner":
+            await guard(conn)  # step 5
         for row, text, item in zip(rows, texts, out, strict=True):
+            if int(row.job_id) not in unfenced:
+                continue  # a fence took its job, or a purge deleted it, since the selection
             embedding_id = await upsert_embedding(
                 conn,
                 model_id=EMBEDDING_MODEL_ID,
@@ -384,6 +407,7 @@ async def embed_awaiting(
     client: EmbedderClient,
     *,
     guard: Guard,
+    guard_step: GuardStep = "owner",
     limit: int | None = None,
     batch: int = BATCH,
     fault: str | None = None,
@@ -391,8 +415,9 @@ async def embed_awaiting(
     stop: Callable[[], bool] | None = None,
 ) -> EmbedReport:
     """Embed the revisions awaiting embedding (created before `created_before`, when given), at most `limit`
-    of them, `batch` per call, as the module docstring says; `afault_point(fault)` after each batch when
-    `fault` is given, and no batch started once `stop()` is true."""
+    of them, `batch` per call, as the module docstring says, each batch's transaction guarded by `guard` at
+    `guard_step`; `afault_point(fault)` after each batch when `fault` is given, and no batch started once
+    `stop()` is true."""
     if not 1 <= batch <= BATCH:
         raise ValueError(f"batch must be 1 to {BATCH}")
     before = _NO_TIME_BOUND if created_before is None else created_before
@@ -425,7 +450,7 @@ async def embed_awaiting(
         finally:  # every batch, a failed or timed-out one included
             EMBED_SECONDS.labels(outcome=outcome).observe(time.monotonic() - started)
         await afault_point(AFTER_HTTP)
-        done, flagged = await _write_batch(engine, guard, rows, texts, out)
+        done, flagged = await _write_batch(engine, guard, guard_step, rows, texts, out)
         embedded += done
         truncated += flagged
         if fault is not None:

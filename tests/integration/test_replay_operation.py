@@ -1,7 +1,8 @@
 """The `replay_raw_items` operation (spec §7.16.1, §14.2; plan M4 Task 12, M1 Carry-forward 10).
 
 Step 1 replays the payload's `rejected` items in one transaction under the operation's claim, after the
-global purge fence (an active one requeues the operation `purge_in_progress`, writing nothing); step 2
+global purge fence (an active one requeues the operation `purge_in_progress`, writing nothing; a fence that
+stands before the claim keeps the operation from it, with no attempt spent: M5 Task 8); step 2
 resolves every payload item that is `pending` then, one transaction each, under the same claim
 (`identity.resolve_item(owner=claim)`), so the items of a run that is over become jobs. A crashed execution
 resumes on the items still `pending`. The progress is `{"asked", "moved", "resolved"}`.
@@ -13,8 +14,9 @@ or invented.
 """
 
 import hashlib
-from collections.abc import Sequence
-from datetime import timedelta
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Any, Final
 
 import httpx
@@ -33,6 +35,7 @@ from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.items import parse_response
 from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.receipts import RAW_BODY_TTL
+from jobhunter.sources.spec_adapters import _spec_adapters
 from jobhunter.worker import operations
 from jobhunter.worker.executions import ExecutionRegistry
 from jobhunter.worker.operations import execute_operation
@@ -175,7 +178,37 @@ async def test_an_active_global_fence_requeues_with_purge_in_progress(
     operation_id = await requested(engine, ids)
     started = utcnow()
 
-    # step 1 under the fence: requeued, nothing written (no item moved, no progress)
+    async def not_before() -> datetime:
+        async with engine.connect() as c:
+            found: datetime = (
+                await c.execute(
+                    sa.text("SELECT not_before FROM operations WHERE id = :o"), {"o": operation_id}
+                )
+            ).scalar_one()
+        return found
+
+    # a fence that stands before the claim: not claimed, no attempt spent, nothing written (M5 Task 8)
+    await execute(engine, operation_id, current_epoch)
+    op = await operation(engine, operation_id)
+    assert (op.status, op.attempts, op.last_error_code, op.progress) == ("pending", 0, None, {})
+    assert await not_before() >= started + operations.GLOBAL_FENCE_RETRY
+    assert await item_states(engine, ids) == [("rejected", "item_contract")] * 2
+
+    # a fence raised after the claim: step 1 requeues, nothing written (no item moved, no progress)
+    async with engine.begin() as c:
+        await c.execute(RELEASE_FENCE, {"f": fence})
+    fences: list[int] = []
+    adapters_of = _spec_adapters
+
+    @asynccontextmanager
+    async def fence_after_the_claim(now: datetime) -> AsyncIterator[Any]:
+        async with engine.begin() as c:
+            fences.append(await insert_test_fence(c, kind="global"))
+        async with adapters_of(now) as adapters:
+            yield adapters
+
+    monkeypatch.setattr(replay, "_spec_adapters", fence_after_the_claim)
+    await make_due(engine)
     await execute(engine, operation_id, current_epoch)
     op = await operation(engine, operation_id)
     assert (op.status, op.attempts, op.last_error_code, op.progress) == (
@@ -184,18 +217,14 @@ async def test_an_active_global_fence_requeues_with_purge_in_progress(
         "purge_in_progress",
         {},
     )
-    async with engine.connect() as c:
-        not_before = (
-            await c.execute(sa.text("SELECT not_before FROM operations WHERE id = :o"), {"o": operation_id})
-        ).scalar_one()
-    assert not_before >= started + replay.PURGE_RETRY_AFTER
+    assert await not_before() >= started + replay.PURGE_RETRY_AFTER
     assert await item_states(engine, ids) == [("rejected", "item_contract")] * 2
 
     # the fence released; a new one raised between step 1 and step 2: the resolution is fenced (the owner
     # lock of an operation claim checks the global fence) and requeues, keeping what step 1 did
+    monkeypatch.setattr(replay, "_spec_adapters", adapters_of)
     async with engine.begin() as c:
-        await c.execute(RELEASE_FENCE, {"f": fence})
-    fences: list[int] = []
+        await c.execute(RELEASE_FENCE, {"f": fences.pop()})
 
     async def fence_after_the_replay(point: str) -> None:
         if point == replay.AFTER_REPLAY_COMMIT:

@@ -599,6 +599,8 @@ async def test_a_version_that_does_not_exist_any_more_is_skipped_as_purged(engin
 
 @pytest.mark.parametrize("fence", ["profile_fence", "global_fence"])
 async def test_a_version_under_an_active_purge_fence_is_skipped(engine, runner, embedder, fence) -> None:
+    """A `profile` fence on the version ends the operation `skipped: fenced`; under delete-everything's
+    `global` fence the operation is not even claimed (M5 Task 8): it stays `pending`, no attempt spent."""
     chain = await make_version(engine)
     op_id = await request(engine, chain.profile_version_id)
     assert await purge(engine, fence, chain.profile_version_id) == "fenced"
@@ -606,7 +608,10 @@ async def test_a_version_under_an_active_purge_fence_is_skipped(engine, runner, 
     await runner.run_one(op_id)
 
     done = await operation(engine, op_id)
-    assert (done.status, done.progress) == ("succeeded", {"skipped": "fenced"})
+    if fence == "global_fence":
+        assert (done.status, done.attempts, done.last_error_code, done.progress) == ("pending", 0, None, {})
+    else:
+        assert (done.status, done.progress) == ("succeeded", {"skipped": "fenced"})
     assert embedder.requests == []
     await nothing_written(engine)
 
