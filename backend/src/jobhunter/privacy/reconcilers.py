@@ -43,7 +43,7 @@ from jobhunter.db.transitions import transition_where
 from jobhunter.observability.alerts import open_alert, open_subjects, raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.epoch import fence_epoch
-from jobhunter.worker.operations import PURGE_KIND, create_operation
+from jobhunter.worker.operations import PURGE_DEDUP_PREFIX, PURGE_KIND, create_operation
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer
 
@@ -127,9 +127,9 @@ async def _requeue(conn: AsyncConnection, defer: Deferrer, manifest: Any) -> int
     """A new purge operation for the manifest, its job deferred, and the alert raised; the rows changed."""
     operation_id, created = await create_operation(
         conn,
-        kind="purge",
+        kind=PURGE_KIND,
         payload={"manifest_id": int(manifest.id)},
-        dedup_key=f"purge:{manifest.manifest_uuid}",
+        dedup_key=f"{PURGE_DEDUP_PREFIX}{manifest.manifest_uuid}",
         defer=defer,
     )
     await raise_alert(

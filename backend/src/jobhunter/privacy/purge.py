@@ -23,14 +23,18 @@ deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["
 
 **The handler** (`run_purge`, kind `purge`; Task 25's replay runs the same procedures in `migrate`):
 
-1. the manifest not `executing` → `succeeded` (a retry that replay, or an earlier execution, completed);
+1. the manifest not `executing` → `succeeded` (a retry that replay, or an earlier execution, completed); no
+   such manifest → `failed('manifest_missing')`, a broken invariant (no code deletes a manifest) that the
+   failure hook's alert makes loud, as an invalid payload is `failed('invalid_payload')`;
 2. no `file_sha256` (A1-A3): when `<manifest_uuid>.json` already exists in `cfg.manifests_dir` (a crash
    after the file's rename, before A3) it is adopted, never recomputed: it must parse (`parse_manifest`) with
    the row's uuid, kind and `format` 1, in the canonical bytes whose hash `record_manifest` stores, else the
    operation ends `failed('manifest_invalid')` with the fence kept (nothing was deleted before A3 and the
    fence held, so an adoptable file's content is still the purge's). Otherwise the fence's cutoff is read
    (`fence_committed_at`) and the quiesce awaited (`wait_for_quiesce`; a timeout requeues
-   `quiesce_timeout` a minute later), the content computed (`compute_content`) and written
+   `quiesce_timeout` a minute later), the content computed (`compute_content`), checked as a replay will
+   read its file (`parse_manifest` of its canonical bytes: a content of any other shape than the format's
+   ends the operation `failed('manifest_invalid')` before anything is written, the fence kept), and written
    (`write_manifest_file`: tmp, fsync, rename, directory fsync). Then one transaction records it
    (`record_manifest`: the file's hash, `scope`, a source fence's affected jobs). Nothing is deleted before;
 3. phase B on the stored `scope`, never re-derived: the kind's `execute`, then for a kind that deletes them
@@ -122,7 +126,9 @@ from jobhunter.privacy.manifests import (
 from jobhunter.privacy.reconcilers import PURGE_FAILED_ALERT
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
+from jobhunter.worker.operations import PURGE_DEDUP_PREFIX as PURGE_DEDUP_PREFIX
 from jobhunter.worker.operations import (
+    PURGE_KIND,
     OperationClaim,
     OperationContext,
     create_operation,
@@ -137,7 +143,6 @@ if TYPE_CHECKING:
     from jobhunter.observability.deadman import DeadmanPinger
     from jobhunter.profile.storage import CvStore
 
-PURGE_DEDUP_PREFIX: Final = "purge:"
 # Read-then-lock rounds of a chunk whose co-members keep changing (as `dedup.groups._LOCK_ROUNDS`).
 CHUNK_LOCK_ROUNDS: Final = 3
 # Tries of a phase that loses a lock to a retryable database error, in all (Ruling T12-1).
@@ -153,6 +158,7 @@ MANIFEST_INVALID: Final = "manifest_invalid"
 POSTCONDITION: Final = "postcondition"
 UNKNOWN_KIND: Final = "unknown_kind"
 INVALID_PAYLOAD: Final = "invalid_payload"
+MANIFEST_MISSING: Final = "manifest_missing"
 
 # The fault points (module docstring).
 BEFORE_FILE: Final = "privacy.purge.before_file"
@@ -202,7 +208,7 @@ async def open_purge(
         await insert_fence(conn, manifest_id=manifest.id, spec=spec)
     operation_id, _ = await create_operation(
         conn,
-        kind="purge",
+        kind=PURGE_KIND,
         payload={"manifest_id": manifest.id},
         dedup_key=f"{PURGE_DEDUP_PREFIX}{manifest.manifest_uuid}",
         defer=defer,
@@ -468,7 +474,7 @@ class _Ending:
         await self._write(lambda conn: self.ctx.wait_in(conn, error_code=error_code, not_before=not_before))
 
 
-@register_operation_handler("purge", on_failed=purge_failed)
+@register_operation_handler(PURGE_KIND, on_failed=purge_failed)
 async def run_purge(ctx: OperationContext) -> None:
     """Run the purge of the payload's manifest (module docstring)."""
     deps = ctx.deps
@@ -486,9 +492,12 @@ async def run_purge(ctx: OperationContext) -> None:
         log.error("purge_payload_invalid", operation_id=claim.operation_id)
         await ending.fail(INVALID_PAYLOAD)
         return
-    if manifest is None or manifest.status != "executing":  # 1.
-        status = None if manifest is None else manifest.status
-        log.info("purge_not_executing", manifest_id=manifest_id, status=status)
+    if manifest is None:  # a broken invariant: no code deletes a manifest
+        log.error("purge_manifest_missing", manifest_id=manifest_id, operation_id=claim.operation_id)
+        await ending.fail(MANIFEST_MISSING)
+        return
+    if manifest.status != "executing":  # 1.
+        log.info("purge_not_executing", manifest_id=manifest_id, status=manifest.status)
         await ending.succeed()
         return
     proc = KINDS.get(manifest.kind)
@@ -538,6 +547,17 @@ def _adoptable(data: bytes, manifest: ManifestRow) -> ManifestContent | None:
     return None
 
 
+def _unparsable(content: ManifestContent, manifest: ManifestRow) -> str | None:
+    """Why a replay would refuse the file of a computed content (`parse_manifest` of its canonical bytes,
+    under its own name), or `None` when it would read the content back unchanged."""
+    data = canonical_bytes(content)
+    try:
+        parsed = parse_manifest(data, file_name=manifest_file_name(manifest.manifest_uuid))
+    except ManifestInvalid as invalid:
+        return invalid.reason
+    return None if canonical_bytes(parsed) == data else "not_canonical"
+
+
 def _owner(run: PurgeRun) -> PurgeOwner:
     if run.owner is None:
         raise RuntimeError("the worker's purge is a live one")
@@ -564,6 +584,11 @@ async def _admit(run: PurgeRun, proc: KindProcedure, ending: _Ending) -> Manifes
             return None
         async with run.engine.begin() as conn:
             content = await compute_content(conn, proc, manifest, fenced_at=since, now=run.now)
+        # the check a replay applies to the file, before anything is written
+        if (reason := _unparsable(content, manifest)) is not None:
+            log.error("purge_manifest_invalid", manifest_id=manifest.id, reason=reason, computed=True)
+            await ending.fail(MANIFEST_INVALID)
+            return None
         await afault_point(BEFORE_FILE)
         sha = write_manifest_file(directory, content)
         await afault_point(AFTER_FILE)

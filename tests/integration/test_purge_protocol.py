@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,7 +31,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.db.transitions import transition
+from jobhunter.db.transitions import transition, transition_where
 from jobhunter.dedup import merge
 from jobhunter.errors import CoMemberChanged, Refusal
 from jobhunter.llm.spend_ledger import EvalRunOwner, mark_dispatched, reserve
@@ -123,13 +123,16 @@ class FencedKind:
     `row_delete` of the request's `job_tombstones` row, in one chunk over that job and its group's members.
     `keep_the_row` makes `execute` delete nothing (its postcondition then fails); the first `deadlocks`
     chunks lose a deadlock (40P01, raised by the server in the chunk's transaction) after their locks;
-    `chunks` records each chunk's held jobs."""
+    `chunks` records each chunk's held jobs. `malformed` adds to the content what the format has not (a
+    replay refuses its file); `watermark` gives it a watermark, as a source or profile purge's has."""
 
     kind: ManifestKind = "retention_purge"
     deletes_exports: bool = True
     keep_the_row: bool = False
     deadlocks: int = 0
     chunks: list[frozenset[int]] = field(default_factory=list)
+    malformed: Mapping[str, Any] | None = None
+    watermark: bool = False
 
     async def compute(self, conn: AsyncConnection, manifest: ManifestRow, *, now: Any) -> ManifestContent:
         max_ids = await max_identity_ids(conn)
@@ -139,7 +142,12 @@ class FencedKind:
             {"op": "fence", "kind": "jobs", "key": "jobs", "job_ids": [job_id]},
             {"op": "row_delete", "table": "job_tombstones", "ids": [row_id], "bound": {"by": "id"}},
         ]  # the export ops come from the protocol (`purge.compute_content`)
-        return new_content(manifest, max_ids=max_ids, operations=operations)
+        content = new_content(manifest, max_ids=max_ids, operations=operations)
+        if self.watermark:  # its `fenced_at` left at `admitted_at`, as `new_content` leaves the content's
+            content["watermark"] = {"fenced_at": content["fenced_at"], "max_ids": {"jobs": max_ids["jobs"]}}
+        if self.malformed is not None:
+            return cast(ManifestContent, {**content, **self.malformed})
+        return content
 
     async def execute(self, run: PurgeRun, content: ManifestContent) -> None:
         jobs = [job for op in content["operations"] if op["op"] == "fence" for job in op["job_ids"]]
@@ -247,9 +255,11 @@ async def fenced_seed(engine: AsyncEngine) -> FencedSeed:
         return FencedSeed(await insert_job(conn), await tombstone_row(conn))
 
 
-async def open_fenced(engine: AsyncEngine, seed: FencedSeed, *, defer: Any = None) -> OpenedPurge:
+async def open_fenced(
+    engine: AsyncEngine, seed: FencedSeed, *, defer: Any = None, now: datetime | None = None
+) -> OpenedPurge:
     """The test kind's A0, as a privacy request opens a purge: `active_config FOR UPDATE`, then
-    `open_purge`."""
+    `open_purge` (at `now`, by default the clock's)."""
     async with engine.begin() as conn:
         await conn.execute(_LOCK_CONFIG)
         return await open_purge(
@@ -257,7 +267,7 @@ async def open_fenced(engine: AsyncEngine, seed: FencedSeed, *, defer: Any = Non
             kind="retention_purge",
             request={"job_id": seed.job.job_id, "tombstone_id": seed.tombstone_id},
             fences=[FenceSpec(kind="jobs", job_ids=(seed.job.job_id,))],
-            now=utcnow(),
+            now=utcnow() if now is None else now,
             defer=defer,
         )
 
@@ -800,27 +810,86 @@ async def test_a_lost_deadlock_reruns_the_phase_then_requeues_lock_conflict(
     engine: AsyncEngine, purger: Purger, fenced_kind: FencedKind, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Ruling T12-1: a 40P01 in the first try of a chunk re-runs phase B from its start and the purge
-    completes; one in every try (`PHASE_TRIES` in all) requeues the operation `lock_conflict` a minute later,
-    an attempt spent, never `bug`."""
+    completes; one in every try of the three (`PHASE_TRIES`) requeues the operation `lock_conflict` a minute
+    later, an attempt spent, never `bug`. The tries are counted: exactly three run, so two or four would
+    fail this test."""
     fenced_kind.deadlocks = 1
     seed = await fenced_seed(engine)
     opened = await open_fenced(engine, seed)
     await purger.run(opened.operation_id)
     assert (await operation(engine, opened.operation_id)).status == "succeeded"
     assert len(fenced_kind.chunks) == 2 and not await exists(engine, "job_tombstones", seed.tombstone_id)
-    assert [e["tries"] for e in logged(caplog, "purge_phase_lost_a_lock")] == [1]
+    assert [(e["phase"], e["tries"]) for e in logged(caplog, "purge_phase_lost_a_lock")] == [("execute", 1)]
 
-    fenced_kind.deadlocks = purge.PHASE_TRIES
+    caplog.clear()
+    fenced_kind.chunks.clear()
+    fenced_kind.deadlocks = 3
     seed = await fenced_seed(engine)
     opened = await open_fenced(engine, seed)
     before = utcnow()
     await purger.run(opened.operation_id)
+    assert fenced_kind.deadlocks == 0 and len(fenced_kind.chunks) == 3  # three tries, each lost
+    assert [(e["phase"], e["tries"]) for e in logged(caplog, "purge_phase_lost_a_lock")] == [
+        ("execute", 1),
+        ("execute", 2),
+        ("execute", 3),
+    ]
     row = await operation(engine, opened.operation_id)
     assert (row.status, row.attempts, row.last_error_code) == ("pending", 1, "lock_conflict")
     assert row.not_before >= before + purge.RETRY_AFTER
     assert await exists(engine, "job_tombstones", seed.tombstone_id)
     assert (await manifest_of(engine, opened.manifest_id)).status == "executing"
     assert [f.released_at for f in await fence_rows(engine, opened.manifest_id)] == [None]
+
+
+async def test_a_lost_deadlock_in_the_export_phase_reruns_it_then_requeues_lock_conflict(
+    engine: AsyncEngine,
+    purger: Purger,
+    fenced_kind: FencedKind,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T12-1 around the export ops (`purge_exports`): the server raises a 40P01 in the export chunk's
+    transaction, after its locks, before its update. One loss re-runs the export phase alone and the purge
+    completes; a loss in each of its three tries requeues `lock_conflict`, an attempt spent, the export still
+    `ready` with its file (the kind's own phase, done before, is not run again)."""
+    losses = 0
+    real = transition_where  # the function `deletion_graph` calls
+
+    async def losing(conn: AsyncConnection, *args: Any, **kwargs: Any) -> Any:
+        nonlocal losses
+        if losses:
+            losses -= 1
+            await conn.execute(_DEADLOCK)
+        return await real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(deletion_graph, "transition_where", losing)
+    losses = 1
+    export_id, export_file = await an_export(engine, purger.cfg.exports_dir, "ready")
+    opened = await open_fenced(engine, await fenced_seed(engine))
+    await purger.run(opened.operation_id)
+    assert (await operation(engine, opened.operation_id)).status == "succeeded"
+    assert await export_row(engine, export_id) == ("purged", None) and not export_file.exists()
+    assert len(fenced_kind.chunks) == 1  # the kind's phase ran once
+    assert [(e["phase"], e["tries"]) for e in logged(caplog, "purge_phase_lost_a_lock")] == [("exports", 1)]
+
+    caplog.clear()
+    losses = 3
+    export_id, export_file = await an_export(engine, purger.cfg.exports_dir, "ready")
+    seed = await fenced_seed(engine)
+    opened = await open_fenced(engine, seed)
+    await purger.run(opened.operation_id)
+    assert losses == 0
+    assert [(e["phase"], e["tries"]) for e in logged(caplog, "purge_phase_lost_a_lock")] == [
+        ("exports", 1),
+        ("exports", 2),
+        ("exports", 3),
+    ]
+    row = await operation(engine, opened.operation_id)
+    assert (row.status, row.attempts, row.last_error_code) == ("pending", 1, "lock_conflict")
+    assert await export_row(engine, export_id) == ("ready", export_file.name) and export_file.exists()
+    assert not await exists(engine, "job_tombstones", seed.tombstone_id)  # the kind's phase had committed
+    assert (await manifest_of(engine, opened.manifest_id)).status == "executing"
 
 
 @pytest.mark.parametrize("kind", ["golden_case_delete", "retention_purge"])
@@ -1127,3 +1196,102 @@ async def test_a_manifest_no_longer_executing_ends_succeeded(engine: AsyncEngine
     await purger.run(again)
     assert (await operation(engine, again)).status == "succeeded"
     assert await manifest_of(engine, opened.manifest_id) == completed
+
+
+# ---- the content checked before its file, a missing manifest, the cutoff stamp -----------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"note": "a field the format has not"},
+        {"operations": [{"op": "truncate", "table": "job_tombstones"}]},
+    ],
+    ids=["extra_field", "unknown_op"],
+)
+async def test_a_computed_content_a_replay_would_refuse_fails_before_anything_is_written(
+    engine: AsyncEngine, purger: Purger, fenced_kind: FencedKind, malformed: Mapping[str, Any]
+) -> None:
+    """Ruling T12-3 (M1): the content is read back as a replay reads its file (`parse_manifest`) before the
+    file is written. A kind whose content fails ends the operation `failed('manifest_invalid')` with no file,
+    nothing recorded or deleted, the fence kept and the alert raised."""
+    fenced_kind.malformed = malformed
+    seed = await fenced_seed(engine)
+    opened = await open_fenced(engine, seed)
+    await purger.run(opened.operation_id)
+
+    row = await operation(engine, opened.operation_id)
+    assert (row.status, row.last_error_code) == ("failed", "manifest_invalid")
+    assert list(purger.cfg.manifests_dir.iterdir()) == []  # neither the file nor its `.tmp`
+    manifest = await manifest_of(engine, opened.manifest_id)
+    assert (manifest.status, manifest.file_sha256, manifest.scope) == ("executing", None, None)
+    assert [f.released_at for f in await fence_rows(engine, opened.manifest_id)] == [None]
+    assert await exists(engine, "job_tombstones", seed.tombstone_id) and fenced_kind.chunks == []
+    assert [a.resolved_at for a in await purge_failed_alerts(engine, opened.manifest_id)] == [None]
+
+
+async def test_a_payload_naming_no_manifest_fails_manifest_missing(
+    engine: AsyncEngine, purger: Purger
+) -> None:
+    """Ruling T12-3 (M2): no code deletes a manifest, so a purge operation whose manifest does not exist is a
+    broken invariant: it ends `failed('manifest_missing')`, loud (the failure hook's alert and
+    `operation.failed`), never `succeeded` as a manifest that left `executing` does."""
+    missing = 2**40
+    async with engine.begin() as conn:
+        operation_id, _ = await ops.create_operation(
+            conn,
+            kind="purge",
+            payload={"manifest_id": missing},
+            dedup_key=f"{purge.PURGE_DEDUP_PREFIX}missing",
+            defer=None,
+        )
+    await purger.run(operation_id)
+    row = await operation(engine, operation_id)
+    assert (row.status, row.last_error_code) == ("failed", "manifest_missing")
+    [alert] = await purge_failed_alerts(engine, missing)
+    assert (alert.severity, alert.resolved_at, alert.context["reason"]) == ("critical", None, "failed")
+    async with engine.connect() as conn:
+        failed = sa.text("SELECT count(*) FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL")
+        assert (
+            await conn.execute(failed, {"k": f"operation.failed:operation:{operation_id}"})
+        ).scalar_one() == 1
+
+
+async def test_fenced_at_is_the_quiesce_cutoff_never_the_admission(
+    engine: AsyncEngine, purger: Purger, fenced_kind: FencedKind, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling T12-3 (M4): the content's `fenced_at`, and its watermark's, are the cutoff the quiesce waited
+    from (`fence_committed_at`, read after A0 committed), not `admitted_at` (`created_at`), which the kind's
+    `new_content` leaves there. A0 is an hour before the purge runs here, so the two differ."""
+    cutoffs: list[datetime] = []
+    waited_from: list[datetime] = []
+    real_cutoff, real_wait = fences.fence_committed_at, fences.wait_for_quiesce  # what `purge` calls
+
+    async def cutoff(engine: AsyncEngine) -> datetime:
+        cutoffs.append(await real_cutoff(engine))
+        return cutoffs[-1]
+
+    async def wait(engine: AsyncEngine, *, since: datetime, clock: Any, sleep: Any) -> bool:
+        waited_from.append(since)
+        return await real_wait(engine, since=since, clock=clock, sleep=sleep)
+
+    monkeypatch.setattr(purge, "fence_committed_at", cutoff)
+    monkeypatch.setattr(purge, "wait_for_quiesce", wait)
+    fenced_kind.watermark = True
+    opened = await open_fenced(engine, await fenced_seed(engine), now=utcnow() - timedelta(hours=1))
+    await purger.run(opened.operation_id)
+
+    manifest = await manifest_of(engine, opened.manifest_id)
+    assert manifest.status == "completed" and manifest.scope is not None
+    [fenced_at] = cutoffs
+    assert waited_from == [fenced_at]
+    assert manifest.scope["admitted_at"] == manifest.created_at.isoformat()
+    assert fenced_at - manifest.created_at > timedelta(minutes=59)  # the two differ
+    assert manifest.scope["fenced_at"] == fenced_at.isoformat()
+    assert manifest.scope["watermark"]["fenced_at"] == fenced_at.isoformat()
+    assert (
+        parse_manifest(
+            purger.file(opened.manifest_uuid).read_bytes(), file_name=purger.file(opened.manifest_uuid).name
+        )
+        == manifest.scope
+    )

@@ -52,9 +52,10 @@ source instance, and on `ad_keys`, its `key_ns`), and is evaluated only within t
   instead names none of the revisions the manifest deletes (by id, or within the bound of an `all` selector
   and not among its kept ids).
 - `file_remove`: no named file on the volume (`FileRoots`); a key that is no plain file name is a violation.
-  A key ending in `KEY_WILDCARD` (`*`) names every file of the volume whose name begins with the rest of it
-  (an export's `<id>-*`: its published archive and an unpublished attempt's, M5 Task 12); `named_files`
-  is the one reading of a key, which `remove_files` (a purge's or a replay's unlink) shares.
+  A prefix key `<stem>-*` (a non-empty stem, the separator, `KEY_WILDCARD`) names every file of the volume
+  whose name begins with `<stem>-` (an export's `<id>-*`: its published archive and an unpublished attempt's,
+  M5 Task 12); a `*` anywhere else makes the key no file name. A directory is never a named file.
+  `named_files` is the one reading of a key, which `remove_files` (a purge's or a replay's unlink) shares.
 - `fence`: no fence of the manifest is active (a final-state condition: the completing transaction releases
   the fences first, then checks, and rolls back on a violation); for a `source` fence, for the stored affected
   jobs that still exist, no `field_provenance` entry or current-revision lineage row names a posting or
@@ -71,6 +72,7 @@ Table and column names come from the content; each is quoted as an identifier.
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -97,8 +99,10 @@ SELECTOR_ALL: Final = "all"
 SOURCE_SELECTOR: Final = "source:"
 # A `field_redact` marker value that means "set" (not NULL), not a value of its own (module docstring).
 MARKER_SET: Final = "set"
-# The last character of a `file_remove` key that names every file the rest prefixes (module docstring).
+# The wildcard of a `file_remove` prefix key `<stem>-*`, which names every file `<stem>-` begins (module
+# docstring); a key may hold it nowhere else.
 KEY_WILDCARD: Final = "*"
+PREFIX_KEY_SUFFIX: Final = "-" + KEY_WILDCARD
 # The states of an export that hold no content (Task 17's table): each satisfies an `exports.status` marker.
 EXPORT_CONTENT_FREE: Final = ("purged", "expired", "failed")
 
@@ -733,25 +737,36 @@ def _plain_name(key: str) -> bool:
 
 
 def _valid_key(key: str) -> bool:
-    """A plain file name, or one followed by `KEY_WILDCARD` (a prefix); no other wildcard."""
-    stem = key.removesuffix(KEY_WILDCARD)
-    return _plain_name(stem) and KEY_WILDCARD not in stem
+    """A plain file name without a wildcard, or a prefix key `<stem>-*`: a non-empty plain stem, then the
+    separator and `KEY_WILDCARD`, so `5-*` never names a file of `50-`."""
+    if not key.endswith(PREFIX_KEY_SUFFIX):
+        return _plain_name(key) and KEY_WILDCARD not in key
+    stem = key.removesuffix(PREFIX_KEY_SUFFIX)
+    return stem != "" and _plain_name(stem) and KEY_WILDCARD not in stem
+
+
+def _no_directory(path: Path) -> bool:
+    """Whether `path` exists and is no directory (a symbolic link is never followed)."""
+    try:
+        return not stat.S_ISDIR(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
 
 
 def named_files(root: Path, key: str) -> list[Path]:
     """The entries of `root` the `file_remove` key `key` names (module docstring), in name order: the file of
-    a plain name when it exists, or every entry whose name begins with a prefix key's stem; `ValueError` for a
-    key that is neither."""
+    a plain name when it exists, or every entry whose name begins with a prefix key's `<stem>-`; a directory
+    is never one. `ValueError` for a key that is neither."""
     if not _valid_key(key):
-        raise ValueError("a file_remove key is a file name or a file name prefix")
-    if not key.endswith(KEY_WILDCARD):
-        return [root / key] if os.path.lexists(root / key) else []
-    stem = key.removesuffix(KEY_WILDCARD)
+        raise ValueError("a file_remove key is a file name or a prefix key <stem>-*")
+    if not key.endswith(PREFIX_KEY_SUFFIX):
+        return [root / key] if _no_directory(root / key) else []
+    prefix = key.removesuffix(KEY_WILDCARD)
     try:
         names = os.listdir(root)
     except FileNotFoundError:
         return []
-    return [root / name for name in sorted(names) if name.startswith(stem)]
+    return [root / name for name in sorted(names) if name.startswith(prefix) and _no_directory(root / name)]
 
 
 def remove_files(root: Path, keys: Sequence[str]) -> int:

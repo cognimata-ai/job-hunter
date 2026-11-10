@@ -150,6 +150,9 @@ RETRY_DELAY: Final = timedelta(minutes=1)
 GLOBAL_FENCE_RETRY: Final = timedelta(minutes=1)
 # The one kind the global fence lets through: delete-everything's own (and every other purge's).
 PURGE_KIND: Final = "purge"
+# A purge operation's dedup key is this prefix and its manifest's uuid: A0's (`privacy.purge.open_purge`), the
+# `purge_fences` reconciler's and the retry route's operations of one manifest share it (M5 Task 12).
+PURGE_DEDUP_PREFIX: Final = "purge:"
 
 FAILED_ALERT_CODE: Final = "operation.failed"
 # The error code of an operation that a requeue or reclaim took past its last attempt.

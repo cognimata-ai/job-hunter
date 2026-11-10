@@ -24,12 +24,16 @@ from jobhunter.ids import uuid7
 from jobhunter.privacy.manifests import (
     MANIFEST_FORMAT,
     THREAD_FORMS,
+    FileRoots,
     ManifestConflict,
     ManifestContent,
     ManifestInvalid,
     Operation,
     canonical_bytes,
+    check_postconditions,
+    named_files,
     parse_manifest,
+    remove_files,
     write_manifest_file,
 )
 from jobhunter.worker.runs import thread_id as run_thread_id
@@ -275,3 +279,52 @@ def test_the_thread_forms_are_the_writers_own() -> None:
         "",
     ):
         assert owner_ids(other) == [], other
+
+
+@pytest.mark.parametrize("key", ["5*", "-*", "*", "a*b", "5-*x", "5-**", "5/-*"])
+def test_a_wildcard_key_is_only_a_stem_its_separator_and_the_wildcard(tmp_path: Path, key: str) -> None:
+    """M5 Task 12: a prefix key is `<non-empty stem>-*`, so a stem never runs into another id's files (`5*`
+    would name `50-…`) and `-*`, with no stem, is refused; a `*` anywhere else makes the key no file name."""
+    (tmp_path / "5-x.jhx").write_bytes(b"\x00")
+    with pytest.raises(ValueError, match="prefix key"):
+        named_files(tmp_path, key)
+    with pytest.raises(ValueError, match="prefix key"):
+        remove_files(tmp_path, [key])
+    assert (tmp_path / "5-x.jhx").exists()
+
+
+def test_a_prefix_key_names_the_files_of_its_stem_and_never_a_directory(tmp_path: Path) -> None:
+    """`5-*` names the files `5-` begins, never `50-…`; a directory named `5-x` is no named file, so the
+    unlink never meets one; a plain key that names a directory names nothing either."""
+    (tmp_path / "5-x").mkdir()
+    (tmp_path / "5-y.jhx").write_bytes(b"\x00")
+    (tmp_path / "5-z.jhx.tmp").write_bytes(b"\x00")
+    (tmp_path / "50-a.jhx").write_bytes(b"\x00")
+    assert named_files(tmp_path, "5-*") == [tmp_path / "5-y.jhx", tmp_path / "5-z.jhx.tmp"]
+    assert named_files(tmp_path, "5-x") == []
+    assert remove_files(tmp_path, ["5-*", "5-x"]) == 2
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["5-x", "50-a.jhx"]
+    assert named_files(tmp_path / "absent", "5-*") == []
+
+
+async def test_the_file_remove_postcondition_reads_keys_through_the_same_grammar(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The postcondition counts `5*` and `-*` as no file name, and a directory `5-x` as no file remaining."""
+    (tmp_path / "5-x").mkdir()
+    content: ManifestContent = {
+        "format": 1,
+        "manifest_uuid": str(uuid7()),
+        "kind": "golden_case_delete",
+        "admitted_at": ADMITTED_AT,
+        "fenced_at": FENCED_AT,
+        "max_ids": {},
+        "operations": [{"op": "file_remove", "volume": "exports", "keys": ["5*", "-*", "5-*"]}],
+    }
+    async with engine.connect() as conn:
+        found = await check_postconditions(conn, content, files=FileRoots(tmp_path, tmp_path))
+    assert [(v.op, v.detail) for v in found] == [("file_remove", "2 keys on exports are no file name")]
+    (tmp_path / "5-y.jhx").write_bytes(b"\x00")
+    async with engine.connect() as conn:
+        found = await check_postconditions(conn, content, files=FileRoots(tmp_path, tmp_path))
+    assert [v.detail for v in found] == ["2 keys on exports are no file name", "1 file on exports remains"]
