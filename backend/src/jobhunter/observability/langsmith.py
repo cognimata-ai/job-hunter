@@ -1,8 +1,12 @@
 """LangSmith tracing with hidden inputs and outputs, one anonymizer and the published tracing state (spec
-§17.8; plan M5 Task 6, O13-O16, O21, Q15-Q17, Rulings T6-1, T6-2, T6-3).
+§17.8; plan M5 Task 6, O13-O16, O21, Q15-Q17, Rulings T6-1, T6-2, T6-3, T6-8).
 
 Tracing is on in the prod compose's worker only (`LANGSMITH_TRACING=true`); dev, test, CI, the E2E stack and
-the spike recorders keep it unset. Only the worker installs a client: the api makes no LLM call.
+the spike recorders keep it unset. Only the worker installs a client. Every other process is explicitly
+untraced, whatever its environment says (`disable_tracing`, which `cli.main` runs first for every command but
+`worker`): the api, and a worker-role command that runs in the worker's environment and may call the LLM in
+its own process, such as `schema-dry-run`. Without that, the SDK would trace such a process through its
+default client, built from the environment, which hides inputs and outputs but has no anonymizer.
 
 **The client** (`make_client`) is `langsmith.Client(api_url=LANGSMITH_EU_ENDPOINT, api_key=<the langsmith_key
 secret>, hide_inputs=True, hide_outputs=True, anonymizer=anonymize)`, and `None` while tracing is off. By
@@ -19,19 +23,34 @@ What langsmith 0.14.11 does with these, as read in its `client.py` (`_hide_run_*
 - the error string, `repr(exc)` followed by the formatted traceback, goes through the anonymizer wrapped as
   `{"error": <string>}`, and the SDK keeps the original string when the answer holds no `error` key: so
   `anonymize` answers every such payload with one, whatever its value was.
-Events keep only what is not a streamed token, and a chain run's `serialized` is dropped. A trace then carries
-the graph's structure, the timings, token counts and error classes (§17.8 L5740), besides the SDK's runtime
-description (its version, the platform's and Python's).
+A trace then carries the graph's structure, the timings, token counts and error classes (§17.8 L5740). Also
+sent, outside the anonymizer, and none of it content:
+- the run names (a graph's or node's name, a runnable's class or function name) and the tags (LangGraph's
+  `graph:step:<n>` and `seq:step:<n>`, and the tracer's own, none of them set by the app);
+- an LLM run's `extra.invocation_params`: the model's parameters and the request's bound options, the wire
+  JSON schema of `output_config` among them, which is the schema of a node's output, not the output;
+- an LLM run's `serialized` manifest: the chat model's constructor arguments (model, `max_tokens`, effort,
+  timeout, base URL, streaming), its key only as the reference `{"type": "secret", "id":
+  ["ANTHROPIC_API_KEY"]}` (langchain-core's `dumpd` never writes a secret's value). A chain run's `serialized`
+  is dropped by the SDK;
+- `extra.runtime`, the SDK's runtime description: its version, the platform's and Python's.
+**The events invariant**: the SDK strips `kwargs` from `new_token` events only (the streamed text), and passes
+any other event as it is. langchain-core's `retry` event (`Runnable.with_retry`, a callback's `on_retry`) puts
+`str(exception)` or `str(result)` in its `kwargs`, which can be content: so no traced code may use
+`with_retry` or `on_retry`. Nothing in the app does (the gateway retries outside langchain-core; LangGraph's
+own retry emits no event).
 
 **The anonymizer** (`anonymize`): a payload that is exactly `{"error": s}` becomes `{"error": error_tag(s)}`;
 any other payload keeps the keys of `METADATA_ALLOWLIST` only, LangGraph's `langgraph_node` becoming `node`
-(unless the payload names a `node` itself), and `usage_metadata` (where langchain-core puts an LLM run's token
-usage, O13) reduced to its integer token counts. `error_tag(s)` is `"<ErrorClass>:<code>"` (§17.8 L5739,
-Ruling T6-1): the class is the last dotted part of the identifier that starts the string, when `(` follows it
-at once (`Unknown` otherwise); the code is the first `code=`, `error_code=` or `error_class=` value in the
-string's first line (the `repr`), its quotes stripped, when it is an identifier of at most 64 characters
-(`unknown` otherwise). A value runs to the next `,` or `)` unless it is quoted, so nothing of a value that is
-no identifier survives: `error_class='Bearer x'` gives `unknown`, and `Authorization: Bearer x` names neither.
+(unless the payload names a `node` itself), and of those only a value that is a string of at most
+`MAX_VALUE_CHARS` (128) characters, an integer or `None` (no list, no mapping, nothing longer); and
+`usage_metadata` (where langchain-core puts an LLM run's token usage, O13) reduced to its integer token
+counts. `error_tag(s)` is `"<ErrorClass>:<code>"` (§17.8 L5739, Ruling T6-1): the class is the last dotted
+part of the identifier that starts the string, when `(` follows it at once (`Unknown` otherwise); the code is
+the first `code=`, `error_code=` or `error_class=` value in the string's first line (the `repr`), its quotes
+stripped, when it is an identifier of at most 64 characters (`unknown` otherwise). A value runs to the next
+`,` or `)` unless it is quoted, and is not trimmed, so nothing of a value that is no identifier survives:
+`error_class='Bearer x'` and `code= abc` give `unknown`, and `Authorization: Bearer x` names neither.
 When no keyword is found, a `NodeFailed` gives the code of its fixed message (Ruling T6-5): its repr is
 `NodeFailed('node <node> failed: <ErrorClass>')`, where `graphs.sanitize` puts the failed error's class name
 (no content), and when the repr is exactly that, both names identifiers of at most 64 characters, the code is
@@ -49,13 +68,15 @@ kept when its heartbeat goes stale.
 
 import re
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from langsmith import Client, run_trees
-from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.config import LANGSMITH_EU_ENDPOINT, AppConfig, tracing_enabled
-from jobhunter.db.sql import q
+
+if TYPE_CHECKING:  # the database layer is imported by the publish only: `cli.main` imports this module for
+    # every command, the container healthchecks included, which load no database stack
+    from sqlalchemy.ext.asyncio import AsyncConnection
 
 # §17.8 L5738, and the token usage (O13).
 METADATA_ALLOWLIST: Final = frozenset(
@@ -72,6 +93,8 @@ METADATA_ALLOWLIST: Final = frozenset(
         "usage_metadata",
     }
 )
+# The longest string an allowlisted metadata key keeps (Fix round 1, M1).
+MAX_VALUE_CHARS: Final = 128
 UNKNOWN_CLASS: Final = "Unknown"
 UNKNOWN_CODE: Final = "unknown"
 # Ruling T6-1. ASCII only: `\w` matches no other letter.
@@ -93,7 +116,7 @@ _NODE_FAILED_REPR: Final = re.compile(
 )
 _TRACEBACK_HEADER: Final = "Traceback (most recent call last):"
 _DETAILS_SUFFIX: Final = "_token_details"
-_PUBLISH: Final = q("UPDATE worker_heartbeat SET tracing = :tracing WHERE id = 1", jsonb=["tracing"])
+_PUBLISH_SQL: Final = "UPDATE worker_heartbeat SET tracing = :tracing WHERE id = 1"
 
 
 @dataclass(frozen=True)
@@ -108,7 +131,7 @@ TRACING_OFF: Final = TracingState(tracing=False, region=None)
 
 
 def _unquoted(value: str) -> str:
-    value = value.strip()
+    """`value` without one pair of enclosing quotes; nothing else is taken off (T6-1: no trimming)."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         return value[1:-1]
     return value
@@ -142,6 +165,11 @@ def _is_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _kept_value(value: object) -> bool:
+    """What an allowlisted key other than `usage_metadata` may hold: a short string, an integer or `None`."""
+    return value is None or _is_count(value) or (isinstance(value, str) and len(value) <= MAX_VALUE_CHARS)
+
+
 def _token_counts(usage: object) -> dict[str, Any]:
     """The integer counts of a `usage_metadata`, and those of its `*_token_details`; nothing else (O13)."""
     if not isinstance(usage, dict):
@@ -162,11 +190,15 @@ def anonymize(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.keys() == {"error"}:
         error = payload["error"]
         return {"error": error_tag(error) if isinstance(error, str) else f"{UNKNOWN_CLASS}:{UNKNOWN_CODE}"}
-    kept = {key: value for key, value in payload.items() if key in METADATA_ALLOWLIST}
-    if "node" not in kept and "langgraph_node" in payload:
+    kept = {
+        key: value
+        for key, value in payload.items()
+        if key in METADATA_ALLOWLIST and key != "usage_metadata" and _kept_value(value)
+    }
+    if "node" not in kept and "langgraph_node" in payload and _kept_value(payload["langgraph_node"]):
         kept["node"] = payload["langgraph_node"]
-    if "usage_metadata" in kept:
-        kept["usage_metadata"] = _token_counts(kept["usage_metadata"])
+    if "usage_metadata" in payload:
+        kept["usage_metadata"] = _token_counts(payload["usage_metadata"])
     return kept
 
 
@@ -197,7 +229,23 @@ def install_tracing(cfg: AppConfig) -> TracingState:
     return TracingState(tracing=True, region="eu")
 
 
-async def publish_tracing_state(conn: AsyncConnection, state: TracingState) -> None:
+def disable_tracing() -> None:
+    """Tracing off for this process, whatever its environment says: every process but the worker (§17.8 "only
+    the worker traces", Ruling T6-8; `cli.main` calls it before any command but `worker` runs).
+
+    `run_trees.configure(enabled=False)` sets the SDK's switch, the context's and the process-wide one, which
+    `langsmith.utils.tracing_is_enabled` reads before the environment, and so does langchain-core's choice of
+    a tracer (`tracers.context._tracing_v2_is_enabled`): no tracer and no client is made. The process has
+    cached no client when it runs (none is made before a traced call), so none needs dropping: `client` is
+    left alone.
+    """
+    run_trees.configure(enabled=False)
+
+
+async def publish_tracing_state(conn: "AsyncConnection", state: TracingState) -> None:
     """Write `state` on `worker_heartbeat.tracing`, in the caller's transaction, which starts with the
     worker's epoch fence (`fence_epoch`), so the row is this worker's."""
-    await conn.execute(_PUBLISH, {"tracing": {"tracing": state.tracing, "region": state.region}})
+    from jobhunter.db.sql import q  # here: see the import of `AsyncConnection`
+
+    statement = q(_PUBLISH_SQL, jsonb=["tracing"])
+    await conn.execute(statement, {"tracing": {"tracing": state.tracing, "region": state.region}})

@@ -1,20 +1,26 @@
 """LangSmith with hidden inputs and outputs, one anonymizer and the published tracing state (spec §17.8; plan
-M5 Task 6, O13-O16, Q15-Q17, Rulings T6-1, T6-2).
+M5 Task 6, O13-O16, Q15-Q17, Rulings T6-1, T6-2, T6-5, T6-8).
 
 The transforms are driven through the real hooks of langsmith 0.14.11's `Client` (`_hide_run_inputs`,
 `_hide_run_outputs`, `_hide_run_metadata`, `_hide_run_error` and `_run_transform`, which applies all four to a
 run), on the client `make_client` builds. Its HTTP session sends every request to an adapter that fails it
 before any socket is opened, so nothing here reaches the network: the client's own control thread asks for
-`/info` once at its start, and that request is refused too. `LANGSMITH_TRACING` is never set in the process
-environment: `make_client` reads the configuration's.
+`/info` once at its start, and that request is refused too. One test traces runnables end to end through such
+a client whose adapter answers instead (`/info`, then 202) and records what would have been sent.
+`LANGSMITH_TRACING` is never set in the process environment: `make_client` reads the configuration's.
 """
 
+import json
 import threading
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 import pytest
 import requests
+import zstandard
 from jobhunter.config import LANGSMITH_EU_ENDPOINT, AppConfig, load_config
 from jobhunter.errors import NodeFailed
 from jobhunter.observability.langsmith import (
@@ -25,8 +31,9 @@ from jobhunter.observability.langsmith import (
     install_tracing,
     make_client,
 )
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tracers.core import _TracerCore
-from langsmith import Client, run_trees
+from langsmith import Client, run_trees, tracing_context
 from requests.adapters import BaseAdapter
 
 KEY: Final = "lsv2-test-key"  # a low-entropy stand-in: no secret scanner reads it as a key
@@ -54,15 +61,15 @@ class RefusingAdapter(BaseAdapter):
         pass
 
 
-class RefusingSession(requests.Session):
-    """A session whose every URL goes to one refusing adapter, whatever adapters the client mounts on it."""
+class OneAdapterSession(requests.Session):
+    """A session whose every URL goes to one adapter, whatever adapters the client mounts on it."""
 
-    def __init__(self, adapter: RefusingAdapter) -> None:
+    def __init__(self, adapter: BaseAdapter) -> None:
         super().__init__()
-        self.refusing = adapter
+        self.adapter = adapter
 
     def get_adapter(self, url: str) -> BaseAdapter:
-        return self.refusing
+        return self.adapter
 
 
 def worker_config(tmp_path: Path, env: dict[str, str] | None = None, *, key: str | None = KEY) -> AppConfig:
@@ -80,7 +87,7 @@ def worker_config(tmp_path: Path, env: dict[str, str] | None = None, *, key: str
 def refusing(monkeypatch: pytest.MonkeyPatch) -> RefusingAdapter:
     """Every `requests.Session` made while the test runs is a refusing one (the client makes its own)."""
     adapter = RefusingAdapter()
-    monkeypatch.setattr(requests, "Session", lambda: RefusingSession(adapter))
+    monkeypatch.setattr(requests, "Session", lambda: OneAdapterSession(adapter))
     return adapter
 
 
@@ -157,6 +164,25 @@ def test_metadata_is_the_allowlist_with_node_renamed(client: Any) -> None:
     assert anonymize({}) == {}
 
 
+def test_an_allowlisted_key_keeps_a_short_string_an_integer_or_none_only(client: Any) -> None:
+    """Review M1: a key of the allowlist (but `usage_metadata`) keeps a string of at most 128 characters, an
+    integer or `None`; a mapping, a list, a longer string, a float and a boolean are dropped, key and all."""
+    metadata = {
+        "run_id": {"cv": CONTENT},
+        "cycle_id": [7, CONTENT],
+        "model": "m" * 129,
+        "effort": "e" * 128,
+        "target_id": None,
+        "attempt_no": True,
+        "profile_version_id": 1.5,
+        "prompt_schema_hash": "9f1c",
+        "langgraph_node": ["score_one", CONTENT],
+    }
+    expected = {"effort": "e" * 128, "target_id": None, "prompt_schema_hash": "9f1c"}
+    assert client._hide_run_metadata(metadata) == expected
+    assert anonymize(metadata) == expected
+
+
 def test_usage_metadata_keeps_token_counts_only(client: Any) -> None:
     usage = {
         "input_tokens": 350,
@@ -230,6 +256,9 @@ def test_usage_metadata_keeps_token_counts_only(client: Any) -> None:
         pytest.param("LlmError(code='rate_limited', detail='x')", "LlmError:rate_limited", id="code"),
         pytest.param('ApiError(error_code="http_429")', "ApiError:http_429", id="error_code"),
         pytest.param("ApiError(code=429)", "ApiError:unknown", id="number"),  # a number is no identifier
+        # a value is not trimmed (review M4): T6-1's fullmatch applies to it as it stands
+        pytest.param("ApiError(code= abc)", "ApiError:unknown", id="space_before_value"),
+        pytest.param("ApiError(code=abc )", "ApiError:unknown", id="space_after_value"),
         pytest.param(f"ApiError(code='{'x' * 65}')", "ApiError:unknown", id="too_long"),  # past 64 characters
         pytest.param(
             "ApiError(barcode='abc')", "ApiError:unknown", id="longer_name"
@@ -311,13 +340,16 @@ def test_install_tracing_configures_the_process_wide_client(
     configured: list[dict[str, Any]] = []
     monkeypatch.setattr(run_trees, "configure", lambda **kwargs: configured.append(kwargs))
     state = install_tracing(worker_config(tmp_path, TRACING_ENV))
-    assert state == TracingState(tracing=True, region="eu")
-    [kwargs] = configured
-    installed = kwargs["client"]
-    assert kwargs == {"client": installed, "enabled": True}
-    assert isinstance(installed, Client) and installed.api_url == LANGSMITH_EU_ENDPOINT
-    assert installed._anonymizer is anonymize
-    installed.close(timeout=0)
+    try:
+        assert state == TracingState(tracing=True, region="eu")
+        [kwargs] = configured
+        installed = kwargs["client"]
+        assert kwargs == {"client": installed, "enabled": True}
+        assert isinstance(installed, Client) and installed.api_url == LANGSMITH_EU_ENDPOINT
+        assert installed._anonymizer is anonymize
+    finally:
+        for made in configured:  # its control thread stops whatever the assertions found (review M5)
+            made["client"].close(timeout=0)
 
 
 def test_without_tracing_install_configures_nothing(
@@ -327,3 +359,128 @@ def test_without_tracing_install_configures_nothing(
     monkeypatch.setattr(run_trees, "configure", lambda **kwargs: configured.append(kwargs))
     assert install_tracing(worker_config(tmp_path)) == TracingState(tracing=False, region=None)
     assert configured == [] and refusing.threads == []
+
+
+# --- Review M6: traced runnables end to end through the client, with no network ---------------------------
+
+SENTINELS: Final = ("CV-SENTINEL-TEXT", "INPUT-SENTINEL-TEXT", "OUTPUT-SENTINEL-TEXT")
+# What `GET /info` answers: multipart ingestion with compression on, what the client starts with in prod.
+INFO: Final = {
+    "version": "0.0.0-test",
+    "instance_flags": {"zstd_compression_enabled": True},
+    "batch_ingest_config": {
+        "use_multipart_endpoint": True,
+        "scale_up_qsize_trigger": 1000,
+        "scale_up_nthreads_limit": 16,
+        "scale_down_nempty_trigger": 4,
+        "size_limit": 100,
+        "size_limit_bytes": 20_971_520,
+    },
+}
+
+
+def sent_body(request: requests.PreparedRequest) -> bytes:
+    """The bytes `request` would have sent, whatever form requests holds them in, zstd decompressed."""
+    body: Any = request.body
+    if body is None:
+        data = b""
+    elif isinstance(body, bytes):
+        data = body
+    elif isinstance(body, str):
+        data = body.encode()
+    elif hasattr(body, "read"):
+        data = body.read()
+    else:
+        data = b"".join(part if isinstance(part, bytes) else str(part).encode() for part in body)
+    if request.headers.get("Content-Encoding") == "zstd":
+        data = zstandard.ZstdDecompressor().decompressobj().decompress(data)
+    return data
+
+
+def multipart_parts(body: bytes) -> dict[str, Any]:
+    """The JSON of each part of a multipart body, by the part's name (`post.<id>`, `patch.<id>.error`, …)."""
+    boundary = body.split(b"\r\n", 1)[0].removeprefix(b"--")
+    message = BytesParser(policy=policy.default).parsebytes(
+        b"Content-Type: multipart/form-data; boundary=" + boundary + b"\r\n\r\n" + body
+    )
+    parts: dict[str, Any] = {}
+    for part in message.iter_parts():
+        payload = part.get_payload(decode=True)
+        assert isinstance(payload, bytes)
+        parts[str(part.get_param("name", header="content-disposition"))] = json.loads(payload)
+    return parts
+
+
+class RecordingAdapter(BaseAdapter):
+    """Answers every request with no network, `GET /info` with `INFO` and anything else 202, and records it:
+    its method, path and body."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[tuple[str, str, bytes]] = []
+        self._lock = threading.Lock()
+
+    def send(self, request: requests.PreparedRequest, *args: Any, **kwargs: Any) -> requests.Response:
+        method, path = request.method or "", urlsplit(request.url or "").path
+        with self._lock:
+            self.sent.append((method, path, sent_body(request)))
+        response = requests.Response()
+        response.request, response.url = request, request.url or ""
+        if method == "GET" and path.endswith("/info"):
+            response.status_code = 200
+            response._content = json.dumps(INFO).encode()
+            response.headers["Content-Type"] = "application/json"
+        else:
+            response.status_code = 202
+            response._content = b"{}"
+        return response
+
+    def close(self) -> None:
+        pass
+
+
+def no_default_client(**kwargs: Any) -> Any:
+    raise AssertionError("only the client under test may be used")
+
+
+def test_a_traced_runnable_sends_neither_its_input_its_output_nor_its_error_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review M6: two runnables traced through the client `make_client` builds, as langchain-core's tracer
+    sends them (the run created, then updated with its output or error through `update_run`, which hides them
+    inline), into multipart bodies, compressed or not. Nothing of the input, the output or the error's text is
+    sent: inputs and outputs are `{}`, and the error part is `ValueError:unknown`."""
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(requests, "Session", lambda: OneAdapterSession(adapter))
+    monkeypatch.setattr(run_trees, "get_cached_client", no_default_client)
+    cv, given, answer = SENTINELS
+
+    def fails(value: dict[str, str]) -> None:
+        raise ValueError(cv)
+
+    def succeeds(value: dict[str, str]) -> dict[str, str]:
+        return {"answer": answer}
+
+    client = make_client(worker_config(tmp_path, TRACING_ENV))
+    assert isinstance(client, Client)
+    try:
+        with tracing_context(client=client, enabled=True):
+            with pytest.raises(ValueError, match=cv):
+                RunnableLambda(fails).invoke({"cv": given})
+            assert RunnableLambda(succeeds).invoke({"cv": given}) == {"answer": answer}
+        client.flush(timeout=10)
+    finally:
+        client.close(timeout=0)
+    assert {path for _, path, _ in adapter.sent} == {"/info", "/runs/multipart"}
+    bodies = [body for method, path, body in adapter.sent if path == "/runs/multipart"]
+    for sentinel in SENTINELS:
+        assert not any(sentinel.encode() in body for body in bodies), sentinel
+    parts: dict[str, Any] = {}
+    for body in bodies:
+        parts.update(multipart_parts(body))
+    runs = {name: run for name, run in parts.items() if name.count(".") == 1}  # `post.<id>`, `patch.<id>`
+    assert {run["name"] for run in runs.values()} == {"fails", "succeeds"}  # both runs, created and ended
+    assert all("end_time" in run for name, run in runs.items() if name.startswith("patch."))
+    assert [value for name, value in parts.items() if name.endswith(".error")] == ["ValueError:unknown"]
+    hidden = [value for name, value in parts.items() if name.endswith((".inputs", ".outputs"))]
+    assert hidden and all(value == {} for value in hidden)

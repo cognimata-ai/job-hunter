@@ -234,6 +234,13 @@ def _http_check(url: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command != "worker":
+        # Only the worker traces (§17.8; M5 Task 6, Ruling T6-8): any other command, the api and a worker-role
+        # command such as `schema-dry-run` among them, runs untraced whatever its environment says. Imported
+        # here, like each command's own modules.
+        from jobhunter.observability.langsmith import disable_tracing
+
+        disable_tracing()
     if args.command == "startup-check":
         startup_or_exit(args.role)
         return 0
