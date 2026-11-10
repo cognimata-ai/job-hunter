@@ -205,6 +205,11 @@ def cycles_of(server: PgServer) -> list[tuple[object, ...]]:
     return rows(server, "SELECT trigger, worker_epoch, status, status_reason FROM score_cycles ORDER BY id")
 
 
+def no_cycle_running(server: PgServer) -> bool:
+    """Whether every cycle has ended (none is `running`)."""
+    return all(cycle[2] != "running" for cycle in cycles_of(server))
+
+
 def calls_of(server: PgServer, target_id: int) -> list[tuple[object, ...]]:
     """`(attempt_no, purpose, ledger state, call status, error_code)` of each of the target's calls."""
     return rows(
@@ -437,6 +442,8 @@ async def test_c14_a_stalled_heartbeat_is_reclaimed_at_three_minutes_and_the_new
     assert calls_of(migrated, target.target_id)[0] == (1, "generate", "ambiguous", "ambiguous", "cancelled")
     w.wait_event("score_claim_heartbeat_lost", 1, target_id=target.target_id, attempt_no=1)
     wait_for(migrated, lambda: published_by_periodic(migrated, [target]), SCORED_WITHIN_S, w)
+    # the periodic cycle ends after it has published its target: wait for its end, then read it
+    wait_for(migrated, lambda: no_cycle_running(migrated), SCORED_WITHIN_S, w)
     published = target_of(migrated, target.target_id)
     assert attempts_of(migrated, target.target_id) == [
         (1, epoch_w, "claim_lost", "stale_heartbeat", "manual"),
