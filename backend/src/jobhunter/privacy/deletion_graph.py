@@ -88,6 +88,18 @@ row ever names a missing file, and a crash in between leaves only files no row n
 re-execution removes. A running export's own publication then finds its row `purged` and unlinks what it
 wrote (Task 17).
 
+**Golden cases** (M5 Task 13, shared with Task 12's golden-case deletion). `settle_and_delete_cases(conn,
+case_ids, *, now, check=None)` deletes the named cases, their `eval_case_results` and eval calls by cascade,
+in the caller's transaction, after the entries of those calls that a reader could still settle (`reserved`,
+`dispatched`): the entries read, their accounts locked (`spend_ledger.lock_for_purge`: month rows, step 6,
+then funded bulk rows, step 7), the cases' rows `FOR UPDATE` in id order (step 10; a call an eval run
+reserves for a case meanwhile waits on its foreign key's `FOR KEY SHARE`), `check(conn, flags)` over the
+cases locked (the golden-case deletion's running-eval-run wait, the graph deletion's refusal of an active
+case), the entries read again under the cases' locks and the accounts of any new one taken (after the rows
+of step 10: the one place it leaves the schedule), each settled (`settle_for_purge`: a `reserved` one
+released, a `dispatched` one `ambiguous`), then the cases deleted (`golden.delete_case`). A case gone
+already is skipped. It returns the ids it deleted.
+
 **Job-graph deletion** (M5 Task 13; §20.2's tombstoning steps 4-7, Deviation 50). `delete_job_graph(conn,
 job_id, *, write_tombstone, held, now) -> JobGraphDeleted` is the one complete cleanup before a job goes,
 which job tombstoning (`write_tombstone=True`), the Adzuna purge and delete-everything (`False`) share. It
@@ -99,14 +111,15 @@ ascending statement (`held`,
 own (`purge_target_set`): a job of G it does not hold, or a target of G left (by job or by revision), is an
 `InvariantViolation` before anything is written. A J that no longer exists is no error: nothing is deleted
 (the chunk of a re-execution after the commit). In order:
-- (4) the golden cases on G's revisions, their rows `FOR UPDATE`: an active one is an `InvariantViolation`
-  (tombstoning left such a job out, the Adzuna purge and delete-everything delete every case that draws on
-  the purged data first); the inactive ones are deleted before the revisions, since
-  `golden_cases.job_revision_id` restricts, with their `eval_case_results` and eval calls (cascade). The
-  entries of those calls still `reserved` or `dispatched` (a run that included the case before it was made
-  inactive) are settled first, as the golden-case deletion settles them (`spend_ledger.lock_for_purge`, then
-  the cases' rows, the entries read again under them, `settle_for_purge`): a call's cascade must leave no
-  entry unsettled (G04);
+- (4) the golden cases on G's revisions, through `settle_and_delete_cases` (below), the golden-case deletion's
+  own sequence: an active one is an `InvariantViolation` once their rows are locked (tombstoning left such a
+  job out, the Adzuna purge and delete-everything delete every case that draws on the purged data first); the
+  inactive ones are deleted before the revisions, since `golden_cases.job_revision_id` restricts, with their
+  `eval_case_results` and eval calls (cascade), the entries of those calls still `reserved` or `dispatched`
+  (a run that included the case before it was made inactive) settled first: a call's cascade must leave no
+  entry unsettled (G04). Unlike the golden-case deletion this step never waits for a running eval run: such a
+  run skips a case whose job is fenced, and a case deleted meanwhile, with no row and never requeued
+  (`scoring.eval_runner`, step 1 and `_Execution.case`), and its late settlement finds the entry settled;
 - (5) the `merge_events` naming a job of G as `from_job_id` or `into_job_id` (both restrict), every
   `reversed_by_event_id` that points at one of them cleared first; the `identity_conflicts` whose
   `posting_job_id` is in G deleted, G removed from the other conflicts' `candidate_job_ids`, and a conflict
@@ -138,7 +151,7 @@ job and revision NULL (`ON DELETE SET NULL`). `ranking.bump` is the caller's, la
 Ids, counts and states only reach a log line.
 """
 
-from collections.abc import Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
@@ -163,7 +176,7 @@ from jobhunter.normalize.keys import AdKey
 from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.manifests import KEY_WILDCARD, Operation, remove_files
-from jobhunter.scoring import batches, targets
+from jobhunter.scoring import batches, golden, targets
 from jobhunter.types import JSONValue
 
 if TYPE_CHECKING:
@@ -406,6 +419,48 @@ async def purge_exports(run: "PurgeRun", ops: Sequence[Operation]) -> int:
     return purged
 
 
+# ---- golden cases (M5 Task 13, shared with the golden-case deletion) ---------------------------------------
+
+# The entries of the cases' eval calls that a reader could still settle: `reserved` or `dispatched`.
+_CASE_ENTRIES: Final = q(
+    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.golden_case_id = ANY(CAST(:cases AS bigint[])) AND l.state IN ('reserved', 'dispatched') "
+    "ORDER BY l.id"
+)
+_LOCK_CASES: Final = q(
+    "SELECT id, active, is_canary FROM golden_cases WHERE id = ANY(CAST(:cases AS bigint[])) "
+    "ORDER BY id FOR UPDATE"
+)
+CaseCheck = Callable[[AsyncConnection, Mapping[int, golden.CaseFlags]], Awaitable[None]]
+
+
+async def settle_and_delete_cases(
+    conn: AsyncConnection, case_ids: Sequence[int], *, now: datetime, check: CaseCheck | None = None
+) -> tuple[int, ...]:
+    """Delete the golden cases `case_ids` with their eval case results and calls, their calls' unsettled
+    entries settled first, in the caller's transaction (module docstring, "Golden cases"); `check` runs over
+    the locked cases' flags before anything is written (it may raise). The ids deleted."""
+    ids = sorted(set(case_ids))
+    if not ids:
+        return ()
+    entries = await _ids(conn, _CASE_ENTRIES, {"cases": ids})
+    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
+    locked = {  # step 10
+        int(row.id): golden.CaseFlags(active=bool(row.active), is_canary=bool(row.is_canary))
+        for row in await conn.execute(_LOCK_CASES, {"cases": ids})
+    }
+    if check is not None:
+        await check(conn, locked)
+    present = sorted(locked)
+    current = await _ids(conn, _CASE_ENTRIES, {"cases": present}) if present else []
+    if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
+        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
+    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+    for case_id in present:
+        await golden.delete_case(conn, case_id)
+    return tuple(present)
+
+
 # ---- the job graph (M5 Task 13) ----------------------------------------------------------------------------
 
 _JOBS: Final = "CAST(:jobs AS bigint[])"
@@ -419,19 +474,10 @@ _TARGETS_LEFT: Final = q(
     f"SELECT count(*) FROM score_targets WHERE job_id = ANY({_JOBS}) "  # noqa: S608
     f"OR job_revision_id IN (SELECT id FROM job_revisions WHERE job_id = ANY({_JOBS}))"
 )
-_CASES_OF_GRAPH: Final = (
-    "SELECT g.id, g.active FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "  # noqa: S608
+_CASES_OF_GRAPH: Final = q(
+    "SELECT g.id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "  # noqa: S608
     f"WHERE r.job_id = ANY({_JOBS}) ORDER BY g.id"
 )
-_CASES: Final = q(_CASES_OF_GRAPH)
-_LOCK_CASES: Final = q(f"{_CASES_OF_GRAPH} FOR UPDATE OF g")
-# The entries of the cases' eval calls that a reader could still settle: `reserved` or `dispatched`.
-_CASE_ENTRIES: Final = q(
-    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
-    "WHERE c.golden_case_id = ANY(CAST(:cases AS bigint[])) AND l.state IN ('reserved', 'dispatched') "
-    "ORDER BY l.id"
-)
-_DELETE_CASES: Final = q("DELETE FROM golden_cases WHERE id = ANY(CAST(:cases AS bigint[]))")
 _EVENTS_NAMING: Final = q(
     f"SELECT id FROM merge_events WHERE from_job_id = ANY({_JOBS}) OR into_job_id = ANY({_JOBS}) "  # noqa: S608
     "ORDER BY id FOR UPDATE"
@@ -496,25 +542,18 @@ class JobGraphDeleted:
     tombstone_id: int | None
 
 
+async def _refuse_active(conn: AsyncConnection, cases: Mapping[int, golden.CaseFlags]) -> None:
+    if active := sorted(case for case, flags in cases.items() if flags.active):
+        raise InvariantViolation(f"active golden cases {active} draw on the revisions of the graph")
+
+
 async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime) -> int:
     """Step 4 (module docstring): the inactive golden cases on G's revisions, their in-flight eval entries
     settled first; an active one is an `InvariantViolation`. How many were deleted."""
-    read = [int(row.id) for row in await conn.execute(_CASES, {"jobs": jobs})]
-    if not read:
+    cases = await _ids(conn, _CASES_OF_GRAPH, {"jobs": jobs})
+    if not cases:
         return 0
-    entries = await _ids(conn, _CASE_ENTRIES, {"cases": read})
-    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
-    cases = (await conn.execute(_LOCK_CASES, {"jobs": jobs})).all()  # step 10
-    if active := [int(case.id) for case in cases if case.active]:
-        raise InvariantViolation(f"jobs {jobs}: active golden cases {active} draw on their revisions")
-    ids = [int(case.id) for case in cases]
-    current = await _ids(conn, _CASE_ENTRIES, {"cases": ids}) if ids else []
-    if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
-        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
-    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
-    if ids:
-        await conn.execute(_DELETE_CASES, {"cases": ids})
-    return len(ids)
+    return len(await settle_and_delete_cases(conn, cases, now=now, check=_refuse_active))
 
 
 async def _forget_merges_and_conflicts(conn: AsyncConnection, jobs: list[int]) -> tuple[int, int]:
@@ -564,7 +603,11 @@ async def delete_job_graph(
     """Delete job `job_id` and every job merged into it, with the graph their targets do not cover, §20.2's
     tombstoning steps 4-7 (module docstring), in the caller's transaction, which holds the jobs' rows and
     their groups' co-members' (`held`) and deleted their targets; J's tombstone with `write_tombstone`.
-    `InvariantViolation` for a job of the graph not held, a target left or an active golden case."""
+    `InvariantViolation` for a job of the graph not held, a target left or an active golden case.
+
+    Its statements select by the graph's job ids, which the caller's content names and its fence keeps
+    closed (no row naming a fenced job is written after the fence), so they need no `max_ids` bound of their
+    own (Ruling T13-3)."""
     jobs = await _ids(conn, _GRAPH_OF, {"job": job_id})
     if not jobs:
         return JobGraphDeleted((), 0, 0, 0, None)

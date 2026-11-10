@@ -12,7 +12,9 @@ from langsmith._internal import _context
 # 8) imports `docparse.worker`, no plugin, and comes after every plugin module it may import.
 # `tests.support.settings` (M2 Task 17) imports `tests.support.profile`, so it comes after it.
 # `tests.support.jobs_list` (M4 Task 4) imports `tests.support.m2` and `tests.support.m3`, no plugin, and its
-# fixture uses `engine` of `tests.support.fixtures`; it comes last.
+# fixture uses `engine` of `tests.support.fixtures`. `tests.support.purges` (M5 Task 13, the purge harness)
+# imports `tests.support.pg`, no plugin, and its fixtures use those of `tests.support.fixtures`; it comes
+# last.
 pytest_plugins = [
     "tests.support.embedder",
     "tests.support.fixtures",
@@ -22,6 +24,7 @@ pytest_plugins = [
     "tests.support.profile",
     "tests.support.settings",
     "tests.support.jobs_list",
+    "tests.support.purges",
 ]
 
 

@@ -16,8 +16,10 @@ the job is honoured by `compute` below (D12), and a writer that comes after the 
 fence.
 
 **The content** (A2, `compute`, under the fence after the quiesce): the request's roots are read again with
-their merged jobs (G, `merged_into_job_id` followed down), and a root whose graph is now exempt (saved,
-applied or an active golden case since A0) is left out, its fence released at completion with the others. The
+their merged jobs (G, `merged_into_job_id` followed down), and a root no longer due by its own row at A0's
+cutoff (`admitted_at - TOMBSTONE_AFTER`: re-opened, or closed again, by a writer that began before the fence,
+`DUE_ROOT_SQL`) or whose graph is now exempt (saved, applied or an active golden case since A0) is left out,
+its fence released at completion with the others (D12, Ruling T13-3). The
 operations: the `fence` of the jobs the content deletes, then `row_delete jobs` of them bounded by id (the
 whole graph's other rows go with them or by their foreign keys); no `affected` set and no watermark (no source
 or profile purge), and no export op (`deletes_exports = False`: a tombstone keeps the exports, which expire
@@ -80,20 +82,24 @@ EXEMPT_SQL: Final = (
     "OR EXISTS (SELECT 1 FROM job_revisions r JOIN golden_cases c ON c.job_revision_id = r.id "
     "WHERE r.job_id = g.id AND c.active))"
 )
+# A root job `j` that is due by its own row: unmerged, not synthetic, closed or stale since before `:cutoff`.
+DUE_ROOT_SQL: Final = (
+    "j.merged_into_job_id IS NULL AND NOT j.synthetic_eval AND j.availability IN ('closed', 'stale') "
+    "AND j.availability_changed_at < :cutoff"
+)
 # The due roots after `:after`, at most `:limit`, each with no exempt or fenced job in its graph.
 _DUE: Final = q(
-    "WITH RECURSIVE due AS (SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "  # noqa: S608
-    "AND NOT j.synthetic_eval AND j.availability IN ('closed', 'stale') "
-    "AND j.availability_changed_at < :cutoff AND j.id > :after), "
+    f"WITH RECURSIVE due AS (SELECT j.id FROM jobs j WHERE {DUE_ROOT_SQL} AND j.id > :after), "  # noqa: S608
     "g(root, id) AS (SELECT id, id FROM due "
     "UNION ALL SELECT g.root, m.id FROM jobs m JOIN g ON m.merged_into_job_id = g.id) "
     f"SELECT d.id FROM due d WHERE NOT EXISTS (SELECT 1 FROM g WHERE g.root = d.id AND ({EXEMPT_SQL} "
     f"OR NOT ({NO_OPEN_FENCE_SQL} OR NOT is_fenced(g.id)))) ORDER BY d.id LIMIT :limit"
 )
-# The roots of `:roots` that exist unmerged, each with the jobs merged into it (itself included).
+# The roots of `:roots` that are still due by their own rows (`DUE_ROOT_SQL`), each with the jobs merged into
+# it (itself included).
 _GRAPHS: Final = q(
-    "WITH RECURSIVE g(root, id) AS (SELECT id, id FROM jobs "
-    "WHERE id = ANY(CAST(:roots AS bigint[])) AND merged_into_job_id IS NULL "
+    "WITH RECURSIVE g(root, id) AS (SELECT j.id, j.id FROM jobs j "  # noqa: S608
+    f"WHERE j.id = ANY(CAST(:roots AS bigint[])) AND {DUE_ROOT_SQL} "
     "UNION ALL SELECT g.root, m.id FROM jobs m JOIN g ON m.merged_into_job_id = g.id) "
     "SELECT root, id FROM g ORDER BY root, id"
 )
@@ -120,11 +126,11 @@ def _ids(values: object) -> list[int]:
     return sorted({int(v) for v in values})
 
 
-async def _graphs(conn: AsyncConnection, roots: Sequence[int]) -> dict[int, list[int]]:
-    """Each existing, unmerged root of `roots` with its graph (itself and every job merged into it), in id
-    order."""
+async def _graphs(conn: AsyncConnection, roots: Sequence[int], *, cutoff: datetime) -> dict[int, list[int]]:
+    """Each root of `roots` still due by its own row at `cutoff` (`DUE_ROOT_SQL`) with its graph (itself and
+    every job merged into it), in id order."""
     graphs: dict[int, list[int]] = {}
-    for row in await conn.execute(_GRAPHS, {"roots": list(roots)}):
+    for row in await conn.execute(_GRAPHS, {"roots": list(roots), "cutoff": cutoff}):
         graphs.setdefault(int(row.root), []).append(int(row.id))
     return graphs
 
@@ -149,7 +155,7 @@ async def open_batch(
     roots = [int(job) for job in (await conn.execute(_DUE, params)).scalars()]
     if not roots:
         return None
-    graphs = await _graphs(conn, roots)
+    graphs = await _graphs(conn, roots, cutoff=cutoff)
     fenced = tuple(sorted({job for graph in graphs.values() for job in graph}))
     request: list[JSONValue] = [*roots]
     opened = await open_purge(
@@ -256,14 +262,16 @@ class JobTombstone:
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime
     ) -> ManifestContent:
         roots = _ids(dict(manifest.request).get(REQUEST_KEY))
-        graphs = await _graphs(conn, roots)
+        # A0's own cutoff: the request's roots were due at `admitted_at` (`created_at`)
+        graphs = await _graphs(conn, roots, cutoff=manifest.created_at - TOMBSTONE_AFTER)
         exempt = {int(r) for r in (await conn.execute(_EXEMPT_ROOTS, {"roots": sorted(graphs)})).scalars()}
         jobs = sorted({job for root, graph in graphs.items() if root not in exempt for job in graph})
         operations: list[Operation] = [{"op": "fence", "kind": "jobs", "key": FENCE_KEY, "job_ids": jobs}]
         if jobs:
             operations.append({"op": "row_delete", "table": "jobs", "ids": jobs, "bound": {"by": "id"}})
-        if exempt:  # saved, applied or made golden since A0 (D12): its fence ends at completion
-            log.info("job_tombstones_exempt", manifest_id=manifest.id, job_ids=sorted(exempt)[:LOGGED_IDS])
+        # re-opened, saved, applied or made golden since A0 (D12): left out, its fence ends at completion
+        if left_out := sorted(set(roots) - set(graphs) | exempt):
+            log.info("job_tombstones_left_out", manifest_id=manifest.id, job_ids=left_out[:LOGGED_IDS])
         return new_content(manifest, max_ids=await max_identity_ids(conn), operations=operations)
 
     async def execute(self, run: PurgeRun, content: ManifestContent) -> None:

@@ -24,15 +24,15 @@ What it holds (every text invented, ids and hashes stand-ins):
   an absence;
 - jobs: `closed_job`, the full graph a tombstone deletes (two revisions, an Adzuna and an ATS posting with
   observations, three keys (one, `htidocid`, also supplied by the active job's posting and the other job's),
-  lineage, occurrences, hard-filter results, user actions with a note, the representative of a group of
-  three, every target state but the batch and claim ones over its revisions and those of the two jobs merged
-  into it (a chain, `merged_job_ids`), an inactive golden case with its eval result and call, feedback,
-  merge events (a reversed pair among them), identity conflicts that name it (an open one's
-  `dedup.identity_conflict` alert), a decision, an open `dedup.ambiguous_grouping` alert); closed or stale
-  state jobs holding an `in_progress` target (online entry `dispatched`), the `in_batch` targets, a
-  `filtered_out` one, and the targets of the `reconciled` and `released` submissions; the active job (its
-  `pending` target the `abandoned` submission's), the other job (restored from an older tombstone, with that
-  tombstone's key), the two other members of the group (one with a `deferred_duplicate` target, one
+  lineage, occurrences, hard-filter results, user actions with a note, the representative of a group of three,
+  every target state but the batch and claim ones over its revisions and those of the two jobs merged into it
+  (a chain, `merged_job_ids`), an inactive golden case with its eval result and call, feedback, merge events
+  (a reversed pair among them), identity conflicts that name it (an open one's `dedup.identity_conflict`
+  alert), a decision (and another of the `filtered` state job's), an open `dedup.ambiguous_grouping` alert);
+  closed or stale state jobs holding an `in_progress` target (online entry `dispatched`), the `in_batch`
+  targets, a `filtered_out` one, and the targets of the `reconciled` and `released` submissions; the active
+  job (its `pending` target the `abandoned` submission's), the other job (restored from an older tombstone,
+  with that tombstone's key), the two other members of the group (one with a `deferred_duplicate` target, one
   `budget_deferred`); the exempt jobs (`exempt_job_ids`: saved, applied, and one an active golden case
   labels);
 - scoring: a completed cycle, a completed and the one active bulk operation, the lane credits, the one live
@@ -62,6 +62,7 @@ from jobhunter.normalize.keys import AdKey
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tests.support.m2 import MINIMAL_PROFILE
+from tests.support.scoring import REASON_OF
 
 InFlight = Literal["preparing", "submit_started", "submit_ambiguous", "submitted", "ended"]
 SEED_AGE: Final = timedelta(days=730)
@@ -72,16 +73,6 @@ SHARED_KEY: Final = AdKey("htidocid", "seed-shared")
 _UNIT_VECTOR: Final = "[" + ",".join(["0"] * 1023 + ["1"]) + "]"
 _MODEL: Final = "claude-sonnet-5-5"
 _SCORING: Final = ("generate", "revise", "critic")
-# The reason (or refusal category) each target state's CHECK needs (§7.11), as `tests.support.scoring`.
-_REASON_OF: Final[Mapping[str, str]] = {
-    "budget_deferred": "budget_exhausted",
-    "expired_unscored": "too_old",
-    "failed_max_tokens": "max_tokens",
-    "failed_invalid_output": "bug",
-    "failed_request": "http_400",
-    "failed_transient": "stream_interrupted",
-    "failed_attempts_exhausted": "attempts_exhausted",
-}
 _ACTIVE: Final = q(
     "SELECT settings_version_id, scope_version_id, model_policy_id, execution_config_id, "
     "evaluation_policy_id, rubric_version_id, prompt_schema_version_id FROM active_config WHERE id = 1"
@@ -99,7 +90,10 @@ class SeedIds:
     merged_job_ids: tuple[int, ...]  # merged into `closed_job_id`, a chain, deepest first
     # closed or stale, but saved, applied or labelled by an active golden case
     exempt_job_ids: tuple[int, ...]
-    shared_key_heir_job_id: int  # the job whose posting supplies `SHARED_KEY` first after `closed_job_id`'s
+    # active; its posting supplies `SHARED_KEY` first after `closed_job_id`'s (the key's heir)
+    active_job_id: int
+    lone_conflict_id: int  # open, on the active job's posting, its one candidate `closed_job_id`
+    shared_conflict_id: int  # open, its candidates `closed_job_id` and `active_job_id`
 
 
 @dataclass(frozen=True)
@@ -945,8 +939,8 @@ async def _target(
         "created_at": s.at(10),
         "updated_at": s.at(days=1),
     }
-    if state in _REASON_OF:
-        values["state_reason"] = _REASON_OF[state]
+    if state in REASON_OF:  # `cancelled`'s reason is the caller's (`state_reason=`)
+        values["state_reason"] = REASON_OF[state]
     if state == "refused":
         values["refusal_category"] = "general_harms"
     if state == "filtered_out":
@@ -1362,15 +1356,18 @@ async def seed_two_year_old_graph(
     await s.update(
         "UPDATE merge_events SET reversed_by_event_id = :u WHERE id = :e", u=unmerge, e=reversed_merge
     )
-    low, high = sorted((closed.id, other.id))
-    await s.row(
-        "dedup_decisions",
-        {"job_a": low, "job_b": high, "decision": "different", "source": "unmerge", "decided_at": s.at(180)},
-        returning=False,
-    )
+    # a decision on each side of the due graph: `closed_job` the lower id of one, `filtered` the higher of the
+    # other (each of `dedup_decisions`' two keys then references the deleted graph)
+    for first, second, source in ((closed, other, "unmerge"), (member, filtered, "user_split")):
+        low, high = sorted((first.id, second.id))
+        await s.row(
+            "dedup_decisions",
+            {"job_a": low, "job_b": high, "decision": "different", "source": source, "decided_at": s.at(180)},
+            returning=False,
+        )
     await _conflict(s, p_adz, closed, [active_job], open_=False)
     lone = await _conflict(s, p_act, active_job, [closed], open_=True)
-    await _conflict(s, p_other, other, [closed, active_job], open_=True)
+    shared = await _conflict(s, p_other, other, [closed, active_job], open_=True)
     await _alert(s, "dedup.identity_conflict", f"conflict:{lone}", resolved=False)
     await _alert(s, "dedup.ambiguous_grouping", f"job:{closed.id}", resolved=False)
     await _alert(s, "retention.failed", "seed", resolved=True)
@@ -1752,5 +1749,7 @@ async def seed_two_year_old_graph(
         due_job_ids=tuple(sorted(job.id for job in due)),
         merged_job_ids=(deep.id, merged.id),
         exempt_job_ids=(saved.id, applied.id, golden.id),
-        shared_key_heir_job_id=active_job.id,
+        active_job_id=active_job.id,
+        lone_conflict_id=lone,
+        shared_conflict_id=shared,
     )

@@ -2,8 +2,8 @@
 the shared job-graph deletion (`privacy.deletion_graph.delete_job_graph`).
 
 `retention_daily`'s rule `job_tombstones` opens a purge per batch of due roots (`job_tombstone.open_due`,
-called here without a deferrer); each `purge` operation is run as the worker runs it (`Purger`, the harness of
-`test_purge_protocol`): the quiesce, the canonical file, phase B (the targets in chunks of 200, then one graph
+called here without a deferrer); each `purge` operation is run as the worker runs it (`tests.support.purges`'
+`Purger`): the quiesce, the canonical file, phase B (the targets in chunks of 200, then one graph
 chunk per root) and phase C's verified completion. The seed-backed test proves the graph complete: every
 table holds a row of the two-year-old seed, and the purges commit against the real schema with every
 foreign key, CHECK and trigger enabled. Every row is invented.
@@ -14,13 +14,12 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.config import AppConfig
+from jobhunter.db.transitions import transition
 from jobhunter.dedup import groups, merge
 from jobhunter.dedup.identity import tombstone_key_hash
 from jobhunter.dedup.revisions import FIELD_CONFLICT_ALERT
@@ -29,12 +28,10 @@ from jobhunter.normalize.keys import AdKey
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.privacy import deletion_graph, purge
 from jobhunter.privacy.kinds import job_tombstone
-from jobhunter.privacy.manifests import FileRoots, ManifestRow, check_postconditions, read_manifest
 from jobhunter.privacy.retention import run_retention_daily
 from jobhunter.profile.storage import CvStore
 from jobhunter.settings.dryrun import count_retained_current_revisions
 from jobhunter.worker import operations as ops
-from jobhunter.worker.operations import OperationDeps
 from jobhunter.worker.tasks import job_task_name
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -54,6 +51,7 @@ from tests.support.m3 import Job, insert_golden_case, insert_id, insert_job, ins
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.privacy_seed import CLOSED_ADZUNA_KEY, SHARED_KEY, seed_two_year_old_graph
 from tests.support.procs import await_until
+from tests.support.purges import Purger, completed, manifest_of
 from tests.support.scoring import member_group
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
@@ -88,71 +86,21 @@ _LEFT: Final = sa.text(
     "(SELECT count(*) FROM duplicate_group_members WHERE job_id = ANY(CAST(:ids AS bigint[]))) AS memberships"
 )
 _FEEDBACK: Final = sa.text("SELECT count(*) AS n, count(job_id) AS with_job FROM score_feedback")
+_CASE_ROWS: Final = (
+    "SELECT (SELECT count(*) FROM golden_cases WHERE id = :g) + (SELECT count(*) FROM eval_case_results "
+    "WHERE golden_case_id = :g) + (SELECT count(*) FROM llm_calls WHERE golden_case_id = :g)"
+)
+HIDDEN: Final = datetime(2026, 9, 1, 8, 30, tzinfo=UTC)
+SEEN: Final = datetime(2026, 8, 19, 9, 0, tzinfo=UTC)
 
 
-# ---- the harness -------------------------------------------------------------------------------------------
-
-
-@pytest.fixture
-def purge_cfg(make_config: Any, migrated: PgServer, tmp_path: Path) -> AppConfig:
-    """The worker's configuration with a manifests, an exports and a CV directory of this test's own."""
-    dirs = {name: tmp_path / name for name in ("manifests", "exports", "cv_store")}
-    for directory in dirs.values():
-        directory.mkdir(mode=0o700)
-    cfg: AppConfig = make_config(
-        "worker",
-        migrated,
-        JOBHUNTER_MANIFESTS_DIR=str(dirs["manifests"]),
-        JOBHUNTER_EXPORTS_DIR=str(dirs["exports"]),
-        JOBHUNTER_CV_STORE_DIR=str(dirs["cv_store"]),
-    )
-    return cfg
-
-
-@dataclass(frozen=True)
-class Purger:
-    """Runs a purge operation as the worker's `run_operation` does, with the worker's dependencies."""
-
-    engine: AsyncEngine
-    cfg: AppConfig
-    deps: OperationDeps
-
-    async def run(self, operation_id: int) -> None:
-        await ops.execute_operation(self.engine, operation_id, epoch=1, deps=self.deps)
-
-    async def again(self, operation_id: int) -> None:
-        """The requeued operation made due at once, then run."""
-        async with self.engine.begin() as conn:
-            await conn.execute(
-                sa.text("UPDATE operations SET not_before = NULL WHERE id = :i"), {"i": operation_id}
-            )
-        await self.run(operation_id)
-
-    @property
-    def files(self) -> FileRoots:
-        return FileRoots(self.cfg.cv_store_dir, self.cfg.exports_dir)
+# ---- the harness (`tests.support.purges`: `purge_cfg`, `purger`, `manifest_of`, `completed`) --------------
 
 
 @pytest.fixture
-def purger(engine: AsyncEngine, purge_cfg: AppConfig) -> Purger:
-    unused: Any = None  # the purge reads none of the profile, score or LLM collaborators
-    deps = OperationDeps(
-        cfg=purge_cfg,
-        gateway=unused,
-        parse_client=unused,
-        cv_store=CvStore(purge_cfg.cv_store_dir),
-        profile_graphs=unused,
-        embedder=None,
-        clock=utcnow,
-        score_steps=unused,
-        batches_client=unused,
-    )
-    return Purger(engine, purge_cfg, deps)
-
-
-@pytest.fixture
-def statements(engine: AsyncEngine) -> Any:
-    """Every statement (with its parameters) the engine's connections send while the test runs, in order."""
+def statements_with_params(engine: AsyncEngine) -> Any:
+    """Every statement with its parameters that the engine's connections send while the test runs, in order
+    (`test_purge_protocol`'s `statements` records the statements alone)."""
     sent: list[tuple[str, Any]] = []
 
     def record(conn: Any, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
@@ -191,28 +139,6 @@ async def tombstone(engine: AsyncEngine, purger: Purger, now: datetime | None = 
     for o in made:
         await purger.run(o.operation_id)
     return made
-
-
-async def manifest_of(engine: AsyncEngine, manifest_id: int) -> ManifestRow:
-    async with engine.connect() as conn:
-        manifest = await read_manifest(conn, manifest_id)
-    assert manifest is not None
-    return manifest
-
-
-async def completed(engine: AsyncEngine, purger: Purger, o: Opened) -> ManifestRow:
-    """The purge's manifest, asserted `completed` with its operation `succeeded`, its fences released and
-    every postcondition holding."""
-    manifest = await manifest_of(engine, o.manifest_id)
-    assert manifest.status == "completed" and manifest.scope is not None
-    async with engine.connect() as conn:
-        status = (
-            await conn.execute(sa.text("SELECT status FROM operations WHERE id = :i"), {"i": o.operation_id})
-        ).scalar_one()
-        assert status == "succeeded"
-        assert all(f.released_at is not None for f in await conn.execute(_FENCE, {"m": o.manifest_id}))
-        assert await check_postconditions(conn, manifest.scope, files=purger.files) == []
-    return manifest
 
 
 async def old_job(
@@ -268,7 +194,8 @@ async def test_a_closed_job_older_than_90_days_is_tombstoned(engine: AsyncEngine
     """On the two-year-old seed (every table holds a row): one batch opens for every due root, the purge
     deletes each root's whole graph with the jobs merged into it, and the commits pass every foreign key,
     CHECK and trigger. The tombstones keep the hashed keys and the four user-action timestamps, never the
-    note; a key another job's posting supplies goes to it; the exempt jobs and the feedback stay."""
+    note; a key another job's posting supplies goes to it; the exempt jobs and the feedback stay; the seed's
+    conflicts naming the closed job lose it (the one left without a candidate goes) and its alerts resolve."""
     now = utcnow()
     async with engine.begin() as conn:
         seed = await seed_two_year_old_graph(conn, now=now)
@@ -276,7 +203,7 @@ async def test_a_closed_job_older_than_90_days_is_tombstoned(engine: AsyncEngine
         feedback_before = tuple((await conn.execute(_FEEDBACK)).one())
     made = await tombstone(engine, purger, now)
     assert [o.roots for o in made] == [list(seed.due_job_ids)]
-    manifest = await completed(engine, purger, made[0])
+    manifest = await completed(purger, made[0].manifest_id, made[0].operation_id)
     assert manifest.scope is not None
     gone = sorted({*seed.due_job_ids, *seed.merged_job_ids})
     assert manifest.scope["operations"] == [
@@ -299,9 +226,37 @@ async def test_a_closed_job_older_than_90_days_is_tombstoned(engine: AsyncEngine
         assert found.scalar_one() == closed.id
         assert (await conn.execute(_TOMBSTONE_OF_KEY, {"h": tombstone_key_hash(SHARED_KEY)})).first() is None
         heir = await conn.execute(_KEY_OWNER, {"ns": SHARED_KEY.ns, "v": SHARED_KEY.value})
-        assert heir.scalar_one() == seed.shared_key_heir_job_id
+        assert heir.scalar_one() == seed.active_job_id
         feedback = tuple((await conn.execute(_FEEDBACK)).one())
+        conflicts = {
+            int(c.id): list(c.candidate_job_ids)
+            for c in await conn.execute(
+                sa.text(
+                    "SELECT id, candidate_job_ids FROM identity_conflicts "
+                    "WHERE id = ANY(CAST(:ids AS bigint[]))"
+                ),
+                {"ids": [seed.lone_conflict_id, seed.shared_conflict_id]},
+            )
+        }
+        alerts = {
+            str(key): bool(resolved)
+            for key, resolved in await conn.execute(
+                sa.text("SELECT dedup_key, resolved_at IS NOT NULL FROM alerts WHERE dedup_key = ANY(:keys)"),
+                {
+                    "keys": [
+                        f"{groups.AMBIGUOUS_GROUPING}:job:{seed.closed_job_id}",
+                        f"{merge.IDENTITY_CONFLICT_ALERT}:conflict:{seed.lone_conflict_id}",
+                    ]
+                },
+            )
+        }
     assert feedback == (feedback_before[0], feedback_before[1] - 1)  # kept, its job NULL
+    # the seed's own conflicts and alerts: the one naming only the closed job goes, the other loses it
+    assert conflicts == {seed.shared_conflict_id: [seed.active_job_id]}
+    assert alerts == {
+        f"{groups.AMBIGUOUS_GROUPING}:job:{seed.closed_job_id}": True,
+        f"{merge.IDENTITY_CONFLICT_ALERT}:conflict:{seed.lone_conflict_id}": True,
+    }
 
     # nothing is due any more: a second pass opens no purge
     assert await open_due(engine, now) == 0
@@ -358,7 +313,7 @@ async def test_an_exemption_gained_after_the_fence_is_honoured(engine: AsyncEngi
     async with engine.begin() as conn:
         await put_user_actions(conn, j2.job_id, saved_at=utcnow())
     await purger.run(o.operation_id)
-    manifest = await completed(engine, purger, o)
+    manifest = await completed(purger, o.manifest_id, o.operation_id)
     assert manifest.scope is not None
     assert manifest.scope["operations"] == [
         {"op": "fence", "kind": "jobs", "key": "jobs", "job_ids": [j1.job_id]},
@@ -377,27 +332,87 @@ async def test_an_exemption_gained_after_the_fence_is_honoured(engine: AsyncEngi
     async with engine.begin() as conn:
         await put_user_actions(conn, j3.job_id, applied_at=utcnow())
     await purger.run(again.operation_id)
-    manifest = await completed(engine, purger, again)
+    manifest = await completed(purger, again.manifest_id, again.operation_id)
     assert manifest.scope is not None
     assert manifest.scope["operations"] == [{"op": "fence", "kind": "jobs", "key": "jobs", "job_ids": []}]
     assert await existing(engine, [j3.job_id]) == [j3.job_id]
     assert await scalar(engine, "SELECT is_fenced(:j)", j=j3.job_id) is False
 
 
-# ---- the graph ---------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("availability", ["active", "closed"])
+async def test_a_root_reopened_before_the_quiesce_is_not_tombstoned(
+    engine: AsyncEngine, purger: Purger, availability: str
+) -> None:
+    """Ruling T13-3: J2 is observed again between A0 and the quiesce (a collection writer that began before
+    the fence moved it back to `active`, or re-opened and closed it again): no longer due at A0's cutoff, it
+    is left out of the content, its note survives, and its fence ends at the completion. J1 is tombstoned."""
+    async with engine.begin() as conn:
+        j1 = await old_job(conn)
+        j2 = await old_job(conn)
+        await put_user_actions(conn, j2.job_id, seen_at=SEEN, note="Erfundene Notiz.")
+    await open_due(engine)
+    [o] = await opened(engine)
+    assert o.roots == [j1.job_id, j2.job_id]
+    async with engine.begin() as conn:
+        await conn.execute(_AGE, {"availability": availability, "changed": utcnow(), "j": j2.job_id})
+    await purger.run(o.operation_id)
+    manifest = await completed(purger, o.manifest_id, o.operation_id)
+    assert manifest.scope is not None
+    assert manifest.scope["operations"] == [
+        {"op": "fence", "kind": "jobs", "key": "jobs", "job_ids": [j1.job_id]},
+        {"op": "row_delete", "table": "jobs", "ids": [j1.job_id], "bound": {"by": "id"}},
+    ]
+    assert await existing(engine, [j1.job_id, j2.job_id]) == [j2.job_id]
+    row = await user_actions(engine, j2.job_id)
+    assert (row.seen_at, row.note) == (SEEN, "Erfundene Notiz.")
+    assert await scalar(engine, "SELECT is_fenced(:j)", j=j2.job_id) is False
 
-_CASE_ROWS: Final = (
-    "SELECT (SELECT count(*) FROM golden_cases WHERE id = :g) + (SELECT count(*) FROM eval_case_results "
-    "WHERE golden_case_id = :g) + (SELECT count(*) FROM llm_calls WHERE golden_case_id = :g)"
-)
 
-
-async def test_an_inactive_golden_case_is_deleted_before_the_revisions(
+async def test_a_golden_case_activated_before_the_quiesce_exempts_its_job(
     engine: AsyncEngine, purger: Purger
 ) -> None:
+    """D12: J2's inactive golden case is made active between A0 and the quiesce (here by SQL:
+    `golden.set_flags` refuses a fenced job, so only a writer that began before the fence could do it):
+    `compute`'s golden-active re-check leaves J2 out, and its case and revision stay."""
+    async with engine.begin() as conn:
+        chain = await insert_profile_chain(conn, 47)
+        j1 = await old_job(conn)
+        j2 = await old_job(conn)
+        case = await insert_golden_case(conn, j2, chain.profile_version_id, active=False)
+    await open_due(engine)
+    [o] = await opened(engine)
+    assert o.roots == [j1.job_id, j2.job_id]
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE golden_cases SET active = true WHERE id = :g"), {"g": case})
+    await purger.run(o.operation_id)
+    manifest = await completed(purger, o.manifest_id, o.operation_id)
+    assert manifest.scope is not None
+    assert [op.get("ids", op.get("job_ids")) for op in manifest.scope["operations"]] == [
+        [j1.job_id],
+        [j1.job_id],
+    ]
+    assert await existing(engine, [j1.job_id, j2.job_id]) == [j2.job_id]
+    assert await scalar(engine, _CASE_ROWS, g=case) == 1
+
+
+# ---- the graph ---------------------------------------------------------------------------------------------
+
+
+_ENTRY: Final = "SELECT state || ':' || coalesce(evidence, '-') FROM llm_spend_ledger WHERE id = :l"
+_CALL_STATUS: Final = "SELECT status FROM llm_calls WHERE id = :c"
+
+
+@pytest.mark.parametrize(
+    ("entry_state", "settled"),
+    [("reserved", "not_billed:never_dispatched"), ("dispatched", "ambiguous:-")],
+)
+async def test_an_inactive_golden_case_is_deleted_before_the_revisions(
+    engine: AsyncEngine, purger: Purger, entry_state: str, settled: str
+) -> None:
     """The inactive case on the job's revision goes before the revisions (its key restricts them), with its
-    eval case result and its eval call by cascade; the call's entry still `reserved` is settled first
-    (released), so no entry is left without its call (G04)."""
+    eval case result and its eval call by cascade; the call's entry, still `reserved` or `dispatched`, is
+    settled first (released, or made `ambiguous` at its reservation), so no entry is left without its call
+    (G04)."""
     async with engine.begin() as conn:
         chain = await insert_profile_chain(conn, 42)
         job = await old_job(conn)
@@ -407,6 +422,9 @@ async def test_an_inactive_golden_case_is_deleted_before_the_revisions(
         await conn.execute(
             sa.text("UPDATE llm_calls SET golden_case_id = :g WHERE id = :c"), {"g": case, "c": call}
         )
+        if entry_state == "dispatched":  # sent before the case was made inactive, never answered
+            await transition(conn, "llm_spend_ledger", ledger, ["reserved"], "dispatched")
+            await transition(conn, "llm_calls", call, ["reserved"], "dispatched")
         await insert_row(
             conn,
             "eval_case_results",
@@ -419,19 +437,17 @@ async def test_an_inactive_golden_case_is_deleted_before_the_revisions(
                 "output": {},
             },
         )
+    assert await scalar(engine, _ENTRY, l=ledger) == f"{entry_state}:-"
     assert await scalar(engine, _CASE_ROWS, g=case) == 3
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     assert await scalar(engine, _CASE_ROWS, g=case) == 0
     assert await existing(engine, [job.job_id]) == []
-    entry = await scalar(
-        engine, "SELECT state || ':' || evidence FROM llm_spend_ledger WHERE id = :l", l=ledger
-    )
-    assert entry == "not_billed:never_dispatched"
+    assert await scalar(engine, _ENTRY, l=ledger) == settled
 
 
 async def test_merged_jobs_join_the_batch(
-    engine: AsyncEngine, purger: Purger, statements: list[tuple[str, Any]]
+    engine: AsyncEngine, purger: Purger, statements_with_params: list[tuple[str, Any]]
 ) -> None:
     """R with M1 merged into it and M2 merged into M1: the request names R, the fence the three, and the
     graph chunk deletes them deepest first (M2, M1, R; `jobs.merged_into_job_id` restricts), one tombstone,
@@ -458,12 +474,12 @@ async def test_merged_jobs_join_the_batch(
     async with engine.connect() as conn:
         [fence] = (await conn.execute(_FENCE, {"m": o.manifest_id})).all()
     assert fence.job_ids == sorted([root.job_id, m1.job_id, m2.job_id])
-    statements.clear()
+    statements_with_params.clear()
     await purger.run(o.operation_id)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     deleted = [
         params["job"]
-        for statement, params in statements
+        for statement, params in statements_with_params
         if statement == "DELETE FROM jobs WHERE id = %(job)s"
     ]
     assert deleted == [m2.job_id, m1.job_id, root.job_id]
@@ -569,7 +585,7 @@ async def test_a_representative_is_replaced_before_it_is_deleted(
     monkeypatch.setattr(purge, "lock_operation_owner", recording_owner)
     monkeypatch.setattr(deletion_graph, "delete_job_graph", recording_graph)
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     for g in (three, two):
         rep, survivors = g.representative.job_id, sorted(m.job_id for m in g.members)
         at = events.index(("graph", rep))
@@ -625,7 +641,7 @@ async def test_a_co_member_joining_during_the_graph_lock_starts_the_chunk_again(
         )
         await blocker.commit()
     await asyncio.wait_for(task, 30)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     assert len(logged(caplog, "purge_chunk_set_changed")) == 1
     assert await existing(engine, [j.job_id, j2.job_id, j3.job_id]) == [j2.job_id, j3.job_id]
     async with engine.connect() as conn:
@@ -671,7 +687,7 @@ async def test_a_restart_after_the_target_chunks_resumes_with_the_graph(
     assert await existing(engine, [job.job_id]) == [job.job_id]
     monkeypatch.setattr(deletion_graph, "delete_job_graph", delete_graph)
     await purger.again(o.operation_id)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     assert await existing(engine, [job.job_id]) == []
     assert sorted(await tombstones(engine, [job.job_id])) == [job.job_id]
 
@@ -717,7 +733,7 @@ async def test_a_graph_with_more_than_200_targets_is_deleted_in_bounded_chunks(
     monkeypatch.setattr(deletion_graph, "purge_target_set", recording_set)
     monkeypatch.setattr(deletion_graph, "delete_job_graph", recording_graph)
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     assert calls == [("targets", 200), ("targets", 60), ("graph", root.job_id)]
     assert await left_of(engine, [root.job_id, merged.job_id]) == (0, 0, 0, 0, 0, 0, 0, 0)
 
@@ -789,7 +805,7 @@ async def test_merge_events_and_conflicts_naming_the_job_go_first(
                 message="m",
             )
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     async with engine.connect() as conn:
         assert [int(i) for i in (await conn.execute(_EVENT_IDS)).scalars()] == [merged_y]
         assert [tuple(r) for r in await conn.execute(_CONFLICTS)] == [
@@ -844,7 +860,7 @@ async def test_a_shared_key_is_reassigned_to_the_earliest_remaining_provenance(
                 },
             )
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     [stone] = (await tombstones(engine, [j.job_id])).values()
     async with engine.connect() as conn:
         assert (await conn.execute(_KEY_OWNER, {"ns": shared.ns, "v": shared.value})).scalar_one() == y.job_id
@@ -861,9 +877,6 @@ async def test_a_shared_key_is_reassigned_to_the_earliest_remaining_provenance(
 
 
 # ---- a re-posted ad ----------------------------------------------------------------------------------------
-
-HIDDEN: Final = datetime(2026, 9, 1, 8, 30, tzinfo=UTC)
-SEEN: Final = datetime(2026, 8, 19, 9, 0, tzinfo=UTC)
 
 
 async def reposted(engine: AsyncEngine, purger: Purger, native_id: str) -> tuple[int, int, int]:
@@ -884,7 +897,7 @@ async def reposted(engine: AsyncEngine, purger: Purger, native_id: str) -> tuple
         await put_user_actions(conn, job_id, seen_at=SEEN, hidden_at=HIDDEN, note="Erfundene Notiz.")
         await conn.execute(_AGE, {"availability": "closed", "changed": utcnow() - OLD, "j": job_id})
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     [stone] = (await tombstones(engine, [job_id])).values()
     again = await pending_item(engine, owner, "adzuna", {"native_id": native_id})
     assert await resolved(engine, owner, again) == "linked"
@@ -929,7 +942,7 @@ async def test_a_second_tombstone_of_a_reposted_key_upserts(engine: AsyncEngine,
     async with engine.begin() as conn:
         await conn.execute(_AGE, {"availability": "closed", "changed": utcnow() - OLD, "j": new_job})
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     [second] = (await tombstones(engine, [new_job])).values()
     assert (
         await scalar(engine, "SELECT tombstone_id FROM tombstone_keys WHERE key_hash = :h", h=key_hash)
@@ -964,7 +977,7 @@ async def test_tombstoning_deletes_no_export(engine: AsyncEngine, purger: Purger
     archive = purger.cfg.exports_dir / name
     archive.write_bytes(b"\x00 encrypted segments")
     [o] = await tombstone(engine, purger)
-    manifest = await completed(engine, purger, o)
+    manifest = await completed(purger, o.manifest_id, o.operation_id)
     assert manifest.scope is not None
     assert [op["op"] for op in manifest.scope["operations"]] == ["fence", "row_delete"]
     assert (
@@ -988,7 +1001,7 @@ async def test_ambiguous_grouping_resolves_for_a_tombstoned_job(engine: AsyncEng
             ):
                 await raise_alert(conn, code=code, severity="info", subject=subject, message="m")
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     async with engine.connect() as conn:
         rows = await conn.execute(
             sa.text("SELECT dedup_key, resolved_at IS NOT NULL FROM alerts WHERE code = ANY(:c)"),
@@ -1013,7 +1026,7 @@ async def test_count_retained_current_revisions_excludes_tombstoned_jobs(
         await insert_job(conn)
         before = await count_retained_current_revisions(conn)
     [o] = await tombstone(engine, purger)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     async with engine.connect() as conn:
         assert await count_retained_current_revisions(conn) == before - 1
 
@@ -1056,5 +1069,5 @@ async def test_the_daily_retention_opens_the_due_tombstones(
     )
     assert deferred == 1
     await purger.run(o.operation_id)
-    await completed(engine, purger, o)
+    await completed(purger, o.manifest_id, o.operation_id)
     assert await existing(engine, [job.job_id]) == []

@@ -65,6 +65,18 @@ _STATE_DOMAIN: Final = sa.text(
     "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'score_targets'::regclass "
     "AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%state = ANY%pending%'"
 )
+# Every foreign key into the job graph's tables, with the referencing table and column(s), by name.
+_GRAPH_KEYS: Final = sa.text(
+    "SELECT c.conname, CAST(c.conrelid AS regclass)::text AS child, CAST(c.confrelid AS regclass)::text "
+    "AS parent, (SELECT array_agg(a.attname ORDER BY k.n) FROM unnest(c.conkey) WITH ORDINALITY AS k(num, n) "
+    "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.num) AS columns FROM pg_constraint c "
+    "WHERE c.contype = 'f' AND CAST(c.confrelid AS regclass)::text IN ('jobs', 'job_revisions', 'postings') "
+    "ORDER BY c.conname"
+)
+_GRAPH_ROWS: Final = {
+    "job_revisions": sa.text("SELECT id FROM job_revisions WHERE job_id = ANY(CAST(:jobs AS bigint[]))"),
+    "postings": sa.text("SELECT id FROM postings WHERE job_id = ANY(CAST(:jobs AS bigint[]))"),
+}
 _DATES: Final = sa.text(
     "SELECT min(first_seen_at) AS first_seen, max(availability_changed_at) AS changed FROM jobs"
 )
@@ -120,3 +132,29 @@ async def test_the_seed_holds_for_every_live_submission_state(
     entry = "reserved" if live_submission == "preparing" else "dispatched"
     assert live.entries == [entry, entry]
     assert terminal == [("abandoned", False), ("reconciled", False), ("released", True)]
+
+
+async def test_every_foreign_key_into_the_job_graph_has_a_seed_row_on_the_due_graph(
+    engine: AsyncEngine, current_epoch: int
+) -> None:
+    """Every foreign key (from the live catalog) into `jobs`, `job_revisions` or `postings` has a seed row
+    that references the graph a tombstoning pass deletes: a due or merged job, or one of their revisions or
+    postings. A table a later task adds with a key into the job graph fails here until the seed links a row
+    of it to the deleted graph, so the seed-backed tombstone test proves the graph deletion covers it."""
+    async with engine.begin() as conn:
+        ids = await seed_two_year_old_graph(conn, now=utcnow())
+    jobs = sorted({*ids.due_job_ids, *ids.merged_job_ids})
+    async with engine.connect() as conn:
+        graph = {"jobs": jobs}
+        for table, statement in _GRAPH_ROWS.items():
+            graph[table] = [int(i) for i in (await conn.execute(statement, {"jobs": jobs})).scalars()]
+        keys = (await conn.execute(_GRAPH_KEYS)).all()
+        unlinked = []
+        for key in keys:
+            assert len(key.columns) == 1, key.conname  # the graph's keys are single-column
+            linked = f'SELECT EXISTS (SELECT 1 FROM "{key.child}" WHERE "{key.columns[0]}" = ANY(:ids))'  # noqa: S608
+            if not (await conn.execute(sa.text(linked), {"ids": graph[key.parent]})).scalar_one():
+                unlinked.append(key.conname)
+    assert len(keys) >= 28  # the keys into the job graph of 2026-11-10, and every key added since
+    assert all(graph.values())
+    assert unlinked == []

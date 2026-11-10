@@ -13,30 +13,32 @@ route keeps its synchronous deletion until Task 18 rewires it to answer 202 (U8,
 `purge.compute_content` adds (a golden case's job may be in an export).
 
 **Phase B** (`execute`), one chunk per named case over its job's row (`PurgeRun.chunk(job_ids=[job])`: the
-fence, `active_config FOR SHARE`, the job `FOR UPDATE`, the owner): the accounts of the case's calls' entries
-still `reserved` or `dispatched` (`spend_ledger.lock_for_purge`: the month rows, step 6, and the funded bulk
-rows, step 7), then the case `FOR UPDATE` (step 10). While a running eval run includes it the chunk rolls
-back and the operation waits `EVAL_WAIT` (5 min) without spending an attempt (`purge.PurgeWait`, error code
-`eval_run_running`: an eval run may take hours, and it has an end of its own). Otherwise those entries are
-read again under the case's lock, an entry reserved since by a run that has ended meanwhile has its accounts
-taken now (after the case row: the one place this chunk leaves the schedule, as `deletion_graph`'s step 7),
-and they are settled (`spend_ledger.settle_for_purge`: a `reserved` one released, a `dispatched` one
-`ambiguous`), since every later reader of an entry joins its call. Then the case is deleted, its
-`eval_case_results` and its eval calls by cascade (`golden.delete_case`); the ledger rows stay. A case gone
-already is skipped: the chunk is idempotent. The kind has no postcondition of its own and nothing to
-re-apply in a replay.
+fence, `active_config FOR SHARE`, the job `FOR UPDATE`, the owner), then
+`deletion_graph.settle_and_delete_cases` (the sequence the job-graph deletion shares, M5 Task 13): the
+accounts of the case's calls' entries still `reserved` or `dispatched` (`spend_ledger.lock_for_purge`: the
+month rows, step 6, and the funded bulk rows, step 7), then the case `FOR UPDATE` (step 10). While a running
+eval run includes it (the helper's check) the chunk rolls back and the operation waits `EVAL_WAIT` (5 min)
+without spending an attempt (`purge.PurgeWait`, error code `eval_run_running`: an eval run may take hours, and
+it has an end of its own). Otherwise those entries are read again under the case's lock, an entry reserved
+since by a run that has ended meanwhile has its accounts taken now (after the case row: the one place this
+chunk leaves the schedule, as `deletion_graph`'s step 7), and they are settled
+(`spend_ledger.settle_for_purge`: a `reserved` one released, a `dispatched` one `ambiguous`), since every
+later reader of an entry joins its call. Then the case is deleted, its `eval_case_results` and its eval calls
+by cascade (`golden.delete_case`); the ledger rows stay. A case gone already is skipped: the chunk is
+idempotent. The kind has no postcondition of its own and nothing to re-apply in a replay.
 
 Ids only reach a log line.
 """
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.llm import spend_ledger
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.deletion_graph import settle_and_delete_cases
 from jobhunter.privacy.fences import refuse_under_global_fence
 from jobhunter.privacy.manifests import (
     ManifestContent,
@@ -64,11 +66,6 @@ REQUEST_KEY: Final = "golden_case_id"
 EVAL_WAIT: Final = timedelta(minutes=5)
 
 _LOCK_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
-# The entries of the case's calls that a reader could still settle: `reserved` or `dispatched`.
-_ENTRIES_IN_FLIGHT: Final = q(
-    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
-    "WHERE c.golden_case_id = :i AND l.state IN ('reserved', 'dispatched') ORDER BY l.id"
-)
 
 log = get_logger("jobhunter.privacy.kinds.golden_case")
 
@@ -92,31 +89,21 @@ async def request_golden_case_delete(
     return opened
 
 
-async def _entries_in_flight(conn: AsyncConnection, case_id: int) -> list[int]:
-    return [int(i) for i in (await conn.execute(_ENTRIES_IN_FLIGHT, {"i": case_id})).scalars()]
-
-
 async def _delete(run: PurgeRun, case_id: int) -> None:
     """One case's chunk (module docstring)."""
     async with run.engine.connect() as conn:
         job_id = await golden.case_job(conn, case_id)
     if job_id is None:
         return  # deleted already
-    async with run.chunk(job_ids=[job_id]) as chunk:
-        conn = chunk.conn
-        entries = await _entries_in_flight(conn, case_id)
-        rows = await spend_ledger.lock_for_purge(conn, entries, now=run.now)  # steps 6 and 7
-        flags = await golden.lock_case(conn, case_id)  # step 10
-        if flags is None:
-            return
-        if await golden.in_running_run(conn, case_id, flags):
+
+    async def unless_running(conn: AsyncConnection, cases: Mapping[int, golden.CaseFlags]) -> None:
+        flags = cases.get(case_id)
+        if flags is not None and await golden.in_running_run(conn, case_id, flags):
             log.info("golden_case_purge_waits", golden_case_id=case_id, manifest_id=run.manifest.id)
             raise PurgeWait(golden.EVAL_RUN_RUNNING, EVAL_WAIT)
-        current = await _entries_in_flight(conn, case_id)
-        if not set(current) <= set(entries):
-            rows = await spend_ledger.lock_for_purge(conn, current, now=run.now)
-        await spend_ledger.settle_for_purge(conn, current, rows, now=run.now)
-        await golden.delete_case(conn, case_id)
+
+    async with run.chunk(job_ids=[job_id]) as chunk:
+        await settle_and_delete_cases(chunk.conn, [case_id], now=run.now, check=unless_running)
 
 
 class GoldenCaseDelete:

@@ -30,7 +30,6 @@ import procrastinate
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.config import AppConfig
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.dedup import merge
 from jobhunter.errors import CoMemberChanged, Refusal
@@ -40,7 +39,6 @@ from jobhunter.privacy.deletion_graph import export_ops
 from jobhunter.privacy.fences import FenceSpec
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.privacy.manifests import (
-    FileRoots,
     ManifestContent,
     ManifestKind,
     ManifestRow,
@@ -48,10 +46,8 @@ from jobhunter.privacy.manifests import (
     Violation,
     canonical_bytes,
     check_postconditions,
-    manifest_file_name,
     max_identity_ids,
     parse_manifest,
-    read_manifest,
 )
 from jobhunter.privacy.purge import (
     KINDS,
@@ -67,7 +63,6 @@ from jobhunter.privacy.reconcilers import PURGE_FAILED_ALERT
 from jobhunter.profile.storage import CvStore
 from jobhunter.types import get_int
 from jobhunter.worker import operations as ops
-from jobhunter.worker.operations import OperationDeps
 from jobhunter.worker.tasks import defer_in_tx, job_task_name
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -79,6 +74,7 @@ from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import Job, insert_golden_case, insert_job, insert_row
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.procs import await_until
+from tests.support.purges import Purger, manifest_of
 from tests.support.reconcile import run_reconciler
 from tests.support.scoring import member_group
 
@@ -97,7 +93,6 @@ _FENCES: Final = sa.text(
 _ALERT: Final = sa.text(
     "SELECT severity, context, occurrences, resolved_at FROM alerts WHERE dedup_key = :k ORDER BY id"
 )
-_DUE: Final = sa.text("UPDATE operations SET not_before = NULL WHERE id = :i")
 _TOMBSTONE: Final = sa.text("INSERT INTO job_tombstones (former_job_id) VALUES (:former) RETURNING id")
 _EXPORT: Final = sa.text(
     "INSERT INTO exports (status, expires_at) VALUES (:status, now() + interval '7 days') RETURNING id"
@@ -183,61 +178,7 @@ def fenced_kind() -> Iterator[FencedKind]:
         assert KINDS == before
 
 
-# ---- the harness -------------------------------------------------------------------------------------------
-
-
-@pytest.fixture
-def purge_cfg(make_config: Any, migrated: PgServer, tmp_path: Path) -> AppConfig:
-    """The worker's configuration with a manifests, an exports and a CV directory of this test's own."""
-    dirs = {name: tmp_path / name for name in ("manifests", "exports", "cv_store")}
-    for directory in dirs.values():
-        directory.mkdir(mode=0o700)
-    cfg: AppConfig = make_config(
-        "worker",
-        migrated,
-        JOBHUNTER_MANIFESTS_DIR=str(dirs["manifests"]),
-        JOBHUNTER_EXPORTS_DIR=str(dirs["exports"]),
-        JOBHUNTER_CV_STORE_DIR=str(dirs["cv_store"]),
-    )
-    return cfg
-
-
-@dataclass(frozen=True)
-class Purger:
-    """Runs a purge operation as the worker's `run_operation` does, with the worker's dependencies."""
-
-    engine: AsyncEngine
-    cfg: AppConfig
-    deps: OperationDeps
-
-    async def run(self, operation_id: int) -> None:
-        await ops.execute_operation(self.engine, operation_id, epoch=1, deps=self.deps)
-
-    async def again(self, operation_id: int) -> None:
-        """The requeued operation made due at once, then run."""
-        async with self.engine.begin() as conn:
-            await conn.execute(_DUE, {"i": operation_id})
-        await self.run(operation_id)
-
-    def file(self, manifest_uuid: uuid.UUID) -> Path:
-        return self.cfg.manifests_dir / manifest_file_name(manifest_uuid)
-
-
-@pytest.fixture
-def purger(engine: AsyncEngine, purge_cfg: AppConfig) -> Purger:
-    unused: Any = None  # the purge reads none of the profile, score or LLM collaborators
-    deps = OperationDeps(
-        cfg=purge_cfg,
-        gateway=unused,
-        parse_client=unused,
-        cv_store=CvStore(purge_cfg.cv_store_dir),
-        profile_graphs=unused,
-        embedder=None,
-        clock=utcnow,
-        score_steps=unused,
-        batches_client=unused,
-    )
-    return Purger(engine, purge_cfg, deps)
+# ---- the harness (`tests.support.purges`: `purge_cfg`, `purger`, `manifest_of`) ---------------------------
 
 
 async def tombstone_row(conn: AsyncConnection) -> int:
@@ -283,13 +224,6 @@ async def golden_case(engine: AsyncEngine) -> int:
 async def open_golden(engine: AsyncEngine, case_id: int, *, defer: Any = None) -> OpenedPurge:
     async with engine.begin() as conn:
         return await request_golden_case_delete(conn, case_id, now=utcnow(), defer=defer)
-
-
-async def manifest_of(engine: AsyncEngine, manifest_id: int) -> ManifestRow:
-    async with engine.connect() as conn:
-        manifest = await read_manifest(conn, manifest_id)
-    assert manifest is not None
-    return manifest
 
 
 async def operation(engine: AsyncEngine, operation_id: int) -> Any:
@@ -406,7 +340,7 @@ async def test_nothing_is_deleted_before_the_file_and_record_exist(
     recomputation would give other `max_ids`), and only then deletes."""
     seed = await fenced_seed(engine)
     opened = await open_fenced(engine, seed)
-    path = purger.file(opened.manifest_uuid)
+    path = purger.manifest_file(opened.manifest_uuid)
 
     monkeypatch.setattr(purge, "afault_point", raising_at(purge.BEFORE_FILE))
     await purger.run(opened.operation_id)
@@ -443,7 +377,7 @@ async def test_the_file_is_canonical_and_equals_scope(engine: AsyncEngine, purge
     await purger.run(opened.operation_id)
 
     manifest = await manifest_of(engine, opened.manifest_id)
-    path = purger.file(opened.manifest_uuid)
+    path = purger.manifest_file(opened.manifest_uuid)
     data = path.read_bytes()
     assert manifest.status == "completed" and manifest.scope is not None
     assert data == canonical_bytes(manifest.scope) and manifest.file_sha256 == hashlib.sha256(data).digest()
@@ -478,7 +412,7 @@ async def test_a_retry_after_record_never_recomputes(
     recorded = await manifest_of(engine, opened.manifest_id)
     assert recorded.file_sha256 is not None and recorded.scope is not None
     assert await exists(engine, "golden_cases", case_id)  # nothing deleted yet
-    written = purger.file(opened.manifest_uuid).read_bytes()
+    written = purger.manifest_file(opened.manifest_uuid).read_bytes()
 
     later = await golden_case(engine)
     export_id, export_file = await an_export(engine, purger.cfg.exports_dir, "ready")
@@ -488,7 +422,7 @@ async def test_a_retry_after_record_never_recomputes(
     manifest = await manifest_of(engine, opened.manifest_id)
     assert manifest.status == "completed"
     assert (manifest.scope, manifest.file_sha256) == (recorded.scope, recorded.file_sha256)
-    assert purger.file(opened.manifest_uuid).read_bytes() == written
+    assert purger.manifest_file(opened.manifest_uuid).read_bytes() == written
     assert later > recorded.scope["max_ids"]["golden_cases"] and await exists(engine, "golden_cases", later)
     assert not await exists(engine, "golden_cases", case_id)
     assert await export_row(engine, export_id) == ("ready", export_file.name) and export_file.exists()
@@ -513,7 +447,7 @@ async def test_a_quiesce_timeout_requeues(
         assert (row.status, row.attempts, row.last_error_code) == ("pending", 1, "quiesce_timeout")
         assert before + purge.RETRY_AFTER <= row.not_before <= utcnow() + purge.RETRY_AFTER
         assert (await manifest_of(engine, opened.manifest_id)).file_sha256 is None
-        assert not purger.file(opened.manifest_uuid).exists()
+        assert not purger.manifest_file(opened.manifest_uuid).exists()
         assert await exists(engine, "golden_cases", case_id)
         await old.rollback()
     monkeypatch.setattr(fences, "QUIESCE_TIMEOUT", timeout)  # a heartbeat's transaction never times it out
@@ -602,9 +536,8 @@ async def test_completion_releases_fences_and_resolves_purge_failed(
     assert (await operation(engine, retry)).status == "succeeded"
     assert not await exists(engine, "job_tombstones", seed.tombstone_id)
     assert await exists(engine, "jobs", seed.job.job_id)  # the fence named it; the purge kept it
-    files = FileRoots(purger.cfg.cv_store_dir, purger.cfg.exports_dir)
     async with engine.connect() as conn:
-        assert await check_postconditions(conn, manifest.scope, files=files) == []
+        assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
 
 
 # ---- the chunk ---------------------------------------------------------------------------------------------
@@ -938,7 +871,7 @@ async def test_an_export_key_names_every_file_its_id_prefixes(engine: AsyncEngin
         max_ids={},
         operations=[{"op": "file_remove", "volume": "exports", "keys": ["5-*", "a*b"]}],
     )
-    files = FileRoots(purger.cfg.cv_store_dir, exports)
+    files = purger.file_roots
     (exports / "50-x.jhx").write_bytes(b"\x00")
     (exports / "5-y.jhx.tmp").write_bytes(b"\x00")
     async with engine.connect() as conn:
@@ -1164,7 +1097,7 @@ async def test_a_file_that_cannot_be_adopted_fails_manifest_invalid_and_keeps_th
     opened = await open_fenced(engine, seed)
     monkeypatch.setattr(purge, "afault_point", raising_at(purge.AFTER_FILE))
     await purger.run(opened.operation_id)
-    path = purger.file(opened.manifest_uuid)
+    path = purger.manifest_file(opened.manifest_uuid)
     path.write_bytes(rewrite(path.read_bytes()))
     monkeypatch.setattr(purge, "afault_point", no_fault)
     await purger.again(opened.operation_id)
@@ -1291,7 +1224,8 @@ async def test_fenced_at_is_the_quiesce_cutoff_never_the_admission(
     assert manifest.scope["watermark"]["fenced_at"] == fenced_at.isoformat()
     assert (
         parse_manifest(
-            purger.file(opened.manifest_uuid).read_bytes(), file_name=purger.file(opened.manifest_uuid).name
+            purger.manifest_file(opened.manifest_uuid).read_bytes(),
+            file_name=purger.manifest_file(opened.manifest_uuid).name,
         )
         == manifest.scope
     )
