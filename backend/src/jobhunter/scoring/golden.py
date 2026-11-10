@@ -22,7 +22,10 @@ seniority) is unknown, which every hard filter passes (positive evidence only).
 **Refusals** are `jobhunter.errors.Refusal`s (M4 Carry-forward 3): domain code never raises the api's
 `Problem`. A user's write that meets a job under a purge fence (`record_feedback`, and `set_flags` activating
 a case) is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (`privacy.fences`, §20.2, M5
-Task 8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced.
+Task 8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced. The deletion of a case
+a running eval run includes is refused with 409 `conflict_state`, `detail = "eval_run_running"`
+(`eval_run_running`, M5 Task 12): `lock_case`, `in_running_run` and `case_job` are shared with the
+golden-case purge (`privacy.kinds.golden_case`).
 
 Nothing here logs content: ids, labels, sources and counts only.
 """
@@ -444,6 +447,53 @@ _SET_FLAGS: Final = q(
 )
 
 
+EVAL_RUN_RUNNING: Final = "eval_run_running"  # the refusal's detail, and a waiting purge's error code
+
+
+class CaseMissing(LookupError):
+    """No `golden_cases` row has the id (its message names the id only)."""
+
+    def __init__(self, case_id: int) -> None:
+        super().__init__(f"golden_cases {case_id}: no such case")
+        self.case_id = case_id
+
+
+@dataclass(frozen=True)
+class CaseFlags:
+    """The flags of a locked case that decide whether a running eval run includes it."""
+
+    active: bool
+    is_canary: bool
+
+
+def eval_run_running() -> Refusal:
+    """The refusal of a deletion of a case a running eval run includes (409 `conflict_state`, detail
+    `eval_run_running`; Carry T19-d)."""
+    return Refusal(
+        409, "conflict_state", "The golden case is part of a running eval run", detail=EVAL_RUN_RUNNING
+    )
+
+
+async def lock_case(conn: AsyncConnection, case_id: int) -> CaseFlags | None:
+    """The case's row `FOR UPDATE` (a call an eval run reserves for it meanwhile, whose foreign key takes
+    `FOR KEY SHARE`, waits for the caller's transaction); its flags, `None` when there is no such case."""
+    case = (await conn.execute(_LOCK_CASE, {"i": case_id})).first()
+    return None if case is None else CaseFlags(active=bool(case.active), is_canary=bool(case.is_canary))
+
+
+async def in_running_run(conn: AsyncConnection, case_id: int, flags: CaseFlags) -> bool:
+    """Whether a `running` eval run includes the case: one of its calls names it, or its kind selects it (a
+    golden run every active case, a canary run every active canary; `eval_runner`'s list)."""
+    params = {"i": case_id, "active": flags.active, "canary": flags.is_canary}
+    return bool((await conn.execute(_IN_RUNNING_RUN, params)).scalar_one())
+
+
+async def case_job(conn: AsyncConnection, case_id: int) -> int | None:
+    """The job of the case's revision (a plain read), `None` when there is no such case."""
+    job_id = (await conn.execute(_CASE_JOB, {"i": case_id})).scalar_one_or_none()
+    return None if job_id is None else int(job_id)
+
+
 def _case(row: Row[Any]) -> CaseRow:
     return CaseRow(
         id=int(row.id),
@@ -487,19 +537,14 @@ async def delete_case_unless_running(conn: AsyncConnection, case_id: int) -> boo
     golden run every active case, a canary run every active canary). The case row is locked `FOR UPDATE`
     first, so a call a run reserves for it meanwhile (its foreign key's `FOR KEY SHARE`) waits for this
     transaction: after a refusal it goes on, after a deletion it fails, and the runner skips the case as
-    deleted."""
-    case = (await conn.execute(_LOCK_CASE, {"i": case_id})).first()
-    if case is None:
+    deleted. The refusal is `eval_run_running()`, which the purge's request shares
+    (`privacy.kinds.golden_case`, M5 Task 12)."""
+    flags = await lock_case(conn, case_id)
+    if flags is None:
         return False
-    params = {"i": case_id, "active": case.active, "canary": case.is_canary}
-    if (await conn.execute(_IN_RUNNING_RUN, params)).scalar_one():
-        log.info("golden_case_delete_refused", golden_case_id=case_id, reason="eval_run_running")
-        raise Refusal(
-            409,
-            "conflict_state",
-            "The golden case is part of a running eval run",
-            detail="delete it once the eval run has ended",
-        )
+    if await in_running_run(conn, case_id, flags):
+        log.info("golden_case_delete_refused", golden_case_id=case_id, reason=EVAL_RUN_RUNNING)
+        raise eval_run_running()
     return await delete_case(conn, case_id)
 
 

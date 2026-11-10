@@ -54,7 +54,8 @@ under the claim predicate like every owner write (M2 Task 18).
 
 **Execution locks** (M3 Task 14, Codex r3 B20). A kind of `OPERATION_LOCKS` runs its jobs under that
 procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side; `replay_raw_items`:
-`replay`, so two replays whose id sets overlap never resolve one item at once, M4 Task 12):
+`replay`, so two replays whose id sets overlap never resolve one item at once, M4 Task 12; `purge`: `purge`,
+one purge at a time, M5 Task 12):
 `defer_operation_job` reads the row's kind and passes the lock on every enqueue, the first one
 (`create_operation`), the `operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer
 alike.
@@ -104,6 +105,7 @@ if TYPE_CHECKING:
     from jobhunter.graphs.score.deps import ScoreDeps
     from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.observability.deadman import DeadmanPinger
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
 
@@ -124,9 +126,10 @@ OperationKind = Literal[
 
 # The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue
 # (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4), and
-# so do the replays of rejected raw items (M4 Task 12, Ruling T12-c: overlapping id sets).
+# so do the replays of rejected raw items (M4 Task 12, Ruling T12-c: overlapping id sets) and the purges (M5
+# Task 12, D5: one purge at a time, so execution follows the manifests' UUIDv7 stream order).
 OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType(
-    {"batch_submit": "batch", "replay_raw_items": "replay"}
+    {"batch_submit": "batch", "replay_raw_items": "replay", "purge": "purge"}
 )
 MAX_OPERATION_ATTEMPTS: Final = 10
 # These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
@@ -180,6 +183,9 @@ class OperationDeps:
     the engine, the gateway, the clock and the gateway's monotonic clock), which the `eval_run` handler scores
     its cases with; `batches_client` is the process's Message Batches client (`WorkerRuntime.batches_client`),
     which the `batch_submit` handler creates its batch with. Neither handler builds its own (Ruling P33).
+    `deadman` is the process's dead-man pinger (`WorkerRuntime.deadman`, M5 Task 5), `None` without one: with
+    the Batches client, a live purge's external effects (`privacy.purge.LiveEffects`, M5 Task 12, Deviation
+    56). It is last and optional, so a test that builds the dependencies without it has none.
     """
 
     cfg: "AppConfig"
@@ -191,6 +197,7 @@ class OperationDeps:
     clock: Callable[[], datetime]
     score_steps: "ScoreDeps"
     batches_client: "BatchesClient"
+    deadman: "DeadmanPinger | None" = None
 
 
 @dataclass(frozen=True)

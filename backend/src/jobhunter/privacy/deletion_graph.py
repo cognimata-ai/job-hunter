@@ -60,7 +60,8 @@ caller's, last.
 **The chunk can lose a deadlock** (40P01), which its order (the month and bulk rows before the target rows,
 which a non-owner takes at step 10) keeps possible, so **the caller retries the whole chunk transaction on a
 retryable database error** (`graphs.sanitize.is_retryable_db_error`: a deadlock, a serialization failure, a
-lost connection; Task 12's `PurgeRun.chunk`, which then requeues `lock_conflict`). The partners:
+lost connection; Task 12's `privacy.purge.run_purge`, which re-runs the phase from its start, three
+tries in all, then requeues `lock_conflict`: Ruling T12-1). The partners:
 - a score attempt reserving a try for a target of T (`spend_ledger.reserve`, which takes no job row): it holds
   its target `FOR SHARE` (the owner row, step 5) and waits for a month row this chunk holds, while the chunk
   waits for that target (step 10, as a non-owner), as with every non-owner mover of a target
@@ -74,23 +75,41 @@ PostgreSQL aborts one of the pair. Either outcome is whole: an aborted try retri
 (`ClaimLost`); an aborted chunk wrote nothing, and its retry finds what is left (over targets deleted already
 it is a no-op).
 
+**The exports** (M5 Task 12; §20.3 L6507, M5-R3, Deviation 18). Every kind but `job_tombstone` deletes every
+export (`KindProcedure.deletes_exports`), since one may hold the purged content. At A2, `export_ops(conn,
+max_export_id=...)` names the `running` and `ready` exports within the bound: a `field_redact exports
+storage_path` with the marker `status = 'purged'` (any content-free state satisfies it: `manifests`), and a
+`file_remove exports` with the key `<id>-*` per export (`export_files_key`: a ready export's published
+archive and an unpublished attempt's, Task 17). Phase B runs them, `purge_exports(run, ops)`, after the kind's
+own chunks, with Task 17's table of export states: in one chunk (`PurgeRun.chunk`, no job rows) a named row
+still `running` or `ready` → `purged` with `storage_path` NULL, a row already content-free (`failed`,
+`expired`, `purged`) left as it is; the files are unlinked only after that commit, so no committed `ready`
+row ever names a missing file, and a crash in between leaves only files no row names, which the idempotent
+re-execution removes. A running export's own publication then finds its row `purged` and unlinks what it
+wrote (Task 17).
+
 Ids, counts and states only reach a log line.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import TextClause
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import transition_where
 from jobhunter.llm import bulk, spend_ledger
 from jobhunter.llm.spend_ledger import CallOutcome, PurgeSettled, Reservation
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.manifests import KEY_WILDCARD, Operation, remove_files
 from jobhunter.scoring import batches, targets
+
+if TYPE_CHECKING:
+    from jobhunter.privacy.purge import PurgeRun
 
 # The call's code of a batch entry a purge made `ambiguous` (the call then goes with its item).
 PURGED_CODE: Final = "purged"
@@ -251,5 +270,79 @@ async def purge_target_set(
         online_entries_released=settled.released,
         online_entries_ambiguous=settled.ambiguous,
         target_ids=ids[:LOGGED_IDS],
+    )
+    return purged
+
+
+# ---- the exports (M5 Task 12) ------------------------------------------------------------------------------
+
+# The states of an export that hold content: a purge's export op names them and moves them `purged`.
+EXPORT_LIVE_STATES: Final = ("running", "ready")
+_LIVE_EXPORTS: Final = q(
+    "SELECT id FROM exports WHERE status = ANY(CAST(:states AS text[])) AND id <= :bound ORDER BY id"
+)
+
+
+def export_files_key(export_id: int) -> str:
+    """The `file_remove` key of an export's files: `<id>-*` (module docstring)."""
+    return f"{export_id}-{KEY_WILDCARD}"
+
+
+def is_export_op(op: Operation) -> bool:
+    """Whether `op` is one of `export_ops`' (a purge runs those with `purge_exports`, not the kind's
+    `execute`)."""
+    return (op["op"] == "field_redact" and op["table"] == "exports") or (
+        op["op"] == "file_remove" and op["volume"] == "exports"
+    )
+
+
+async def export_ops(conn: AsyncConnection, *, max_export_id: int) -> list[Operation]:
+    """A2: the operations that purge the `running` and `ready` exports with an id up to `max_export_id`
+    (module docstring); none when there is no such export."""
+    params = {"states": list(EXPORT_LIVE_STATES), "bound": max_export_id}
+    ids = [int(i) for i in (await conn.execute(_LIVE_EXPORTS, params)).scalars()]
+    if not ids:
+        return []
+    return [
+        {
+            "op": "field_redact",
+            "table": "exports",
+            "ids": ids,
+            "columns": ["storage_path"],
+            "marker": {"status": "purged"},
+        },
+        {"op": "file_remove", "volume": "exports", "keys": [export_files_key(i) for i in ids]},
+    ]
+
+
+async def purge_exports(run: "PurgeRun", ops: Sequence[Operation]) -> int:
+    """Phase B's export ops (module docstring): the named rows still `running` or `ready` → `purged` in one
+    chunk, then, after its commit, the files the keys name unlinked; how many rows moved."""
+    ids = sorted(
+        {i for op in ops if op["op"] == "field_redact" and op["table"] == "exports" for i in op["ids"]}
+    )
+    purged = 0
+    if ids:
+        async with run.chunk() as chunk:
+            moved = await transition_where(
+                chunk.conn,
+                "exports",
+                list(EXPORT_LIVE_STATES),
+                "purged",
+                where="t.id = ANY(CAST(:ids AS bigint[]))",
+                params={"ids": ids},
+                set_={"storage_path": None},
+            )
+            purged = len(moved)
+    keys = [
+        key for op in ops if op["op"] == "file_remove" and op["volume"] == "exports" for key in op["keys"]
+    ]
+    removed = remove_files(run.cfg.exports_dir, keys)
+    log.info(
+        "purge_exports_done",
+        manifest_id=run.manifest.id,
+        exports_purged=purged,
+        files_removed=removed,
+        export_ids=ids[:LOGGED_IDS],
     )
     return purged

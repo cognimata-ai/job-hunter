@@ -25,7 +25,8 @@ included) and `name_mismatch` (a file name other than `<manifest_uuid>.json`).
 stores the content in `scope` with the file's hash, once: a retry may record the same content again, other
 content raises `ManifestConflict`; it adds the affected jobs to the manifest's active `source` fence. Nothing
 is deleted before it commits. `complete_manifest` moves the row `executing → completed` (`transition()`); the
-§7.14 CHECK refuses it without the file's hash.
+§7.14 CHECK refuses it without the file's hash. `read_manifest` reads a row, `read_manifest_file` a file
+(the purge's adoption of a file a crash left before A3, M5 Task 12).
 
 **`max_identity_ids`**: per table of the `public` schema, the greatest value of its identity column, or 0: a
 column whose sequence it owns, an identity (`login_lockouts.generation`, the surrogate `api_idempotency.id`,
@@ -51,6 +52,9 @@ source instance, and on `ad_keys`, its `key_ns`), and is evaluated only within t
   instead names none of the revisions the manifest deletes (by id, or within the bound of an `all` selector
   and not among its kept ids).
 - `file_remove`: no named file on the volume (`FileRoots`); a key that is no plain file name is a violation.
+  A key ending in `KEY_WILDCARD` (`*`) names every file of the volume whose name begins with the rest of it
+  (an export's `<id>-*`: its published archive and an unpublished attempt's, M5 Task 12); `named_files`
+  is the one reading of a key, which `remove_files` (a purge's or a replay's unlink) shares.
 - `fence`: no fence of the manifest is active (a final-state condition: the completing transaction releases
   the fences first, then checks, and rolls back on a violation); for a `source` fence, for the stored affected
   jobs that still exist, no `field_provenance` entry or current-revision lineage row names a posting or
@@ -67,7 +71,7 @@ Table and column names come from the content; each is quoted as an identifier.
 import hashlib
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +97,8 @@ SELECTOR_ALL: Final = "all"
 SOURCE_SELECTOR: Final = "source:"
 # A `field_redact` marker value that means "set" (not NULL), not a value of its own (module docstring).
 MARKER_SET: Final = "set"
+# The last character of a `file_remove` key that names every file the rest prefixes (module docstring).
+KEY_WILDCARD: Final = "*"
 # The states of an export that hold no content (Task 17's table): each satisfies an `exports.status` marker.
 EXPORT_CONTENT_FREE: Final = ("purged", "expired", "failed")
 
@@ -266,6 +272,12 @@ def _existing(path: Path) -> bytes | None:
         return existing.read()
 
 
+def read_manifest_file(directory: Path, manifest_uuid: str | UUID) -> bytes | None:
+    """The bytes of the manifest's file in `directory`, `None` when there is none (a symbolic link is never
+    followed: `OSError`)."""
+    return _existing(directory / manifest_file_name(manifest_uuid))
+
+
 def write_manifest_file(directory: Path, content: ManifestContent) -> bytes:
     """Write `content`'s file in `directory` and return its sha256 (module docstring): `<uuid>.json.tmp`
     (mode 0600; a leftover of a crashed write is truncated), fsync, rename to `<uuid>.json`, fsync of the
@@ -327,6 +339,7 @@ _INSERT: Final = q(
     f"VALUES (:uuid, :kind, 'executing', :request, :now) RETURNING {_ROW}",
     jsonb=["request"],
 )
+_READ: Final = q(f"SELECT {_ROW} FROM deletion_manifests WHERE id = :id")  # noqa: S608 (constant)
 # A3's record, once: a retry may store the same hash (and so the same content) again.
 _RECORD: Final = q(
     "UPDATE deletion_manifests SET file_sha256 = :sha, scope = :scope "
@@ -374,6 +387,12 @@ async def insert_manifest(
     now`: the manifest's `admitted_at`), in the caller's transaction; the row."""
     params = {"uuid": uuid7(), "kind": kind, "request": dict(request), "now": now}
     return _manifest_row((await conn.execute(_INSERT, params)).one())
+
+
+async def read_manifest(conn: AsyncConnection, manifest_id: int) -> ManifestRow | None:
+    """The manifest `manifest_id` (a plain read), `None` when there is none."""
+    row = (await conn.execute(_READ, {"id": manifest_id})).first()
+    return None if row is None else _manifest_row(row)
 
 
 async def max_identity_ids(conn: AsyncConnection) -> dict[str, int]:
@@ -439,6 +458,10 @@ class FileRoots:
 
     cv_store: Path
     exports: Path
+
+    def root(self, volume: Literal["cv_store", "exports"]) -> Path:
+        """The directory `volume` is mounted at."""
+        return self.cv_store if volume == "cv_store" else self.exports
 
 
 @dataclass(frozen=True)
@@ -709,12 +732,50 @@ def _plain_name(key: str) -> bool:
     return key not in ("", ".", "..") and "/" not in key and "\x00" not in key
 
 
+def _valid_key(key: str) -> bool:
+    """A plain file name, or one followed by `KEY_WILDCARD` (a prefix); no other wildcard."""
+    stem = key.removesuffix(KEY_WILDCARD)
+    return _plain_name(stem) and KEY_WILDCARD not in stem
+
+
+def named_files(root: Path, key: str) -> list[Path]:
+    """The entries of `root` the `file_remove` key `key` names (module docstring), in name order: the file of
+    a plain name when it exists, or every entry whose name begins with a prefix key's stem; `ValueError` for a
+    key that is neither."""
+    if not _valid_key(key):
+        raise ValueError("a file_remove key is a file name or a file name prefix")
+    if not key.endswith(KEY_WILDCARD):
+        return [root / key] if os.path.lexists(root / key) else []
+    stem = key.removesuffix(KEY_WILDCARD)
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    return [root / name for name in sorted(names) if name.startswith(stem)]
+
+
+def remove_files(root: Path, keys: Sequence[str]) -> int:
+    """Unlink every file of `root` the keys name (`named_files`; one gone meanwhile is fine), then fsync the
+    directory when one went; how many were unlinked."""
+    removed = 0
+    for key in keys:
+        for path in named_files(root, key):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            removed += 1
+    if removed:
+        fsync_directory(root)
+    return removed
+
+
 def _file_remove(index: int, op: FileRemoveOp, files: FileRoots) -> list[Violation]:
-    root = files.cv_store if op["volume"] == "cv_store" else files.exports
+    root = files.root(op["volume"])
     found: list[str] = []
-    if odd := sum(not _plain_name(key) for key in op["keys"]):
+    if odd := sum(not _valid_key(key) for key in op["keys"]):
         found.append(f"{_rows(odd, 'key')} on {op['volume']} {'is' if odd == 1 else 'are'} no file name")
-    if present := sum(_plain_name(key) and os.path.lexists(root / key) for key in op["keys"]):
+    if present := sum(len(named_files(root, key)) for key in op["keys"] if _valid_key(key)):
         found.append(f"{_rows(present, 'file')} on {op['volume']} {_remain(present)}")
     return [Violation(index, "file_remove", None, detail) for detail in found]
 

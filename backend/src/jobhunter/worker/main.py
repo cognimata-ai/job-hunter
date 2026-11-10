@@ -43,7 +43,8 @@
    5), the dead-man pinger (`observability.deadman.DeadmanPinger`) on a `HealthchecksClient` of its own (its
    HTTP client, the ping URL, `HEALTHCHECKS_API_URL`, the API key), the engine, this worker's epoch and the
    clock, which the collection deps (the `finalize` node's fast path), the runtime (`run_collect`'s
-   `_finalize`, `deadman_sync`) and every reconcile context (`deadman_ping`) carry; without it one
+   `_finalize`, `deadman_sync`), every reconcile context (`deadman_ping`) and the operation dependencies (a
+   live purge's effects, M5 Task 12) carry; without it one
    `deadman_disabled` line, with its reason (`not_configured`, `ping_url_form`);
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a transaction
    of its own, fenced by this worker's epoch: a source without its secret is `disabled('missing_secret')` and
@@ -231,6 +232,9 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.observability.backup_health",
     # M5 Task 9: the `manifest_shipping` (every tick, Deviation 43) and `purge_fences` (D7) reconcilers
     "jobhunter.privacy.reconcilers",
+    # M5 Task 12: the `purge` handler and its failure hook, and the purge kinds' procedures (`KINDS`)
+    "jobhunter.privacy.purge",
+    "jobhunter.privacy.kinds",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -393,6 +397,7 @@ class _WorkerProcess:
             clock=utcnow,
             score_steps=score_deps,
             batches_client=batches_client,
+            deadman=pinger,
         )
         dispatcher = self._alert_dispatcher(engine, epoch)
         runtime = WorkerRuntime(

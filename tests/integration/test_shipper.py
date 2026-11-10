@@ -11,15 +11,14 @@ snapshot id); the database is the shared server, written as the backup role. The
 
 import hashlib
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.backup.restic import Restic, ResticError
-from jobhunter.backup.runner import CommandResult
+from jobhunter.backup.restic import ResticError
 from jobhunter.backup.shipper import ShipResult, ship_manifests
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
@@ -36,6 +35,7 @@ from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx, task_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.backups import FakeRestic
 from tests.support.pg import PgServer, config_for
 
 pytestmark = pytest.mark.integration
@@ -46,34 +46,6 @@ _ITEMS: Final = sa.text(
     "ORDER BY manifest_uuid"
 )
 _ROLE: Final = sa.text("SELECT current_user")
-
-
-def lines(path: Path) -> list[str]:
-    return path.read_text(encoding="utf-8").splitlines()
-
-
-class Unreachable:
-    async def run(self, argv: Sequence[str], **_: Any) -> CommandResult:
-        raise AssertionError(f"the fake restic ran {argv[1]}")
-
-
-class FakeRestic(Restic):
-    """`backup` records the file list it is given (the files, its tags) and returns the next snapshot id, or
-    raises `failure`; nothing else is called."""
-
-    def __init__(self, cfg: AppConfig, *, failure: ResticError | None = None) -> None:
-        super().__init__(cfg, Unreachable())
-        self.failure = failure
-        self.backups: list[tuple[list[str], tuple[str, ...]]] = []
-
-    async def backup(
-        self, *, paths: Sequence[Path] = (), files_from: Path | None = None, tags: Sequence[str]
-    ) -> str:
-        assert not paths and files_from is not None
-        self.backups.append((lines(files_from), tuple(tags)))
-        if self.failure is not None:
-            raise self.failure
-        return f"{len(self.backups):064x}"
 
 
 @pytest.fixture

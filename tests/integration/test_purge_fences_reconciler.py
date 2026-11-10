@@ -7,6 +7,12 @@ raises `privacy.purge_failed` (critical, subject `manifest:<id>`) and keeps the 
 new one is created (`purge:<uuid>`) and the alert raised. The alert is resolved once the manifest leaves
 `executing`. Retention keeps every purge operation of an `executing` manifest, so a failed one stays to be
 retried.
+
+The reconciler is the backstop of the `purge` operation's failure hook (M5 Task 12, `privacy.purge`), which
+raises the same alert at once in the transaction that ends the operation `failed`. These tests pin the
+reconciler alone, so the hook is removed for each of them (`without_the_failure_hook`): whether another test
+module imported `privacy.purge` before them never changes what they see. `test_purge_protocol.py` pins the
+hook and the two together.
 """
 
 from datetime import datetime, timedelta
@@ -31,6 +37,7 @@ from jobhunter.privacy.retention import run_retention_daily
 from jobhunter.profile.storage import CvStore
 from jobhunter.worker import reconcilers
 from jobhunter.worker.operations import (
+    FAILURE_HOOKS,
     OperationClaim,
     cancel_operation,
     claim_operation,
@@ -44,6 +51,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.pg import PgServer
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def without_the_failure_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reconciler alone (module docstring): no `purge` failure hook while the test runs."""
+    monkeypatch.delitem(FAILURE_HOOKS, "purge", raising=False)
+
 
 _PURGES: Final = sa.text(
     "SELECT id, status, payload, dedup_key FROM operations WHERE kind = 'purge' ORDER BY id"

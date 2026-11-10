@@ -5,13 +5,21 @@ as the backup role and a purge leave it: a `succeeded` set has its snapshot, dum
 counts; a `completed` manifest its file hash and completion time; a `shipped` one its shipment, whose items
 name the manifest's uuid and file hash (§19.5). Every value is a stand-in: no snapshot id or hash is real.
 Each helper commits its rows and returns the id.
+
+`FakeRestic` (M5 Task 10, shared since Task 12) is restic for the shipper in process: its `backup` records the
+file list it is given and returns a stand-in snapshot id, and nothing else ever runs a command.
 """
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
-from typing import Final, Literal
+from pathlib import Path
+from typing import Any, Final, Literal
 
 import sqlalchemy as sa
+from jobhunter.backup.restic import Restic, ResticError
+from jobhunter.backup.runner import CommandResult
 from jobhunter.clock import utcnow
+from jobhunter.config import AppConfig
 from jobhunter.observability.backup_health import BackupStatus
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -99,3 +107,31 @@ async def manifest(
     """A manifest not shipped: `completed` at `completed_at`, with its file hash, or still `executing`."""
     sha = b"\x02" if status == "completed" else None
     return await _insert(engine, _COMPLETED, {"status": status, "sha": sha, "completed_at": completed_at})
+
+
+def lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+class Unreachable:
+    async def run(self, argv: Sequence[str], **_: Any) -> CommandResult:
+        raise AssertionError(f"the fake restic ran {argv[1]}")
+
+
+class FakeRestic(Restic):
+    """`backup` records the file list it is given (the files, its tags) and returns the next snapshot id, or
+    raises `failure`; nothing else is called."""
+
+    def __init__(self, cfg: AppConfig, *, failure: ResticError | None = None) -> None:
+        super().__init__(cfg, Unreachable())
+        self.failure = failure
+        self.backups: list[tuple[list[str], tuple[str, ...]]] = []
+
+    async def backup(
+        self, *, paths: Sequence[Path] = (), files_from: Path | None = None, tags: Sequence[str]
+    ) -> str:
+        assert not paths and files_from is not None
+        self.backups.append((lines(files_from), tuple(tags)))
+        if self.failure is not None:
+            raise self.failure
+        return f"{len(self.backups):064x}"
