@@ -11,7 +11,6 @@ and the switch's context variable is set inside a copied context only.
 import contextvars
 import threading
 from collections.abc import Callable, Iterator
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -57,13 +56,18 @@ def in_a_new_thread(read: Callable[[], object]) -> object:
 
 
 def test_a_command_other_than_the_worker_runs_untraced_whatever_the_environment_says(
-    traced_environment: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    traced_environment: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`schema-dry-run`, the review's case, with its own work faked and the real `disable_tracing`."""
+    from jobhunter import cli_schema_dry_run
+
+    monkeypatch.setattr(cli_schema_dry_run, "run_schema_dry_run", lambda args: 0)
+
     def run() -> None:
         _context._TRACING_ENABLED.set(None)  # unset in this copied context: the environment decides
         # the environment is live: the SDK and langchain-core would trace
         assert ls_utils.tracing_is_enabled() is True and _tracing_v2_is_enabled() is True
-        assert cli.main(["http-check", (tmp_path / "healthz").as_uri()]) == 1  # a command that needs nothing
+        assert cli.main(["schema-dry-run", "--live"]) == 0
         # off for this context, and for any thread the process starts later
         assert ls_utils.tracing_is_enabled() is False and _tracing_v2_is_enabled() is False
         assert in_a_new_thread(ls_utils.tracing_is_enabled) is False
@@ -72,18 +76,17 @@ def test_a_command_other_than_the_worker_runs_untraced_whatever_the_environment_
         assert not any(isinstance(handler, LangChainTracer) for handler in handlers)
 
     contextvars.copy_context().run(run)
-    assert capsys.readouterr().err == "http-check: ValueError\n"
 
 
 @pytest.mark.parametrize(
     ("argv", "module", "name"),
     [
-        (["http-check", "http://127.0.0.1:1/healthz"], "jobhunter.cli", "_http_check"),
         (["schema-dry-run", "--live"], "jobhunter.cli_schema_dry_run", "run_schema_dry_run"),
         (["api"], "jobhunter.cli_api", "run_api"),
         (["ops", "notify-test"], "jobhunter.cli_ops", "run_ops_command"),
+        (["startup-check", "--role", "api"], "jobhunter.cli", "startup_or_exit"),
     ],
-    ids=["http-check", "schema-dry-run", "api", "ops"],
+    ids=["schema-dry-run", "api", "ops", "startup-check"],
 )
 def test_tracing_is_turned_off_before_the_command_runs(
     monkeypatch: pytest.MonkeyPatch, argv: list[str], module: str, name: str
@@ -100,6 +103,30 @@ def test_tracing_is_turned_off_before_the_command_runs(
     monkeypatch.setattr(importlib.import_module(module), name, command)
     assert cli.main(argv) == 0
     assert calls == ["disable_tracing", name]
+
+
+@pytest.mark.parametrize(
+    ("argv", "name"),
+    [(["http-check", "http://127.0.0.1:1/healthz"], "_http_check"), (["worker-health"], "_worker_health")],
+    ids=["http-check", "worker-health"],
+)
+def test_the_healthcheck_probes_leave_the_tracing_sdk_alone(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], name: str
+) -> None:
+    """Ruling T6-9: the two probes load neither langchain nor langsmith, which their import guard tests pin
+    (`test_cli_http_check.py`, `test_worker_singleton.py`), so they cannot trace and are not made to load the
+    SDK only to switch it off."""
+    calls: list[str] = []
+
+    def probe(*args: object) -> int:
+        calls.append(name)
+        return 0
+
+    monkeypatch.setattr(tracing, "disable_tracing", lambda: calls.append("disable_tracing"))
+    monkeypatch.setattr(cli, name, probe)
+    assert cli.main(argv) == 0
+    assert calls == [name]
+    assert frozenset({"http-check", "worker-health"}) == cli.UNTRACEABLE_PROBES
 
 
 def test_the_worker_command_installs_its_own_tracing(monkeypatch: pytest.MonkeyPatch) -> None:

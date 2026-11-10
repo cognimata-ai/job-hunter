@@ -8,6 +8,11 @@ from typing import Final, get_args
 from jobhunter.config import Role, load_config, startup_or_exit
 
 HTTP_CHECK_TIMEOUT_S: Final = 3
+# The container healthchecks, which `main` leaves out of `disable_tracing` (M5 Task 6, Ruling T6-9): they
+# import neither langchain nor langsmith, so they cannot trace, and loading the SDK only to switch it off
+# would cost each of them about a quarter of a second, every few seconds. Their import guard tests pin that
+# they load neither; a probe that comes to load one leaves this set.
+UNTRACEABLE_PROBES: Final = frozenset({"http-check", "worker-health"})
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -234,7 +239,7 @@ def _http_check(url: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.command != "worker":
+    if args.command != "worker" and args.command not in UNTRACEABLE_PROBES:
         # Only the worker traces (§17.8; M5 Task 6, Ruling T6-8): any other command, the api and a worker-role
         # command such as `schema-dry-run` among them, runs untraced whatever its environment says. Imported
         # here, like each command's own modules.
