@@ -45,7 +45,7 @@ _LIBRARY_LOGGERS = (
 )
 # The tables `reset_database` empties with TRUNCATE (the migrator owns them, so only the migrator may
 # truncate). The seeded configuration chain, `active_config`, `ranking_state` and `sources` are kept
-# (`reset_database` restores the first three to their seeded state), `schedule_state` and `deadman_state` are
+# (`reset_database` restores them to their seeded state), `schedule_state` and `deadman_state` are
 # reset (below), and so are `checkpoint_migrations`, which the checkpointer reads to know its schema is set
 # up, and `schema_compat`, `migrate`'s record of the migration chain (M5). `source_instances` is
 # named on purpose: CASCADE empties it anyway with `watchlist_companies` and `ats_snapshots`, so
@@ -217,6 +217,8 @@ ON CONFLICT (id) DO UPDATE SET
 # it, so every other column takes its default (NULL today), whatever columns a later task adds. No foreign key
 # references the table.
 _DEADMAN_RESET: Final = ("DELETE FROM deadman_state", "INSERT INTO deadman_state (id) VALUES (1)")
+# A source purge's record on the kept `sources` rows (M5 Task 15), which `migrate` seeds NULL.
+_SOURCES_RESET: Final = "UPDATE sources SET purge_fence_at = NULL WHERE purge_fence_at IS NOT NULL"
 # Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the shipped
 # rubric v2 (M3 Task 3) and the shipped prompt-schema version 2 (M3 Task 4; `_SEEDED_ROWS` fails the reset
 # when one is missing), and the pointers a profile or a scope apply sets left NULL (the pending scope, the
@@ -344,7 +346,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
     (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the shipped
     prompt-schema version 2, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
     (`_M2_DELETE`); the schedule and the dead-man state reset (`_DEADMAN_RESET`: its row inserted again as
-    the seed inserts it); then the settings versions after 1, the scope versions no settings
+    the seed inserts it); the sources' `purge_fence_at` NULL again, as `migrate` seeds it (`_SOURCES_RESET`: a
+    source purge's record, M5 Task 15); then the settings versions after 1, the scope versions no settings
     version uses, the model policies, execution configs and evaluation policies that no settings version or
     `active_config` names, the rubric rows other than the shipped v1 and v2 and the prompt-schema rows other
     than the two shipped versions that `active_config` does not name deleted, and the ranking generation set
@@ -385,6 +388,7 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
         for statement in _DEADMAN_RESET:
             conn.execute(statement)
+        conn.execute(_SOURCES_RESET)
         for statement in _CONFIGURATION_RESET:
             conn.execute(statement, seeded if "%(" in statement else None)
 

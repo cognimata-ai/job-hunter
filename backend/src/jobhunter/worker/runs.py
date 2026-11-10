@@ -37,6 +37,11 @@ The reconcilers `queued_runs` (a queued run without a live job: re-deferred once
 `failed('orphaned_queue')`) and `stale_data` (§17.5, §17.6) complete the set. Every time threshold uses the
 caller's clock (`ctx.now`), never the database's `now()`.
 
+**Cancellation** (§7.16.4, M5 Task 15): `cancel_active_runs` ends the `queued` and `running` collections
+`cancelled(<reason>)` under `active_config FOR UPDATE` (a source purge's admission, `SOURCE_PURGE_CANCEL`, and
+its replay's re-application). A running attempt is closed `cancelled`; its execution's next owner write is
+refused, so it stops (`lost`) and writes nothing more.
+
 Every run that reaches a terminal status is counted in `RUNS` (and, when it started, timed in `RUN_DURATION`)
 by the owner of the transaction that ended it, once that transaction has committed (ruling T12-e): the
 functions that end a run inside a caller's transaction report a `RunEnd`, and the owner passes it to
@@ -113,6 +118,9 @@ RECURSION_LIMIT: Final = 200
 MAX_CONCURRENCY: Final = 4  # the graph's parallel tasks: the fetch fan-out (§9.2)
 
 REDEFERRED: Final = "redeferred"
+# The reasons a run ends `cancelled` with (§7.16.4, `cancel_active_runs`).
+CancelReason = Literal["source_purge"]
+SOURCE_PURGE_CANCEL: Final[CancelReason] = "source_purge"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
 ORPHANED_QUEUE_ALERT: Final = "run.orphaned_queue"
 FAILED_ALERT: Final = "run.failed"
@@ -237,6 +245,11 @@ _ACTIVE_CONFIG = q(
 _ACTIVE_RUN = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
     "finished_at, status_reason FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running')"
+)
+# The active collections `cancel_active_runs` ends: every one, or those queued up to `:before`.
+_ACTIVE_TO_CANCEL = q(
+    "SELECT id, status, attempt_no FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running') "
+    "AND (CAST(:before AS timestamptz) IS NULL OR queued_at <= :before) ORDER BY id FOR UPDATE"
 )
 _RUN_BY_ID = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
@@ -480,6 +493,45 @@ async def begin_new_attempt(
         "run_new_attempt", run_id=run_id, attempt_no=following, end_reason=end_reason, resume_count=resumes
     )
     return following
+
+
+@dataclass(frozen=True)
+class CancelledRun:
+    """A run `cancel_active_runs` ended: its id and its end, for the transaction's owner to observe."""
+
+    run_id: int
+    end: RunEnd
+
+
+async def cancel_active_runs(
+    conn: AsyncConnection, *, reason: CancelReason, queued_at_or_before: datetime | None = None
+) -> list[CancelledRun]:
+    """End every `queued` or `running` collection run `cancelled(reason)` (§7.16.4: delete-everything, a
+    source purge), in id order, in the caller's transaction, which holds `active_config FOR UPDATE` (step 2);
+    only the runs queued at or before `queued_at_or_before` when it is given (a replay's re-application of a
+    source purge's admission keeps a later run). Each run row is locked `FOR UPDATE` (an owner row, step 5),
+    moved by its owner predicate (`attempt_no`), and a `running` run's current attempt is closed `cancelled`.
+    The running execution learns of it at its next owner write (its heartbeat is refused: `lost`). Returns
+    the runs it ended, for the caller to observe after its commit (`observe_run_ends`)."""
+    params = {"before": queued_at_or_before}
+    cancelled: list[CancelledRun] = []
+    for row in (await conn.execute(_ACTIVE_TO_CANCEL, params)).all():
+        run_id, attempt_no = int(row.id), int(row.attempt_no)
+        await transition(
+            conn,
+            _TABLE,
+            run_id,
+            [str(row.status)],
+            "cancelled",
+            reason=reason,
+            owner={"attempt_no": attempt_no},
+        )
+        if row.status == "running":
+            await conn.execute(_END_ATTEMPT, {"i": run_id, "a": attempt_no, "reason": "cancelled"})
+        duration = await _duration(conn, run_id) if row.status == "running" else None
+        cancelled.append(CancelledRun(run_id, RunEnd(status="cancelled", duration_s=duration)))
+        log.info("run_cancelled", run_id=run_id, attempt_no=attempt_no, status=str(row.status), reason=reason)
+    return cancelled
 
 
 async def annotate_run(conn: AsyncConnection, run_id: int, *, attempt_no: int, reason: str) -> bool:

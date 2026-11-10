@@ -53,7 +53,14 @@ What it holds (every text invented, ids and hashes stand-ins):
   entries' (a purge's release subtracts from them);
 - the rest: a session, a login attempt and lockout, an idempotency row, alerts open and resolved, operations,
   a shipped deletion manifest with its shipment, released fence and purged batch item, a backup set and its
-  restore test, an expired and a ready export.
+  restore test, an expired and a ready export;
+- for the source purge (Task 15): every observation holds a whole normalized posting
+  (`tests.support.observations.normalized`), so a job can be rebuilt from its remaining postings.
+  `closed_job` is the mixed job (an Adzuna and an ATS posting; its current revision's lineage names both);
+  the Adzuna-only jobs (`adzuna_only_job_ids`) are the active job, the other job (named by merge events) and
+  an active job into which another was merged (the merge event names both; both revisions have Adzuna
+  lineage); each golden case draws on Adzuna (`det_input_sources`). Both new jobs are active, so no tombstone
+  is due for them.
 
 A scenario that needs another live submission state runs on another seeded database (`live_submission`).
 """
@@ -72,6 +79,7 @@ from jobhunter.normalize.keys import AdKey
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tests.support.m2 import MINIMAL_PROFILE
+from tests.support.observations import normalized
 from tests.support.scoring import REASON_OF
 
 InFlight = Literal["preparing", "submit_started", "submit_ambiguous", "submitted", "ended"]
@@ -120,6 +128,12 @@ class SeedIds:
     # every `propose_queries` and `extract_profile` call of the purgeable version, in id order
     purgeable_call_ids: tuple[int, ...] = ()
     ready_export_id: int = 0
+    # Task 15: the source purge's jobs (module docstring)
+    adzuna_only_job_ids: tuple[int, ...] = ()  # every job whose only postings are Adzuna's
+    adzuna_merge_root_id: int = 0  # Adzuna-only, `adzuna_merged_job_id` merged into it
+    adzuna_merged_job_id: int = 0
+    golden_job_id: int = 0  # the active golden case's job (the case draws on Adzuna)
+    batched_job_ids: tuple[int, ...] = ()  # the jobs of the live submission's `in_batch` targets
 
 
 @dataclass(frozen=True)
@@ -990,6 +1004,7 @@ async def _posting(
             "list_item_sha256": s.uniq("list-item"),
         },
     )
+    seen = normalized(native_id)  # a whole posting, so a source purge can rebuild the job from it (Task 15)
     observation = await s.row(
         "posting_observations",
         {
@@ -998,10 +1013,10 @@ async def _posting(
             "source_instance_id": instance,
             "raw_response_sha256": s.uniq("response"),
             "observed_at": s.at(),
-            "normalized": {},
+            "normalized": seen.model_dump(mode="json"),
             "content_hash": s.uniq("content"),
-            "completeness": "full",
-            "quality": "ok",
+            "completeness": seen.description_completeness,
+            "quality": seen.description_quality,
         },
     )
     await s.update("UPDATE postings SET latest_observation_id = :o WHERE id = :p", o=observation, p=posting)
@@ -1475,6 +1490,26 @@ async def seed_two_year_old_graph(
             casts={"reasons": "text[]"},
             returning=False,
         )
+
+    # Task 15: an Adzuna-only job with a job merged into it (the merge event names both), each revision
+    # drawing on Adzuna (lineage)
+    adzuna_root = await _job(s, "adzuna-root", availability="active")
+    adzuna_merged = await _job(s, "adzuna-merged", availability="active", merged_into=adzuna_root.id)
+    p_root, o_root = await _posting(s, adzuna_root, coll.adzuna_instance, "seed-adz-5", availability="active")
+    await _key(s, AdKey("adzuna", "seed-adz-5"), adzuna_root, [(p_root, o_root, 30)])
+    for revision in (adzuna_root.current, adzuna_merged.current):  # the merged job's posting moved
+        await s.row(
+            "job_revision_sources",
+            {
+                "job_revision_id": revision,
+                "field": "title",
+                "source_id": "adzuna",
+                "posting_id": p_root,
+                "observation_id": o_root,
+            },
+            returning=False,
+        )
+    await _event(s, "strong_key_merge", adzuna_merged, adzuna_root, 45)
 
     # user actions, the older tombstone, the group, merges, decisions, conflicts
     await _actions(s, closed, seen_at=s.at(60), hidden_at=s.at(120), note="Erfundene Notiz.")
@@ -1956,4 +1991,9 @@ async def seed_two_year_old_graph(
         in_flight_call_id=purgeable.in_flight,
         purgeable_call_ids=tuple(sorted(purgeable.calls)),
         ready_export_id=ready,
+        adzuna_only_job_ids=tuple(sorted((active_job.id, other.id, adzuna_root.id))),
+        adzuna_merge_root_id=adzuna_root.id,
+        adzuna_merged_job_id=adzuna_merged.id,
+        golden_job_id=golden.id,
+        batched_job_ids=tuple(job.id for job in batched),
     )

@@ -100,6 +100,15 @@ of step 10: the one place it leaves the schedule), each settled (`settle_for_pur
 released, a `dispatched` one `ambiguous`), then the cases deleted (`golden.delete_case`). A case gone
 already is skipped. It returns the ids it deleted.
 
+**Eval calls** (M5 Task 15: the Adzuna purge's eval calls whose `input_refs` name a tainted revision and that
+no golden case's deletion takes). `settle_and_delete_calls(conn, call_ids, *, now)` follows the same sequence
+in the caller's transaction: the calls' entries still `reserved` or `dispatched` read, their accounts locked
+(`spend_ledger.lock_for_purge`, steps 6 and 7), the calls `FOR UPDATE` in id order (step 10), the entries read
+again under them (the accounts of a new one taken after step 10, as for the cases) and settled
+(`settle_for_purge`), then the calls deleted. The eval run's late `settle` of such a call finds its ledger row
+alone, settled already (`llm_settle_call_purged`), and its dispatch marker finds no call (`FencedOut`). A call
+gone already is skipped; it returns the ids it deleted.
+
 **Job-graph deletion** (M5 Task 13; §20.2's tombstoning steps 4-7, Deviation 50). `delete_job_graph(conn,
 job_id, *, write_tombstone, held, now) -> JobGraphDeleted` is the one complete cleanup before a job goes,
 which job tombstoning (`write_tombstone=True`), the Adzuna purge and delete-everything (`False`) share. It
@@ -148,6 +157,12 @@ own (`purge_target_set`): a job of G it does not hold, or a target of G left (by
 `det_results`, `llm_results` and the targets went with the targets; `score_feedback` keeps its row with the
 job and revision NULL (`ON DELETE SET NULL`). `ranking.bump` is the caller's, last.
 
+`purge_job_graph(run, root, graph, *, write_tombstone)` runs it as a purge does (Deviation 50; the Adzuna
+purge and delete-everything, M5 Tasks 15 and 16): the graph's targets in `PurgeRun.chunk(job_ids=graph)`
+transactions of at most `TARGET_SET_CHUNK` targets each (`purge_target_set`), until a chunk finds fewer, then
+one `PurgeRun.chunk(job_ids=graph, with_groups_of=graph)` that runs `delete_job_graph`; each chunk bumps the
+ranking last.
+
 Ids, counts and states only reach a log line.
 """
 
@@ -160,6 +175,7 @@ from sqlalchemy import TextClause
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition_where
 from jobhunter.dedup import groups
@@ -461,6 +477,40 @@ async def settle_and_delete_cases(
     return tuple(present)
 
 
+# ---- eval calls (M5 Task 15) -------------------------------------------------------------------------------
+
+# The entries of the calls that a reader could still settle: `reserved` or `dispatched`.
+_CALL_ENTRIES: Final = q(
+    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.id = ANY(CAST(:calls AS bigint[])) AND l.state IN ('reserved', 'dispatched') ORDER BY l.id"
+)
+_LOCK_CALLS: Final = q(
+    "SELECT id FROM llm_calls WHERE id = ANY(CAST(:calls AS bigint[])) ORDER BY id FOR UPDATE"
+)
+_DELETE_CALLS: Final = q("DELETE FROM llm_calls WHERE id = ANY(CAST(:calls AS bigint[]))")
+
+
+async def settle_and_delete_calls(
+    conn: AsyncConnection, call_ids: Sequence[int], *, now: datetime
+) -> tuple[int, ...]:
+    """Delete the eval calls `call_ids` that no golden case's deletion takes (the Adzuna purge's calls naming
+    a tainted revision), their entries still `reserved` or `dispatched` settled first (module docstring,
+    "Eval calls"), in the caller's transaction. The ids deleted (a call gone already is skipped)."""
+    ids = sorted(set(call_ids))
+    if not ids:
+        return ()
+    entries = await _ids(conn, _CALL_ENTRIES, {"calls": ids})
+    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
+    present = await _ids(conn, _LOCK_CALLS, {"calls": ids})  # step 10
+    current = await _ids(conn, _CALL_ENTRIES, {"calls": present}) if present else []
+    if not set(current) <= set(entries):  # an entry reserved after the first read
+        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
+    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+    if present:
+        await conn.execute(_DELETE_CALLS, {"calls": present})
+    return tuple(present)
+
+
 # ---- the job graph (M5 Task 13) ----------------------------------------------------------------------------
 
 _JOBS: Final = "CAST(:jobs AS bigint[])"
@@ -646,4 +696,40 @@ async def delete_job_graph(
         identity_conflicts=conflicts,
         tombstone_id=tombstone_id,
     )
+    return deleted
+
+
+# The targets of a job graph (by job or by revision), `TARGET_SET_CHUNK` at a time in id order.
+_GRAPH_TARGET_PAGE: Final = q(
+    f"SELECT id FROM score_targets WHERE job_id = ANY({_JOBS}) "  # noqa: S608
+    f"OR job_revision_id IN (SELECT id FROM job_revisions WHERE job_id = ANY({_JOBS})) "
+    "ORDER BY id LIMIT :limit"
+)
+
+
+async def purge_job_graph(
+    run: "PurgeRun", root: int, graph: Sequence[int], *, write_tombstone: bool
+) -> JobGraphDeleted:
+    """The job-graph deletion as a purge runs it (module docstring, "Job-graph deletion", Deviation 50):
+    the graph's targets in chunks of their own (`run.chunk(job_ids=graph)`, at most `TARGET_SET_CHUNK` a
+    transaction, `purge_target_set`) until a chunk finds fewer, then one graph chunk that holds the graph and
+    every co-member of its groups (`run.chunk(job_ids=graph, with_groups_of=graph)`) and runs
+    `delete_job_graph` for `root`; each chunk bumps the ranking last. The fence over the graph keeps its
+    targets closed, so the pages need no bound of their own (Ruling T13-3). Every chunk is idempotent."""
+    jobs = sorted(set(graph))
+    while True:
+        async with run.chunk(job_ids=jobs) as chunk:
+            params = {"jobs": jobs, "limit": targets.TARGET_SET_CHUNK}
+            page = await _ids(chunk.conn, _GRAPH_TARGET_PAGE, params)
+            if page:
+                await purge_target_set(chunk.conn, page, manifest_id=run.manifest.id, now=run.now)
+                await ranking.bump(chunk.conn)
+        if len(page) < targets.TARGET_SET_CHUNK:
+            break
+    async with run.chunk(job_ids=jobs, with_groups_of=jobs) as chunk:
+        deleted = await delete_job_graph(
+            chunk.conn, root, write_tombstone=write_tombstone, held=chunk.held, now=run.now
+        )
+        if deleted.job_ids:
+            await ranking.bump(chunk.conn)
     return deleted
