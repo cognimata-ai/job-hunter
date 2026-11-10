@@ -22,10 +22,16 @@ name: jobhunter-dev
 x-app-build: &app-build
   context: ..
   dockerfile: Dockerfile
+  # The app image is the `runtime` stage: the Dockerfile's last stage is `backup` (M5 Task 10), which a build
+  # without a target would produce.
+  target: runtime
   args:
     PYTHON_IMAGE: "${python:?}"
     UV_IMAGE: "${uv:?}"
     NODE_IMAGE: "${node:?}" # the stage that builds the SPA (M4 Task 19)
+    # The backup stage's sources (M5 Task 10): every FROM of the Dockerfile needs its image, built or not.
+    RESTIC_IMAGE: "${restic:?}"
+    PGVECTOR_IMAGE: "${pgvector:?}"
   # Optional: a CA bundle for the package downloads of the build, for hosts behind a TLS-intercepting proxy
   # (SSL_CERT_FILE of the calling shell; empty when unset). Mounted for the RUN steps only, never in a layer.
   secrets: [build_ca]
@@ -197,6 +203,34 @@ services:
     pids_limit: 16
     restart: unless-stopped
 
+  # The deletion-manifest shipper (spec §19.5 step 5; M5 Task 10, D19, Deviation 28), on demand only: the dev
+  # and E2E stacks have no backup container, so a deletion shows "confirmed offsite" once this has run:
+  #
+  #   $DC run --rm shipper jobhunter backup init   # once, for a new restic_repo volume
+  #   $DC run --rm shipper                         # ship the manifests written since
+  #
+  # Its repository is the local restic_repo volume (no S3 on the dev disk); restic's cache and the file list live
+  # on backup_staging. Both mount points are 10001:10001 0700 in the backup image, so a new volume is writable.
+  shipper:
+    <<: *app
+    image: jobhunter-backup:dev
+    build:
+      <<: *app-build
+      target: backup
+    profiles: [shipper]
+    command: ["jobhunter", "backup", "ship"]
+    restart: "no"
+    environment:
+      <<: *app-env
+      RESTIC_REPOSITORY: /data/restic-repo
+    secrets: [db_backup, db_restore, restic_password]
+    volumes:
+      - manifests:/data/manifests:ro
+      - restic_repo:/data/restic-repo
+      - backup_staging:/data/staging
+    networks: [internal]
+    depends_on: { migrate: { condition: service_completed_successfully } }
+
   devproxy:
     image: "${caddy:?}"
     # Not in the secrets group and given no secret (§19.2). The image's caddy binary carries the file capability
@@ -235,6 +269,10 @@ volumes:
   # mode 0700 from the app image's /data/manifests and /data/exports
   manifests: {}
   exports: {}
+  # M5 Task 10: the shipper's local restic repository and its staging (restic's cache, the file list),
+  # 10001:10001, mode 0700 from the backup image's /data/restic-repo and /data/staging
+  restic_repo: {}
+  backup_staging: {}
   # RAM only, so a decrypted CV never reaches a disk (§12.2); the setgid root (2770, group 10011) gives every
   # per-job directory the group that both the worker and docparse hold.
   parse_jobs:
@@ -250,5 +288,6 @@ secrets:
   db_backup: { file: ../.secrets/dev/db_backup }
   db_restore: { file: ../.secrets/dev/db_restore }
   pg_bootstrap: { file: ../.secrets/dev/pg_bootstrap }
+  restic_password: { file: ../.secrets/dev/restic_password }
   anthropic_key: { file: ../.secrets/dev/anthropic_key }
   build_ca: { file: "${SSL_CERT_FILE:-/dev/null}" }

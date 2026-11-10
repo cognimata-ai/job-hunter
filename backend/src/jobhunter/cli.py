@@ -66,6 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_golden_commands(commands)
     _add_eval_commands(commands)
     _add_ops_commands(commands)
+    _add_backup_commands(commands)
     return parser
 
 
@@ -182,6 +183,20 @@ def _add_ops_commands(commands: "argparse._SubParsersAction[argparse.ArgumentPar
         type=_interval_hours,
         metavar="N",
         help="the period to apply when no database is reachable (before it exists), 1 to 168",
+    )
+
+
+def _add_backup_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    backup = commands.add_parser(
+        "backup", help="the backup container's jobs (§19.5), as the backup role; never print a secret"
+    )
+    backup_commands = backup.add_subparsers(dest="backup_command", required=True)
+    backup_commands.add_parser(
+        "init",
+        help='initialise the restic repository unless it exists; print {"created": true|false} (run once)',
+    )
+    backup_commands.add_parser(
+        "ship", help="ship the deletion manifests to the restic repository unless they are unchanged"
     )
 
 
@@ -302,6 +317,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_ops import run_ops_command
 
         return run_ops_command(args)
+    if args.command == "backup":
+        # Imported here: the backup commands need the restic wrapper, the shipper and the database layer.
+        from jobhunter.cli_backup import run_backup_command
+
+        return run_backup_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

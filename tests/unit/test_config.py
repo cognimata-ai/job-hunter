@@ -11,6 +11,7 @@ from jobhunter.config import (
     ALL_SECRETS,
     ROLE_SECRETS,
     AppConfig,
+    ResticSettings,
     Role,
     StartupCheckFailed,
     load_config,
@@ -796,6 +797,56 @@ def test_manifests_and_exports_dirs_default_to_the_volumes_and_follow_the_enviro
     }
     cfg = load_config("worker", env, secrets)
     assert (cfg.manifests_dir, cfg.exports_dir) == (tmp_path / "manifests", tmp_path / "exports")
+
+
+# --- M5 Task 10: the backup container's staging directory and restic repository ----------------------------
+
+BACKUP_SECRETS = {"db_backup": b"b", "db_restore": b"r", "restic_password": b"p"}
+
+
+def test_staging_dir_and_restic_default_to_the_volume_and_no_repository(tmp_path: Path) -> None:
+    cfg = load_config("backup", BASE_ENV, write_secrets(tmp_path / "s", **BACKUP_SECRETS))
+    assert (cfg.staging_dir, cfg.restic) == (Path("/data/staging"), None)
+    # An empty repository variable is no repository either.
+    empty = load_config("backup", {**BASE_ENV, "RESTIC_REPOSITORY": ""}, tmp_path / "s")
+    assert empty.restic is None
+
+
+def test_restic_settings_follow_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **BACKUP_SECRETS)
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_STAGING_DIR": str(tmp_path / "staging"),
+        "RESTIC_REPOSITORY": "s3:https://s3.example.test/bucket",
+        "AWS_DEFAULT_REGION": "eu-central-1",
+    }
+    cfg = load_config("backup", env, secrets)
+    assert cfg.staging_dir == tmp_path / "staging"
+    assert cfg.restic == ResticSettings(
+        repository="s3:https://s3.example.test/bucket",
+        region="eu-central-1",
+        cache_dir=tmp_path / "staging" / ".restic-cache",  # the cache lives in the staging volume by default
+    )
+    elsewhere = load_config(
+        "restore",
+        {**env, "AWS_DEFAULT_REGION": "", "RESTIC_CACHE_DIR": str(tmp_path / "cache")},
+        write_secrets(tmp_path / "r", db_migrator=b"m", restic_password=b"p"),
+    )
+    assert elsewhere.restic == ResticSettings("s3:https://s3.example.test/bucket", None, tmp_path / "cache")
+
+
+def test_environ_keeps_restic_and_the_region_but_never_an_s3_key(tmp_path: Path) -> None:
+    env = {
+        **BASE_ENV,
+        "RESTIC_REPOSITORY": "/data/restic-repo",
+        "RESTIC_CACHE_DIR": "/var/cache/restic",
+        "AWS_DEFAULT_REGION": "eu-central-1",
+        # The S3 keys come from the secret files only (R13): never loaded from the environment.
+        "AWS_ACCESS_KEY_ID": "AKIDNOTAKEY",
+        "AWS_SECRET_ACCESS_KEY": "not-a-secret",
+    }
+    cfg = load_config("backup", env, write_secrets(tmp_path / "s", **BACKUP_SECRETS))
+    assert set(cfg.environ) == set(BASE_ENV) | {"RESTIC_REPOSITORY", "RESTIC_CACHE_DIR", "AWS_DEFAULT_REGION"}
 
 
 # --- M4 Task 19: the built SPA the api serves (`JOBHUNTER_SPA_DIR`) ---------------------------------------

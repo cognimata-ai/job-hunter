@@ -4,10 +4,15 @@
 # into /opt/venv, and the built SPA in /opt/spa, which the api serves (M4 Task 19). The runtime stage holds no
 # source tree, no Node runtime and no node_modules, and runs as 10001:10001 (spec §19.1, §19.2).
 #
-# PYTHON_IMAGE, UV_IMAGE and NODE_IMAGE are the digest-pinned references of deploy/images.lock; the compose
-# files pass them.
-# BuildKit does not expand variables in `COPY --from`, so the uv image becomes a named stage. `--locked` fails the
-# build when uv.lock no longer matches pyproject.toml (`--frozen` would install the stale lock silently).
+# The backup image (M5 Task 10, Deviation 29: the backup and restore roles) is the `backup` stage, the last
+# one: the runtime plus restic and the PostgreSQL 17 client. A build without a target would produce it, so
+# every build of the app image names `target: runtime`.
+#
+# PYTHON_IMAGE, UV_IMAGE, NODE_IMAGE, RESTIC_IMAGE and PGVECTOR_IMAGE are the digest-pinned references of
+# deploy/images.lock; the compose files pass them.
+# BuildKit does not expand variables in `COPY --from`, so the uv, restic and pgvector images become named
+# stages. `--locked` fails the build when uv.lock no longer matches pyproject.toml (`--frozen` would install
+# the stale lock silently).
 #
 # The optional build secret `build_ca` is a CA bundle for the build steps that reach the package index, for
 # hosts whose outbound HTTPS goes through a TLS-intercepting proxy. It is mounted for those RUN steps only and
@@ -16,7 +21,13 @@
 ARG PYTHON_IMAGE
 ARG UV_IMAGE
 ARG NODE_IMAGE
+ARG RESTIC_IMAGE
+ARG PGVECTOR_IMAGE
 FROM ${UV_IMAGE} AS uv
+# The sources of the backup stage only: restic's static binary, and the PostgreSQL client of the server's own
+# build (no download; the client and the server are one build).
+FROM ${RESTIC_IMAGE} AS restic
+FROM ${PGVECTOR_IMAGE} AS pgclient
 
 # The SPA (frontend/): only its `dist` leaves this stage.
 FROM ${NODE_IMAGE} AS spa
@@ -53,4 +64,27 @@ RUN mkdir -p /data/cv /data/manifests /data/exports \
     && chmod 0700 /data/cv /data/manifests /data/exports
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1
 WORKDIR /
+USER 10001:10001
+
+# The backup and restore roles' image (M5 Task 10, Deviation 29): restic 0.19.1, and pg_dump, pg_restore and
+# psql with the nine libraries of theirs the runtime lacks (libpq and its Kerberos, LDAP and SASL
+# dependencies, each with its versioned target), registered with the dynamic linker. Root for the copies and
+# ldconfig, then the app user again. The mount points of the backup_staging volume and of the dev shipper's
+# local restic repository are made 10001:10001 0700 as the runtime's are: a fresh named volume takes their
+# owner and mode, so `restic init` as 10001 can write the repository.
+FROM runtime AS backup
+USER root
+COPY --from=restic /usr/bin/restic /usr/local/bin/restic
+COPY --from=pgclient /usr/lib/postgresql/17/bin/pg_dump /usr/lib/postgresql/17/bin/pg_restore \
+    /usr/lib/postgresql/17/bin/psql /opt/pgclient/bin/
+COPY --from=pgclient /usr/lib/x86_64-linux-gnu/libpq.so.5* /usr/lib/x86_64-linux-gnu/libgssapi_krb5.so.2* \
+    /usr/lib/x86_64-linux-gnu/libldap-2.5.so.0* /usr/lib/x86_64-linux-gnu/libkrb5.so.3* \
+    /usr/lib/x86_64-linux-gnu/libk5crypto.so.3* /usr/lib/x86_64-linux-gnu/libkrb5support.so.0* \
+    /usr/lib/x86_64-linux-gnu/liblber-2.5.so.0* /usr/lib/x86_64-linux-gnu/libsasl2.so.2* \
+    /usr/lib/x86_64-linux-gnu/libkeyutils.so.1* /opt/pgclient/lib/
+RUN echo /opt/pgclient/lib > /etc/ld.so.conf.d/pgclient.conf \
+    && ldconfig \
+    && mkdir -p /data/staging /data/restic-repo \
+    && chown 10001:10001 /data/staging /data/restic-repo \
+    && chmod 0700 /data/staging /data/restic-repo
 USER 10001:10001

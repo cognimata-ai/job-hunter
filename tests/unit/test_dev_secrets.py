@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "dev-secrets.sh"
-B64_SECRETS = ("session_secret", "data_key")
+B64_SECRETS = ("session_secret", "data_key", "restic_password")  # restic_password: the shipper (M5 Task 10)
 PASSWORDS = ("pg_bootstrap", "db_app", "db_migrator", "db_backup", "db_restore")
 NAMES = (*B64_SECRETS, *PASSWORDS, "anthropic_key")
 KEY_VARIABLE = "JOBHUNTER_ANTHROPIC_API_KEY"

@@ -33,7 +33,9 @@ from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
 from jobhunter.secret_names import SECRET_NAMES
 
-Role = Literal["api", "worker", "migrate"]
+Role = Literal["api", "worker", "migrate", "backup", "restore"]
+# M5 Task 10 (R4, Deviation 37): the database login of a DSN; `AppConfig.dsn` picks the role's own by default.
+DbRole = Literal["app", "migrator", "backup", "restore"]
 EnvName = Literal["prod", "dev", "test"]
 
 STARTUP_FAILED_EXIT_CODE: Final = 78
@@ -57,12 +59,18 @@ DEFAULT_SPA_DIR: Final = Path("/opt/spa")
 # encrypted export archives (§20.3: the worker writes them, the api serves them).
 DEFAULT_MANIFESTS_DIR: Final = Path("/data/manifests")
 DEFAULT_EXPORTS_DIR: Final = Path("/data/exports")
+# M5 Task 10 (Deviation 29): the backup container's `backup_staging` volume, where the backup and restore jobs
+# stage what they back up or restore (Tasks 24 and 26), and the default home of restic's cache.
+DEFAULT_STAGING_DIR: Final = Path("/data/staging")
+RESTIC_CACHE_DIR_NAME: Final = ".restic-cache"
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
-ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
-# M5 (plan Task 4, spec §19.2 L6167-6168): the two names without a prefix that the worker reads as well, the
-# ntfy topic of the alert dispatcher and the healthchecks Management API base (§17.7).
-ENV_NAMES: Final = ("NTFY_TOPIC_URL", "HEALTHCHECKS_API_URL")
+# M5 Task 10: `RESTIC_` for the backup and restore roles' repository and cache (`ResticSettings`).
+ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_", "RESTIC_")
+# M5 (plan Task 4, spec §19.2 L6167-6168): the names without a prefix that the worker reads as well, the ntfy
+# topic of the alert dispatcher and the healthchecks Management API base (§17.7); and (Task 10) the S3 region
+# of the backup and restore roles. The S3 keys themselves are secret files, never environment variables (R13).
+ENV_NAMES: Final = ("NTFY_TOPIC_URL", "HEALTHCHECKS_API_URL", "AWS_DEFAULT_REGION")
 DEFAULT_HEALTHCHECKS_API_URL: Final = "https://healthchecks.io/api/v3"
 _TRACING_VARS: Final = (
     "LANGSMITH_TRACING",
@@ -144,8 +152,33 @@ ROLE_SECRETS: Final[Mapping[Role, RoleSecrets]] = MappingProxyType(
             ),
         ),
         "migrate": RoleSecrets(required=frozenset({"db_migrator"}), optional=frozenset()),
+        # M5 Task 10 (R4, Deviation 37): the backup container dumps as the backup role and restore-tests as
+        # the restore role; a disaster restore loads as the migrator. An `s3:` repository needs both S3 keys
+        # (`restic_s3_credentials`); the dev shipper's local repository needs none.
+        "backup": RoleSecrets(
+            required=frozenset({"db_backup", "db_restore", "restic_password"}),
+            optional=frozenset({"s3_access_key_id", "s3_secret_access_key"}),
+        ),
+        "restore": RoleSecrets(
+            required=frozenset({"db_migrator", "restic_password"}),
+            optional=frozenset({"s3_access_key_id", "s3_secret_access_key"}),
+        ),
     }
 )
+# The login of each database role (§7.1: user name and its password's secret file), and the one a role's DSN
+# uses unless it names another: a disaster restore loads the dump as the migrator, which owns the schema.
+_DB_LOGINS: Final[Mapping[DbRole, tuple[str, str]]] = MappingProxyType(
+    {
+        "app": ("jobhunter_app", "db_app"),
+        "migrator": ("jobhunter_migrator", "db_migrator"),
+        "backup": ("jobhunter_backup", "db_backup"),
+        "restore": ("jobhunter_restore", "db_restore"),
+    }
+)
+DEFAULT_DB_ROLES: Final[Mapping[Role, DbRole]] = MappingProxyType(
+    {"api": "app", "worker": "app", "migrate": "migrator", "backup": "backup", "restore": "migrator"}
+)
+_S3_SECRETS: Final = ("s3_access_key_id", "s3_secret_access_key")
 
 
 class StartupCheckFailed(Exception):
@@ -165,6 +198,17 @@ class DbSettings:
     host: str
     port: int
     name: str
+
+
+@dataclass(frozen=True)
+class ResticSettings:
+    """M5 Task 10: the restic repository of the backup and restore roles (`RESTIC_REPOSITORY`: a local path,
+    or `s3:<endpoint>/<bucket>`), its S3 region (`AWS_DEFAULT_REGION`, `None` when unset or empty) and
+    restic's cache directory (`RESTIC_CACHE_DIR`, default `<staging_dir>/.restic-cache`)."""
+
+    repository: str
+    region: str | None
+    cache_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +244,10 @@ class AppConfig:
     # manifests' files, and `JOBHUNTER_EXPORTS_DIR`, where the export archives are kept.
     manifests_dir: Path
     exports_dir: Path
+    # M5 Task 10: `JOBHUNTER_STAGING_DIR`, the backup and restore jobs' staging directory (every staging path
+    # of Tasks 24 and 26 is under it), and the restic repository (`None` without `RESTIC_REPOSITORY`).
+    staging_dir: Path
+    restic: ResticSettings | None
     # M5 Task 4: `NTFY_TOPIC_URL`, the topic the worker's alert dispatcher pushes to (`None` when unset or
     # empty: no push; a prod worker needs an https one, `ntfy_in_prod`), registered for log masking by
     # `startup_or_exit`; and `HEALTHCHECKS_API_URL`, the Management API base of §17.7.
@@ -223,13 +271,20 @@ class AppConfig:
             raise ValueError(f"secret {name!r} is not valid base64")
         return decoded
 
-    def dsn(self, driver: Literal["sqlalchemy", "psycopg"]) -> str:
-        user, secret_name = (
-            ("jobhunter_migrator", "db_migrator") if self.role == "migrate" else ("jobhunter_app", "db_app")
-        )
+    def dsn(
+        self,
+        driver: Literal["sqlalchemy", "psycopg"],
+        *,
+        db_role: DbRole | None = None,
+        database: str | None = None,
+    ) -> str:
+        """The DSN of `db_role` (default: the role's own, `DEFAULT_DB_ROLES`) on `database` (default:
+        `JOBHUNTER_DB_NAME`), with the password of that role's secret file."""
+        user, secret_name = _DB_LOGINS[DEFAULT_DB_ROLES[self.role] if db_role is None else db_role]
         password = quote(self.secret(secret_name), safe="")
         scheme = "postgresql+psycopg" if driver == "sqlalchemy" else "postgresql"
-        return f"{scheme}://{user}:{password}@{self.db.host}:{self.db.port}/{quote(self.db.name, safe='')}"
+        name = quote(self.db.name if database is None else database, safe="")
+        return f"{scheme}://{user}:{password}@{self.db.host}:{self.db.port}/{name}"
 
 
 def _decode_b64(raw: bytes) -> bytes | None:
@@ -280,6 +335,18 @@ def _parse_db_settings(environ: Mapping[str, str]) -> DbSettings:
     return DbSettings(host=environ.get("JOBHUNTER_DB_HOST") or "postgres", port=int(port_text), name=name)
 
 
+def _restic_settings(environ: Mapping[str, str], staging_dir: Path) -> ResticSettings | None:
+    repository = environ.get("RESTIC_REPOSITORY")
+    if not repository:
+        return None
+    cache_dir = environ.get("RESTIC_CACHE_DIR")
+    return ResticSettings(
+        repository=repository,
+        region=environ.get("AWS_DEFAULT_REGION") or None,
+        cache_dir=Path(cache_dir) if cache_dir else staging_dir / RESTIC_CACHE_DIR_NAME,
+    )
+
+
 def load_config(
     role: Role,
     environ: Mapping[str, str] | None = None,
@@ -289,7 +356,7 @@ def load_config(
 
     The secrets directory is `secrets_dir`, else `JOBHUNTER_SECRETS_DIR`, else `/run/secrets`; the same
     validation applies to every directory. Of the environment it keeps the names with one of `ENV_PREFIXES`,
-    and the two of `ENV_NAMES`.
+    and those of `ENV_NAMES`.
     """
     source = os.environ if environ is None else environ
     env = {k: v for k, v in source.items() if k.startswith(ENV_PREFIXES) or k in ENV_NAMES}
@@ -304,6 +371,7 @@ def load_config(
     contents, modes, unreadable = _read_secret_files(secrets_dir)
     optional = ROLE_SECRETS[role].optional
     contents = {name: value for name, value in contents.items() if value or name not in optional}
+    staging_dir = Path(env.get("JOBHUNTER_STAGING_DIR") or DEFAULT_STAGING_DIR)
 
     return AppConfig(
         role=role,
@@ -326,6 +394,8 @@ def load_config(
         spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
         manifests_dir=Path(env.get("JOBHUNTER_MANIFESTS_DIR") or DEFAULT_MANIFESTS_DIR),
         exports_dir=Path(env.get("JOBHUNTER_EXPORTS_DIR") or DEFAULT_EXPORTS_DIR),
+        staging_dir=staging_dir,
+        restic=_restic_settings(env, staging_dir),
         ntfy_topic_url=env.get("NTFY_TOPIC_URL") or None,
         healthchecks_api_url=env.get("HEALTHCHECKS_API_URL") or DEFAULT_HEALTHCHECKS_API_URL,
         secrets=MappingProxyType(contents),
@@ -353,6 +423,18 @@ def _check_secret_files(cfg: AppConfig) -> None:
         raise StartupCheckFailed("secrets_not_world_readable", _names(world_readable))
     if foreign := (set(cfg.secrets) | cfg.unreadable_secrets) - allowed:
         raise StartupCheckFailed("foreign_secret_mounted", _names(foreign))
+
+
+def _check_restic_s3_credentials(cfg: AppConfig) -> None:
+    """M5 Task 10 (R4, Deviation 37): the backup and restore roles reach an `s3:` repository with both S3
+    keys, which restic gets in its environment from the secret files (`restic_s3_credentials`). The detail
+    names the missing secrets, never a value or the repository."""
+    if cfg.role not in ("backup", "restore") or cfg.restic is None:
+        return
+    if not cfg.restic.repository.startswith("s3:"):
+        return
+    if absent := [name for name in _S3_SECRETS if not cfg.secrets.get(name)]:
+        raise StartupCheckFailed("restic_s3_credentials", f"an s3: repository needs {', '.join(absent)}")
 
 
 def _check_key_material(cfg: AppConfig) -> None:
@@ -547,6 +629,8 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     env = cfg.environ
 
     _check_secret_files(cfg)
+    # Right after (M5 Task 10): the secrets an `s3:` repository needs, which the role table cannot require.
+    _check_restic_s3_credentials(cfg)
 
     if "LANGSMITH_GATEWAY" in env:
         raise StartupCheckFailed("langsmith_gateway_set", "LANGSMITH_GATEWAY must not be set")
