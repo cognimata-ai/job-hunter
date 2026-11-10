@@ -150,9 +150,10 @@ the items after. `cancel_batched(conn, *, submission_ids, reason)` is the same m
 of the given submissions.
 
 **Target-set deletion** (§20.2 L6369-6378; Task 23, Rulings P8, P52, Carries T10-f, T13-a, T16-c).
-`delete_target_set(conn, target_ids, *, now) -> int` deletes a set T of at most `TARGET_SET_CHUNK` (200)
-targets with every row they own, in the caller's transaction (the score-history retention's chunk, which holds
-`active_config FOR SHARE`; M5's purges reuse it), and returns how many targets it deleted. It is a non-owner
+`delete_target_set(conn, target_ids, *, now, on_cancelled=None) -> int` deletes a set T of at most
+`TARGET_SET_CHUNK` (200) targets with every row they own, in the caller's transaction (the score-history
+retention's chunk, which holds `active_config FOR SHARE`; M5's purges reuse it, through
+`privacy.deletion_graph.purge_target_set`), and returns how many targets it deleted. It is a non-owner
 mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_targets`, step 7), then T's rows
 `FOR UPDATE` in id order (step 10), before the attempts (T16-c); then the nine steps:
 1. `cancel_targets(target_ids=T, reason='purged')`: every target of T that is neither published nor
@@ -160,8 +161,10 @@ mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_tar
    `cancelled` (T10-f); an `in_batch` one is cancelled individually, as a merge cancels it (L3979, Ruling P8):
    its `batch_submission_id` cleared, its attempt `cancelled`, the submission untouched; each cancelled
    target's follow-up hold is given back once. S:L6370's "the submission's cancel is requested first"
-   disagrees with S:L3979; M5, whose purges are the callers that meet `in_batch` targets (the retention
-   deletes terminal ones only), decides it for purges;
+   and S:L3979 both hold for M5's purges, the callers that meet `in_batch` targets (the retention deletes
+   terminal ones only; M5 Task 11, Deviation 13): `privacy.deletion_graph.purge_target_set` records the
+   submission's cancel and leaves the evidence of the deleted items before it calls this, which cancels the
+   purged targets individually; the batch's other targets stay `in_batch`;
 2. `resume_draft_id := NULL` on T;
 3. the `result_evidence` and `det_results` (every instance, superseded or current) of T's results; the
    `score_feedback` and `golden_cases.labelled_from_result_id` references become NULL by their foreign keys;
@@ -172,6 +175,9 @@ mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_tar
 7. the `batch_items` of T with their `llm_calls` (a deferred pair), then every other `llm_calls` row of T's
    attempts; the spend ledger rows stay;
 8. the `score_attempts` of T; 9. T itself.
+A caller's `on_cancelled(conn)` hook runs between step 2 and step 3: a purge settles there the online spend
+entries whose calls step 7 deletes (`spend_ledger.settle_for_purge`), once step 1 has cancelled their targets,
+so no dispatch marker of theirs can commit any more (M5 Task 11, `privacy.deletion_graph`).
 Step 7 is the schedule's exception: it writes `llm_calls` rows (step 9 of the lock schedule) after rows of
 step 10 (T, its drafts and critic notes, its items), an order the foreign keys force (a draft and a critic
 note reference their call, an item and its call each other), which the spec's steps follow. For the retention
@@ -224,7 +230,7 @@ Ids, counts, codes and amounts only reach a log line.
 """
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR
@@ -1340,9 +1346,16 @@ _SET_DELETES: Final = (
 )
 
 
-async def delete_target_set(conn: AsyncConnection, target_ids: Sequence[int], *, now: datetime) -> int:
+async def delete_target_set(
+    conn: AsyncConnection,
+    target_ids: Sequence[int],
+    *,
+    now: datetime,
+    on_cancelled: Callable[[AsyncConnection], Awaitable[None]] | None = None,
+) -> int:
     """Delete the targets `target_ids` (at most `TARGET_SET_CHUNK`) and every row they own, in the caller's
-    transaction (module docstring); how many targets it deleted. `ValueError` for a larger set."""
+    transaction (module docstring); how many targets it deleted. `on_cancelled(conn)`, when given, runs after
+    step 2 (the targets cancelled) and before step 3's deletes. `ValueError` for a larger set."""
     ids = sorted(set(target_ids))
     if len(ids) > TARGET_SET_CHUNK:
         raise ValueError(f"a target-set deletion takes at most {TARGET_SET_CHUNK} targets, not {len(ids)}")
@@ -1352,6 +1365,8 @@ async def delete_target_set(conn: AsyncConnection, target_ids: Sequence[int], *,
     await conn.execute(_LOCK_SET, {"ids": ids})  # step 10, in id order, before the attempts (T16-c)
     cancelled = await cancel_targets(conn, target_ids=ids, reason=PURGED, now=now)  # 1
     await conn.execute(_UNRESUME, {"ids": ids})  # 2
+    if on_cancelled is not None:  # a purge settles its online entries here (M5 Task 11)
+        await on_cancelled(conn)
     counts: dict[str, int] = {}
     for name, statement in _SET_DELETES:  # 3 to 9, in order
         counts[name] = (await conn.execute(statement, {"ids": ids})).rowcount

@@ -1,0 +1,227 @@
+"""The purges' deletion graph (spec §20.2, §20.4, §10.10, §7.16.6; plan M5 Task 11, P1, G04, M5-R3, Deviation
+13): what a purge deletes beyond the rows that cascade, and what it settles first. Tasks 12 to 16 (the purge
+kinds) call it from their chunks.
+
+**Target-set deletion** (Task 11). `purge_target_set(conn, target_ids, *, manifest_id, now) -> PurgedTargets`
+deletes a set T of at most `scoring.targets.TARGET_SET_CHUNK` (200) score targets with every row they own
+(`targets.delete_target_set`), for the purge of the deletion manifest `manifest_id`, in the caller's
+transaction. The caller has committed its fence over T's jobs (A0) and holds `active_config FOR SHARE` and the
+job rows `FOR UPDATE` in id order (steps 2 and 4), so no batch-item processing, publication or cancellation
+of T's targets runs meanwhile (each takes a job row first), and no batch preparation batches them
+(`batches.ELIGIBLE_SQL` leaves fenced jobs out). M3's `delete_target_set` alone would delete a batched
+target's item and call while its batch can still return results: its late line then names no item of ours
+(`batch.custom_id_anomaly`) and the submission stays `ended` for good, holding `batch_one_in_flight` (P1); and
+an online try's entry would lose its call unsettled (G04). So, in the lock schedule's order:
+1. the batch submissions that hold an item of T and are still live or released (`batches.IN_FLIGHT`,
+   `released`) `FOR UPDATE` in id order (step 5, their owner rows), then T's items in them, read under those
+   locks;
+2. the accounts of every entry settled below (`spend_ledger.lock_for_purge`: their month rows, then their
+   funded bulk rows) and the bulk rows of T's unreleased follow-up items (`bulk.lock_for_targets`, which
+   `delete_target_set` takes again), steps 6 and 7, before any row of step 10;
+3. each `preparing` submission abandoned (`batches.abandon_preparing`: every entry `not_billed(
+   'never_dispatched')`, its targets `pending`, their attempts `cancelled('batch_abandoned')`; no follow-on),
+   whichever of its targets T holds: the execution that prepared it is fenced at its next step
+   (`submit_start`), so none of its requests is sent;
+4. the cancel recorded (`batches.record_cancel`, sent by the poll after the commit) on each
+   `submit_started`, `submit_ambiguous`, `submitted` or `ended` submission that holds an `in_batch` target of
+   T; `delete_target_set`'s step 1 cancels T's targets individually (`batch_submission_id := NULL`), and the
+   batch's other targets stay `in_batch`: their items come back `canceled` and retry online
+   (`batch_canceled`, M5-R3);
+5. every item of T in such a submission (any but a `preparing` one), whatever its target's state, with its
+   entry `dispatched` → `ambiguous` (`spend_ledger.settle`, counted at its reservation until the month
+   closes; its call, deleted below, `ambiguous` with `PURGED_CODE`): a target cancelled individually out of
+   a running batch (§10.10) leaves its item in flight too. Then every such item still `awaiting` gives its
+   follow-up hold back (`bulk.release_item_hold`): no decision of a deleted item ever will;
+6. one `purged_batch_items (submission_id, custom_id, manifest_id)` row, ids only, for every item of T whose
+   submission can still return results (`submit_started`, `submit_ambiguous`, `submitted`, `ended`,
+   `released`: a release moves its targets out of `in_batch` and settles their entries, yet its batch is
+   still polled or adopted). It is the positive evidence on which the poll skips the item's late line as
+   `purged` (any other line of no item stays foreign) and the adoption keeps the submission's original
+   membership (`scoring.batch_results`, `scoring.batch_adoption`); it goes with its submission;
+7. `delete_target_set(T, on_cancelled=...)`. Its hook runs once its step 1 has cancelled T, so no try of T's
+   can be reserved or dispatched any more (`mark_dispatched` re-checks its owner under the owner lock): T's
+   online entries, those read before step 2 and any its attempts' calls hold now (`reserved` or `dispatched`,
+   not a batch item's), are taken again (`lock_for_purge`, current after the writes above, its locks held
+   already) and settled (`spend_ledger.settle_for_purge`: a `reserved` one released, the counters `-r` and a
+   funded allocation credited; a `dispatched` one `ambiguous`). Every later reader of an online entry joins
+   its call, so one left unsettled when its call goes could never be settled or recovered; the coroutine's
+   late `settle` or `release_never_dispatched` finds it alone, a no-op.
+`delete_target_set` then deletes T with its items and calls; the ledger rows stay. `ranking.bump` is the
+caller's, last. A score attempt reserving a try for a target of T meanwhile holds its target `FOR SHARE` and
+waits for the month row this chunk holds, while the chunk waits for that target: PostgreSQL aborts one of the
+pair, as with every non-owner mover of a target (`targets._cancel`), and either outcome is whole.
+
+Ids, counts and states only reach a log line.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Final
+
+from sqlalchemy import TextClause
+from sqlalchemy.engine import Row
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from jobhunter.db.sql import q
+from jobhunter.llm import bulk, spend_ledger
+from jobhunter.llm.spend_ledger import CallOutcome, PurgeSettled, Reservation
+from jobhunter.observability.logging import get_logger
+from jobhunter.scoring import batches, targets
+
+# The call's code of a batch entry a purge made `ambiguous` (the call then goes with its item).
+PURGED_CODE: Final = "purged"
+LOGGED_IDS: Final = 20  # the target ids a log line names, at most
+# The submissions a purge locks: every one that can still return results, and a `preparing` one.
+_LOCKED_STATES: Final = (*batches.IN_FLIGHT, "released")
+# Those that can still return results: an item of theirs a purge deletes leaves its evidence (step 6).
+_RETURNING: Final = tuple(state for state in _LOCKED_STATES if state != "preparing")
+_SET: Final = "CAST(:ids AS bigint[])"
+_SUBMISSIONS: Final = "CAST(:subs AS bigint[])"
+_SUBMISSIONS_OF_SET: Final = q(
+    f"SELECT DISTINCT submission_id FROM batch_items WHERE target_id = ANY({_SET})"  # noqa: S608
+)
+_LOCK_SUBMISSIONS: Final = q(
+    f"SELECT id, state FROM batch_submissions WHERE id = ANY({_SUBMISSIONS}) "  # noqa: S608
+    "AND state = ANY(CAST(:states AS text[])) ORDER BY id FOR UPDATE"
+)
+# T's items in the locked submissions, with their targets' pins and their entries, in id order.
+_ITEMS_OF_SET: Final = q(
+    "SELECT i.id, i.submission_id, i.decision, i.hold_released_at, t.state AS target_state, "  # noqa: S608
+    "t.batch_submission_id, c.id AS call_id, l.id AS ledger_id, l.state AS entry_state, l.budget_month, "
+    "l.reserved_usd, l.purpose_class, l.model_requested FROM batch_items i "
+    "JOIN score_targets t ON t.id = i.target_id JOIN llm_calls c ON c.id = i.llm_call_id "
+    "JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    f"WHERE i.target_id = ANY({_SET}) AND i.submission_id = ANY({_SUBMISSIONS}) ORDER BY i.id"
+)
+# Every entry of the given submissions' items (a `preparing` one's, which its abandon releases).
+_ENTRIES_OF_SUBMISSIONS: Final = q(
+    "SELECT c.spend_ledger_id FROM batch_items i JOIN llm_calls c ON c.id = i.llm_call_id "  # noqa: S608
+    f"WHERE i.submission_id = ANY({_SUBMISSIONS}) ORDER BY c.spend_ledger_id"
+)
+# T's online entries still unsettled: those of its attempts' calls, never a batch item's.
+_ONLINE_ENTRIES: Final = q(
+    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "  # noqa: S608
+    f"WHERE c.attempt_id IN (SELECT id FROM score_attempts WHERE target_id = ANY({_SET})) "
+    "AND NOT l.batch AND l.state IN ('reserved', 'dispatched') ORDER BY l.id"
+)
+_RECORD_PURGED: Final = q(
+    "INSERT INTO purged_batch_items (submission_id, custom_id, manifest_id) "  # noqa: S608
+    "SELECT i.submission_id, i.custom_id, :manifest FROM batch_items i "
+    f"JOIN batch_submissions s ON s.id = i.submission_id WHERE i.target_id = ANY({_SET}) "
+    "AND s.state = ANY(CAST(:states AS text[])) ORDER BY i.submission_id, i.custom_id"
+)
+
+log = get_logger("jobhunter.privacy.deletion_graph")
+
+
+@dataclass(frozen=True)
+class PurgedTargets:
+    """What `purge_target_set` did: the targets it deleted, the submissions whose cancel it recorded and those
+    it abandoned, the batch entries it made `ambiguous`, and the online entries it released and made
+    `ambiguous`."""
+
+    targets: int
+    submissions_cancel_requested: tuple[int, ...]
+    submissions_abandoned: tuple[int, ...]
+    entries_ambiguous: int
+    online_entries_released: int
+    online_entries_ambiguous: int
+
+
+def _reservation(item: Row[tuple[object, ...]]) -> Reservation:
+    return Reservation(
+        ledger_id=int(item.ledger_id),
+        llm_call_id=int(item.call_id),
+        month=item.budget_month,
+        reserved_usd=item.reserved_usd,
+        purpose_class=item.purpose_class,
+        model=item.model_requested,
+        batch=True,
+    )
+
+
+async def _ids(conn: AsyncConnection, statement: TextClause, params: dict[str, object]) -> list[int]:
+    return [int(i) for i in (await conn.execute(statement, params)).scalars()]
+
+
+async def purge_target_set(
+    conn: AsyncConnection, target_ids: Sequence[int], *, manifest_id: int, now: datetime
+) -> PurgedTargets:
+    """Delete the targets `target_ids` (at most `targets.TARGET_SET_CHUNK`) for the purge of manifest
+    `manifest_id`, settling and recording first what their batches and online tries still hold (module
+    docstring), in the caller's transaction; `ValueError` for a larger set."""
+    ids = sorted(set(target_ids))
+    if len(ids) > targets.TARGET_SET_CHUNK:
+        raise ValueError(f"a purge chunk takes at most {targets.TARGET_SET_CHUNK} targets, not {len(ids)}")
+    if not ids:
+        return PurgedTargets(0, (), (), 0, 0, 0)
+    candidates = await _ids(conn, _SUBMISSIONS_OF_SET, {"ids": ids})
+    locked: dict[int, str] = {}
+    if candidates:  # 1. the owner rows (step 5), then T's items under them
+        params = {"subs": candidates, "states": list(_LOCKED_STATES)}
+        locked = {int(r.id): str(r.state) for r in await conn.execute(_LOCK_SUBMISSIONS, params)}
+    items = (await conn.execute(_ITEMS_OF_SET, {"ids": ids, "subs": list(locked)})).all() if locked else []
+    preparing = sorted(s for s, state in locked.items() if state == "preparing")
+    in_flight = [item for item in items if locked[int(item.submission_id)] != "preparing"]
+    batched = sorted(
+        {
+            int(item.submission_id)
+            for item in in_flight
+            if item.target_state == "in_batch" and item.batch_submission_id == item.submission_id
+        }
+    )
+    online = await _ids(conn, _ONLINE_ENTRIES, {"ids": ids})
+    abandoned_entries = await _ids(conn, _ENTRIES_OF_SUBMISSIONS, {"subs": preparing}) if preparing else []
+    # 2. steps 6 and 7, before any row of step 10
+    entries = [*abandoned_entries, *(int(item.ledger_id) for item in in_flight), *online]
+    await spend_ledger.lock_for_purge(conn, entries, now=now)
+    await bulk.lock_for_targets(conn, ids)
+    for submission_id in preparing:  # 3.
+        await batches.abandon_preparing(conn, submission_id, now=now)
+    requested = tuple(await batches.record_cancel(conn, submission_ids=batched, now=now))  # 4.
+    ambiguous = released_holds = 0
+    call = CallOutcome("ambiguous", error_code=PURGED_CODE)
+    for item in in_flight:  # 5. the month row, the funded bulk row, the ledger rows, the attempt
+        if item.entry_state == "dispatched":
+            await spend_ledger.settle(
+                conn, _reservation(item), outcome="ambiguous", evidence=None, usage=None, call=call, now=now
+            )
+            ambiguous += 1
+    for item in in_flight:  # the bulk row, then the item
+        if item.decision is None and item.hold_released_at is None:
+            await bulk.release_item_hold(conn, item_id=int(item.id))
+            released_holds += 1
+    params = {"ids": ids, "manifest": manifest_id, "states": list(_RETURNING)}
+    recorded = (await conn.execute(_RECORD_PURGED, params)).rowcount  # 6.
+    settled = PurgeSettled(0, 0)
+
+    async def settle_online(cancelled: AsyncConnection) -> None:  # 7., T cancelled
+        nonlocal settled
+        current = sorted({*online, *await _ids(cancelled, _ONLINE_ENTRIES, {"ids": ids})})
+        rows = await spend_ledger.lock_for_purge(cancelled, current, now=now)
+        settled = await spend_ledger.settle_for_purge(cancelled, current, rows, now=now)
+
+    deleted = await targets.delete_target_set(conn, ids, now=now, on_cancelled=settle_online)
+    purged = PurgedTargets(
+        targets=deleted,
+        submissions_cancel_requested=requested,
+        submissions_abandoned=tuple(preparing),
+        entries_ambiguous=ambiguous,
+        online_entries_released=settled.released,
+        online_entries_ambiguous=settled.ambiguous,
+    )
+    log.info(
+        "purge_target_set_deleted",
+        manifest_id=manifest_id,
+        targets=purged.targets,
+        submissions_cancel_requested=list(requested),
+        submissions_abandoned=preparing,
+        entries_ambiguous=ambiguous,
+        holds_released=released_holds,
+        purged_batch_items=recorded,
+        online_entries_released=settled.released,
+        online_entries_ambiguous=settled.ambiguous,
+        target_ids=ids[:LOGGED_IDS],
+    )
+    return purged

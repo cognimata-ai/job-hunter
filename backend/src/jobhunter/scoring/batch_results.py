@@ -38,8 +38,13 @@ consecutive failed passes the item is given up: the critical `batch.item_unproce
 submission, ids only), then the missing-item path in a fresh transaction (when that raises too, the alert
 stays and the next pass tries again); the worker's `FencedOut` and a cancellation propagate. When the stream
 was read to its end, every line named an item of the submission and no item failed, `finalize_results` runs; a
-line naming no item of ours raises the critical `batch.custom_id_anomaly` (with the count of foreign lines;
-the items such a stream lacks are not measured) and completes nothing; a cut stream completes nothing and
+line naming no item of the submission is `purged` when a `purged_batch_items` row names `(submission_id,
+custom_id)` (M5 Task 11, Deviation 13: a purge deleted that item, `privacy.deletion_graph`): skipped, nothing
+stored, accounted for (the completion runs as if it were ours), counted in `PollReport.purged` and logged
+`batch_results_purged`; so is a line whose item a purge deleted during the pass (its processing finds it gone,
+or waited for the purge's job lock), on the same evidence. Any other line naming no item of ours raises the
+critical `batch.custom_id_anomaly` (with the count of foreign lines; the items such a stream lacks are not
+measured) and completes nothing; a cut stream completes nothing and
 decides no item `missing` (L3961): the next poll reads it again, and every item already decided replays its
 stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot validate,
 `BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
@@ -155,6 +160,10 @@ _ENDED: Final = q(
 )
 _STATE_OF: Final = q("SELECT state FROM batch_submissions WHERE id = :s")
 _ITEMS_OF: Final = q("SELECT id, target_id, attempt_no, custom_id FROM batch_items WHERE submission_id = :s")
+# The purge evidence (M5 Task 11, Deviation 13): the custom ids of the submission's items a purge deleted, and
+# whether one line is one of them.
+_PURGED_OF: Final = q("SELECT custom_id FROM purged_batch_items WHERE submission_id = :s")
+_PURGED_LINE: Final = q("SELECT 1 FROM purged_batch_items WHERE submission_id = :s AND custom_id = :c")
 _AWAITING: Final = q(
     "SELECT id, target_id, attempt_no, custom_id FROM batch_items "
     "WHERE submission_id = :s AND processed_at IS NULL ORDER BY id"
@@ -293,11 +302,31 @@ async def items_of(conn: AsyncConnection, submission_id: int) -> dict[str, batch
     }
 
 
+async def purged_custom_ids(conn: AsyncConnection, submission_id: int) -> frozenset[str]:
+    """The `custom_id`s of the submission's items a purge deleted (`purged_batch_items`, M5 Task 11): the
+    positive evidence on which a line of no item is `purged`, never foreign."""
+    return frozenset(str(c) for c in (await conn.execute(_PURGED_OF, {"s": submission_id})).scalars())
+
+
+async def _purged_line(engine: AsyncEngine, submission_id: int, custom_id: str) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.execute(_PURGED_LINE, {"s": submission_id, "c": custom_id})
+        return found.first() is not None
+
+
 @dataclass(frozen=True)
 class _Failed:
     """An item whose processing raised this pass (Ruling T17-a): the error's class only."""
 
     error_class: str
+
+
+@dataclass(frozen=True)
+class _Purged:
+    """An item a purge deleted while this pass processed it (M5 Task 11): its line is `purged`."""
+
+
+_PURGED: Final = _Purged()
 
 
 async def _process(
@@ -308,11 +337,13 @@ async def _process(
     *,
     now: datetime,
     epoch: int | None,
-) -> batch_items.Decision | _Failed:
+) -> batch_items.Decision | _Failed | _Purged:
     """One item in a transaction of its own (never two: Codex r6 B1), fenced by the worker epoch. Ruling
     T17-a: an unexpected error of the item is logged with its class only and returned as `_Failed`, its
     transaction rolled back, so the caller goes on with the next item; a fence (`FencedOut`, the worker's or
-    the owner's) and a cancellation propagate."""
+    the owner's) and a cancellation propagate. An item a purge deleted after the caller read it (M5 Task 11:
+    its processing found it gone, or waited for the purge's job lock) is `_Purged` when the purge evidence
+    names its line."""
     try:
         async with engine.begin() as conn:
             if epoch is not None:
@@ -323,6 +354,9 @@ async def _process(
     except FencedOut:
         raise
     except Exception as exc:  # noqa: BLE001 - Ruling T17-a: one item's error must not stop the lane; logged, counted
+        if await _purged_line(engine, submission.id, result.custom_id):
+            log.info("batch_item_purged", submission_id=submission.id, item_id=item.id)
+            return _PURGED
         failed = _Failed(type(exc).__name__)
         log.error(
             "batch_item_failed",
@@ -339,7 +373,8 @@ async def _process(
 @dataclass(frozen=True)
 class _Streamed:
     """What one read of a submission's results did: the items it decided now, its follow-ups, the lines that
-    named no item of ours, whether the stream was read to its end, and the class of an unreadable line."""
+    named no item of ours (`foreign`) and those of items a purge deleted (`purged`, M5 Task 11), whether the
+    stream was read to its end, and the class of an unreadable line."""
 
     decided: int = 0
     followups: int = 0
@@ -348,6 +383,7 @@ class _Streamed:
     unreadable: str | None = None
     failed: tuple[tuple[str, batch_items.Item, str], ...] = ()  # (custom_id, item, error class), this pass
     processed: frozenset[int] = frozenset()  # the items decided, or found decided, this pass
+    purged: int = 0
 
 
 async def _stream(
@@ -362,17 +398,25 @@ async def _stream(
     buffered whole)."""
     async with engine.connect() as conn:
         items = await items_of(conn, ended.submission.id)
-    decided = followups = foreign = 0
+        purged_ids = await purged_custom_ids(conn, ended.submission.id)
+    decided = followups = foreign = purged = 0
     failed: list[tuple[str, batch_items.Item, str]] = []
     processed: set[int] = set()
     try:
         stream = await client.results(ended.provider_batch_id)
         async for line in stream:
             item = items.get(line.custom_id)
-            if item is None:
-                foreign += 1
+            if item is None:  # no item of ours: a purged one's on positive evidence only, else foreign
+                if line.custom_id in purged_ids:
+                    purged += 1
+                else:
+                    foreign += 1
                 continue
             decision = await _process(engine, ended.submission, item, line, now=now, epoch=epoch)
+            if isinstance(decision, _Purged):  # dealt with: out of `failed_items` too
+                processed.add(item.id)
+                purged += 1
+                continue
             if isinstance(decision, _Failed):
                 failed.append((line.custom_id, item, decision.error_class))
                 continue
@@ -390,8 +434,12 @@ async def _stream(
             unreadable=failure.unreadable,
         )
         unreadable = failure.error_class if failure.unreadable else None
-        return _Streamed(decided, followups, foreign, False, unreadable, tuple(failed), frozenset(processed))
-    return _Streamed(decided, followups, foreign, stream.complete, None, tuple(failed), frozenset(processed))
+        return _Streamed(
+            decided, followups, foreign, False, unreadable, tuple(failed), frozenset(processed), purged
+        )
+    return _Streamed(
+        decided, followups, foreign, stream.complete, None, tuple(failed), frozenset(processed), purged
+    )
 
 
 @dataclass(frozen=True)
@@ -433,6 +481,8 @@ async def finalize_results(
             await _item_unprocessable(engine, submission_id, item.id, epoch=epoch)
             continue
         decided.add(item.id)
+        if isinstance(decision, _Purged):  # deleted by a purge since it was read: nothing left to decide
+            continue
         missing += not decision.replayed
         await afault_point(AFTER_MISSING_ITEM)
     left = {item_id: n for item_id, n in ended.failed_items.items() if item_id not in decided}
@@ -548,6 +598,8 @@ async def process_results(
         async with engine.begin() as conn:
             await fence_epoch(conn, epoch)
             await cycles.request_cycle(conn, trigger="batch_followup", defer=defer)
+    if streamed.purged:  # accounted for: the lines of items a purge deleted (M5 Task 11)
+        log.info("batch_results_purged", submission_id=submission_id, purged=streamed.purged)
     if streamed.foreign:
         await custom_id_anomaly(engine, submission_id, epoch=epoch, foreign=streamed.foreign)
         return streamed, None
@@ -718,7 +770,7 @@ async def custom_id_anomaly(
 @dataclass(frozen=True)
 class PollReport:
     """What one poll did: the submissions it looked at, the cancels it sent, the batches it found ended, the
-    items it decided, their follow-ups, and the submissions it reconciled."""
+    items it decided, their follow-ups, the submissions it reconciled, and the lines it skipped as purged."""
 
     polled: int = 0
     cancels: int = 0
@@ -726,6 +778,7 @@ class PollReport:
     decided: int = 0
     followups: int = 0
     reconciled: int = 0
+    purged: int = 0  # the lines of items a purge deleted (M5 Task 11)
 
 
 async def _retrieve(
@@ -834,6 +887,7 @@ async def poll(
             decided=report.decided + streamed.decided + (0 if finalized is None else finalized.missing),
             followups=report.followups + streamed.followups,
             reconciled=report.reconciled + (finalized is not None and finalized.reconciled),
+            purged=report.purged + streamed.purged,
         )
     if rows:
         log.info("batch_polled", **asdict(report))

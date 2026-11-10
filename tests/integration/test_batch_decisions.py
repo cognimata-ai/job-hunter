@@ -7,7 +7,8 @@ from its own result and decides its target.
   never batches them again, alerts on the missing ones, keeps the follow-ups' holds, and leaves the ledger's
   counters equal to its rows.
 - Review Focus 2: a profile confirmed during a batch cancels its `in_batch` targets; the poll sends the
-  provider cancel, and every late item is `ignored_fenced` with its spend settled.
+  provider cancel, and every late item is `ignored_fenced` with its spend settled from usage and no output
+  stored (P2, M5 Task 11).
 - Codex r1 #26: a succeeded item whose output holds a NUL or a lone surrogate, is cut short, stopped at
   `max_tokens` or came from another model settles `billed` with no output stored and the gateway's code.
 - The other rows of the table: a refusal, an unexpected stop, an unreadable output, both errored types, a
@@ -137,6 +138,10 @@ async def test_reconfirm_during_a_batch_cancels_in_batch_targets_and_fences_late
     assert fake_llm.state.batches[submitted.provider_id].cancel_requested is True
     assert set(await decisions(engine)) == {"ignored_fenced"} and await count_rows(engine, "llm_results") == 0
     assert set(ledger_states(await batch_ledger(engine))) <= {"billed", "not_billed"}
+    # P2 (M5 Task 11): a fenced item settles from its usage and stores no output of the cancelled target
+    entries = await entries_by_custom_id(engine)
+    assert {(e.state, e.status) for e in entries.values()} == {("billed", "completed")}
+    assert not any(e.has_output for e in entries.values())
     targets = await targets_by_custom_id(engine)
     assert {(t.state, t.state_reason) for t in targets.values()} == {("cancelled", "tuple_superseded")}
     assert await submission_state(engine, submitted.submission_id) == "reconciled"

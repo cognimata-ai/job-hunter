@@ -15,7 +15,10 @@ workspace is this installation's alone, A2 B15), less the batches some submissio
 submission, the candidates are the batches created within `[submit_started_at - 1 min, submit_started_at + 10
 min]` whose request count totals ours; the results of every ended candidate are downloaded whole (ids only)
 before anything is decided, so the listing's order decides nothing, and a candidate is confirmed only when it
-alone names exactly our `custom_id` set and no other intersects it partially: the adoption transaction
+alone names exactly our `custom_id` set and no other intersects it partially. Our set is the submission's
+items' `custom_id`s and those of its items a purge deleted (`purged_batch_items`, M5 Task 11, Deviation 13),
+so a batch whose ids equal the original set is still `equal` (rule 1) after a purge, and the poll's path then
+counts the purged lines `purged`: the adoption transaction
 (`active_config FOR SHARE`, the owner `FOR UPDATE` under `state IN ('submit_ambiguous', 'released')` without a
 provider id) adopts its id and moves the submission to `ended` (a released one keeps `released_at`, outside
 the singleton; a recorded cancel stays a record: an ended batch has nothing to cancel, Codex r7 B3) and
@@ -60,7 +63,7 @@ from jobhunter.llm.batches import (
 from jobhunter.observability.alerts import open_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batches, cycles
-from jobhunter.scoring.batch_results import custom_id_anomaly, items_of, process_results
+from jobhunter.scoring.batch_results import custom_id_anomaly, items_of, process_results, purged_custom_ids
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, defer_in_tx
@@ -298,8 +301,10 @@ async def _reconcile_one(
         if started - WINDOW_BEFORE <= b.created_at <= started + WINDOW_AFTER
         and b.request_counts.total == row.request_count
     ]
-    async with engine.connect() as conn:
-        ours = frozenset((await items_of(conn, submission_id)).keys())
+    async with engine.connect() as conn:  # our membership: the items, and those a purge deleted (M5 Task 11)
+        ours = frozenset((await items_of(conn, submission_id)).keys()) | await purged_custom_ids(
+            conn, submission_id
+        )
     # every ended candidate downloaded first (ids only), so the decision is the listing order's in no way
     equal: list[BatchSummary] = []
     partial: list[frozenset[str]] = []

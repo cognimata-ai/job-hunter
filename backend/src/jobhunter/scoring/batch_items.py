@@ -7,14 +7,16 @@ Carries T8-b, T10-b, T10-f, Deviation 27): `process_item`, one item in the calle
 1. `active_config FOR SHARE` and the item's job row `FOR SHARE` (`publish.lock_config_and_job`, the caller's
    steps 1 and 1a of the publish transaction, before the owner row: Carry T10-b);
 2. the owner, the submission `FOR SHARE` in the state the caller expects (`BatchSubmissionOwner`, else
-   `FencedOut`);
+   `FencedOut`), then **the fence decided** (P2, M5 Task 11): whether the target is still `in_batch` under
+   the item's pin (step 5's predicate, read without its lock), before anything is stored;
 3. **the spend first, with the gateway's own classification** (Codex r1 #26): a `succeeded` item's message is
    classified as an online try of its first stage is (`gateway.classify_message`: another served model is
    `model_mismatch`, `max_tokens` is `max_tokens_first_stage`, `refusal`, `end_turn` with the schema's mirror,
    the parse and `storable`, else `invalid_output`, any other stop reason `unexpected_stop_reason`) and
    settled `billed` from its usage at batch prices, its call `completed` with the code and the wire JSON only
-   when the output is usable, so the usage is always billed and a partial, refused, malformed or unstorable
-   output is never stored; an `errored`, `canceled` or `expired` item settles `not_billed(batch_item_errored |
+   when the output is usable and the fence passed, so the usage is always billed and a partial, refused,
+   malformed or unstorable output, or one of a fenced or cancelled target, is never stored; an `errored`,
+   `canceled` or `expired` item settles `not_billed(batch_item_errored |
    batch_item_canceled | batch_item_expired)` with its call `error` (`call_error_code`: the code its decision
    reason names, an errored item's followed by `:` and the provider's nested `error.error.type`, made storable
    and bounded to `PROVIDER_TYPE_MAX` characters, never the provider's message, Carry T8-b); a
@@ -32,7 +34,10 @@ Carries T8-b, T10-b, T10-f, Deviation 27): `process_item`, one item in the calle
    attempt_no = :a` (L3959). No row is `ignored_fenced`: the target was released, cancelled (a tuple
    supersession cancels the targets of its submissions, so their `canceled` items land here, A2 B1) or moved
    on, and the attempt, if still `running`, ends `cancelled('ignored_fenced')` (a non-owner ends an attempt
-   only so, Carry T10-f);
+   only so, Carry T10-f). A fence decided as passed in step 2 that fails here (node 9's revision
+   supersession takes the job `FOR SHARE` too, so it may cancel the target in between) drops the output the
+   settlement stored, in this transaction (P2). An item a purge deleted while this transaction waited for its
+   job row is a `LookupError` (`scoring.batch_results` then finds the purge's evidence);
 6. with the fence passed, the decision table (below), the item recorded (`awaiting → <result type>`,
    `decision`, `stop_reason`), the item's hold released once for every decision but `followup`
    (`bulk.release_item_hold`), and `ranking.bump` last (the publish transaction bumps it itself).
@@ -160,10 +165,16 @@ _ITEM: Final = q(
     "WHERE i.id = :i AND i.submission_id = :s"
 )
 _LOCK_ITEM: Final = q("SELECT result_type, decision FROM batch_items WHERE id = :i FOR UPDATE")
-_LOCK_BATCHED: Final = q(
+_BATCHED: Final = (
     "SELECT id FROM score_targets WHERE id = :t AND state = 'in_batch' AND batch_submission_id = :s "
-    "AND attempt_no = :a FOR UPDATE"
+    "AND attempt_no = :a"
 )
+# The fence decided before the settlement (P2, read under the job and owner locks), then taken (step 10).
+_STILL_BATCHED: Final = q(_BATCHED)
+_LOCK_BATCHED: Final = q(f"{_BATCHED} FOR UPDATE")
+# A fence that failed only at its lock, after a settlement that stored the output: the output dropped (the
+# call row is this transaction's since its settlement).
+_DROP_OUTPUT: Final = q("UPDATE llm_calls SET output_json = NULL WHERE id = :c")
 _ATTEMPT: Final = "t.id = :attempt"
 
 log = get_logger("jobhunter.scoring.batch_items")
@@ -312,13 +323,18 @@ async def process_item(
     await publishing.lock_config_and_job(conn, row.job_id)  # steps 1 and 1a
     await BatchSubmissionOwner(submission.id, submission.state).lock(conn)  # step 5
     version = await load_prompt_version(conn, row.prompt_schema_version_id)
-    classified = await _settle(conn, row, result, version, now=now)  # steps 6, 7 and 9
+    fence = {"t": row.target_id, "s": submission.id, "a": row.attempt_no}
+    fenced = (await conn.execute(_STILL_BATCHED, fence)).first() is None  # decided before anything is stored
+    classified = await _settle(conn, row, result, version, store_output=not fenced, now=now)  # steps 6-9
     await bulk.lock_accounts(conn, submission.bulk_operation_id)  # step 7 (re-taken when funded)
-    locked = (await conn.execute(_LOCK_ITEM, {"i": item.id})).one()  # step 10
+    locked = (await conn.execute(_LOCK_ITEM, {"i": item.id})).first()  # step 10
+    if locked is None:  # deleted while this transaction waited for its job row (a purge, M5 Task 11)
+        raise LookupError(f"batch item {item.id} of submission {submission.id} was deleted")
     if locked.decision is not None:  # decided meanwhile: its settlement was the duplicate
         return _stored(locked)
-    fence = {"t": row.target_id, "s": submission.id, "a": row.attempt_no}
-    if (await conn.execute(_LOCK_BATCHED, fence)).first() is None:
+    if fenced or (await conn.execute(_LOCK_BATCHED, fence)).first() is None:
+        if not fenced and classified is not None and classified.parsed is not None:
+            await conn.execute(_DROP_OUTPUT, {"c": row.reservation.llm_call_id})  # fenced since the decision
         decided = await _fenced(conn, row)
     else:
         decided = await _decide(conn, submission, row, result, classified, version, now=now)
@@ -353,10 +369,16 @@ async def process_item(
 
 
 async def _settle(
-    conn: AsyncConnection, row: _ItemRow, result: ItemResult, version: PromptVersion, *, now: datetime
+    conn: AsyncConnection,
+    row: _ItemRow,
+    result: ItemResult,
+    version: PromptVersion,
+    *,
+    store_output: bool,
+    now: datetime,
 ) -> Classified | None:
-    """Step 3 (module docstring): the item's entry settled from its result; the classification of a
-    `succeeded` one."""
+    """Step 3 (module docstring): the item's entry settled from its result, its usable output stored only
+    with `store_output` (the item's fence passed, P2); the classification of a `succeeded` one."""
     res = row.reservation
     if result.result_type == "succeeded":
         if result.message is None:
@@ -364,7 +386,8 @@ async def _settle(
         classified = classify_message(
             node_model=res.model, schema=score_schema("generate", version), message=result.message
         )
-        output = classified.parsed  # exactly when the code is `None`: the wire JSON is stored then only
+        # exactly when the code is `None`, and only for an item whose fence passed: the wire JSON is stored
+        output = classified.parsed if store_output else None
         call = CallOutcome(
             status="completed",
             model_served=classified.model_served,

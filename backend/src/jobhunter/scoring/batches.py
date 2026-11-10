@@ -21,6 +21,9 @@ month and bulk rows, so no batch-lane transaction runs meanwhile):
    `batch_submission_id` cleared, their running attempts ended `cancelled`, each target's follow-up hold
    released (`targets.cancel_batched`: the bulk rows first, Ruling P52). An item that arrives later for such a
    target is fenced (`ignored_fenced`, `scoring.batch_items`).
+`record_cancel(conn, *, submission_ids, now) -> list[int]` is step 1 for the given submissions alone (M5 Task
+11): a purge records the cancel of the submissions that hold its `in_batch` targets, whose targets it cancels
+itself, individually (`privacy.deletion_graph`).
 
 **Eligibility** (`ELIGIBLE_SQL`, L3939, A2 §5.4): one static predicate over `score_targets t` binding `:b`
 (the bulk operation) and `:policy` (the active evaluation policy): a `pending` target of the operation whose
@@ -115,7 +118,10 @@ callers are the recovery of a lost execution and `submit_start`, which holds it)
 each entry released (`release_never_dispatched`: the calls `cancelled`, the counters and the bulk debit
 credited); the items' holds released; the submission's `in_batch` targets → `pending`; the attempts still
 `running` → `cancelled('batch_abandoned')` (A2 B10, Deviation 12; the targets first, T16-c); the follow-on;
-no ranking bump (below).
+no ranking bump (below). `abandon_preparing(conn, submission_id, *, now) -> int` is that move without the
+locks and the follow-on (the targets it moved): a purge that meets a `preparing` submission abandons it so
+(M5 Task 11), holding the row already; the execution that prepared it is fenced at its next step
+(`submit_start`), so nothing of it is sent.
 
 **The recovery of a lost execution** (`recover_lost`, Codex r1 #23, r2 B12, r3 B2, B3): every `preparing` or
 `submit_started` submission (of `operation_id`, when given) whose operation is not `running` under the claim
@@ -448,6 +454,11 @@ _RECORD: Final = q(
     "UPDATE batch_submissions SET cancel_requested_at = coalesce(cancel_requested_at, :now) "
     "WHERE llm_tuple_id = :tuple AND state = ANY(CAST(:states AS text[])) RETURNING id"
 )
+# `_RECORD` per submission (a purge's, M5 Task 11).
+_RECORD_SUBMISSIONS: Final = q(
+    "UPDATE batch_submissions SET cancel_requested_at = coalesce(cancel_requested_at, :now) "
+    "WHERE id = ANY(CAST(:ids AS bigint[])) AND state = ANY(CAST(:states AS text[])) RETURNING id"
+)
 _FOLLOW_ON_STATES: Final = frozenset({"submit_rejected", "abandoned", "reconciled"})
 # Ruling T16-d: a live `batch_submit` of the bulk operation, and whether `:n` of its targets are eligible.
 _LIVE_SUBMIT: Final = q(
@@ -492,6 +503,22 @@ async def request_cancel(conn: AsyncConnection, *, llm_tuple_id: int, now: datet
         attempts=cancelled.attempts,
     )
     return RequestedCancel(len(submissions), cancelled.targets, cancelled.attempts)
+
+
+async def record_cancel(conn: AsyncConnection, *, submission_ids: Sequence[int], now: datetime) -> list[int]:
+    """The cancellation recorded on the submissions `submission_ids` that are not terminal (`IN_FLIGHT`), as
+    `request_cancel` records it for a tuple (a request recorded earlier keeps its time), in the caller's
+    transaction, which holds their rows: the per-submission form a purge uses (M5 Task 11), which cancels
+    its own targets individually. The worker sends `messages.batches.cancel` after the commit
+    (`batch_results.cancel_requested`, from the poll while a `submitted` batch is in progress). The ids
+    recorded, in order."""
+    if not submission_ids:
+        return []
+    params = {"now": now, "ids": sorted(set(submission_ids)), "states": list(IN_FLIGHT)}
+    recorded = sorted(int(i) for i in (await conn.execute(_RECORD_SUBMISSIONS, params)).scalars())
+    if recorded:
+        log.info("batch_cancel_recorded", submission_ids=recorded)
+    return recorded
 
 
 # ---- the preparation ---------------------------------------------------------------------------------------
@@ -1132,6 +1159,20 @@ async def abandon(
     locked = (await conn.execute(_LOCK_IN_STATE, {"s": submission_id, "state": "preparing"})).first()
     if locked is None:
         return False
+    await abandon_preparing(conn, submission_id, now=now)
+    await follow_on(conn, submission_id=submission_id, defer=defer)  # it logs what it requested
+    return True
+
+
+async def abandon_preparing(conn: AsyncConnection, submission_id: int, *, now: datetime) -> int:
+    """The `preparing → abandoned` move of step 4d (module docstring), without its follow-on, in the caller's
+    transaction, which holds `active_config` and the submission row `FOR UPDATE` while it is `preparing`:
+    its entries `reserved → not_billed('never_dispatched')` (`release_never_dispatched`: the calls
+    `cancelled`, the counters and the bulk debit credited), the items' holds released, its `in_batch` targets
+    back to `pending` under the batch pin, then the attempts still `running` → `cancelled('batch_abandoned')`
+    (the targets first, T16-c); how many targets it moved. `abandon` (the recovery of a lost execution, and
+    `submit_start` for an obsolete one) and a purge that meets a `preparing` submission (M5 Task 11, which
+    requests no follow-on: the execution that prepared it is fenced at its next step) both take it."""
     await transition(conn, _SUBMISSIONS, submission_id, ["preparing"], "abandoned")
     items = await _items(conn, submission_id)
     for item in items:  # the month row, the bulk debit and the ledger entries
@@ -1140,16 +1181,14 @@ async def abandon(
         await bulk.release_item_hold(conn, item_id=item.id)
     moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "cancelled", ABANDONED_DETAIL)
-    requested = await follow_on(conn, submission_id=submission_id, defer=defer)
     log.warning(
         "batch_abandoned",
         submission_id=submission_id,
         items=len(items),
         attempts=ended,
         targets=moved,
-        follow_on=requested,
     )
-    return True
+    return moved
 
 
 # ---- the recovery of a lost execution and the follow-on ----------------------------------------------------
