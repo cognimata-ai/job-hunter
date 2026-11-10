@@ -88,10 +88,57 @@ row ever names a missing file, and a crash in between leaves only files no row n
 re-execution removes. A running export's own publication then finds its row `purged` and unlinks what it
 wrote (Task 17).
 
+**Job-graph deletion** (M5 Task 13; §20.2's tombstoning steps 4-7, Deviation 50). `delete_job_graph(conn,
+job_id, *, write_tombstone, held, now) -> JobGraphDeleted` is the one complete cleanup before a job goes,
+which job tombstoning (`write_tombstone=True`), the Adzuna purge and delete-everything (`False`) share. It
+deletes J and, first and deepest first, every job whose `merged_into_job_id` leads to J
+(`jobs.merged_into_job_id` restricts deleting J): the graph G, read under the caller's lock. The caller's
+transaction holds the rows of G and of every co-member of their duplicate groups `FOR UPDATE` in one
+ascending statement (`held`,
+`PurgeRun.chunk(job_ids=G, with_groups_of=G)`), and the caller has deleted G's targets in chunks of their
+own (`purge_target_set`): a job of G it does not hold, or a target of G left (by job or by revision), is an
+`InvariantViolation` before anything is written. A J that no longer exists is no error: nothing is deleted
+(the chunk of a re-execution after the commit). In order:
+- (4) the golden cases on G's revisions, their rows `FOR UPDATE`: an active one is an `InvariantViolation`
+  (tombstoning left such a job out, the Adzuna purge and delete-everything delete every case that draws on
+  the purged data first); the inactive ones are deleted before the revisions, since
+  `golden_cases.job_revision_id` restricts, with their `eval_case_results` and eval calls (cascade). The
+  entries of those calls still `reserved` or `dispatched` (a run that included the case before it was made
+  inactive) are settled first, as the golden-case deletion settles them (`spend_ledger.lock_for_purge`, then
+  the cases' rows, the entries read again under them, `settle_for_purge`): a call's cascade must leave no
+  entry unsettled (G04);
+- (5) the `merge_events` naming a job of G as `from_job_id` or `into_job_id` (both restrict), every
+  `reversed_by_event_id` that points at one of them cleared first; the `identity_conflicts` whose
+  `posting_job_id` is in G deleted, G removed from the other conflicts' `candidate_job_ids`, and a conflict
+  left without a candidate deleted, the `dedup.identity_conflict` alert of each deleted conflict resolved;
+  each job of G leaves its duplicate group, deepest first, through `groups.leave_group(reason=MEMBER_LEFT,
+  held=held)`: it checks that every member is held, dissolves a group left with fewer than two members or
+  re-elects one whose representative left (so `duplicate_groups.representative_job_id`, a restricting key,
+  names no job of G) and settles the group's deferred targets (a survivor's target no longer deferrable moves
+  to `pending`, D01); `representative.reelect` alone would neither check the locks nor settle. Then each
+  job's `dedup.ambiguous_grouping` alert is resolved (M1 Carry-forward 11), also when it was in no group,
+  and its `dedup.field_conflict` alerts (subject `job:<id>:<field>`), as a merge resolves its from-job's
+  (carry 7): no later event of a deleted job would resolve either;
+- (6) `current_revision_id := NULL` (a deferred key), G's revisions deleted (lineage, occurrences cascade),
+  then its postings (observations, `ad_key_sources`, snapshot absences and the conflicts on them cascade);
+  each key G owns that another job's posting also supplies is re-assigned to the job of its earliest
+  remaining provenance row (`first_seen_at`, then the posting id, as the unmerge orders them), and G's
+  other `ad_keys` are deleted. The foreign key of a re-assigned key takes `FOR KEY SHARE` on its heir's row:
+  the one lock of this transaction outside the schedule, a lost deadlock its caller retries;
+- (7) with `write_tombstone`, J's `job_tombstones` row (`former_job_id = J`, `tombstoned_at = now`), whose
+  `user_actions` holds J's four user-action timestamps `seen_at`, `saved_at`, `applied_at` and `hidden_at`
+  as ISO 8601 with their offset (`null` when unset; never the note, M3 ledger T22-b: what the identity
+  resolution's restore reads, §8.6 step 3), and a `tombstone_keys` row per deleted key
+  (`identity.tombstone_key_hash`), upserted `ON CONFLICT (key_hash) DO UPDATE SET tombstone_id =
+  EXCLUDED.tombstone_id` (P15): a key a later tombstone holds names the later one. A re-assigned key is
+  hashed by no tombstone: it still has an owner. Then G's `user_job_actions` and the jobs, deepest first.
+`det_results`, `llm_results` and the targets went with the targets; `score_feedback` keeps its row with the
+job and revision NULL (`ON DELETE SET NULL`). `ranking.bump` is the caller's, last.
+
 Ids, counts and states only reach a log line.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
@@ -102,11 +149,22 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition_where
+from jobhunter.dedup import groups
+from jobhunter.dedup.identity import tombstone_key_hash
+from jobhunter.dedup.merge import IDENTITY_CONFLICT_ALERT
+from jobhunter.dedup.representative import AMBIGUOUS_GROUPING
+from jobhunter.dedup.revisions import FIELD_CONFLICT_ALERT
+from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS, to_iso
+from jobhunter.errors import InvariantViolation
 from jobhunter.llm import bulk, spend_ledger
 from jobhunter.llm.spend_ledger import CallOutcome, PurgeSettled, Reservation
+from jobhunter.normalize.fields import CONFLICT_FIELDS
+from jobhunter.normalize.keys import AdKey
+from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.manifests import KEY_WILDCARD, Operation, remove_files
 from jobhunter.scoring import batches, targets
+from jobhunter.types import JSONValue
 
 if TYPE_CHECKING:
     from jobhunter.privacy.purge import PurgeRun
@@ -346,3 +404,203 @@ async def purge_exports(run: "PurgeRun", ops: Sequence[Operation]) -> int:
         export_ids=ids[:LOGGED_IDS],
     )
     return purged
+
+
+# ---- the job graph (M5 Task 13) ----------------------------------------------------------------------------
+
+_JOBS: Final = "CAST(:jobs AS bigint[])"
+# J and every job whose `merged_into_job_id` leads to it, deepest first (J, depth 0, last).
+_GRAPH_OF: Final = q(
+    "WITH RECURSIVE g(id, depth) AS (SELECT id, 0 FROM jobs WHERE id = :job "
+    "UNION ALL SELECT j.id, g.depth + 1 FROM jobs j JOIN g ON j.merged_into_job_id = g.id) "
+    "SELECT id FROM g ORDER BY depth DESC, id"
+)
+_TARGETS_LEFT: Final = q(
+    f"SELECT count(*) FROM score_targets WHERE job_id = ANY({_JOBS}) "  # noqa: S608
+    f"OR job_revision_id IN (SELECT id FROM job_revisions WHERE job_id = ANY({_JOBS}))"
+)
+_CASES_OF_GRAPH: Final = (
+    "SELECT g.id, g.active FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "  # noqa: S608
+    f"WHERE r.job_id = ANY({_JOBS}) ORDER BY g.id"
+)
+_CASES: Final = q(_CASES_OF_GRAPH)
+_LOCK_CASES: Final = q(f"{_CASES_OF_GRAPH} FOR UPDATE OF g")
+# The entries of the cases' eval calls that a reader could still settle: `reserved` or `dispatched`.
+_CASE_ENTRIES: Final = q(
+    "SELECT l.id FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.golden_case_id = ANY(CAST(:cases AS bigint[])) AND l.state IN ('reserved', 'dispatched') "
+    "ORDER BY l.id"
+)
+_DELETE_CASES: Final = q("DELETE FROM golden_cases WHERE id = ANY(CAST(:cases AS bigint[]))")
+_EVENTS_NAMING: Final = q(
+    f"SELECT id FROM merge_events WHERE from_job_id = ANY({_JOBS}) OR into_job_id = ANY({_JOBS}) "  # noqa: S608
+    "ORDER BY id FOR UPDATE"
+)
+_EVENTS: Final = "CAST(:events AS bigint[])"
+_UNREVERSE: Final = q(
+    f"UPDATE merge_events SET reversed_by_event_id = NULL WHERE reversed_by_event_id = ANY({_EVENTS})"  # noqa: S608
+)
+_DELETE_EVENTS: Final = q(f"DELETE FROM merge_events WHERE id = ANY({_EVENTS})")  # noqa: S608
+_CONFLICTS_NAMING: Final = q(
+    "SELECT id, posting_job_id, candidate_job_ids FROM identity_conflicts "  # noqa: S608
+    f"WHERE posting_job_id = ANY({_JOBS}) OR candidate_job_ids && {_JOBS} ORDER BY id FOR UPDATE"
+)
+_DELETE_CONFLICT: Final = q("DELETE FROM identity_conflicts WHERE id = :id")
+_SET_CANDIDATES: Final = q(
+    "UPDATE identity_conflicts SET candidate_job_ids = CAST(:candidates AS bigint[]) WHERE id = :id"
+)
+_UNPOINT: Final = q(f"UPDATE jobs SET current_revision_id = NULL WHERE id = ANY({_JOBS})")  # noqa: S608
+_DELETE_REVISIONS: Final = q(f"DELETE FROM job_revisions WHERE job_id = ANY({_JOBS})")  # noqa: S608
+_LOCK_KEYS: Final = q(
+    f"SELECT key_ns, key_value FROM ad_keys WHERE job_id = ANY({_JOBS}) "  # noqa: S608
+    "ORDER BY key_ns, key_value FOR UPDATE"
+)
+_DELETE_POSTINGS: Final = q(f"DELETE FROM postings WHERE job_id = ANY({_JOBS})")  # noqa: S608
+# Each key of G that another job's posting still supplies goes to the job of its earliest provenance row.
+_REASSIGN_KEYS: Final = q(
+    "UPDATE ad_keys k SET job_id = heir.job_id FROM (SELECT DISTINCT ON (s.key_ns, s.key_value) "  # noqa: S608
+    "s.key_ns, s.key_value, p.job_id FROM ad_key_sources s JOIN postings p ON p.id = s.posting_id "
+    f"JOIN ad_keys o ON o.key_ns = s.key_ns AND o.key_value = s.key_value WHERE o.job_id = ANY({_JOBS}) "
+    "ORDER BY s.key_ns, s.key_value, s.first_seen_at, s.posting_id) heir "
+    "WHERE k.key_ns = heir.key_ns AND k.key_value = heir.key_value RETURNING k.key_ns"
+)
+_DELETE_KEYS: Final = q(
+    f"DELETE FROM ad_keys WHERE job_id = ANY({_JOBS}) RETURNING key_ns, key_value"  # noqa: S608
+)
+_ACTIONS_OF: Final = q(
+    f"SELECT {', '.join(ACTION_TIMESTAMPS)} FROM user_job_actions WHERE job_id = :job"  # noqa: S608
+)
+_TOMBSTONE: Final = q(
+    "INSERT INTO job_tombstones (former_job_id, user_actions, tombstoned_at) VALUES (:job, :actions, :now) "
+    "RETURNING id",
+    jsonb=["actions"],
+)
+_TOMBSTONE_KEYS: Final = q(
+    "INSERT INTO tombstone_keys (key_hash, tombstone_id) "
+    "SELECT h, :tombstone FROM unnest(CAST(:hashes AS bytea[])) AS h "
+    "ON CONFLICT (key_hash) DO UPDATE SET tombstone_id = EXCLUDED.tombstone_id"
+)
+_DELETE_ACTIONS: Final = q(f"DELETE FROM user_job_actions WHERE job_id = ANY({_JOBS})")  # noqa: S608
+_DELETE_JOB: Final = q("DELETE FROM jobs WHERE id = :job")
+
+
+@dataclass(frozen=True)
+class JobGraphDeleted:
+    """What `delete_job_graph` deleted: the jobs (deepest first, J last; none when J was gone already), their
+    revisions and postings, how many keys it re-assigned, and J's tombstone (`None` without one)."""
+
+    job_ids: tuple[int, ...]
+    revisions: int
+    postings: int
+    keys_reassigned: int
+    tombstone_id: int | None
+
+
+async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime) -> int:
+    """Step 4 (module docstring): the inactive golden cases on G's revisions, their in-flight eval entries
+    settled first; an active one is an `InvariantViolation`. How many were deleted."""
+    read = [int(row.id) for row in await conn.execute(_CASES, {"jobs": jobs})]
+    if not read:
+        return 0
+    entries = await _ids(conn, _CASE_ENTRIES, {"cases": read})
+    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
+    cases = (await conn.execute(_LOCK_CASES, {"jobs": jobs})).all()  # step 10
+    if active := [int(case.id) for case in cases if case.active]:
+        raise InvariantViolation(f"jobs {jobs}: active golden cases {active} draw on their revisions")
+    ids = [int(case.id) for case in cases]
+    current = await _ids(conn, _CASE_ENTRIES, {"cases": ids}) if ids else []
+    if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
+        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
+    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+    if ids:
+        await conn.execute(_DELETE_CASES, {"cases": ids})
+    return len(ids)
+
+
+async def _forget_merges_and_conflicts(conn: AsyncConnection, jobs: list[int]) -> tuple[int, int]:
+    """Step 5's merge events and identity conflicts (module docstring); how many of each were deleted."""
+    events = await _ids(conn, _EVENTS_NAMING, {"jobs": jobs})
+    if events:
+        await conn.execute(_UNREVERSE, {"events": events})
+        await conn.execute(_DELETE_EVENTS, {"events": events})
+    deleted = 0
+    graph = set(jobs)
+    for conflict in (await conn.execute(_CONFLICTS_NAMING, {"jobs": jobs})).all():
+        candidates = [int(job) for job in conflict.candidate_job_ids if int(job) not in graph]
+        if int(conflict.posting_job_id) in graph or not candidates:
+            await conn.execute(_DELETE_CONFLICT, {"id": int(conflict.id)})
+            await resolve_alert(conn, code=IDENTITY_CONFLICT_ALERT, subject=f"conflict:{conflict.id}")
+            deleted += 1
+        else:
+            await conn.execute(_SET_CANDIDATES, {"id": int(conflict.id), "candidates": candidates})
+    return len(events), deleted
+
+
+async def _resolve_job_alerts(conn: AsyncConnection, job_id: int) -> None:
+    """The open alerts about the job whose subject names it (module docstring): no later event of a deleted
+    job would resolve them."""
+    await resolve_alert(conn, code=AMBIGUOUS_GROUPING, subject=f"job:{job_id}")
+    for field_name in CONFLICT_FIELDS:
+        await resolve_alert(conn, code=FIELD_CONFLICT_ALERT, subject=f"job:{job_id}:{field_name}")
+
+
+async def _tombstone(conn: AsyncConnection, job_id: int, keys: Sequence[AdKey], *, now: datetime) -> int:
+    """Step 7's tombstone of J (module docstring); its id."""
+    row = (await conn.execute(_ACTIONS_OF, {"job": job_id})).first()
+    actions: dict[str, JSONValue] = {
+        name: None if row is None else to_iso(getattr(row, name)) for name in ACTION_TIMESTAMPS
+    }
+    params = {"job": job_id, "actions": actions, "now": now}
+    tombstone_id = int((await conn.execute(_TOMBSTONE, params)).scalar_one())
+    if keys:
+        hashes = [tombstone_key_hash(key) for key in keys]
+        await conn.execute(_TOMBSTONE_KEYS, {"tombstone": tombstone_id, "hashes": hashes})
+    return tombstone_id
+
+
+async def delete_job_graph(
+    conn: AsyncConnection, job_id: int, *, write_tombstone: bool, held: Collection[int], now: datetime
+) -> JobGraphDeleted:
+    """Delete job `job_id` and every job merged into it, with the graph their targets do not cover, §20.2's
+    tombstoning steps 4-7 (module docstring), in the caller's transaction, which holds the jobs' rows and
+    their groups' co-members' (`held`) and deleted their targets; J's tombstone with `write_tombstone`.
+    `InvariantViolation` for a job of the graph not held, a target left or an active golden case."""
+    jobs = await _ids(conn, _GRAPH_OF, {"job": job_id})
+    if not jobs:
+        return JobGraphDeleted((), 0, 0, 0, None)
+    if unheld := sorted(set(jobs) - set(held)):
+        raise InvariantViolation(f"job {job_id}: the rows of jobs {unheld} of its graph are not locked")
+    if left := int((await conn.execute(_TARGETS_LEFT, {"jobs": jobs})).scalar_one()):
+        raise InvariantViolation(f"job {job_id}: {left} targets of its graph are left")
+    cases = await _delete_cases(conn, jobs, now=now)  # 4.
+    events, conflicts = await _forget_merges_and_conflicts(conn, jobs)  # 5.
+    for job in jobs:
+        await groups.leave_group(conn, job, reason=groups.MEMBER_LEFT, held=held)
+        await _resolve_job_alerts(conn, job)
+    await conn.execute(_UNPOINT, {"jobs": jobs})  # 6.
+    revisions = (await conn.execute(_DELETE_REVISIONS, {"jobs": jobs})).rowcount
+    await conn.execute(_LOCK_KEYS, {"jobs": jobs})
+    postings = (await conn.execute(_DELETE_POSTINGS, {"jobs": jobs})).rowcount
+    reassigned = len((await conn.execute(_REASSIGN_KEYS, {"jobs": jobs})).all())
+    keys = [
+        AdKey(str(row.key_ns), str(row.key_value)) for row in await conn.execute(_DELETE_KEYS, {"jobs": jobs})
+    ]
+    tombstone_id = await _tombstone(conn, job_id, keys, now=now) if write_tombstone else None  # 7.
+    await conn.execute(_DELETE_ACTIONS, {"jobs": jobs})
+    for job in jobs:  # deepest first: `jobs.merged_into_job_id` restricts
+        await conn.execute(_DELETE_JOB, {"job": job})
+    deleted = JobGraphDeleted(tuple(jobs), revisions, postings, reassigned, tombstone_id)
+    log.info(
+        "job_graph_deleted",
+        job_id=job_id,
+        job_ids=jobs[:LOGGED_IDS],
+        revisions=revisions,
+        postings=postings,
+        keys_reassigned=reassigned,
+        keys_deleted=len(keys),
+        golden_cases=cases,
+        merge_events=events,
+        identity_conflicts=conflicts,
+        tombstone_id=tombstone_id,
+    )
+    return deleted

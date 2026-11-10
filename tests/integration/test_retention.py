@@ -128,6 +128,8 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         # M3 Task 23: the score tables (their own tests are in test_retention_m3.py); `score_history`'s
         # window is the active settings' `retention.score_history_months`, read at the start of the pass
         "score_history": timedelta(0),
+        # M5 Task 13: closed or stale jobs are tombstoned 90 days after `availability_changed_at`
+        "job_tombstones": timedelta(days=90),
         "cycle_threads": timedelta(days=14),
         "score_cycles": timedelta(days=397),
         "batch_submissions": timedelta(days=397),
@@ -140,8 +142,16 @@ def test_rules_name_every_report_key_with_its_window() -> None:
     names = [rule.name for rule in RULES]
     assert names.index("draft_content") < names.index("cv_files")  # the content, then the file
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
-    # M3 (Codex r1 #37-#39): after `eval_runs` and before `checkpoints`, in this order
-    m3 = ["score_history", "cycle_threads", "score_cycles", "batch_submissions", "bulk_operations"]
+    # M3 (Codex r1 #37-#39): after `eval_runs` and before `checkpoints`, in this order; M5 Task 13's
+    # `job_tombstones` after `score_history` (Task 14 inserts `profile_purges` after it)
+    m3 = [
+        "score_history",
+        "job_tombstones",
+        "cycle_threads",
+        "score_cycles",
+        "batch_submissions",
+        "bulk_operations",
+    ]
     start = names.index("eval_runs") + 1
     assert names[start : start + len(m3) + 1] == [*m3, "checkpoints"]
     # A dependency is named explicitly (ruling T21-f), and only ever on a rule that runs before it.

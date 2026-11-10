@@ -130,6 +130,13 @@ never deleted, so no call of a running run, nor the `dispatched` entry it holds,
 the reason of `golden.delete_case_unless_running`). No M3 rule deletes a job, a revision or a profile version,
 so the synthetic rows of the golden set (Ruling T19-a) and the inputs of every golden case stay.
 
+**The M5 rule** (Task 13), after `score_history`: `job_tombstones` (§20.1 L6397) deletes nothing itself. It
+opens the tombstoning of the closed or stale root jobs whose `availability_changed_at` lies 90 days back and
+that are not saved or applied and draw no active golden case, with every job merged into them (M3 plan Task
+23's exemption contract): at most 10 batches of 200 roots, each a fenced transaction of its own that commits
+the batch's deletion manifest, its `jobs` fence and its `purge` operation (`privacy.kinds.job_tombstone`),
+which deletes them afterwards. It counts the roots it fenced.
+
 **Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
 bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
 `cycle_threads` 500 threads, `procrastinate_jobs` 1,000 jobs, `draft_content` 100 drafts, `cv_files` and
@@ -186,12 +193,13 @@ from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
 from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.kinds import job_tombstone
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring import batches, targets
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.worker.epoch import fence_epoch
-from jobhunter.worker.tasks import delete_finished_jobs
+from jobhunter.worker.tasks import defer_in_tx, delete_finished_jobs
 
 
 @dataclass(frozen=True)
@@ -231,6 +239,9 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     # The M3 rules (Task 23). `score_history`'s window is the active settings'
     # `retention.score_history_months` calendar months after the target ended, read when the rule starts.
     RetentionRule("score_history", timedelta(0)),
+    # M5 Task 13: closed or stale jobs 90 days after `availability_changed_at`, tombstoned by a purge each
+    # batch opens (the rule fences them; the `purge` operation deletes them).
+    RetentionRule("job_tombstones", job_tombstone.TOMBSTONE_AFTER),
     RetentionRule("cycle_threads", timedelta(days=14)),  # threads of the cycles that ended that long ago
     # A cycle's thread is found through its row, so never after a failed thread purge (Codex r1 #38).
     RetentionRule("score_cycles", THIRTEEN_MONTHS, depends_on=("cycle_threads",)),
@@ -777,6 +788,8 @@ async def _apply(
         return await _delete_eval_runs(engine, cutoff, epoch)
     if rule.name == "score_history":
         return await _purge_score_history(engine, now, epoch)
+    if rule.name == "job_tombstones":
+        return await job_tombstone.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
     if rule.name == "cycle_threads":
         return await _purge_cycle_threads(engine, saver, cutoff, epoch)
     params: dict[str, object] = {"cutoff": cutoff}
@@ -828,9 +841,11 @@ async def run_retention_daily(
     rule name, `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
     `checkpoints`, `profile_checkpoints` and `cycle_threads` count threads, `cv_files` and `cv_store_orphans`
-    files, `score_history` targets. `queue` must be open; `cv_store` is the CV store whose files the two file
-    rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer the current worker
-    epoch: the pass stops before that write and writes nothing more (see "The epoch fence").
+    files, `score_history` targets, `job_tombstones` the root jobs whose tombstoning it opened. `queue` must
+    be open (`job_tombstones` defers its purges' jobs with `defer_in_tx`); `cv_store` is the CV store whose
+    files the two file rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer
+    the current worker epoch: the pass stops before that write and writes nothing more (see "The epoch
+    fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass
