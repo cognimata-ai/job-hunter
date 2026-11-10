@@ -181,7 +181,11 @@ class World:
             async def close_async(self) -> None:
                 events.append("queue_close")
 
-            async def run_worker_async(self, **options: object) -> None:
+            def run_worker_async(self, **options: object) -> Awaitable[None]:
+                world.loops.append(str(options["name"]))  # made: from here on this loop may run
+                return self._run_worker(**options)
+
+            async def _run_worker(self, **options: object) -> None:
                 world.runtimes.append(options["additional_context"]["runtime"])  # type: ignore[index]
                 if options["name"] == "jh-tick":  # this loop asks for the shutdown, as a SIGTERM would
                     options["additional_context"]["runtime"].shutdown.requested.set()  # type: ignore[index]
@@ -206,14 +210,17 @@ class World:
             return 3, {}
 
         def fake_build_collect_graph(saver: object, deps: object) -> object:
+            world.built.append(("collect", "tracing_install" in events))
             world.deps.append(deps)
             return object()
 
         def fake_build_profile_graphs(saver: object, deps: object) -> object:
+            world.built.append(("profile", "tracing_install" in events))
             world.profile_deps.append(deps)
             return world.profile_graphs
 
         def fake_build_score_graphs(deps: object) -> object:
+            world.built.append(("score", "tracing_install" in events))
             world.score_deps.append(deps)
             return world.score_graphs
 
@@ -252,11 +259,37 @@ class World:
             from jobhunter.errors import FencedOut
 
             world.fenced.append(epoch)
+            world.last_fenced = conn
             if world.superseded:
                 raise FencedOut(owner=world.fence_owner)
 
+        # M5 Task 6 (Ruling T6-2): step 7 installs tracing before any graph is built (the real install:
+        # tracing is off in these configurations, so it only returns the state), step 8 publishes that state.
+        from jobhunter.observability import langsmith
+
+        real_install = langsmith.install_tracing
+
+        def recording_install(cfg: object) -> object:
+            events.append("tracing_install")
+            return real_install(cfg)  # type: ignore[arg-type]
+
+        async def fake_publish(conn: object, state: object) -> None:
+            events.append("tracing_publish")
+            world.loops_at_publish.append(len(world.loops))
+            world.publish_fenced.append(conn is world.last_fenced)  # its transaction's own fence came first
+            if world.publish_error is not None:
+                raise world.publish_error
+            world.published.append(state)
+
+        self.built: list[tuple[str, bool]] = []  # each graph build, and whether tracing was installed by then
+        self.loops: list[str] = []  # each worker loop made, in order
+        self.published: list[object] = []  # the tracing states step 8 published
+        self.loops_at_publish: list[int] = []  # how many loops had been made when it published
+        self.publish_fenced: list[bool] = []  # whether the publish's connection was the one fenced last
+        self.last_fenced: object = None  # the connection of the last fence (a new one per transaction)
+        self.publish_error: Exception | None = None  # what the publish raises, if anything
         self.synced: list[object] = []
-        self.fenced: list[int] = []  # the epochs step 8's guard fenced
+        self.fenced: list[int] = []  # the epochs step 8's guards fenced
         self.superseded = False  # a newer worker took over before step 8
         self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
         self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
@@ -288,6 +321,8 @@ class World:
             "make_clients": recording_make_clients,
             "sync_instances": fake_sync_instances,
             "fence_epoch": fake_fence_epoch,
+            "install_tracing": recording_install,
+            "publish_tracing_state": fake_publish,
         }.items():
             monkeypatch.setattr(main, name, fake)
         secrets_dir = tmp_path / "secrets"
@@ -336,11 +371,13 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
         "lock_acquire",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
         "make_clients",
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -381,12 +418,13 @@ async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_in
 async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
     monkeypatch, tmp_path
 ) -> None:
-    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed."""
+    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed; so is
+    the first statement of the tracing state's publish (M5 Task 6, Ruling T6-2)."""
     from jobhunter.worker.main import worker_main
 
     world = World(monkeypatch, tmp_path)
     assert await worker_main(world.cfg) == 0
-    assert world.fenced == [3] and world.synced == [world.cfg]
+    assert world.fenced == [3, 3] and world.synced == [world.cfg]
 
 
 async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_70(
@@ -407,6 +445,7 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
         "lock_acquire",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
@@ -414,7 +453,7 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
         "sync_instances",
         *TEARDOWN,
     ]
-    assert world.synced == [] and world.runtimes == []
+    assert world.synced == [] and world.runtimes == [] and world.published == []
     [event] = logged(caplog, "worker_superseded_at_start")
     assert (event["epoch"], event["exit_code"], event["level"]) == (3, 70, "critical")
     assert logged(caplog, "worker_failed") == []
@@ -485,6 +524,7 @@ async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exi
     assert await worker_main(world.cfg) == 0
     assert world.events[world.events.index("sync_instances") :] == [
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -619,11 +659,13 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
         "lock_acquire",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
         "make_clients",
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -679,11 +721,13 @@ START = [
     "lock_acquire",
     "claim",
     "watchdog_start",
+    "tracing_install",
     "queue_open",
     "saver_open",
     "http_configure",
     "make_clients",
     "sync_instances",
+    "tracing_publish",
     "reconcile_start",
 ]
 
@@ -913,6 +957,71 @@ async def test_an_arming_that_fails_takes_the_source_sync_s_failure_path(
     fake_arming(monkeypatch, world, raises=refusal)
     assert await worker_main(world.cfg) == code
     assert world.events == [*START[:-1], "deadman_arm", *TEARDOWN]  # no start reconciler, no loop
+    assert len(logged(caplog, event)) == 1
+    assert "must not be logged" not in caplog.text
+
+
+# --- M5 Task 6: tracing installed before any graph is built, its state published before any loop -----------
+
+
+async def test_tracing_is_installed_before_every_graph_build_and_published_before_every_loop(
+    monkeypatch, tmp_path
+) -> None:
+    """Ruling T6-2: step 7 installs LangSmith's process-wide client before it builds a graph (the profile,
+    score and collection graphs); step 8 publishes the state the install returned, after the source sync, in
+    a transaction fenced by this worker's epoch, before any worker loop is made."""
+    from jobhunter.observability.langsmith import TracingState
+    from jobhunter.worker import main
+    from jobhunter.worker.tasks import QUEUES
+
+    world = World(monkeypatch, tmp_path)
+    state = TracingState(tracing=True, region="eu")
+    installed: list[object] = []
+
+    def install(cfg: object) -> TracingState:
+        world.events.append("tracing_install")
+        installed.append(cfg)
+        return state
+
+    monkeypatch.setattr(main, "install_tracing", install)
+    assert await main.worker_main(world.cfg) == 0
+    assert world.events == [*START, *TEARDOWN]
+    assert installed == [world.cfg]
+    assert world.built == [("profile", True), ("score", True), ("collect", True)]
+    assert world.published == [state] and world.fenced == [3, 3] and world.publish_fenced == [True]
+    assert world.loops_at_publish == [0] and world.loops == [f"jh-{name}" for name in QUEUES]
+
+
+async def test_a_worker_without_tracing_publishes_that_it_does_not_trace(monkeypatch, tmp_path) -> None:
+    """The real install on a configuration without tracing: no client, and the state says so (the api shows
+    it rather than nothing)."""
+    from jobhunter.observability.langsmith import TracingState
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    assert world.published == [TracingState(tracing=False, region=None)]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code", "event"),
+    [
+        (FencedOut(owner=WORKER_EPOCH), 70, "worker_superseded_at_start"),  # a newer worker took over
+        (OSError("detail that must not be logged"), 1, "worker_failed"),  # the database failed
+    ],
+)
+async def test_a_publish_that_fails_takes_the_source_sync_s_failure_path(
+    monkeypatch, tmp_path, caplog, refusal: Exception, code: int, event: str
+) -> None:
+    """Ruling T6-2: a fence that refuses the publish's transaction ends the start as the sync's does (exit
+    70), any other error fails it (exit 1); no start reconciler and no loop runs."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.publish_error = refusal
+    assert await worker_main(world.cfg) == code
+    assert world.events == [*START[:-1], *TEARDOWN]  # the publish is the last step it reached
+    assert world.published == [] and world.loops == []
     assert len(logged(caplog, event)) == 1
     assert "must not be logged" not in caplog.text
 

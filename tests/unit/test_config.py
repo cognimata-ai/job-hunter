@@ -336,10 +336,85 @@ def test_tracing_with_all_langsmith_requirements_met_passes(
         "LANGSMITH_HIDE_OUTPUTS": "true",
         "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
     }
-    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)))
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
     # a legacy endpoint alias that is the EU endpoint too is fine
     env["LANGCHAIN_ENDPOINT"] = "https://eu.api.smith.langchain.com"
-    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **secrets)))
+
+
+# --- M5 Task 6 (O15, Q15): tracing needs its key from the secret file, one endpoint and no sampling --------
+
+TRACING_ENV = {
+    "LANGSMITH_TRACING": "true",
+    "LANGSMITH_HIDE_INPUTS": "true",
+    "LANGSMITH_HIDE_OUTPUTS": "true",
+    "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+}
+LANGSMITH_KEY = b"lsv2-test-key"  # a low-entropy stand-in: no secret scanner reads it as a key
+
+
+def langsmith_failure(
+    tmp_path: Path, env_extra: dict[str, str], secrets: dict[str, bytes]
+) -> StartupCheckFailed:
+    env = {**BASE_ENV, **TRACING_ENV, **env_extra}
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
+    return exc.value
+
+
+@pytest.mark.parametrize("key", [None, b"", b"\n"])
+def test_tracing_without_langsmith_key_is_refused(tmp_path: Path, key: bytes | None) -> None:
+    secrets = WORKER_SECRETS if key is None else {**WORKER_SECRETS, "langsmith_key": key}
+    failure = langsmith_failure(tmp_path, {}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", "tracing needs the langsmith_key secret")
+    # without tracing a worker needs no key (it is optional)
+    run_startup_assertions(load_config("worker", BASE_ENV, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_RUNS_ENDPOINTS", "LANGCHAIN_RUNS_ENDPOINTS"])
+@pytest.mark.parametrize("value", ['[{"api_url": "https://replica.example", "api_key": "x"}]', ""])
+def test_runs_endpoints_are_refused(tmp_path: Path, name: str, value: str) -> None:
+    """A write replica is a second destination the endpoint check never sees: set at all, it is refused, and
+    the detail names the variable, never its value."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: value}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+    assert "replica" not in str(failure)
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"])
+def test_api_key_variables_are_refused(tmp_path: Path, name: str) -> None:
+    """The key comes from the `langsmith_key` secret file only, never from the environment."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: "lsv2-env-key"}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+    assert "lsv2-env-key" not in str(failure)
+    both = langsmith_failure(tmp_path / "both", {"LANGSMITH_API_KEY": "a", "LANGCHAIN_API_KEY": "b"}, secrets)
+    assert both.detail == "tracing needs LANGCHAIN_API_KEY, LANGSMITH_API_KEY unset"
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_TRACING_SAMPLING_RATE", "LANGCHAIN_TRACING_SAMPLING_RATE"])
+@pytest.mark.parametrize("rate", ["0.25", "1.0"])
+def test_a_sampling_rate_is_refused(tmp_path: Path, name: str, rate: str) -> None:
+    """No sampling (Q15): every trace is sent, so no rate may be set, not even 1.0."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: rate}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+
+
+def test_the_widened_langsmith_check_keeps_its_place_in_the_order(tmp_path: Path) -> None:
+    """The hide flags and the endpoint are checked first, then the key; and `langsmith_config` still comes
+    before the key material's checks."""
+    wrong_endpoint = {"LANGSMITH_ENDPOINT": "https://api.smith.langchain.com", "LANGSMITH_API_KEY": "x"}
+    failure = langsmith_failure(tmp_path, wrong_endpoint, WORKER_SECRETS)
+    assert (failure.check, failure.detail) == (
+        "langsmith_config",
+        "tracing needs a correct LANGSMITH_ENDPOINT",
+    )
+    short_key = {**WORKER_SECRETS, "data_key": b64(16)}
+    assert langsmith_failure(tmp_path / "t", {}, short_key).check == "langsmith_config"
 
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:

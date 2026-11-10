@@ -57,3 +57,18 @@ def test_an_alert_names_its_delivery_state(document: dict[str, Any]) -> None:
     assert resolve["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/AlertOut"
     }
+
+
+def test_the_system_health_names_the_published_tracing_state(document: dict[str, Any]) -> None:
+    """M5 (Q17): `langsmith` is required and nullable, `null` until a worker published its tracing state."""
+    schemas = document["components"]["schemas"]
+    health = schemas["SystemHealthOut"]
+    assert "langsmith" in health["required"]
+    assert health["properties"]["langsmith"]["anyOf"] == [
+        {"$ref": "#/components/schemas/TracingStateOut"},
+        {"type": "null"},
+    ]
+    state = schemas["TracingStateOut"]
+    assert set(state["required"]) == {"tracing", "region"}
+    assert state["properties"]["tracing"]["type"] == "boolean"
+    assert state["properties"]["region"]["anyOf"] == [{"const": "eu", "type": "string"}, {"type": "null"}]

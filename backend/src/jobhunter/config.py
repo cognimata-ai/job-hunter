@@ -65,6 +65,17 @@ _TRACING_VARS: Final = (
     "LANGCHAIN_TRACING_V2",
     "LANGCHAIN_TRACING",
 )
+# M5 Task 6 (O15, Q15): what must be unset while tracing is on, each under both of the SDK's prefixes. A write
+# replica is a destination the endpoint check never sees; the key comes from the `langsmith_key` secret file
+# only; and every trace is sent, unsampled.
+_TRACING_UNSET_VARS: Final = (
+    "LANGSMITH_RUNS_ENDPOINTS",
+    "LANGCHAIN_RUNS_ENDPOINTS",
+    "LANGSMITH_API_KEY",
+    "LANGCHAIN_API_KEY",
+    "LANGSMITH_TRACING_SAMPLING_RATE",
+    "LANGCHAIN_TRACING_SAMPLING_RATE",
+)
 # Every fake mode and test control, refused in prod (`fake_mode_in_prod`, §16.8 check 3), M4 Task 18's two
 # stack controls of the fake LLM included.
 _FAKE_MODE_VARS: Final = (
@@ -464,6 +475,35 @@ def _check_healthchecks_api_url(cfg: AppConfig) -> None:
         )
 
 
+def tracing_enabled(cfg: AppConfig) -> bool:
+    """Whether LangSmith tracing is on: any of the SDK's tracing variables is `true`, in any case (the SDK
+    reads each of them; `langsmith_config` and `observability.langsmith.make_client` share this reading)."""
+    return any(cfg.environ.get(name, "").lower() == "true" for name in _TRACING_VARS)
+
+
+def _check_langsmith(cfg: AppConfig) -> None:
+    """§16.8 check 4 (`langsmith_config`), when tracing is on: the hide flags are `true` and the endpoint
+    is the EU one (the legacy endpoint variable too, when set); then (M5 Task 6, O15, Q15) the `langsmith_key`
+    secret is present, and no write replica, API key or sampling rate is set in the environment. The detail
+    names the variables or the secret, never a value."""
+    if not tracing_enabled(cfg):
+        return
+    env = cfg.environ
+    wrong = [name for name in ("LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS") if env.get(name) != "true"]
+    if env.get("LANGSMITH_ENDPOINT") != LANGSMITH_EU_ENDPOINT:
+        wrong.append("LANGSMITH_ENDPOINT")
+    # The SDK falls back to the legacy endpoint variable, so a non-EU value must not be left behind.
+    if env.get("LANGCHAIN_ENDPOINT", "") not in ("", LANGSMITH_EU_ENDPOINT):
+        wrong.append("LANGCHAIN_ENDPOINT")
+    if wrong:
+        raise StartupCheckFailed("langsmith_config", f"tracing needs a correct {', '.join(wrong)}")
+    if not cfg.secrets.get("langsmith_key", b"").strip():
+        raise StartupCheckFailed("langsmith_config", "tracing needs the langsmith_key secret")
+    # Set at all, the empty string included: how the SDK reads an empty value is not this check's to rely on.
+    if present := {name for name in _TRACING_UNSET_VARS if name in env}:
+        raise StartupCheckFailed("langsmith_config", f"tracing needs {_names(present)} unset")
+
+
 def _check_ntfy_token(cfg: AppConfig) -> None:
     """Review M2: the `ntfy_token` secret, when set, is sent as `Authorization: Bearer <token>`, so it must be
     a header value: visible ASCII only, without spaces or control characters (`ntfy_token_header_safe`). The
@@ -505,18 +545,8 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     if cfg.env == "prod" and (fake := [name for name in _FAKE_MODE_VARS if name in env]):
         raise StartupCheckFailed("fake_mode_in_prod", f"{', '.join(fake)} must not be set in prod")
 
-    # The langsmith SDK enables tracing from any of these variables, so each one counts here.
-    if any(env.get(name, "").lower() == "true" for name in _TRACING_VARS):
-        wrong = [
-            name for name in ("LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS") if env.get(name) != "true"
-        ]
-        if env.get("LANGSMITH_ENDPOINT") != LANGSMITH_EU_ENDPOINT:
-            wrong.append("LANGSMITH_ENDPOINT")
-        # The SDK falls back to the legacy endpoint variable, so a non-EU value must not be left behind.
-        if env.get("LANGCHAIN_ENDPOINT", "") not in ("", LANGSMITH_EU_ENDPOINT):
-            wrong.append("LANGCHAIN_ENDPOINT")
-        if wrong:
-            raise StartupCheckFailed("langsmith_config", f"tracing needs a correct {', '.join(wrong)}")
+    # The langsmith SDK enables tracing from any of `_TRACING_VARS`, so each one counts here.
+    _check_langsmith(cfg)
 
     _check_key_material(cfg)
     _check_ntfy_token(cfg)

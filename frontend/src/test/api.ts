@@ -936,6 +936,7 @@ export function healthOut(overrides: Partial<SystemHealthOut> = {}): SystemHealt
       langgraph: "1.2.15",
     },
     embedder: { ok: true, model_id: "embedder-model@abc/fp32", checksum_ok: true },
+    langsmith: null,
     ...overrides,
   };
 }

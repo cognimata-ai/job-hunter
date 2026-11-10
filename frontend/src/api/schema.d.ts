@@ -5041,6 +5041,8 @@ export interface components {
          *     - `scoring`: the score lane.
          *     - `table_bytes`: the size of every table of the `public` schema, in bytes.
          *     - `embedder`: the embedder's health as the readiness check read it.
+         *     - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when the
+         *       worker's heartbeat goes stale.
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
@@ -5048,6 +5050,7 @@ export interface components {
             database_bytes: number;
             disk: components["schemas"]["DiskUsage"];
             embedder: components["schemas"]["EmbedderOut"];
+            langsmith: components["schemas"]["TracingStateOut"] | null;
             /** Last Fully Successful Run Age S */
             last_fully_successful_run_age_s: number | null;
             last_run: components["schemas"]["RunOut"] | null;
@@ -5132,6 +5135,17 @@ export interface components {
             removed: components["schemas"]["SpanOut"][];
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
+        };
+        /**
+         * TracingStateOut
+         * @description The tracing state the worker published at its start: whether it sends traces to LangSmith (inputs and
+         *     outputs hidden), and the region it sends them to (`eu`; `null` when it does not trace).
+         */
+        TracingStateOut: {
+            /** Region */
+            region: "eu" | null;
+            /** Tracing */
+            tracing: boolean;
         };
         /**
          * UnackedAlertsOut

@@ -27,10 +27,12 @@ gave no usable answer, `unusable` for another model or dimension). Never an exce
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), each provider's quota
 window at `now` (`quota_health`, the header status's view), the LLM spend of the month (`llm_spend`, plan
-Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions and the
-embedder's health (with its model id) as the readiness check read it. Run ages are reported, never readiness
-gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs` and the run lists
-(`observability.lists`); every select of one either names `RUN_COLUMNS`, its fields, or fills a
+Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions, the
+embedder's health (with its model id) as the readiness check read it and the LangSmith tracing state the
+last worker published at its start (`tracing_state`, M5 Task 6, Q17: the api has no LangSmith configuration
+of its own; `null` until a worker published one, and kept when its heartbeat goes stale). Run ages are
+reported, never readiness gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs` and the
+run lists (`observability.lists`); every select of one either names `RUN_COLUMNS`, its fields, or fills a
 `worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks too.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
@@ -94,6 +96,9 @@ _PING: Final = q("SELECT 1")
 _SET_STATEMENT_TIMEOUT: Final = q("SELECT set_config('statement_timeout', :timeout, true)")
 _MIGRATION_VERSIONS: Final = q("SELECT version_num FROM alembic_version")
 _HEARTBEAT_AGE: Final = q(HEARTBEAT_AGE_SQL)
+# What the worker published at its start (`observability.langsmith.publish_tracing_state`); before that, no
+# row or NULL.
+_TRACING_STATE: Final = q("SELECT tracing FROM worker_heartbeat WHERE id = 1")
 
 log = get_logger("jobhunter.observability.health")
 
@@ -486,8 +491,22 @@ async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool
     )
 
 
-# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes` and the
-# caller's readiness report (`EmbedderOut`).
+class TracingStateOut(BaseModel):
+    """The tracing state the worker published at its start: whether it sends traces to LangSmith (inputs and
+    outputs hidden), and the region it sends them to (`eu`; `null` when it does not trace)."""
+
+    tracing: bool
+    region: Literal["eu"] | None
+
+
+async def tracing_state(conn: AsyncConnection) -> TracingStateOut | None:
+    """The last published tracing state, `None` before a worker published one (module docstring)."""
+    stored = (await conn.execute(_TRACING_STATE)).scalar_one_or_none()
+    return None if stored is None else TracingStateOut.model_validate(stored)
+
+
+# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes`,
+# `tracing_state` and the caller's readiness report (`EmbedderOut`).
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -502,6 +521,8 @@ class SystemHealthOut(BaseModel):
     - `scoring`: the score lane.
     - `table_bytes`: the size of every table of the `public` schema, in bytes.
     - `embedder`: the embedder's health as the readiness check read it.
+    - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when
+      the worker's heartbeat goes stale.
     """
 
     ready: ReadyState
@@ -520,6 +541,7 @@ class SystemHealthOut(BaseModel):
     table_bytes: dict[str, int]
     versions: Versions
     embedder: EmbedderOut
+    langsmith: TracingStateOut | None
 
 
 @dataclass(frozen=True)
@@ -629,4 +651,5 @@ async def system_health(
         table_bytes=await refresh_table_bytes(conn),
         versions=_versions(),
         embedder=EmbedderOut(ok=embedder.ok, model_id=embedder.model_id, checksum_ok=embedder.checksum_ok),
+        langsmith=await tracing_state(conn),
     )

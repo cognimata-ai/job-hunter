@@ -12,7 +12,10 @@
    registration order (`claim_epoch_and_sweep`, M3 Task 27; a sweep defers through its own transaction's
    connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
 6. the watchdog;
-7. the task app opened, the checkpointer, the M2 operation dependencies (Task 11), the collection graph on
+7. LangSmith's process-wide client installed first, before any graph is compiled (M5 Task 6, Ruling T6-2:
+   `observability.langsmith.install_tracing`, only when tracing is on, which the prod compose alone sets; it
+   returns the tracing state step 8 publishes; the api never installs one); then the task app opened, the
+   checkpointer, the M2 operation dependencies (Task 11), the collection graph on
    its `CollectDeps` and the `WorkerRuntime` with a fresh `ShutdownState`. The operation dependencies, after
    the checkpointer: the LLM gateway on its `httpx2` client (`llm.transport.make_http_client`: in fake LLM
    mode the recorded transport, else the `anthropic_key` secret; with neither, a gateway that is not
@@ -44,15 +47,19 @@
    `deadman_disabled` line, with its reason (`not_configured`, `ping_url_form`);
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a transaction
    of its own, fenced by this worker's epoch: a source without its secret is `disabled('missing_secret')` and
-   never planned, plan Deviation 6); then, when step 7 built a dead-man pinger, its watermark armed
+   never planned, plan Deviation 6); then the tracing state step 7's install returned published on
+   `worker_heartbeat.tracing` (`observability.langsmith.publish_tracing_state`, M5 Task 6, Ruling T6-2: in a
+   transaction of its own that starts with this worker's epoch fence; `/api/system/health` shows it); then,
+   when step 7 built a dead-man pinger, its watermark armed
    (`DeadmanPinger.arm`, M5 Task 5, Ruling T5-2: a watermark never set skips the runs that ended before this
    start, with no ping; under the dead-man lock, in a transaction fenced by this worker's epoch: no run of
    this worker can end before step 10); then the start reconcilers (`stalled_jobs` releases the jobs of dead
    workers) and, outside the test env, the metrics server. When the fence refuses the epoch, a newer worker
-   took over during this start (final review C2): the refused transaction (the sync's, or the arming's after a
-   sync the takeover followed) wrote nothing, so this worker's stale view of the secrets cannot undo the newer
-   worker's sync, and the start ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling
-   FR-i) before any loop runs; a database error in either fails the start (`worker_failed`, exit 1). When the
+   took over during this start (final review C2): the refused transaction (the sync's, or the publish's or
+   the arming's after a sync the takeover followed) wrote nothing, so neither this worker's stale view of the
+   secrets nor its tracing state can overwrite the newer worker's, and the start ends there
+   (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs; a database
+   error in any of the three fails the start (`worker_failed`, exit 1). When the
    start reconcilers' cadence is fenced instead (a takeover that committed after the sync), the cadence
    requests the graceful stop of a superseded worker (`runtime.request_shutdown`, reason `epoch_superseded`,
    Ruling T24-a), and the start ends there too, before any loop runs, with that path's exit 0;
@@ -144,6 +151,7 @@ from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability import deadman
 from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
+from jobhunter.observability.langsmith import install_tracing, publish_tracing_state
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
@@ -332,8 +340,9 @@ class _WorkerProcess:
         # 6. The watchdog.
         self.watchdog = Watchdog(self.lock_session, ident.instance_id, epoch)
         self.watchdog.start()
-        # 7. The task app opened, the checkpointer, the operation dependencies, the collection graph and the
-        # runtime.
+        # 7. Tracing installed before any graph is compiled (M5 Task 6), the task app opened, the
+        # checkpointer, the operation dependencies, the collection graph and the runtime.
+        tracing = install_tracing(cfg)
         await queue.open_async()
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
         llm_http = self.llm_http = llm_transport.make_http_client(cfg)
@@ -403,22 +412,25 @@ class _WorkerProcess:
             deadman=pinger,
         )
 
-        # 8. The source instances synced with the secrets under this worker's epoch fence, the dead-man's
-        # watermark armed, the start reconcilers, the metrics server.
+        # 8. The source instances synced with the secrets under this worker's epoch fence, the tracing state
+        # published under it, the dead-man's watermark armed, the start reconcilers, the metrics server.
         async def fenced(conn: AsyncConnection) -> None:
             await fence_epoch(conn, epoch)
 
         try:
             async with engine.begin() as conn:
                 await sync_instances(conn, cfg, guard=fenced)
+            async with engine.begin() as conn:  # M5 Task 6 (Ruling T6-2)
+                await fence_epoch(conn, epoch)
+                await publish_tracing_state(conn, tracing)
             if pinger is not None:  # M5 Task 5 (Ruling T5-2): no run of this worker has ended yet
                 await pinger.arm()
         except FencedOut as refused:
             if not refused.worker_superseded:
                 raise  # not this worker's own fence: the start failed (`worker_failed`, exit 1), F5 Minor 1
             # A newer worker owns the work (`fence_epoch` logged both epochs) and the refused transaction (the
-            # sync's, or the arming's) wrote nothing. No loop has started; the teardown follows (it
-            # closes what the start built), then the watchdog's superseded exit (Ruling FR-i). The restart
+            # sync's, the publish's or the arming's) wrote nothing. No loop has started; the teardown follows
+            # (it closes what the start built), then the watchdog's superseded exit (Ruling FR-i). The restart
             # stands by while that worker is healthy.
             log.critical("worker_superseded_at_start", epoch=epoch, exit_code=WATCHDOG_EXIT_CODE)
             return WATCHDOG_EXIT_CODE
