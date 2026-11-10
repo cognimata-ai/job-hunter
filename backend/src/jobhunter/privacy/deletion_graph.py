@@ -459,9 +459,8 @@ async def settle_live_spend(
     bulks = await _ids(conn, _ACTIVE_BULKS, {"bound": bulk_bound})
     for bulk_operation_id in bulks:
         await bulk.cancel(conn, bulk_operation_id, now=now)
-    rows = await spend_ledger.lock_for_purge(
-        conn, online, now=now
-    )  # read again: the settles above wrote them
+    # the online entries' accounts read again: the settles above wrote them (their locks are held)
+    rows = await spend_ledger.lock_for_purge(conn, online, now=now)
     settled = await spend_ledger.settle_for_purge(conn, online, rows, now=now)
     done = LiveSpendSettled(
         abandoned=tuple(preparing),
