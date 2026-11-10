@@ -160,6 +160,14 @@ def _make_dir(path: Path) -> Path:
     return path
 
 
+def _private_dir(path: Path) -> Path:
+    """`path` as a directory of mode 0700 (created when missing), as the app image makes its volumes' mount
+    points (M5 Task 9)."""
+    path.mkdir(mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
 def _write_secrets(workdir: Path) -> dict[str, str]:
     """Write the secret files of the server and of every application role; return the role passwords."""
     passwords: dict[str, str] = {role: secrets.token_hex(24) for role in _PASSWORD_FILE}
@@ -378,6 +386,10 @@ def server_env(
 
     The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret). Its
     docparse jobs' root (M2 Task 11) is the server's own directory, never the container's `/data/parse`.
+    Every role's deletion manifests and exports (M5 Task 9: `JOBHUNTER_MANIFESTS_DIR`,
+    `JOBHUNTER_EXPORTS_DIR`) are the server's `manifests/` and `exports/`, created here with mode 0700 as
+    the image creates its volumes' mount points: the defaults under `/data` do not exist outside the image,
+    and the in-process and child workers write there.
     `embedder_url` is the embedder the role reaches (`JOBHUNTER_EMBEDDER_URL`): the session's fake embedder,
     as `make_config` and `proc_env` pass it (Task 22); without it the configuration's default stays.
     """
@@ -398,6 +410,8 @@ def server_env(
         "JOBHUNTER_DB_NAME": _DB_NAME,
         "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
         "JOBHUNTER_SECRETS_DIR": str(server.secrets_dir(role)),
+        "JOBHUNTER_MANIFESTS_DIR": str(_private_dir(server.workdir / "manifests")),
+        "JOBHUNTER_EXPORTS_DIR": str(_private_dir(server.workdir / "exports")),
         **fake_sources,
         **embedder,
         **env,

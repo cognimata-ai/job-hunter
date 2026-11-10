@@ -782,6 +782,22 @@ def test_parse_jobs_dir_defaults_to_the_tmpfs_and_follows_the_environment(tmp_pa
     assert load_config("worker", env, secrets).parse_jobs_dir == tmp_path / "parse"
 
 
+# --- M5 Task 9: the deletion manifests' and the exports' volumes (R18) -------------------------------------
+
+
+def test_manifests_and_exports_dirs_default_to_the_volumes_and_follow_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    cfg = load_config("worker", BASE_ENV, secrets)
+    assert (cfg.manifests_dir, cfg.exports_dir) == (Path("/data/manifests"), Path("/data/exports"))
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_MANIFESTS_DIR": str(tmp_path / "manifests"),
+        "JOBHUNTER_EXPORTS_DIR": str(tmp_path / "exports"),
+    }
+    cfg = load_config("worker", env, secrets)
+    assert (cfg.manifests_dir, cfg.exports_dir) == (tmp_path / "manifests", tmp_path / "exports")
+
+
 # --- M4 Task 19: the built SPA the api serves (`JOBHUNTER_SPA_DIR`) ---------------------------------------
 
 

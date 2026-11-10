@@ -44,9 +44,13 @@ RUN --mount=type=secret,id=build_ca,required=false \
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
 COPY --from=spa /src/frontend/dist /opt/spa
-# The mount point of the cv_store volume (encrypted CV files, §12.1), owned by the app user and private to it:
-# Docker gives a fresh named volume the ownership and mode of the image's directory.
-RUN mkdir -p /data/cv && chown 10001:10001 /data/cv && chmod 0700 /data/cv
+# The mount points of the cv_store volume (encrypted CV files, §12.1) and, since M5 (R18), of the manifests
+# volume (the deletion manifests' files, §19.5) and the exports volume (the encrypted export archives, §20.3),
+# each owned by the app user and private to it: Docker gives a fresh named volume the ownership and mode of the
+# image's directory.
+RUN mkdir -p /data/cv /data/manifests /data/exports \
+    && chown 10001:10001 /data/cv /data/manifests /data/exports \
+    && chmod 0700 /data/cv /data/manifests /data/exports
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1
 WORKDIR /
 USER 10001:10001

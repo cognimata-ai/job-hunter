@@ -161,6 +161,8 @@
     "llm.unexpected_stop_reason",
     "notify.delivery_failed",
     "operation.failed",
+    "privacy.manifest_unshipped",
+    "privacy.purge_failed",
     "profile.extract_generation_mismatch",
     "quota.ambiguous_attempt",
     "quota.exhausted",

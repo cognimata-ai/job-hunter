@@ -17,6 +17,10 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+`operations` deletes an operation 30 days after it finished, except a purge operation whose deletion manifest
+is still `executing` (M5 Task 9, D7): a failed purge keeps its fence until it is retried, and the
+`purge_fences` reconciler re-queues a manifest only when it has no pending, running or failed operation.
+
 **The M1 rules** (Task 24), after `operations`; none deletes what the live pipeline still uses:
 - `raw_items`: 90 days by `created_at`; an observation keeps its provenance copy (`raw_item_id := NULL`). A
   `deferred('job_fenced')` item stays past the 90 days, as long as its request: a later run re-resolves it
@@ -257,9 +261,12 @@ _DELETES: Final[dict[str, TextClause]] = {
     "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
     "login_attempts": q("DELETE FROM login_attempts WHERE at < :cutoff"),
     "alerts": q("DELETE FROM alerts WHERE resolved_at < :cutoff"),
+    # A purge operation of an `executing` manifest stays, however old (D7: its manifest is retried from it).
     "operations": q(
-        "DELETE FROM operations "
-        "WHERE status IN ('succeeded', 'failed', 'cancelled') AND finished_at < :cutoff"
+        "DELETE FROM operations o "
+        "WHERE o.status IN ('succeeded', 'failed', 'cancelled') AND o.finished_at < :cutoff "
+        "AND NOT (o.kind = 'purge' AND EXISTS (SELECT 1 FROM deletion_manifests m "
+        "WHERE m.status = 'executing' AND o.payload -> 'manifest_id' = to_jsonb(m.id)))"
     ),
     "raw_items": q("DELETE FROM raw_items WHERE created_at < :cutoff AND disposition <> 'deferred'"),
     "raw_bodies": q(

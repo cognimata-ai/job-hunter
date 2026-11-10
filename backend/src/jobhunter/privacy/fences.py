@@ -29,20 +29,58 @@ re-creates a row of a deleted job.
 `refuse_under_global_fence(conn)` right after they lock `active_config` (delete-everything commits its fence
 under `active_config FOR UPDATE`): while the `global` fence stands they are refused with 409
 `delete_everything_in_progress` (`db.fence_guard.delete_everything_in_progress`).
+
+**The fence writers** (M5 Task 9; §7.14, §19.5 step 3). A purge's A0 transaction inserts its manifest
+(`manifests.insert_manifest`) and its fences, `insert_fence(conn, manifest_id=..., spec=FenceSpec(...))`: a
+`global`, a `source` (its source; the stored affected jobs are added at A3 by `manifests.record_manifest`),
+a `profile` (its version) or a `jobs` fence (the batch, at least one job), the job ids distinct and in order.
+The completing transaction releases them, `release_fences(conn, manifest_id)`: `released_at := now()` on every
+active fence of the manifest, the number released. Neither commits.
+
+**The quiesce** (D1). A transaction that began before A0 committed cannot see the fence, so once A0 has
+committed the purge reads its commit cutoff, `fence_committed_at(engine)` (`clock_timestamp()` in a statement
+of its own, after the commit: the manifest's `fenced_at`), and waits, `wait_for_quiesce(engine, since=...,
+clock=..., sleep=...)`, until no transaction of the application role that began before it is still open:
+`pg_stat_activity` rows of `jobhunter_app` in this database (controller ruling T9-1: a transaction in another
+database cannot touch this one's rows, and the test server hosts many) other than the polling backend with
+`xact_start < since`. An idle session (procrastinate's `LISTEN`, a pooled connection) has no `xact_start`.
+The application role sees its own sessions' `xact_start`. Each poll is a transaction of its own on a pooled
+connection (`pg_stat_activity` is a snapshot per transaction), and nothing is held open between polls, every
+`QUIESCE_POLL_S` by the caller's `sleep`; the caller holds no transaction of its own meanwhile. Past
+`QUIESCE_TIMEOUT` by the caller's `clock` it returns `False` (the purge then waits and tries again), else
+`True`.
 """
 
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Final
 
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.fence_guard import delete_everything_in_progress
 from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.errors import Refusal
+from jobhunter.privacy.manifests import FenceKind
 
 PURGE_IN_PROGRESS: Final = "purge_in_progress"
 NO_OPEN_FENCE_SQL: Final = "NOT EXISTS (SELECT 1 FROM purge_fences f WHERE f.released_at IS NULL)"
+QUIESCE_POLL_S: Final = 1.0
+QUIESCE_TIMEOUT: Final = timedelta(minutes=10)
+# The application role's own transactions that began before `:since`, in this database (module docstring).
+_OLDER_OPEN: Final = q(
+    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE usename = 'jobhunter_app' "
+    "AND datname = current_database() AND pid <> pg_backend_pid() AND xact_start < :since)"
+)
+_COMMITTED_AT: Final = q("SELECT clock_timestamp()")
+_INSERT_FENCE: Final = q(
+    "INSERT INTO purge_fences (kind, source_id, profile_version_id, job_ids, manifest_id) "
+    "VALUES (:kind, :source_id, :profile_version_id, CAST(:job_ids AS bigint[]), :manifest_id) RETURNING id"
+)
+_RELEASE: Final = q(
+    "UPDATE purge_fences SET released_at = now() WHERE manifest_id = :m AND released_at IS NULL RETURNING id"
+)
 
 _LOCK: Final = q("SELECT id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR SHARE")
 _FENCED: Final = q(
@@ -90,3 +128,61 @@ async def refuse_under_global_fence(conn: AsyncConnection) -> None:
     holds `active_config`."""
     if await global_fence_active(conn):
         raise delete_everything_in_progress()
+
+
+@dataclass(frozen=True)
+class FenceSpec:
+    """A fence to raise: its kind and the key the kind needs (§7.14's CHECKs refuse any other combination)."""
+
+    kind: FenceKind
+    source_id: str | None = None
+    profile_version_id: int | None = None
+    job_ids: tuple[int, ...] = ()
+
+
+async def insert_fence(conn: AsyncConnection, *, manifest_id: int, spec: FenceSpec) -> int:
+    """Raise `spec`'s fence for the manifest `manifest_id`, its job ids distinct and in order; its id (module
+    docstring). The caller commits it with the manifest (A0)."""
+    params = {
+        "kind": spec.kind,
+        "source_id": spec.source_id,
+        "profile_version_id": spec.profile_version_id,
+        "job_ids": sorted(set(spec.job_ids)),
+        "manifest_id": manifest_id,
+    }
+    return int((await conn.execute(_INSERT_FENCE, params)).scalar_one())
+
+
+async def release_fences(conn: AsyncConnection, manifest_id: int) -> int:
+    """Release every active fence of the manifest (`released_at := now()`); the number released."""
+    return len((await conn.execute(_RELEASE, {"m": manifest_id})).all())
+
+
+async def fence_committed_at(engine: AsyncEngine) -> datetime:
+    """The database's `clock_timestamp()`, read in a transaction of its own after the fence's committed: the
+    cutoff `wait_for_quiesce` waits from (module docstring)."""
+    async with engine.connect() as conn:
+        committed: datetime = (await conn.execute(_COMMITTED_AT)).scalar_one()
+    return committed
+
+
+async def _older_open(engine: AsyncEngine, since: datetime) -> bool:
+    async with engine.connect() as conn:  # a transaction of its own, rolled back when the block ends
+        return bool((await conn.execute(_OLDER_OPEN, {"since": since})).scalar_one())
+
+
+async def wait_for_quiesce(
+    engine: AsyncEngine,
+    *,
+    since: datetime,
+    clock: Callable[[], datetime],
+    sleep: Callable[[float], Awaitable[None]],
+) -> bool:
+    """Wait until no application transaction that began before `since` is open (D1, module docstring): `True`
+    once none is, `False` once `QUIESCE_TIMEOUT` has passed on `clock` with one still open."""
+    deadline = clock() + QUIESCE_TIMEOUT
+    while await _older_open(engine, since):
+        if clock() >= deadline:
+            return False
+        await sleep(QUIESCE_POLL_S)
+    return True

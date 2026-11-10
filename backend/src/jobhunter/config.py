@@ -52,6 +52,11 @@ DEFAULT_CV_STORE_DIR: Final = Path("/data/cv")
 DEFAULT_PARSE_JOBS_DIR: Final = Path("/data/parse")
 # M4 (plan Task 19): the built SPA in the app image (the Dockerfile's `spa` stage), which the api serves.
 DEFAULT_SPA_DIR: Final = Path("/opt/spa")
+# M5 (plan Task 9, R18): the `manifests` volume of the deletion manifests' files (§19.5: the worker writes
+# them, `migrate` rewrites and replays them, the backup container ships them) and the `exports` volume of the
+# encrypted export archives (§20.3: the worker writes them, the api serves them).
+DEFAULT_MANIFESTS_DIR: Final = Path("/data/manifests")
+DEFAULT_EXPORTS_DIR: Final = Path("/data/exports")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -191,6 +196,10 @@ class AppConfig:
     parse_jobs_dir: Path
     # `JOBHUNTER_SPA_DIR`: the built SPA the api serves (`api.static.SpaFiles`); absent outside the image.
     spa_dir: Path
+    # M5 Task 9: `JOBHUNTER_MANIFESTS_DIR`, where `privacy.manifests.write_manifest_file` writes the deletion
+    # manifests' files, and `JOBHUNTER_EXPORTS_DIR`, where the export archives are kept.
+    manifests_dir: Path
+    exports_dir: Path
     # M5 Task 4: `NTFY_TOPIC_URL`, the topic the worker's alert dispatcher pushes to (`None` when unset or
     # empty: no push; a prod worker needs an https one, `ntfy_in_prod`), registered for log masking by
     # `startup_or_exit`; and `HEALTHCHECKS_API_URL`, the Management API base of §17.7.
@@ -315,6 +324,8 @@ def load_config(
         cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
         parse_jobs_dir=Path(env.get("JOBHUNTER_PARSE_JOBS_DIR") or DEFAULT_PARSE_JOBS_DIR),
         spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
+        manifests_dir=Path(env.get("JOBHUNTER_MANIFESTS_DIR") or DEFAULT_MANIFESTS_DIR),
+        exports_dir=Path(env.get("JOBHUNTER_EXPORTS_DIR") or DEFAULT_EXPORTS_DIR),
         ntfy_topic_url=env.get("NTFY_TOPIC_URL") or None,
         healthchecks_api_url=env.get("HEALTHCHECKS_API_URL") or DEFAULT_HEALTHCHECKS_API_URL,
         secrets=MappingProxyType(contents),

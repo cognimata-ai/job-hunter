@@ -229,6 +229,8 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.observability.deadman",
     # M5 Task 7: the `backup_health` reconciler, the backup alerts and age gauge (O1, Deviation 12)
     "jobhunter.observability.backup_health",
+    # M5 Task 9: the `manifest_shipping` (every tick, Deviation 43) and `purge_fences` (D7) reconcilers
+    "jobhunter.privacy.reconcilers",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

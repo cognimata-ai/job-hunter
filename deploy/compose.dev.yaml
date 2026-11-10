@@ -89,6 +89,9 @@ services:
     restart: "no"
     environment: *app-env
     secrets: [db_migrator]
+    # The manifest replay (§19.5): it writes a pending-retry manifest's file, removes CV files and, for a
+    # replayed or pending-retry purge, export archives (M5 Task 9).
+    volumes: [manifests:/data/manifests, cv_store:/data/cv, exports:/data/exports]
     networks: [internal]
     depends_on: { postgres: { condition: service_healthy } }
 
@@ -105,7 +108,7 @@ services:
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080 # readiness and system health probe it
     secrets: [session_secret, data_key, db_app]
-    volumes: [cv_store:/data/cv] # the encrypted CV uploads (§12.1)
+    volumes: [cv_store:/data/cv, exports:/data/exports:ro] # the encrypted CV uploads (§12.1); export downloads
     networks: [proxy, internal] # both internal: no route to the internet
     healthcheck:
       test: ["CMD", "jobhunter", "http-check", "http://localhost:8000/healthz"]
@@ -125,7 +128,7 @@ services:
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080
     secrets: [data_key, db_app, anthropic_key] # anthropic_key may be empty: no key (M2 Task 23)
-    volumes: [cv_store:/data/cv, parse_jobs:/data/parse]
+    volumes: [cv_store:/data/cv, manifests:/data/manifests, exports:/data/exports, parse_jobs:/data/parse]
     # A service-level group_add replaces the x-app list: the secrets group again, and jobhunter-parse, the
     # group of the parse_jobs tmpfs it shares with docparse (§19.1).
     group_add: ["10010", "10011"]
@@ -228,6 +231,10 @@ networks:
 volumes:
   pgdata: {}
   cv_store: {} # the encrypted CV files (§12.1); the app image's /data/cv gives it 10001:10001, mode 0700
+  # M5 Task 9: the deletion manifests' files (§19.5) and the encrypted export archives (§20.3), 10001:10001,
+  # mode 0700 from the app image's /data/manifests and /data/exports
+  manifests: {}
+  exports: {}
   # RAM only, so a decrypted CV never reaches a disk (§12.2); the setgid root (2770, group 10011) gives every
   # per-job directory the group that both the worker and docparse hold.
   parse_jobs:

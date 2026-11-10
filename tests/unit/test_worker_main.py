@@ -1145,8 +1145,15 @@ M3_RECONCILERS = {
     "batch_submissions": ["tick"],
 }
 # M5 Task 5: the dead-man switch's durable path, registered by `observability.deadman` (O-ops Q6, O10); M5
-# Task 7: the backup alerts and age gauge, registered by `observability.backup_health` (O1, Deviation 12).
-M5_RECONCILERS = {"deadman_ping": ["tick"], "backup_health": ["heavy"]}
+# Task 7: the backup alerts and age gauge, registered by `observability.backup_health` (O1, Deviation 12); M5
+# Task 9: the manifests' shipping (every tick, Deviation 43) and the purge fences' watch (D7), registered by
+# `privacy.reconcilers`.
+M5_RECONCILERS = {
+    "deadman_ping": ["tick"],
+    "backup_health": ["heavy"],
+    "manifest_shipping": ["tick"],
+    "purge_fences": ["heavy"],
+}
 # The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
 # the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
 # import in `test_the_registering_modules_list_every_m3_module`).
@@ -1168,7 +1175,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     ONLY `worker.main._REGISTERING_MODULES` (step 4, before the takeover; never `worker.main` itself, whose
     imports would register most of it anyway) holds exactly:
     - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set),
-      and M5's `deadman_ping` (Task 5, `observability.deadman`);
+      and M5's `deadman_ping` (Task 5, `observability.deadman`), `backup_health` (Task 7) and
+      `manifest_shipping` and `purge_fences` (Task 9, `privacy.reconcilers`);
     - the five takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, Task
       16's `batch_submissions`), each run in a fenced transaction of its own since Task 27;
     - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
