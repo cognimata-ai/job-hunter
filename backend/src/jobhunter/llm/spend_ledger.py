@@ -48,9 +48,13 @@ reservation is charged in full with `evidence='reservation_bound_violated'` and 
 already moved to `ambiguous` settles late through §7.16.7's `ambiguous → billed | not_billed` (plan Deviation
 24); one already `billed` or `not_billed` is left alone (`llm_settle_duplicate`). A score attempt's
 `cost_usd` follows each try at what it counts (billed its cost, ambiguous its reservation, L3911). The
-provider metadata it writes is made storable first (`storable_outcome`). `settle` updates no metric: it
-returns the figures (`SettleFigures`), and the gateway records them after its transaction has committed
-(`record_settlement_metrics`), so a rolled-back settlement is never counted.
+provider metadata it writes is made storable first (`storable_outcome`). The call's `output_json` is set by
+SQL only while its `content_purged_at` is NULL (M5 Task 14, Deviation 54): the expression is evaluated on the
+row the update locks, and again on the newest version after a lock wait, so a profile purge's redaction that
+committed first wins whatever the settlement read, and a response that arrives after it settles its usage,
+cost and ledger state but stores no content (logged `llm_settle_output_redacted`, ids only). `settle` updates
+no metric: it returns the figures (`SettleFigures`), and the gateway records them after its transaction has
+committed (`record_settlement_metrics`), so a rolled-back settlement is never counted.
 
 **The cap reached** (§6.9.4): `raise_cap_reached` raises `llm.cap_reached` once per month (the month row's
 `cap_reached_alerted_at`, never cleared); `resolve_cap_reached` and `resolve_stale_cap_alerts` resolve it.
@@ -1676,7 +1680,8 @@ async def settle(
     row (locked after the month row, before the ledger rows), in full also above `budget_usd` (L1164). A
     score call's attempt `cost_usd` moves by what the try now counts at minus what it counted before (L3911):
     `+ s` billed, `+ r` ambiguous, `+ (s - r)` late billed, `- r` late not billed. The call's provider
-    metadata is written storable (`storable_outcome`).
+    metadata is written storable (`storable_outcome`), and its output only while no purge redacted it
+    (`content_purged_at` NULL, read on the row the update locks; module docstring).
     """
     _check_settlement(res, outcome, evidence, usage, call)
     call = storable_outcome(call)
@@ -1710,14 +1715,7 @@ async def settle(
     await transition(
         conn, "llm_spend_ledger", entry.id, [entry.state], outcome, reason=reason, set_=entry_set
     )
-    await transition(
-        conn,
-        "llm_calls",
-        entry.call_id,
-        [entry.call_status],
-        call.status,
-        set_=_call_set(call, usage, cost, entry, now),
-    )
+    await _settle_call(conn, entry, call, _call_set(call, usage, cost, entry, now))
     delta = budget.settlement_delta(outcome, entry.reserved_usd, cost)
     budget.apply_count(row, delta, entry.purpose_class, bucket=entry.bucketed)
     await _save(conn, row, now)
@@ -1738,9 +1736,40 @@ async def settle(
     return await _figures(conn, entry, row, p, counted_at)
 
 
+# The call's output, set only while no purge has redacted the call (M5 Task 14, Deviation 54): evaluated on
+# the row the update locks, and again on its newest version after a lock wait, so a redaction that committed
+# first wins whatever the settlement read before it.
+_OUTPUT_UNLESS_REDACTED: Final = "CASE WHEN t.content_purged_at IS NULL THEN CAST(:output_json AS jsonb) END"
+
+
+async def _settle_call(
+    conn: AsyncConnection, entry: _Entry, call: CallOutcome, values: Mapping[str, object]
+) -> None:
+    """The call row's settlement, `values` and the output unless the call is redacted (module docstring,
+    "Settlement"); `TransitionConflict` when the call is no longer in the state the entry was read with."""
+    output = None if call.output_json is None else dict(call.output_json)
+    moved = await transition_where(
+        conn,
+        "llm_calls",
+        [entry.call_status],
+        call.status,
+        where="t.id = :call_id",
+        params={"call_id": entry.call_id, "output_json": output},
+        set_=values,
+        set_sql={"output_json": _OUTPUT_UNLESS_REDACTED},
+        jsonb=["output_json"],
+        returning=("id", "content_purged_at"),
+    )
+    if not moved:
+        raise TransitionConflict("llm_calls", entry.call_id, call.status)
+    if output is not None and moved[0]["content_purged_at"] is not None:
+        log.info("llm_settle_output_redacted", ledger_id=entry.id, llm_call_id=entry.call_id)
+
+
 def _call_set(
     call: CallOutcome, usage: Usage | None, cost: Decimal | None, entry: _Entry, now: datetime
 ) -> dict[str, object]:
+    """The call row's settled columns but its output (`_settle_call` sets that)."""
     values: dict[str, object] = {
         "model_served": call.model_served,
         "http_status": call.http_status,
@@ -1748,7 +1777,6 @@ def _call_set(
         "stop_reason": call.stop_reason,
         "refusal_category": call.refusal_category,
         "provider_request_id": call.provider_request_id,
-        "output_json": None if call.output_json is None else dict(call.output_json),
         "first_event_at": call.first_event_at,
         "ended_at": now,
         "cost_usd": entry.reserved_usd if cost is None else cost,

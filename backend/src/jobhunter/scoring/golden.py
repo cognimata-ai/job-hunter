@@ -21,11 +21,12 @@ seniority) is unknown, which every hard filter passes (positive evidence only).
 
 **Refusals** are `jobhunter.errors.Refusal`s (M4 Carry-forward 3): domain code never raises the api's
 `Problem`. A user's write that meets a job under a purge fence (`record_feedback`, and `set_flags` activating
-a case) is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (`privacy.fences`, §20.2, M5
-Task 8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced. The deletion of a case
-a running eval run includes is refused with 409 `conflict_state`, `detail = "eval_run_running"`
-(`eval_run_running`, M5 Task 12): `lock_case`, `in_running_run` and `case_job` are shared with the
-golden-case purge (`privacy.kinds.golden_case`).
+a case) is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (`privacy.fences`, §20.2, M5 Task
+8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced. `set_flags` also refuses to
+activate a case whose profile version is purged or fenced (M5 Task 14), read under `active_config FOR SHARE`,
+its first lock. The deletion of a case a running eval run includes is refused with 409 `conflict_state`,
+`detail = "eval_run_running"` (`eval_run_running`, M5 Task 12): `lock_case`, `in_running_run` and `case_job`
+are shared with the golden-case purge (`privacy.kinds.golden_case`).
 
 Nothing here logs content: ids, labels, sources and counts only.
 """
@@ -48,7 +49,7 @@ from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.language import detect_language
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.observability.logging import get_logger
-from jobhunter.privacy.fences import fenced_jobs, lock_unfenced_jobs, purge_in_progress
+from jobhunter.privacy.fences import fenced_jobs, lock_unfenced_jobs, purge_in_progress, version_fenced
 from jobhunter.profile.contacts import strip_contacts
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.det_results import det_facts_from_inputs, det_inputs
@@ -426,9 +427,16 @@ _LIST: Final = q(
 )
 _ONE: Final = q(f"SELECT {_CASE_COLUMNS} WHERE g.id = :i")
 _LOCK_CASE: Final = q("SELECT active, is_canary FROM golden_cases WHERE id = :i FOR UPDATE")
-# The job of a case's revision (a plain read: `set_flags` then takes the job's row `FOR SHARE`).
+# The job of a case's revision (a plain read: the golden-case purge then takes the job's row `FOR UPDATE`).
 _CASE_JOB: Final = q(
     "SELECT r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id WHERE g.id = :i"
+)
+# The case's job and its profile version, whether purged (plain reads after `set_flags`' `active_config`
+# lock: then its job's row `FOR SHARE`).
+_CASE_VERSION: Final = q(
+    "SELECT r.job_id, g.profile_version_id, v.purged_at IS NOT NULL AS purged FROM golden_cases g "
+    "JOIN job_revisions r ON r.id = g.job_revision_id JOIN profile_versions v ON v.id = g.profile_version_id "
+    "WHERE g.id = :i"
 )
 # A running eval run includes the case (`delete_case_unless_running`): it has a call naming the case, or its
 # kind selects it (a golden run every active case, a canary run every active canary; `eval_runner`'s list).
@@ -554,17 +562,32 @@ async def set_flags(
     """Set the case's `active` and `is_canary` flags (`None` keeps one) in the caller's transaction, its
     `updated_at` to `now` (the caller's clock); the case.
 
-    At most `MAX_CANARIES` cases are canaries (L4632): making a third one a canary is a 422
-    `validation_failed`; the check and the write are serialised by an advisory transaction lock, so two
-    concurrent requests cannot both pass it. An unknown case is a 404. Activating a case (`active=True`)
-    first takes its job's row `FOR SHARE` (step 4 of the lock schedule) and refuses a job under a purge fence,
-    or one gone, with 409 `conflict_state`, `detail = "purge_in_progress"` (module docstring); a case
+    Its first statement takes `active_config FOR SHARE` (step 2 of the lock schedule, before the canary lock
+    and the job row; M5 Task 14, Deviation 25): a profile purge's admission holds it `FOR UPDATE` while it
+    reads its version's eligibility, which an active case on the version spoils, so an activation either
+    commits before that read or waits for the admission and then meets its fence. At most `MAX_CANARIES`
+    cases are canaries (L4632): making a third one a canary is a 422 `validation_failed`; the check and the
+    write are serialised by an advisory transaction lock, so two concurrent requests cannot both pass it. An
+    unknown case is a 404. Activating a case (`active=True`) refuses, with 409 `conflict_state`, `detail =
+    "purge_in_progress"` (module docstring): a case whose profile version is purged or under an unreleased
+    `profile` or `global` fence (`privacy.fences.version_fenced`, read after the `active_config` lock); then
+    it takes its job's row `FOR SHARE` (step 4) and refuses a job under a purge fence, or one gone. A case
     deactivated or made a canary is not activated, so neither is refused."""
+    await conn.execute(_LOCK_CONFIG)  # step 2, the first lock
     if active:
-        job_id = (await conn.execute(_CASE_JOB, {"i": case_id})).scalar_one_or_none()
-        if job_id is None:
+        case = (await conn.execute(_CASE_VERSION, {"i": case_id})).first()
+        if case is None:
             raise Refusal(404, "not_found", "Golden case not found")
-        if not await lock_unfenced_jobs(conn, [int(job_id)]):
+        version = int(case.profile_version_id)
+        if case.purged or await version_fenced(conn, version):
+            log.info(
+                "golden_case_activation_refused",
+                golden_case_id=case_id,
+                reason="profile_purge",
+                version_id=version,
+            )
+            raise purge_in_progress()
+        if not await lock_unfenced_jobs(conn, [int(case.job_id)]):
             log.info("golden_case_activation_refused", golden_case_id=case_id, reason="purge_in_progress")
             raise purge_in_progress()
     if is_canary:

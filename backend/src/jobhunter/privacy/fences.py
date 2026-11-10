@@ -24,6 +24,15 @@ re-creates a row of a deleted job.
 - `NO_OPEN_FENCE_SQL`: "no fence is open", the uncorrelated `NOT EXISTS` a selection ORs before `is_fenced`
   (D21): an InitPlan, run once, that spares every row the function while no fence stands.
 
+**A profile version's fence** (M5 Task 14). `is_fenced` matches a `profile` fence through a tuple of its
+version; the writers that name a version, not a job and a tuple, read it with `version_fenced(conn,
+profile_version_id)`: an unreleased `profile` fence of the version or the `global` fence (§20.2's table: the
+latter matches everything). Its predicate, `version_fenced_sql(<the version's SQL>)`, is what the profile
+purge's selection reads. The callers hold `active_config` (A0 commits its fence under it `FOR UPDATE`), read
+it in a statement after that lock, and refuse: `golden.set_flags` (activating a case, 409 `conflict_state`,
+`purge_in_progress`) and `queries.proposals.request_proposal` (an `InvariantViolation`: no caller asks for a
+fenced version).
+
 **The privacy requests** (`request_golden_case_delete`, `request_source_purge`, `request_export`: Tasks 12,
 15 and 17), which the edge and the write guard exempt (`api.edge.fence_exempt`), call
 `refuse_under_global_fence(conn)` right after they lock `active_config` (delete-everything commits its fence
@@ -83,6 +92,17 @@ _RELEASE: Final = q(
 )
 
 _LOCK: Final = q("SELECT id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR SHARE")
+
+
+def version_fenced_sql(version: str) -> str:
+    """The predicate "the profile version `version` (a SQL expression) is fenced" (module docstring)."""
+    return (
+        "EXISTS (SELECT 1 FROM purge_fences f WHERE f.released_at IS NULL AND (f.kind = 'global' "  # noqa: S608
+        f"OR (f.kind = 'profile' AND f.profile_version_id = {version})))"
+    )
+
+
+_VERSION_FENCED: Final = q(f"SELECT {version_fenced_sql('CAST(:pv AS bigint)')}")
 _FENCED: Final = q(
     "SELECT j.id FROM unnest(CAST(:ids AS bigint[])) AS j(id) "  # noqa: S608 (the module's constant)
     f"WHERE NOT {NO_OPEN_FENCE_SQL} AND is_fenced(j.id, CAST(:tuple AS bigint)) ORDER BY j.id"
@@ -121,6 +141,12 @@ async def lock_unfenced_jobs(
     no unreleased fence matches (module docstring)."""
     held = await lock_jobs_shared(conn, job_ids)
     return held - await fenced_jobs(conn, held, llm_tuple_id=llm_tuple_id)
+
+
+async def version_fenced(conn: AsyncConnection, profile_version_id: int) -> bool:
+    """Whether an unreleased `profile` fence of the version, or the `global` fence, stands (module docstring);
+    the caller holds `active_config` and reads it after that lock."""
+    return bool((await conn.execute(_VERSION_FENCED, {"pv": profile_version_id})).scalar_one())
 
 
 async def refuse_under_global_fence(conn: AsyncConnection) -> None:

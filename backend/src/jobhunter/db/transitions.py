@@ -21,7 +21,7 @@ registry), where the `assert_transition` trigger checks them, row by row, as def
 
 import enum
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
@@ -1024,6 +1024,7 @@ async def transition_where(
     set_sql: Mapping[str, str] | None = None,
     from_sql: str | None = None,
     returning: Sequence[str] = ("id",),
+    jsonb: Collection[str] = (),
 ) -> list[RowMapping]:
     """Move every row of `table` in one of `from_states` that `where` selects to `to_state`; return them.
 
@@ -1041,6 +1042,9 @@ async def transition_where(
       (`gen_random_uuid()`, `t.attempt_no + 1`, `a.lane`, `:epoch`); `set_` maps one to a value, as in
       `transition()`.
     - `returning` names columns of `t`.
+    - `jsonb` names keys of `params` bound as JSONB, as `db.sql.q`'s `jsonb` does (a mapping or a list as
+      JSON, `None` as SQL NULL, never a JSON `null`), for static SQL that reads them with
+      `CAST(:name AS jsonb)` (M5 Task 14: `spend_ledger.settle`'s output, set only on an unredacted call).
 
     A cast is written `CAST(:name AS type)`: `sa.text` does not recognise `:name::type` as a bind. The
     assignments bind the to-state, a text reason and the `set_` values under their column names, and the
@@ -1050,13 +1054,15 @@ async def transition_where(
     table or edge, a reason without a reason column, a column that is not settable or that the transition
     clears, whether in `set_` or in `set_sql`), a column in both `set_` and `set_sql`, an empty `where`, a
     `:name` of `where`, `from_sql` or `set_sql` that `params` does not give and a key of `params` that none of
-    them binds, a `:name::type` cast, a bind name that collides with the assignments', and a `returning` name
-    that is not a column name. Zero rows is not an error: the caller reads the list. The `assert_transition`
-    trigger still checks every row.
+    them binds, a `:name::type` cast, a bind name that collides with the assignments', a `returning` name
+    that is not a column name, and a `jsonb` name that is no key of `params`. Zero rows is not an error: the
+    caller reads the list. The `assert_transition` trigger still checks every row.
     """
     spec = _spec(table)
     set_ = set_ or {}
     set_sql = set_sql or {}
+    if untyped := sorted(set(jsonb) - set(params)):
+        raise ValueError(f"{table}: {untyped} in jsonb have no value in params")
     if both := set(set_) & set(set_sql):
         raise ValueError(f"{table}: {sorted(both)} are assigned by both set_ and set_sql")
     cleared = _validate(spec, from_states, to_state, reason, {}, {**set_, **set_sql})
@@ -1081,12 +1087,15 @@ async def transition_where(
     columns = ", ".join(f"t.{name}" for name in returning)
     predicate = f"t.{spec.state_col} = ANY(:{_FROM_BIND}) AND ({where})"
     # The registry's identifiers and the caller's static SQL, checked above; every value is a bind.
+    typed = [sa.bindparam(name, params[name], type_=JSONB(none_as_null=True)) for name in sorted(set(jsonb))]
+    plain = {name: value for name, value in params.items() if name not in jsonb}
     statement = sa.text(
         f"UPDATE {spec.table} AS t SET {set_list}{source} WHERE {predicate} RETURNING {columns}"  # noqa: S608
     ).bindparams(
         *emitted,
         sa.bindparam(_FROM_BIND, list(from_states), type_=ARRAY(sa.Text)),
-        **params,
+        *typed,
+        **plain,
     )
     return list((await conn.execute(statement)).mappings())
 

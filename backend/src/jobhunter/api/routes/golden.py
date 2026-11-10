@@ -16,9 +16,10 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   comment, profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `title` the case's
   revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
   list's one statement; `profile_version` the version's number).
-- `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
-  canary is 422 `validation_failed` (L4632), an unknown case 404, activating a case whose job is under a
-  purge fence 409 `conflict_state` with `detail = "purge_in_progress"` (M5 Task 8).
+- `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`, `active_config
+  FOR SHARE` first): a third canary is 422 `validation_failed` (L4632), an unknown case 404, activating a
+  case whose job is under a purge fence (M5 Task 8), or whose profile version is purged or fenced (M5 Task
+  14), 409 `conflict_state` with `detail = "purge_in_progress"`.
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
   deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
 - `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
@@ -206,6 +207,10 @@ async def list_golden_cases(
     response_model=GoldenCaseOut,
     responses={
         **_NOT_FOUND,
+        409: {
+            "description": "Activating a case whose job or profile version is being purged, or whose profile "
+            "version was purged (`conflict_state`, detail `purge_in_progress`)"
+        },
         422: {"description": "Invalid body, or a third canary (`validation_failed`)"},
         **CSRF_RESPONSES,
         **BODY_LIMIT_RESPONSES,

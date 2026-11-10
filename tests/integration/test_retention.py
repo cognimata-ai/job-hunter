@@ -130,6 +130,9 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "score_history": timedelta(0),
         # M5 Task 13: closed or stale jobs are tombstoned 90 days after `availability_changed_at`
         "job_tombstones": timedelta(days=90),
+        # M5 Task 14: a version's content once its score history expired, the window the active settings'
+        # `retention.score_history_months`, read under A0's lock
+        "profile_purges": timedelta(0),
         "cycle_threads": timedelta(days=14),
         "score_cycles": timedelta(days=397),
         "batch_submissions": timedelta(days=397),
@@ -143,10 +146,11 @@ def test_rules_name_every_report_key_with_its_window() -> None:
     assert names.index("draft_content") < names.index("cv_files")  # the content, then the file
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
     # M3 (Codex r1 #37-#39): after `eval_runs` and before `checkpoints`, in this order; M5 Task 13's
-    # `job_tombstones` after `score_history` (Task 14 inserts `profile_purges` after it)
+    # `job_tombstones` after `score_history`, and Task 14's `profile_purges` after it
     m3 = [
         "score_history",
         "job_tombstones",
+        "profile_purges",
         "cycle_threads",
         "score_cycles",
         "batch_submissions",

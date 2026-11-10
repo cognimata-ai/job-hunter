@@ -18,6 +18,16 @@ What it holds (every text invented, ids and hashes stand-ins):
   file, its confirmed draft, its extraction call and its `summary` vector; the newer one active, with a
   `title:0` vector too), a discarded draft, a tuple per version (the newer one active), a ready query
   proposal with its call and the query it proposed beside a user's query;
+- the purgeable version (Task 14), the oldest of the three, confirmed first: neither active nor the previous
+  one, no feedback names it, its one case is inactive and its tuple's targets ended terminally two years
+  ago, so a profile purge at `now` takes it. Its CV file (a name of the store's form, with its texts), its
+  confirmed draft with its content and its extraction call (`input_refs` naming the draft), its `summary`
+  vector, its tuple with a published target on `closed_job`'s first revision and a cancelled one on the
+  active job, an inactive golden case labelled from that result (with its eval result and call), and its
+  query proposals: a `ready` one (its call, and an earlier attempt's call that no proposal names), a
+  `failed` one (its call, named by no proposal) and a `running` one with its `pending` `propose_queries`
+  operation and that operation's call still `dispatched` (its entry `dispatched`), each call's `input_refs`
+  naming the proposal and the version;
 - collection: a watchlist board and its Greenhouse instance, a collect run with its attempt, a coverage cell
   and interval, an Adzuna quota window (closed) with its billed ledger entry, the run's fetch request with
   its response and two raw items (one linked to an observation), a complete ATS snapshot with a member and
@@ -94,6 +104,22 @@ class SeedIds:
     active_job_id: int
     lone_conflict_id: int  # open, on the active job's posting, its one candidate `closed_job_id`
     shared_conflict_id: int  # open, its candidates `closed_job_id` and `active_job_id`
+    # Task 14: the user's three versions, the oldest one purgeable at `now` (module docstring)
+    active_version_id: int = 0
+    previous_version_id: int = 0  # the newest confirmed before the active one
+    purgeable_version_id: int = 0
+    purgeable_tuple_id: int = 0
+    purgeable_draft_id: int = 0
+    purgeable_cv_file_id: int = 0
+    purgeable_case_id: int = 0  # inactive, on `closed_job`'s first revision
+    ready_proposal_id: int = 0
+    failed_proposal_id: int = 0
+    running_proposal_id: int = 0
+    running_operation_id: int = 0  # the running proposal's `pending` `propose_queries` operation
+    in_flight_call_id: int = 0  # that operation's call, `dispatched`
+    # every `propose_queries` and `extract_profile` call of the purgeable version, in id order
+    purgeable_call_ids: tuple[int, ...] = ()
+    ready_export_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -469,6 +495,155 @@ async def _profiles(s: _Seeder, active: _Active) -> _Profile:
         },
     )
     return _Profile(versions[0], versions[1], tuples[0], tuples[1])
+
+
+@dataclass(frozen=True)
+class _Purgeable:
+    version: int
+    tuple_id: int
+    draft: int
+    cv_file: int
+    ready: int
+    failed: int
+    running: int
+    operation: int
+    in_flight: int
+    calls: tuple[int, ...]
+
+
+async def _purgeable_profile(s: _Seeder, active: _Active) -> _Purgeable:
+    """The oldest user version (module docstring), confirmed before the two others: its CV file, its confirmed
+    draft with its extraction call, the version, its tuple, its `summary` vector and its three proposals with
+    their calls and the running one's operation."""
+    cv = await s.row(
+        "cv_files",
+        {
+            "sha256": s.uniq("cv"),
+            "mime": "text/plain",
+            "size_bytes": 64,
+            "storage_path": f"{uuid4()}.bin",
+            "raw_text_enc": b"\x00seed",
+            "stripped_text": "Erfundener alter Lebenslauf.",
+            "extraction_method": "pasted",
+            "uploaded_at": s.at(),
+        },
+    )
+    version = await s.next_id("profile_versions")
+    draft = await s.row(
+        "profile_drafts",
+        {
+            "cv_file_id": cv,
+            "status": "confirmed",
+            "status_changed_at": s.at(10),
+            "reviewed_text": "Erfundener alter Lebenslauf.",
+            "reviewed_text_sha256": s.uniq("reviewed"),
+            "draft_json": dict(MINIMAL_PROFILE),
+            "confirmed_profile_version_id": version,
+            "confirm_response": {"profile_version_id": version},
+            "created_at": s.at(),
+            "updated_at": s.at(10),
+        },
+    )
+    await s.row(
+        "profile_versions",
+        {
+            "id": version,
+            "version_no": await _next_version_no(s),
+            "draft_id": draft,
+            "cv_file_id": cv,
+            "profile_json": dict(MINIMAL_PROFILE),
+            "profile_hash": s.uniq("profile"),
+            "confirmed_at": s.at(10),
+        },
+        overriding=True,
+        returning=False,
+    )
+    extract = await _call(
+        s,
+        active,
+        purpose="extract_profile",
+        minutes=5,
+        profile_draft_id=draft,
+        input_refs={"profile_draft_id": draft},
+        output_json={"summary": "Erfundene Zusammenfassung."},
+    )
+    await s.update("UPDATE profile_drafts SET llm_call_id = :c WHERE id = :d", c=extract, d=draft)
+    llm_tuple = await s.row(
+        "llm_tuples",
+        {
+            "profile_version_id": version,
+            "rubric_version_id": active.rubric_version_id,
+            "prompt_schema_version_id": active.prompt_schema_version_id,
+            "model_policy_id": active.model_policy_id,
+            "created_at": s.at(11),
+        },
+    )
+    embedding = await _embedding(s, "query")
+    await s.row(
+        "profile_vectors",
+        {"profile_version_id": version, "kind": "summary", "embedding_id": embedding},
+        returning=False,
+    )
+
+    def refs(proposal: int) -> dict[str, Any]:
+        return {"proposal_id": proposal, "profile_version_id": version}
+
+    proposed = {"queries": [{"text": "Erfundene alte Suche", "lang": "de"}]}
+    ready_id, failed_id, running_id = [await s.next_id("query_proposals") for _ in range(3)]
+    # the ready one: a first call whose output failed the check (named by no proposal), then the repair
+    earlier = await _call(
+        s, active, purpose="propose_queries", minutes=12, logical_call_no=1, input_refs=refs(ready_id)
+    )
+    repair = await _call(
+        s,
+        active,
+        purpose="propose_queries",
+        minutes=13,
+        logical_call_no=2,
+        input_refs=refs(ready_id),
+        output_json=proposed,
+    )
+    failing = await _call(
+        s, active, purpose="propose_queries", minutes=14, logical_call_no=1, input_refs=refs(failed_id)
+    )
+    for proposal, status, published in (
+        (ready_id, "ready", {"items": proposed, "llm_call_id": repair}),
+        (failed_id, "failed", {}),
+        (running_id, "running", {}),
+    ):
+        await s.row(
+            "query_proposals",
+            {
+                "id": proposal,
+                "profile_version_id": version,
+                "status": status,
+                "created_at": s.at(12),
+                **published,
+            },
+            overriding=True,
+            returning=False,
+        )
+    operation = await _operation(
+        s,
+        "propose_queries",
+        "pending",
+        str(running_id),
+        {"proposal_id": running_id, "scope_version_id": active.scope_version_id},
+    )
+    owner = {"kind": "operation", "id": operation, "claim_id": str(uuid4())}  # a claim since reclaimed
+    in_flight = await _call(
+        s,
+        active,
+        purpose="propose_queries",
+        entry_state="dispatched",
+        minutes=15,
+        logical_call_no=1,
+        input_refs={**refs(running_id), "owner": owner, "deadline_s": 300},
+    )
+    calls = (extract, earlier, repair, failing, in_flight)
+    return _Purgeable(
+        version, llm_tuple, draft, cv, ready_id, failed_id, running_id, operation, in_flight, calls
+    )
 
 
 async def _next_version_no(s: _Seeder) -> int:
@@ -1222,6 +1397,7 @@ async def seed_two_year_old_graph(
         m=s.month,
         t=s.at(),
     )
+    purgeable = await _purgeable_profile(s, active)  # confirmed first: its draft is the oldest
     profile = await _profiles(s, active)
     coll = await _collection(s, active)
 
@@ -1439,6 +1615,19 @@ async def seed_two_year_old_graph(
     golden_result = await _published(
         s, sc, golden, golden.current, act, profile.active_version, contested=False
     )
+    # the purgeable version's tuple: a published target and a cancelled one, both ended two years ago
+    purgeable_result = await _published(
+        s, sc, closed, closed.revisions[0], purgeable.tuple_id, purgeable.version, contested=False
+    )
+    await _ended(
+        s,
+        sc,
+        active_job,
+        active_job.current,
+        purgeable.tuple_id,
+        "cancelled",
+        state_reason="tuple_superseded",
+    )
 
     claim = uuid4()
     claimed = await _target(
@@ -1569,6 +1758,7 @@ async def seed_two_year_old_graph(
     for revision, version, result, is_active in (
         (golden.current, profile.active_version, golden_result, True),
         (closed.current, profile.old_version, old_result, False),
+        (closed.revisions[0], purgeable.version, purgeable_result, False),
     ):
         golden_cases.append(
             await s.row(
@@ -1752,4 +1942,18 @@ async def seed_two_year_old_graph(
         active_job_id=active_job.id,
         lone_conflict_id=lone,
         shared_conflict_id=shared,
+        active_version_id=profile.active_version,
+        previous_version_id=profile.old_version,
+        purgeable_version_id=purgeable.version,
+        purgeable_tuple_id=purgeable.tuple_id,
+        purgeable_draft_id=purgeable.draft,
+        purgeable_cv_file_id=purgeable.cv_file,
+        purgeable_case_id=golden_cases[2],
+        ready_proposal_id=purgeable.ready,
+        failed_proposal_id=purgeable.failed,
+        running_proposal_id=purgeable.running,
+        running_operation_id=purgeable.operation,
+        in_flight_call_id=purgeable.in_flight,
+        purgeable_call_ids=tuple(sorted(purgeable.calls)),
+        ready_export_id=ready,
     )

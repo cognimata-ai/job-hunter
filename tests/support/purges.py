@@ -1,7 +1,8 @@
 """The purge test harness (M5 Tasks 12-16): a `purge` operation run as the worker runs it.
 
-- `purge_cfg`: the worker's configuration with a manifests, an exports and a CV-store directory of the test's
-  own (each mode 0700, under `tmp_path`);
+- `purge_cfg`: the worker's configuration with a manifests and an exports directory of the test's own (each
+  mode 0700, under `tmp_path`) and the api's CV store (`cv_store_dir`): the worker and the api share the
+  volume, so a test that runs a purge and the api together (Task 14's race tests) has one store;
 - `purger`: a `Purger` over the shared engine and `purge_cfg`, with the worker's operation dependencies (the
   purge reads none of the profile, score or LLM collaborators, so those are left unset). `run(operation_id)`
   executes the operation as `run_operation` does (`operations.execute_operation`, epoch 1);
@@ -47,9 +48,10 @@ _FENCES_RELEASED: Final = sa.text(
 
 
 @pytest.fixture
-def purge_cfg(make_config: Any, migrated: PgServer, tmp_path: Path) -> AppConfig:
-    """The worker's configuration with a manifests, an exports and a CV directory of this test's own."""
-    dirs = {name: tmp_path / name for name in ("manifests", "exports", "cv_store")}
+def purge_cfg(make_config: Any, migrated: PgServer, tmp_path: Path, cv_store_dir: Path) -> AppConfig:
+    """The worker's configuration with a manifests and an exports directory of this test's own and the api's
+    CV store."""
+    dirs = {name: tmp_path / name for name in ("manifests", "exports")}
     for directory in dirs.values():
         directory.mkdir(mode=0o700)
     cfg: AppConfig = make_config(
@@ -57,7 +59,7 @@ def purge_cfg(make_config: Any, migrated: PgServer, tmp_path: Path) -> AppConfig
         migrated,
         JOBHUNTER_MANIFESTS_DIR=str(dirs["manifests"]),
         JOBHUNTER_EXPORTS_DIR=str(dirs["exports"]),
-        JOBHUNTER_CV_STORE_DIR=str(dirs["cv_store"]),
+        JOBHUNTER_CV_STORE_DIR=str(cv_store_dir),
     )
     return cfg
 

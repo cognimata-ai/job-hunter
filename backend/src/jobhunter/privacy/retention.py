@@ -130,12 +130,19 @@ never deleted, so no call of a running run, nor the `dispatched` entry it holds,
 the reason of `golden.delete_case_unless_running`). No M3 rule deletes a job, a revision or a profile version,
 so the synthetic rows of the golden set (Ruling T19-a) and the inputs of every golden case stay.
 
-**The M5 rule** (Task 13), after `score_history`: `job_tombstones` (§20.1 L6397) deletes nothing itself. It
-opens the tombstoning of the closed or stale root jobs whose `availability_changed_at` lies 90 days back and
-that are not saved or applied and draw no active golden case, with every job merged into them (M3 plan Task
-23's exemption contract): at most 10 batches of 200 roots, each a fenced transaction of its own that commits
-the batch's deletion manifest, its `jobs` fence and its `purge` operation (`privacy.kinds.job_tombstone`),
-which deletes them afterwards. It counts the roots it fenced.
+**The M5 rules**, after `score_history`; neither deletes anything itself:
+- `job_tombstones` (Task 13, §20.1 L6397) opens the tombstoning of the closed or stale root jobs whose
+  `availability_changed_at` lies 90 days back and that are not saved or applied and draw no active golden
+  case, with every job merged into them (M3 plan Task 23's exemption contract): at most 10 batches of 200
+  roots, each a fenced transaction of its own that commits the batch's deletion manifest, its `jobs` fence and
+  its `purge` operation (`privacy.kinds.job_tombstone`), which deletes them afterwards. It counts the roots it
+  fenced.
+- `profile_purges` (Task 14, §20.1, §20.2's profile purge, D11) opens the purge of each eligible profile
+  version: not synthetic, neither the active nor the previous version, its score history expired
+  (`retention.score_history_months`, read under the admission's lock), no active golden case and no feedback
+  naming it. Each is a fenced transaction of its own under `active_config FOR UPDATE` that cancels the
+  version's live proposal operations and commits its manifest, its `profile` fence and its `purge` operation
+  (`privacy.kinds.profile_purge`). It counts the versions it fenced.
 
 **Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
 bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
@@ -175,7 +182,6 @@ is logged: the database that would hold the outcome is the one that failed, so t
 rule: it is never caught as one.
 """
 
-import calendar
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -193,7 +199,7 @@ from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
 from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
-from jobhunter.privacy.kinds import job_tombstone
+from jobhunter.privacy.kinds import job_tombstone, profile_purge
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring import batches, targets
 from jobhunter.settings.active import lock_active
@@ -242,6 +248,9 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     # M5 Task 13: closed or stale jobs 90 days after `availability_changed_at`, tombstoned by a purge each
     # batch opens (the rule fences them; the `purge` operation deletes them).
     RetentionRule("job_tombstones", job_tombstone.TOMBSTONE_AFTER),
+    # M5 Task 14: an old profile version's content once its score history expired (the window is the active
+    # settings' `retention.score_history_months`, read under each admission's lock), by a purge per version.
+    RetentionRule("profile_purges", timedelta(0)),
     RetentionRule("cycle_threads", timedelta(days=14)),  # threads of the cycles that ended that long ago
     # A cycle's thread is found through its row, so never after a failed thread purge (Codex r1 #38).
     RetentionRule("score_cycles", THIRTEEN_MONTHS, depends_on=("cycle_threads",)),
@@ -408,13 +417,7 @@ _PURGE_EXTRACT_OUTPUTS: Final = q(
 # newest and the previous confirmed drafts are the user's own: the adversarial seed's confirmed drafts name
 # synthetic versions (Ruling T19-a), newer than the user's but never activated.
 _PROTECTED_FILES: Final = q(
-    "WITH newest AS (SELECT d.id, d.confirmed_profile_version_id AS version FROM profile_drafts d "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1), "
-    "previous AS (SELECT d.confirmed_profile_version_id AS version FROM profile_drafts d JOIN newest n "
-    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1) "
+    f"WITH {profile_purge.NEWEST_AND_PREVIOUS} "  # noqa: S608 (the constant the profile purge shares)
     "SELECT v.cv_file_id FROM profile_versions v WHERE v.cv_file_id IS NOT NULL "
     "AND (v.id = CAST(:active AS bigint) OR v.id IN (SELECT version FROM newest) "
     "OR v.id IN (SELECT version FROM previous)) "
@@ -462,13 +465,7 @@ _ENDED_CYCLE_THREADS: Final = q(
 )
 # `score_history` (module docstring): the targets §20.1 lets go (L6304), ended in these states before the
 # cutoff; one page after `:after`, and a chunk's candidates `:ids` checked again under `active_config`.
-_ENDED_TARGET_STATES: Final = (
-    "published_accepted",
-    "published_contested",
-    *targets.RETRYABLE_STATES,
-    "expired_unscored",
-    "cancelled",
-)
+_ENDED_TARGET_STATES: Final = profile_purge.ENDED_TARGET_STATES
 _EXPIRED_HISTORY: Final = (
     "t.state = ANY(CAST(:states AS text[])) AND t.state_changed_at < :cutoff "  # noqa: S608
     "AND t.llm_tuple_id IS DISTINCT FROM (SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) "
@@ -574,14 +571,6 @@ async def _purge_cycle_threads(
         after = int(batch[-1].id)
 
 
-def _months_before(t: datetime, months: int) -> datetime:
-    """`t` moved back `months` calendar months, its day clamped to the last of a shorter month (31 March less
-    one month is the last day of February)."""
-    year, month = divmod(t.year * 12 + t.month - 1 - months, 12)
-    month += 1
-    return t.replace(year=year, month=month, day=min(t.day, calendar.monthrange(year, month)[1]))
-
-
 async def _history_chunk(
     conn: AsyncConnection, page: Sequence[int], params: Mapping[str, object], now: datetime
 ) -> int:
@@ -610,7 +599,7 @@ async def _purge_score_history(engine: AsyncEngine, now: datetime, epoch: int) -
         months = (await active_settings(conn)).retention.score_history_months
     params: dict[str, object] = {
         "states": list(_ENDED_TARGET_STATES),
-        "cutoff": _months_before(now, months),
+        "cutoff": profile_purge.months_before(now, months),
         "listed_since": now - batches.RELEASED_LISTED_FOR,
     }
     deleted, after = 0, 0
@@ -790,6 +779,8 @@ async def _apply(
         return await _purge_score_history(engine, now, epoch)
     if rule.name == "job_tombstones":
         return await job_tombstone.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
+    if rule.name == "profile_purges":
+        return await profile_purge.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
     if rule.name == "cycle_threads":
         return await _purge_cycle_threads(engine, saver, cutoff, epoch)
     params: dict[str, object] = {"cutoff": cutoff}
@@ -841,8 +832,9 @@ async def run_retention_daily(
     rule name, `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
     `checkpoints`, `profile_checkpoints` and `cycle_threads` count threads, `cv_files` and `cv_store_orphans`
-    files, `score_history` targets, `job_tombstones` the root jobs whose tombstoning it opened. `queue` must
-    be open (`job_tombstones` defers its purges' jobs with `defer_in_tx`); `cv_store` is the CV store whose
+    files, `score_history` targets, `job_tombstones` the root jobs whose tombstoning it opened,
+    `profile_purges` the versions whose purge it opened. `queue` must be open (`job_tombstones` and
+    `profile_purges` defer their purges' jobs with `defer_in_tx`); `cv_store` is the CV store whose
     files the two file rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer
     the current worker epoch: the pass stops before that write and writes nothing more (see "The epoch
     fence").

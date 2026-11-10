@@ -697,6 +697,14 @@ WHERE_ID = {"where": "t.id = :id", "params": {"id": 1}}
             "not a column name",
         ),
         ("score_targets", ["pending"], "pending", {**WHERE_ID, "returning": ()}, "returning is empty"),
+        # a JSONB bind names a value of params (M5 Task 14)
+        (
+            "score_targets",
+            ["pending"],
+            "pending",
+            {**WHERE_ID, "jsonb": ["report"]},
+            r"\['report'\] in jsonb have no value in params",
+        ),
         # an expression over another table would make SQLAlchemy append its own FROM inside the SET list
         (
             "score_targets",

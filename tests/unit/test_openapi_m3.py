@@ -26,7 +26,7 @@ M3_ROUTES: Final[dict[tuple[str, str], set[str]]] = {
     ("post", "/api/system/score-cycle"): {"400", "401", "403", "409", "422", "429"},
     ("post", "/api/jobs/{job_id}/feedback"): {"401", "403", "404", "409", "413", "422", "429"},
     ("get", "/api/golden-cases"): {"400", "401", "422", "429"},
-    ("patch", "/api/golden-cases/{case_id}"): {"401", "403", "404", "413", "422", "429"},
+    ("patch", "/api/golden-cases/{case_id}"): {"401", "403", "404", "409", "413", "422", "429"},
     ("delete", "/api/golden-cases/{case_id}"): {"401", "403", "404", "409", "422", "429"},
     ("post", "/api/alerts/{alert_id}/ack"): {"401", "403", "404", "422", "429"},
     ("get", "/api/system/spend"): {"401", "429"},

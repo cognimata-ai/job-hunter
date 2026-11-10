@@ -6690,6 +6690,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Activating a case whose job or profile version is being purged, or whose profile version was purged (`conflict_state`, detail `purge_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
             413: {
                 headers: {
