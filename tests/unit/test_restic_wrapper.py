@@ -223,7 +223,7 @@ async def test_snapshots_are_read_from_the_json_listing(tmp_path: Path) -> None:
             "tags": ["manifests"],
             "id": SNAPSHOT_ID,
         },
-        {"time": "2026-11-10T09:00:00.5+02:00", "paths": ["/data/staging/set"], "id": "a1" * 32},
+        {"time": "2026-11-10T10:00:00.5+02:00", "paths": ["/data/staging/set"], "id": "a1" * 32},
     ]
     runner = FakeRunner({"snapshots": [exited(0, json.dumps(listing).encode())]})
     found = await Restic(backup_config(tmp_path), runner).snapshots(tags=["manifests", "set:3"])
@@ -231,7 +231,7 @@ async def test_snapshots_are_read_from_the_json_listing(tmp_path: Path) -> None:
     assert value_of(runner.calls[0].argv, "--tag") == "manifests,set:3"  # every tag (restic: comma = and)
     assert [(s.id, s.time.isoformat(), s.tags, s.paths) for s in found] == [
         (SNAPSHOT_ID, "2026-11-10T07:11:12.785474+00:00", ("manifests",), ("/data/manifests/a.json",)),
-        ("a1" * 32, "2026-11-10T07:00:00.500000+00:00", (), ("/data/staging/set",)),
+        ("a1" * 32, "2026-11-10T08:00:00.500000+00:00", (), ("/data/staging/set",)),
     ]
     untagged = FakeRunner({"snapshots": [exited(0, b"[]")]})
     assert await Restic(backup_config(tmp_path), untagged).snapshots(tags=()) == []
@@ -241,6 +241,23 @@ async def test_snapshots_are_read_from_the_json_listing(tmp_path: Path) -> None:
     with pytest.raises(ResticError) as refused:
         await garbled.snapshots(tags=())
     assert refused.value.code == "unparsable"
+
+
+async def test_snapshots_are_sorted_oldest_first(tmp_path: Path) -> None:
+    """Whatever order restic prints, newest first here, and whatever offset each time carries: by time."""
+    times = {
+        "c3": "2026-11-12T01:00:00+00:00",  # the newest
+        "a1": "2026-11-10T09:00:00+02:00",  # 07:00 UTC: the oldest, though its text sorts after b2's
+        "b2": "2026-11-10T08:30:00Z",
+        "d4": "2026-11-10T08:30:00+00:00",  # the same instant as b2: restic's order kept
+    }
+    listing = [{"time": time, "paths": ["/data/manifests"], "id": key * 32} for key, time in times.items()]
+    runner = FakeRunner({"snapshots": [exited(0, json.dumps(listing).encode())]})
+
+    found = await Restic(backup_config(tmp_path), runner).snapshots(tags=["manifests"])
+
+    assert [info.id for info in found] == ["a1" * 32, "b2" * 32, "d4" * 32, "c3" * 32]
+    assert [info.time for info in found] == sorted(info.time for info in found)
 
 
 @pytest.mark.parametrize(

@@ -9,12 +9,15 @@ shipped. Otherwise it lists every file of the stream, one absolute path per line
 `cfg.staging_dir` (removed afterwards), runs one `restic backup --files-from-verbatim <list> --tag
 manifests`, and then, in one transaction as `jobhunter_backup`, inserts a `manifest_shipments` row (the
 snapshot id, `shipped_at` = `now`) with one `manifest_shipment_items` row per file: exactly the files the
-snapshot holds, since a listed file that cannot be read fails the backup (restic exit 3). Every run ships
-every file, so the latest `manifests` snapshot is always the complete stream, and coverage is exact: a
+snapshot holds, since a listed file that cannot be read makes restic exit 3 and no row is written then. Every
+run ships every file, so the latest shipment's snapshot is the complete stream, and coverage is exact: a
 manifest whose file did not exist yet has no item. The worker's `manifest_shipping` reconciler then marks
 `shipped` each completed manifest an item names with its file's hash.
 
-A restic failure raises `ResticError` before any row is written. A file of another name (a stray
+A restic failure raises `ResticError` before any row is written. On exit 3 restic has still saved an
+incomplete snapshot tagged `manifests` (the files it could read): no row names it, but until the next run
+restic's newest `manifests` snapshot is that one. The next run ships a complete one, since the stream still
+differs from the latest shipment's items. A file of another name (a stray
 `notes.json`, a directory) is left out: its name is no uuid an item could hold. The log lines carry counts and
 the shipment id only.
 """

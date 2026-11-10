@@ -68,7 +68,8 @@ USER 10001:10001
 
 # The backup and restore roles' image (M5 Task 10, Deviation 29): restic 0.19.1, and pg_dump, pg_restore and
 # psql with the nine libraries of theirs the runtime lacks (libpq and its Kerberos, LDAP and SASL
-# dependencies, each with its versioned target), registered with the dynamic linker. Root for the copies and
+# dependencies), registered with the dynamic linker. Only each library's versioned file is copied (a COPY
+# source that is a symlink would land as a second full copy); ldconfig creates the soname links. Root for the copies and
 # ldconfig, then the app user again. The mount points of the backup_staging volume and of the dev shipper's
 # local restic repository are made 10001:10001 0700 as the runtime's are: a fresh named volume takes their
 # owner and mode, so `restic init` as 10001 can write the repository.
@@ -77,11 +78,11 @@ USER root
 COPY --from=restic /usr/bin/restic /usr/local/bin/restic
 COPY --from=pgclient /usr/lib/postgresql/17/bin/pg_dump /usr/lib/postgresql/17/bin/pg_restore \
     /usr/lib/postgresql/17/bin/psql /opt/pgclient/bin/
-COPY --from=pgclient /usr/lib/x86_64-linux-gnu/libpq.so.5* /usr/lib/x86_64-linux-gnu/libgssapi_krb5.so.2* \
-    /usr/lib/x86_64-linux-gnu/libldap-2.5.so.0* /usr/lib/x86_64-linux-gnu/libkrb5.so.3* \
-    /usr/lib/x86_64-linux-gnu/libk5crypto.so.3* /usr/lib/x86_64-linux-gnu/libkrb5support.so.0* \
-    /usr/lib/x86_64-linux-gnu/liblber-2.5.so.0* /usr/lib/x86_64-linux-gnu/libsasl2.so.2* \
-    /usr/lib/x86_64-linux-gnu/libkeyutils.so.1* /opt/pgclient/lib/
+COPY --from=pgclient /usr/lib/x86_64-linux-gnu/libpq.so.5.* /usr/lib/x86_64-linux-gnu/libgssapi_krb5.so.2.* \
+    /usr/lib/x86_64-linux-gnu/libldap-2.5.so.0.* /usr/lib/x86_64-linux-gnu/libkrb5.so.3.* \
+    /usr/lib/x86_64-linux-gnu/libk5crypto.so.3.* /usr/lib/x86_64-linux-gnu/libkrb5support.so.0.* \
+    /usr/lib/x86_64-linux-gnu/liblber-2.5.so.0.* /usr/lib/x86_64-linux-gnu/libsasl2.so.2.* \
+    /usr/lib/x86_64-linux-gnu/libkeyutils.so.1.* /opt/pgclient/lib/
 RUN echo /opt/pgclient/lib > /etc/ld.so.conf.d/pgclient.conf \
     && ldconfig \
     && mkdir -p /data/staging /data/restic-repo \

@@ -13,13 +13,16 @@ this process's environment never holds a key. The runner logs the command's name
 restic answers that it does not (exit 10): any other failure (a wrong password, a lock, an unreachable
 endpoint) raises, so an existing repository is never initialised again; the runbook runs it once. `backup`
 backs up `paths` and the files named in `files_from`, one name per line read verbatim
-(`--files-from-verbatim`: never a pattern, and a listed file that is missing fails the backup with exit 3,
-where `--files-from` would skip it and still exit 0), with each of `tags`, and returns the `snapshot_id` of
-the `--json` summary. `restore` runs `restic restore <snapshot>:<subfolder> --target <target>` (the
-`snapshotID:subfolder` form of restic >= 0.17, read from 0.19.1's `restore --help`): the subfolder's content
-lands directly in `target`, not under its absolute path. `snapshots` lists the snapshots carrying every one of
-`tags`, oldest first. `forget_prune` forgets the snapshots tagged `tag` beyond the daily, weekly and monthly
-counts and prunes the data they alone held.
+(`--files-from-verbatim`: never a pattern, and a listed file that is missing makes restic exit 3, where
+`--files-from` would skip it and still exit 0), with each of `tags`, and returns the `snapshot_id` of the
+`--json` summary. On exit 3 restic still saves a snapshot, incomplete (the files it could read) and with the
+tags given, before `ResticError("backup", "incomplete")` is raised here: until a later backup succeeds, the
+newest snapshot of those tags may be that incomplete one. `restore` runs `restic restore
+<snapshot>:<subfolder> --target <target>` (the `snapshotID:subfolder` form of restic >= 0.17, read from
+0.19.1's `restore --help`): the subfolder's content lands directly in `target`, not under its absolute path.
+`snapshots` lists the snapshots carrying every one of `tags`, sorted by time, oldest first (whatever order
+restic printed them in). `forget_prune` forgets the snapshots tagged `tag` beyond the daily, weekly and
+monthly counts and prunes the data they alone held.
 
 Every failure raises `ResticError(command, code)`: the code is `incomplete` (exit 3: a source file could not
 be read), `repository_absent` (10), `locked` (11), `wrong_password` (12), `failed` (any other exit status),
@@ -131,7 +134,7 @@ def _snapshot_infos(stdout: bytes) -> list[SnapshotInfo]:
             )
     except (ValueError, TypeError, KeyError):
         raise ResticError("snapshots", "unparsable", 0) from None
-    return infos
+    return sorted(infos, key=lambda info: info.time)  # stable: restic's order among equal times
 
 
 class Restic:
@@ -192,7 +195,8 @@ class Restic:
         await self._run("restore", "--target", str(target), "--", f"{snapshot}:{subfolder}")
 
     async def snapshots(self, *, tags: Sequence[str]) -> list[SnapshotInfo]:
-        """The snapshots that carry every one of `tags` (all of them for none), oldest first."""
+        """The snapshots that carry every one of `tags` (all of them for none), sorted by time, oldest
+        first."""
         args = ["--json"]
         if tags:
             args += ["--tag", ",".join(_tag(tag) for tag in tags)]

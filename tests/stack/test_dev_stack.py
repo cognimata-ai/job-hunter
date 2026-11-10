@@ -63,6 +63,7 @@ SECRET_NAMES = (
     "db_migrator",
     "db_backup",
     "db_restore",
+    "restic_password",  # M5 Task 10: the shipper's repository password
     "anthropic_key",
 )
 SECRETS_DIR: Final = REPO / ".secrets/dev"

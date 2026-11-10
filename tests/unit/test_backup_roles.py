@@ -92,6 +92,36 @@ def test_an_s3_repository_needs_both_s3_secrets(tmp_path: Path, role: Role) -> N
     assert refusal(role, write_secrets(tmp_path / "none", base)) is None
 
 
+@pytest.mark.parametrize("role", ["backup", "restore"])
+@pytest.mark.parametrize("name", ["RESTIC_PASSWORD", "RESTIC_PASSWORD_COMMAND"])
+@pytest.mark.parametrize("value", ["password-not-real-xyz", ""])
+def test_a_restic_password_in_the_environment_is_refused(
+    tmp_path: Path, role: Role, name: str, value: str
+) -> None:
+    """R13: the password comes from the `restic_password` secret file only; one set in the environment, even
+    empty, is refused instead of ignored, and the refusal never shows its value."""
+    secrets = write_secrets(tmp_path / "s", BACKUP_SECRETS if role == "backup" else RESTORE_SECRETS)
+    failed = refusal(role, secrets, RESTIC_REPOSITORY="/data/restic-repo", **{name: value})
+    assert failed is not None
+    assert (failed.check, failed.detail) == (
+        "restic_password_env",
+        f"{name} must be unset: the password comes from the restic_password secret file",
+    )
+    assert "password-not-real-xyz" not in str(failed) and "password-not-real-xyz" not in repr(failed)
+
+    both = refusal(role, secrets, RESTIC_PASSWORD="x", RESTIC_PASSWORD_COMMAND="cat /x")
+    assert both is not None and both.detail.startswith(
+        "RESTIC_PASSWORD, RESTIC_PASSWORD_COMMAND must be unset"
+    )
+    # The password file variable is no refusal: restic is given its own path anyway.
+    assert refusal(role, secrets, RESTIC_PASSWORD_FILE="/run/secrets/restic_password") is None
+
+
+def test_only_the_backup_and_restore_roles_check_the_restic_password(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", {"db_migrator": b"m"})
+    assert refusal("migrate", secrets, RESTIC_PASSWORD="ignored-here") is None
+
+
 def test_dsn_selects_the_db_role_and_database(tmp_path: Path) -> None:
     secrets = {
         "db_app": b"app pw",

@@ -179,6 +179,9 @@ DEFAULT_DB_ROLES: Final[Mapping[Role, DbRole]] = MappingProxyType(
     {"api": "app", "worker": "app", "migrate": "migrator", "backup": "backup", "restore": "migrator"}
 )
 _S3_SECRETS: Final = ("s3_access_key_id", "s3_secret_access_key")
+# M5 Task 10 (R13): restic's other sources of the repository password, which the backup and restore roles
+# refuse: the password comes from the `restic_password` secret file only (`backup.restic` passes its path).
+_RESTIC_PASSWORD_VARS: Final = ("RESTIC_PASSWORD", "RESTIC_PASSWORD_COMMAND")
 
 
 class StartupCheckFailed(Exception):
@@ -437,6 +440,21 @@ def _check_restic_s3_credentials(cfg: AppConfig) -> None:
         raise StartupCheckFailed("restic_s3_credentials", f"an s3: repository needs {', '.join(absent)}")
 
 
+def _check_restic_password_env(cfg: AppConfig) -> None:
+    """M5 Task 10 (R13), for the backup and restore roles: neither `RESTIC_PASSWORD` nor
+    `RESTIC_PASSWORD_COMMAND` is set, the empty string included (`restic_password_env`), as tracing needs the
+    LangSmith key variables unset: the repository password comes from the `restic_password` secret file
+    only, and one set in the environment would be ignored silently. The detail names the variables, never a
+    value."""
+    if cfg.role not in ("backup", "restore"):
+        return
+    if present := {name for name in _RESTIC_PASSWORD_VARS if name in cfg.environ}:
+        raise StartupCheckFailed(
+            "restic_password_env",
+            f"{_names(present)} must be unset: the password comes from the restic_password secret file",
+        )
+
+
 def _check_key_material(cfg: AppConfig) -> None:
     """Assertion 5: key lengths, and that the session secret and the data key differ."""
     decoded: dict[str, bytes] = {}
@@ -629,8 +647,10 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     env = cfg.environ
 
     _check_secret_files(cfg)
-    # Right after (M5 Task 10): the secrets an `s3:` repository needs, which the role table cannot require.
+    # Right after (M5 Task 10): the secrets an `s3:` repository needs, which the role table cannot require,
+    # and no repository password from the environment.
     _check_restic_s3_credentials(cfg)
+    _check_restic_password_env(cfg)
 
     if "LANGSMITH_GATEWAY" in env:
         raise StartupCheckFailed("langsmith_gateway_set", "LANGSMITH_GATEWAY must not be set")

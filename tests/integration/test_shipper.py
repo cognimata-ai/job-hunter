@@ -78,11 +78,18 @@ class FakeRestic(Restic):
 
 @pytest.fixture
 def backup_cfg(migrated: PgServer, tmp_path: Path) -> AppConfig:
-    """The backup role against the shared server, with a manifests directory of this test's own."""
-    manifests = tmp_path / "manifests"
+    """The backup role against the shared server, with a manifests and a staging directory of this test's own
+    (0700, as the images make the volumes' mount points): the server's shared staging directory is every
+    backup test's, so a test here asserts on its own."""
+    manifests, staging = tmp_path / "manifests", tmp_path / "staging"
     manifests.mkdir(mode=0o700)
+    staging.mkdir(mode=0o700)
     return config_for(
-        migrated, "backup", JOBHUNTER_MANIFESTS_DIR=str(manifests), RESTIC_REPOSITORY=str(tmp_path / "repo")
+        migrated,
+        "backup",
+        JOBHUNTER_MANIFESTS_DIR=str(manifests),
+        JOBHUNTER_STAGING_DIR=str(staging),
+        RESTIC_REPOSITORY=str(tmp_path / "repo"),
     )
 
 
@@ -139,6 +146,7 @@ async def test_ship_lists_json_files_only_never_tmp(
 
     result = await ship_manifests(backup_cfg, restic, backup_engine, now=utcnow())
 
+    assert backup_cfg.staging_dir == directory.parent / "staging"  # this test's own
     listed, tags = restic.backups[0]
     assert sorted(listed) == sorted(str(directory / f"{u}.json") for u, _ in (a, b))
     assert tags == ("manifests",)
