@@ -156,6 +156,7 @@ from jobhunter.llm import bulk
 from jobhunter.normalize.fields import CONFLICT_FIELDS, CONFLICT_RULE
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy import fences
 from jobhunter.scoring import filters, targets
 from jobhunter.scoring.targets import CancelReason
 from jobhunter.types import JSONValue, get_object
@@ -182,9 +183,6 @@ _LOCK_JOBS: Final = q(
 _CO_MEMBERS: Final = q(_CO_MEMBERS_OF)
 _PAIR_STATE: Final = q(
     "SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
-)
-_FENCED: Final = q(
-    "SELECT j.id FROM unnest(CAST(:ids AS bigint[])) AS j(id) WHERE is_fenced(j.id) ORDER BY j.id"
 )
 _DERIVE: Final = q(
     "WITH p AS (SELECT min(first_seen_at) AS first_seen, max(last_seen_at) AS last_seen, "
@@ -319,11 +317,9 @@ async def co_members(conn: AsyncConnection, job_ids: Iterable[int]) -> frozenset
 
 async def fenced_jobs(conn: AsyncConnection, job_ids: Iterable[int]) -> list[int]:
     """The jobs of `job_ids` that an unreleased purge fence matches (`is_fenced`, §20.2), in id order. Its
-    caller holds their rows: the statement runs after the lock, with a snapshot of its own (§20.2)."""
-    ids = sorted(set(job_ids))
-    if not ids:
-        return []
-    return [int(job_id) for job_id in (await conn.execute(_FENCED, {"ids": ids})).scalars()]
+    caller holds their rows: the statement runs after the lock, with a snapshot of its own (§20.2). The check
+    is `privacy.fences.fenced_jobs`, the one copy of it."""
+    return sorted(await fences.fenced_jobs(conn, set(job_ids)))
 
 
 async def derive_from_postings(conn: AsyncConnection, job_id: int) -> Derived:

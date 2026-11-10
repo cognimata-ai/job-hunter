@@ -15,6 +15,11 @@ after the writer read its work) counts as fenced: the writer writes nothing for 
 - Score now, Retry and Score individually answer 404 for J, as the detail does;
 - the Jobs list omits J.
 
+`det_completeness` also meets a `source` fence that names J only through the lineage of J's revision
+(`job_revision_sources`), the branch `is_fenced` evaluates at call time. The embed write leaves out a revision
+deleted since its selection (its job surviving), and the embedder's backlog and a run's partial cause leave
+out the revisions of a fenced job (M5 Task 8 fix round 1).
+
 Every datum is invented.
 """
 
@@ -31,8 +36,11 @@ import sqlalchemy as sa
 from jobhunter import embeddings
 from jobhunter.clock import utcnow
 from jobhunter.db.snapshot import read_snapshot
-from jobhunter.embeddings import EmbedderClient, embed_awaiting, make_http_client
+from jobhunter.embeddings import EmbedderClient, embed_awaiting, embedding_text, make_http_client, text_sha256
 from jobhunter.errors import Refusal
+from jobhunter.graphs.collect.nodes import finalize
+from jobhunter.graphs.collect.nodes.embed import REVISIONS_AWAITING, make_embed
+from jobhunter.graphs.collect.state import initial_state
 from jobhunter.jobs.listing import select_page
 from jobhunter.jobs.query import JobsQuery
 from jobhunter.quota import ledger
@@ -41,11 +49,13 @@ from jobhunter.scoring import reconcilers as scoring_reconcilers  # registers `d
 from jobhunter.settings import scope_apply
 from jobhunter.worker import operations as ops
 from jobhunter.worker.embedding_reconcile import reconcile_awaiting_embedding
+from jobhunter.worker.epoch import fence_epoch
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.collect import ctx, queued_run
+from tests.support.collect import ctx, make_deps, queued_run
 from tests.support.eval import scored_job
 from tests.support.faults import PausePoint
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.jobs_list import Card, seed_cards
 from tests.support.m3 import Job, insert_job
@@ -92,6 +102,17 @@ _ACTIONS: Final = sa.text("SELECT job_id, saved_at FROM user_job_actions ORDER B
 _GROUP_MEMBERS: Final = sa.text("SELECT count(*) FROM duplicate_group_members WHERE group_id = :g")
 _FLAG: Final = sa.text("SELECT score_individually FROM duplicate_group_members WHERE job_id = :j")
 _CASE_ACTIVE: Final = sa.text("SELECT active FROM golden_cases WHERE id = :i")
+# A lineage row naming `:s` for the revision's description: what a posting of that source left behind.
+_LINEAGE: Final = sa.text(
+    "INSERT INTO job_revision_sources (job_revision_id, field, source_id) VALUES (:r, 'description_text', :s)"
+)
+# A source of none of the test jobs' postings: a fence on it matches a job by lineage alone.
+LINEAGE_SOURCE: Final = "adzuna"
+_EMBEDDINGS_OF_TEXT: Final = sa.text("SELECT count(*) FROM embeddings WHERE text_sha256 = :sha")
+_LLM_INPUT: Final = sa.text("SELECT llm_input FROM job_revisions WHERE id = :r")
+_OPEN_UNAVAILABLE: Final = sa.text(
+    "SELECT count(*) FROM alerts WHERE code = 'embedder.unavailable' AND resolved_at IS NULL"
+)
 # A job with one published result (`published_result`), deleted child first as a purge's chunk deletes it.
 _DELETE_PUBLISHED_JOB: Final = (
     "SET CONSTRAINTS ALL DEFERRED",
@@ -193,12 +214,23 @@ def refusal(raised: pytest.ExceptionInfo[Refusal]) -> dict[str, Any]:
 # ---- the det instances -------------------------------------------------------------------------------------
 
 
+async def fence_by(engine: AsyncEngine, how: str, job: Job) -> int:
+    """A fence over `job`: a `jobs` fence naming it, or a `source` fence naming it only through the lineage
+    of its revision (the job has no posting of that source, and the fence no affected set)."""
+    async with engine.begin() as conn:
+        if how == "jobs":
+            return await fence_jobs(conn, job.job_id)
+        await conn.execute(_LINEAGE, {"r": job.revision_id, "s": LINEAGE_SOURCE})
+        return await insert_test_fence(conn, kind="source", source_id=LINEAGE_SOURCE)
+
+
+@pytest.mark.parametrize("fenced_by", ["jobs", "source_lineage"])
 async def test_det_completeness_skips_a_fenced_job(
-    engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App
+    engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App, fenced_by: str
 ) -> None:
     (fenced, fenced_result), (_, other_result) = await published_jobs(engine, 2)
     scope = await active_scope(engine)
-    fence_id = await fence(engine, fenced.job_id)
+    fence_id = await fence_by(engine, fenced_by, fenced)
     assert await run_reconciler("det_completeness", engine, now=utcnow(), epoch=1) == 1
     assert await current_for(engine, fenced_result, scope) == []
     assert len(await current_for(engine, other_result, scope)) == 1
@@ -381,7 +413,7 @@ async def test_the_embed_node_writes_no_vector_for_a_fenced_job(
         fence_id = await fence(engine, fenced_job)
         pause.resume()
         report = await asyncio.wait_for(task, 30)
-        assert (report.embedded, report.awaiting) == (1, 1)
+        assert (report.embedded, report.awaiting) == (1, 0)  # the fenced revision is no backlog
         assert await statuses(engine, revisions) == ["awaiting_embedding", "embedded"]
         assert await count_rows(engine, "embeddings") == 1  # no vector of the fenced job's text
         await release(engine, fence_id)
@@ -518,3 +550,91 @@ async def test_a_writer_meeting_a_deleted_job_writes_nothing(
         await other.commit()
     assert await asyncio.wait_for(pass_, 30) == 0
     assert await instances_of(engine, result) == [] and await count_rows(engine, "det_results") == 0
+
+
+# ---- fix round 1: a revision deleted under the embed write, and the fenced backlog -----------------------
+
+
+async def test_a_revision_deleted_during_its_embed_call_gets_no_vector(
+    engine: AsyncEngine, current_epoch: int, fake_embedder: Any, revisions_awaiting: Any, monkeypatch: Any
+) -> None:
+    """A purge deletes a selected revision while its embed call runs; its job survives, unfenced (a source
+    purge that rebuilt the job and released its fence). The write locks the revisions still awaiting and
+    writes no `embeddings` row of the deleted revision's text (the reconciler's guard: the epoch first)."""
+    deleted, kept = await revisions_awaiting(engine, 2)
+    async with engine.connect() as conn:
+        deleted_text = text_sha256(
+            embedding_text((await conn.execute(_LLM_INPUT, {"r": deleted})).scalar_one())
+        )
+    pause = PausePoint(embeddings.AFTER_HTTP)
+    monkeypatch.setattr(embeddings, "afault_point", pause)
+
+    async def epoch(conn: Any) -> None:
+        await fence_epoch(conn, current_epoch)
+
+    async with make_http_client() as http:
+        client = EmbedderClient(fake_embedder.base_url, http)
+        task = asyncio.create_task(embed_awaiting(engine, client, guard=epoch, guard_step="epoch"))
+        await asyncio.wait_for(pause.reached.wait(), 10)
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text("UPDATE jobs SET current_revision_id = NULL WHERE current_revision_id = :r"),
+                {"r": deleted},
+            )
+            await conn.execute(sa.text("DELETE FROM job_revisions WHERE id = :r"), {"r": deleted})
+        pause.resume()
+        report = await asyncio.wait_for(task, 30)
+    assert report.embedded == 1
+    assert await statuses(engine, [kept]) == ["embedded"]
+    assert await scalar(engine, _EMBEDDINGS_OF_TEXT, sha=deleted_text) == 0
+    assert await count_rows(engine, "embeddings") == 1
+
+
+async def test_a_fenced_backlog_leaves_the_embedder_alert_resolvable(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    fake_embedder: Any,
+    revisions_awaiting: Any,
+) -> None:
+    """`embedder.unavailable` resolves once nothing a pass would take awaits: a fenced job's revision is no
+    backlog while its fence stands, and is one again once it is released."""
+    (revision,) = await revisions_awaiting(engine, 1)
+    (job_id,) = await jobs_of(engine, [revision])
+    async with engine.begin() as conn:
+        await embeddings.raise_unavailable(conn, kind="unavailable", run_id=None)
+    fence_id = await fence(engine, job_id)
+    async with engine.connect() as conn:
+        assert await embeddings.count_awaiting(conn) == 0
+    async with make_http_client() as http:
+        client = EmbedderClient(fake_embedder.base_url, http)
+        assert (
+            await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, embedder=client)) == 0
+        )
+    assert fake_embedder.batches == [] and await scalar(engine, _OPEN_UNAVAILABLE) == 0
+    await release(engine, fence_id)
+    async with engine.connect() as conn:
+        assert await embeddings.count_awaiting(conn) == 1
+
+
+async def test_a_run_whose_only_awaiting_revisions_are_fenced_is_not_partial(
+    engine: AsyncEngine, current_epoch: int, revisions_awaiting: Any
+) -> None:
+    """The run end's I6 count, its partial cause `awaiting_embedding` and the embed node's
+    `revisions_awaiting` leave out the revisions of a fenced job; released, they count again."""
+    owner = await queued_run(engine)
+    revisions = await revisions_awaiting(engine, 2)  # created in the run
+    fence_id = await fence(engine, *await jobs_of(engine, revisions))
+    node = make_embed(make_deps(engine, lambda instance: pytest.fail(f"no fetch: {instance.source_id}")))
+
+    async def run_end() -> tuple[int, list[str]]:
+        async with engine.connect() as conn:
+            counted = await finalize.run_revisions(conn, owner.run_id)
+            causes = await finalize.partial_conditions(conn, owner.run_id, revisions=counted)
+        return counted.awaiting, list(causes)
+
+    assert await run_end() == (0, [])
+    assert (await node(initial_state(owner.run_id, owner.attempt_no)))["counters"][REVISIONS_AWAITING] == 0
+    await release(engine, fence_id)
+    assert await run_end() == (2, ["awaiting_embedding"])
+    assert (await node(initial_state(owner.run_id, owner.attempt_no)))["counters"][REVISIONS_AWAITING] == 2

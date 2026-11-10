@@ -19,9 +19,10 @@ and whose tuple's profile has vectors, a revision embedded by this pass or earli
 lock schedule's order: `fence_epoch` (step 1), `active_config FOR SHARE` (step 2), the candidates' job rows
 `FOR SHARE` and their purge fences (step 4: the target of a fenced job gets none, §20.2, M5 Task 8), the
 targets `FOR UPDATE SKIP LOCKED` (other domain rows); then, when the embedder answered, `embedder.unavailable`
-resolved once no revision awaits at all ("embedder healthy and backlog cleared", §17.6); and last, when a
-similarity was set (the unscored section ranks by it, §7.1 L1255), the ranking bump (`ranking_state`, the last
-lock). Ids and counts only reach a log line.
+resolved once no revision awaits at all ("embedder healthy and backlog cleared", §17.6; a revision of a fenced
+job, which no pass takes, is no backlog: `embeddings.count_awaiting`); and last, when a similarity was set
+(the unscored section ranks by it, §7.1 L1255), the ranking bump (`ranking_state`, the last lock). Ids and
+counts only reach a log line.
 """
 
 from datetime import timedelta

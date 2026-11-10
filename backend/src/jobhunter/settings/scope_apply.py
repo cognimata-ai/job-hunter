@@ -41,7 +41,10 @@ incomplete_results`); `progress` is `{"done", "total", "det_done", "det_total"}`
    - `filters.recompute_stale(conn, {sid: scope}, guard=<owner lock>)`: up to `BATCH` stale jobs `FOR SHARE`,
      then the owner row `FOR SHARE` (`lock_operation_owner`: a stale execution is fenced, having written
      nothing), then the results (`filters.refilter_job`, the pure writer: no target moves, no instance, no
-     `active_config` lock: Codex r5 B3);
+     `active_config` lock: Codex r5 B3). These chunks do not skip a job under a purge fence, unlike the
+     `det_results` chunks below (M5 Task 8, Ruling T8-4): §20.2 lists no hard-filter writer, and
+     `hard_filter_results` is a current projection of the job's facts, overwritten in place when they change
+     and deleted with its job, so nothing of it outlives a purge;
    - `set_progress`, the **last statement**. A save that holds `active_config` and reuses this live apply
      (`INSERT … ON CONFLICT` on `operations_live_dedup`) waits for an uncommitted update of the live row, so
      it waits at most for the tail of a chunk, never for a whole one.

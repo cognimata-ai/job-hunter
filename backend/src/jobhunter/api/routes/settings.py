@@ -4,7 +4,9 @@ and the reads).
 `POST /api/settings/dry-run` (`{payload}`) → 200 `{errors, warnings, projections, effects}`: the preview of a
 proposed settings document against the active one (`settings.dryrun.dry_run`). Errors are part of the
 preview and come with a 200; the save answers them with a 422. The dry-run runs in a read-only transaction
-(`SET TRANSACTION READ ONLY`, the transaction's first statement), where PostgreSQL refuses any write and any
+(`SET TRANSACTION READ ONLY`, the transaction's first statement after the write guard's read of
+delete-everything's fence, `db.fence_guard`, which PostgreSQL allows before it: only an isolation change or a
+return to read-write must come first), where PostgreSQL refuses any write and any
 `SELECT … FOR UPDATE | SHARE` (SQLSTATE 25006): it writes nothing and takes no row lock, so a preview never
 waits for a settings save or a reservation in progress. `effects` are sorted by name. The request's
 `payload` is plain JSON, so an invalid draft reaches the dry-run and comes back as its field issues; the

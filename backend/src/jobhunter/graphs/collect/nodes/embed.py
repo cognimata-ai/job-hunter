@@ -5,8 +5,8 @@ backlog of an earlier outage goes first, oldest first), with the run's owner row
 guard (`ledger.lock_run_owner`: a superseded attempt raises `FencedOut` before it commits a vector), taken
 after the batch's job rows (`guard_step="owner"`, step 5 of the lock schedule after step 4), and the fault
 point `collect.embed.between_batches` after each batch (crash case C7). A revision whose job is under a purge
-fence gets no vector (§20.2, M5 Task 8): it stays awaiting, and counts in `revisions_awaiting`. Its update's
-counters: `revisions_embedded`, `revisions_truncated` (flagged by the service at 1,024 tokens) and
+fence gets no vector (§20.2, M5 Task 8): it stays awaiting, and does not count in `revisions_awaiting`. Its
+update's counters: `revisions_embedded`, `revisions_truncated` (flagged by the service at 1,024 tokens) and
 `revisions_awaiting`, the revisions still awaiting when it ended, which make the run `partial` (§7.16.4, I6;
 Task 23 decides the status).
 

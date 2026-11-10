@@ -18,7 +18,10 @@ unseen, those of the routes that take no `active_config` (the CV upload and past
   `GLOBAL_FENCE_SQL`, a driver statement) is the transaction's first. The async engine runs the listener in
   a greenlet that carries the calling task's context (`sqlalchemy/util/concurrency.py`, SQLAlchemy 2.1.4),
   so it reads the request's `WRITE_GUARD`. A refused transaction never began on SQLAlchemy's side: the read
-  stays in the driver's transaction, which the pool's reset rolls back when the connection is returned.
+  stays in the driver's transaction, which the pool's reset rolls back when the connection is returned. A
+  connection whose begin was refused is discarded, never reused: SQLAlchemy leaves it with autobegin off, so a
+  later statement on it would begin no transaction and fire no guard (every caller lets the refusal end the
+  `async with` that opened it).
 - `suspended()`: clears `WRITE_GUARD` for its block. Two transactions of a guarded request run without it:
   the alert of a 500 (`api.errors.persist_unhandled_alert`, written even under the fence) and a read
   snapshot (`db.snapshot.read_snapshot`), whose `SET TRANSACTION ISOLATION LEVEL …` must be its first

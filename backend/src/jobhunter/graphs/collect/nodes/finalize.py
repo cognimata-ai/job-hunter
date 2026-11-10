@@ -37,7 +37,8 @@ from one of the run's snapshots (below).
   jobs (`enqueue_targets.RUN_JOB_SQL`) that is retained and unfenced has a live target of the tuple
   (`targets.NEEDS_TARGET_SQL` is false), detail `{"llm_tuple_id", "revisions", "missing"}`;
 - I6: the run's revisions still `awaiting_embedding`, counted (`{"awaiting": n}`): never a failure, the
-  partial cause `awaiting_embedding`;
+  partial cause `awaiting_embedding`. A revision of a job under a purge fence is not counted (M5 Task 8 fix
+  round 1, `embeddings.AWAITING_UNFENCED_SQL`): no batch takes it while the fence stands;
 - I7: the outcome reducer saw no conflict. A conflict raises outside any node and never reaches this node
   (`execute_run` ends that run `failed_invariant('I7')`), so the node checks `outcome_conflicts == 0`.
 
@@ -67,7 +68,7 @@ from typing import Final, Literal, cast, get_args
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.embeddings import NOT_SYNTHETIC_REVISION_SQL
+from jobhunter.embeddings import AWAITING_UNFENCED_SQL, NOT_SYNTHETIC_REVISION_SQL
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
@@ -178,7 +179,8 @@ _I5 = q(
 # The run's revisions: the user's jobs' only (a synthetic golden-case job's are never embedded, Ruling T19-a).
 _REVISIONS = q(
     "SELECT count(*) AS created, count(*) FILTER (WHERE r.embedding_status = 'embedded') AS embedded, "  # noqa: S608
-    "count(*) FILTER (WHERE r.embedding_status = 'awaiting_embedding') AS awaiting FROM job_revisions r "
+    "count(*) FILTER (WHERE r.embedding_status = 'awaiting_embedding' "
+    f"AND {AWAITING_UNFENCED_SQL}) AS awaiting FROM job_revisions r "
     f"WHERE r.created_at >= (SELECT started_at FROM runs WHERE id = :run) AND {NOT_SYNTHETIC_REVISION_SQL}"
 )
 _PARTIAL = q(

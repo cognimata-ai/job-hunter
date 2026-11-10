@@ -530,7 +530,9 @@ def _describes(cur: Window, obs: Observation) -> bool:
 # -- the authoritative path
 async def lock_run_owner(conn: AsyncConnection, owner: "RunOwner") -> None:
     """The owner row `FOR SHARE` with its predicate (§3.3.3), else `FencedOut("run")`; and no active `global`
-    purge fence (§20.2), else `FencedOut("purge_fence")`. The first statement of every owner transaction."""
+    purge fence (§20.2), else `FencedOut("purge_fence")`. Step 5 of the lock schedule: an owner transaction's
+    first lock, but for the job rows (step 4) that one takes before it (`enqueue_targets`' chunks, the embed
+    node's batches, `embeddings._write_batch`)."""
     if (await conn.execute(_OWNER, {"run": owner.run_id, "attempt": owner.attempt_no})).first() is None:
         raise FencedOut("run")
     if await global_fence_active(conn):

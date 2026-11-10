@@ -139,7 +139,7 @@ from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation, Tra
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
-from jobhunter.privacy.fences import purge_in_progress
+from jobhunter.privacy.fences import fenced_jobs, purge_in_progress
 from jobhunter.quota import ledger
 from jobhunter.scoring import filters
 from jobhunter.scoring.targets import DENIED
@@ -891,8 +891,8 @@ async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> Non
     group, member_ids, _ = await _lock_group(conn, group_id, (job_id,))
     if job_id not in member_ids:
         raise InvariantViolation(f"job {job_id} is not a member of duplicate group {group_id}")
-    if fenced := await merge.fenced_jobs(conn, member_ids):  # the members' rows are held: their fences now
-        log.warning("split_refused_fenced", group_id=group_id, job_ids=fenced)
+    if fenced := await fenced_jobs(conn, member_ids):  # the members' rows are held: their fences now
+        log.warning("split_refused_fenced", group_id=group_id, job_ids=sorted(fenced))
         raise purge_in_progress()
     for other in member_ids:
         if other != job_id:

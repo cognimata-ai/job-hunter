@@ -249,7 +249,7 @@ from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.observability.logging import get_logger
-from jobhunter.privacy.fences import lock_unfenced_jobs
+from jobhunter.privacy.fences import lock_jobs_shared, lock_unfenced_jobs
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import cycles, filters, similarity
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
@@ -1463,7 +1463,6 @@ _PROGRESS: Final = q(
     f"SELECT count(*) AS total, count(*) FILTER (WHERE NOT {NEEDS_TARGET_SQL}) AS done "  # noqa: S608
     f"FROM jobs j WHERE {RETAINED_JOB_SQL}"
 )
-_LOCK_JOBS: Final = q("SELECT id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR SHARE")
 _PROFILE_OF: Final = q("SELECT profile_version_id FROM llm_tuples WHERE id = :tuple")
 _BULK_PENDING: Final = q(
     "SELECT count(*) FROM score_targets WHERE bulk_operation_id = :bulk AND state = 'pending' "
@@ -1516,9 +1515,9 @@ async def create_chunk(
 
 
 async def lock_jobs(conn: AsyncConnection, job_ids: Sequence[int]) -> None:
-    """The job rows `FOR SHARE` in id order, in one statement (step 4); a deleted one is simply absent."""
-    if job_ids:
-        await conn.execute(_LOCK_JOBS, {"ids": sorted(job_ids)})
+    """The job rows `FOR SHARE` in id order, in one statement (step 4); a deleted one is simply absent
+    (`privacy.fences.lock_jobs_shared`, the one copy of that lock)."""
+    await lock_jobs_shared(conn, job_ids)
 
 
 def moved(counts: Counter[str]) -> bool:
