@@ -33,9 +33,17 @@ transaction of its own after the epoch claim (Task 27), and its start's tick sta
   is continued: no domain row of the score lane changes (targets, attempts, drafts, critic notes, results
   and their instances, cycles), its checkpoint writes stay on its own cycle's thread, and it exits
   superseded (70) or after its own graceful stop (0), whichever of its watchdog and its fenced epoch sees the
-  takeover first. Stopped inside a transaction of its own tick, the zombie would hold rows the takeover
-  sweeps wait for until their lock timeout (`takeover_blocked`, M0 ruling T13-b), so the claim is made away
-  from the tick (second 10 to 40).
+  takeover first. The pause freezes every coroutine of the zombie, and one of them can be inside a fenced
+  transaction: its tick, the aux queue's operation claim or a heavy reconciler. That transaction holds the
+  `worker_heartbeat` row `FOR KEY SHARE`, and its session stays `idle in transaction`. The takeover's epoch
+  claim (or a sweep, for an owner row) waits for it until the lock timeout, and the start ends
+  `takeover_blocked` (exit 1, M0 ruling T13-b). In production the restart policy (`restart: unless-stopped`)
+  starts the worker again, and the next start repeats the takeover (§3.3.1 step 3). The server ends the
+  frozen session `idle_in_transaction_session_timeout` (§19.1, 60 s) after the pause at the latest.
+  `take_over` starts the second worker the same way. The claim is made away from the tick (second 10 to
+  40), so the zombie is seldom frozen inside its own tick. The case runs twice: `paused`, where chance
+  decides whether a fenced transaction is open at the pause, and `frozen_in_a_fenced_transaction`
+  (`tests.crash.frozen_worker`), where one always is, so the first start is always blocked.
 - **C29** (`score.claim.after_claim`): the worker dies after the claim; the takeover fails the cycle
   `orphaned` (its warn alert, which the next completed cycle resolves) and reclaims the targets; the next
   tick's periodic cycle scores them.
@@ -72,6 +80,7 @@ from tests.support.settings import fresh_key
 pytestmark = [pytest.mark.crash, pytest.mark.slow]
 WORKER: Final = [sys.executable, "-m", "jobhunter.cli", "worker"]
 STALLING_WORKER: Final = [sys.executable, "-m", "tests.crash.score_worker"]
+FROZEN_WORKER: Final = [sys.executable, "-m", "tests.crash.frozen_worker"]
 FAULT_EXIT: Final = 86
 SUPERSEDED_EXIT: Final = 70
 READY_WITHIN_S: Final = 60
@@ -83,6 +92,11 @@ C14_STALL_S: Final = 400
 C14_BEAT_STALL_S: Final = 200
 C14_CLAIM_SECONDS: Final = range(20, 36)  # the reclaiming tick comes 205 s to 220 s after the claim
 C17_CLAIM_SECONDS: Final = range(10, 41)
+# How long the server lets a session stay `idle in transaction` (ms): the bound on a paused worker's open
+# transaction (§19.1 `postgresql.conf`, which the test server runs too). `take_over` reads it.
+IDLE_IN_TRANSACTION_TIMEOUT: Final = (
+    "SELECT setting::int FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'"
+)
 SIGTERM_STALL_S: Final = 600
 PUBLISHED: Final = ("published_accepted", "published_contested")
 # The score lane's domain rows a zombie must leave as they are (C17), each with every column.
@@ -159,6 +173,36 @@ def spawn_ready(procs: ProcessGroup, args: list[str], env: dict[str, str]) -> Pr
     worker = procs.spawn(args, env)
     worker.wait_event("worker_ready", READY_WITHIN_S)
     return worker
+
+
+def take_over(
+    procs: ProcessGroup, env: dict[str, str], server: PgServer, paused_at: float
+) -> tuple[Proc, int]:
+    """The worker that replaces one paused at `paused_at` (`time.monotonic()`), started the way the restart
+    policy starts it. Returns the ready worker and how many of its starts were blocked.
+
+    A start whose takeover met a row lock of the paused worker ends `takeover_blocked` (exit 1, ruling T13-b),
+    and is started again (C17 in the module docstring). Only that end is started again, and only until the
+    server's `idle_in_transaction_session_timeout` (as the worker's role sees it) has passed since the pause.
+    By then the server has ended every frozen session of the paused worker, so a start begun later must be
+    ready. A timeout of 0 would leave no bound, and then no start is started again.
+    """
+    found = pg_one(server, "app", IDLE_IN_TRANSACTION_TIMEOUT)
+    assert found is not None
+    frozen_until = paused_at + int(str(found[0])) / 1000
+    blocked = 0
+    while True:
+        started = time.monotonic()
+        worker = procs.spawn(WORKER, env)
+        try:
+            worker.wait_event("worker_ready", READY_WITHIN_S)
+        except TimeoutError:
+            if started >= frozen_until or worker.exit_within(10) != 1:
+                raise
+            worker.wait_event("takeover_blocked", 1, error_class="OperationalError")
+            blocked += 1
+            continue
+        return worker, blocked
 
 
 def stalling_env(
@@ -461,19 +505,27 @@ async def test_c14_a_stalled_heartbeat_is_reclaimed_at_three_minutes_and_the_new
     assert w.exit_within(60) == 0
 
 
+@pytest.mark.parametrize("frozen", [False, True], ids=["paused", "frozen_in_a_fenced_transaction"])
 async def test_c17_a_zombie_worker_with_a_cycle_in_flight_writes_no_domain_row(
-    migrated, proc_env, procs, engine, logged_in_client
+    frozen, migrated, proc_env, procs, engine, logged_in_client
 ) -> None:
     (target,) = await targets_of_an_inactive_tuple(engine, 1)
     paused = proc_env("worker", migrated, JOBHUNTER_FAULT="score.claim.after_claim:pause")
-    a = spawn_ready(procs, WORKER, paused)
+    a = spawn_ready(procs, FROZEN_WORKER if frozen else WORKER, paused)
     await request_cycle(engine, migrated, logged_in_client, at=C17_CLAIM_SECONDS)
     a.wait_event("fault_point_reached", 60, point="score.claim.after_claim")
     wait_until(a.is_stopped, 10)
+    paused_at = time.monotonic()
     epoch_a = epoch(migrated)
     one(migrated, "UPDATE worker_heartbeat SET heartbeat_at = now() - interval '2 minutes'")
     stale_jobs(migrated)
-    b = spawn_ready(procs, WORKER, proc_env("worker", migrated))
+    b, blocked = take_over(procs, proc_env("worker", migrated), migrated, paused_at)
+    if frozen:
+        backend = a.wait_event("frozen_transaction_open", 1)["backend_pid"]
+        # the open transaction held the first start back; then the server ended its session (the takeover
+        # terminates the lock session only)
+        assert blocked > 0
+        assert one(migrated, "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", backend) == (0,)
     epoch_b = epoch(migrated)
     wait_for(migrated, lambda: published_by_periodic(migrated, [target]), SCORED_WITHIN_S, a, b)
     # the periodic cycle ends after it has published its target: wait for its end, then read it
