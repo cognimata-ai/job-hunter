@@ -15,9 +15,11 @@ an online try's entry would lose its call unsettled (G04). So, in the lock sched
 1. the batch submissions that hold an item of T and are still live or released (`batches.IN_FLIGHT`,
    `released`) `FOR UPDATE` in id order (step 5, their owner rows), then T's items in them, read under those
    locks;
-2. the accounts of every entry settled below (`spend_ledger.lock_for_purge`: their month rows, then their
-   funded bulk rows) and the bulk rows of T's unreleased follow-up items (`bulk.lock_for_targets`, which
-   `delete_target_set` takes again), steps 6 and 7, before any row of step 10;
+2. the accounts of every entry settled below and of no other (`spend_ledger.lock_for_purge`: their month
+   rows, then their funded bulk rows: the entries of each `preparing` submission, the `dispatched` entries of
+   T's other items, and T's online entries read now) and the bulk rows of T's unreleased follow-up items
+   (`bulk.lock_for_targets`, which `delete_target_set` takes again), steps 6 and 7, before any row of step
+   10;
 3. each `preparing` submission abandoned (`batches.abandon_preparing`: every entry `not_billed(
    'never_dispatched')`, its targets `pending`, their attempts `cancelled('batch_abandoned')`; no follow-on),
    whichever of its targets T holds: the execution that prepared it is fenced at its next step
@@ -41,15 +43,36 @@ an online try's entry would lose its call unsettled (G04). So, in the lock sched
 7. `delete_target_set(T, on_cancelled=...)`. Its hook runs once its step 1 has cancelled T, so no try of T's
    can be reserved or dispatched any more (`mark_dispatched` re-checks its owner under the owner lock): T's
    online entries, those read before step 2 and any its attempts' calls hold now (`reserved` or `dispatched`,
-   not a batch item's), are taken again (`lock_for_purge`, current after the writes above, its locks held
-   already) and settled (`spend_ledger.settle_for_purge`: a `reserved` one released, the counters `-r` and a
-   funded allocation credited; a `dispatched` one `ambiguous`). Every later reader of an online entry joins
-   its call, so one left unsettled when its call goes could never be settled or recovered; the coroutine's
-   late `settle` or `release_never_dispatched` finds it alone, a no-op.
+   not a batch item's), are taken again (`lock_for_purge`, its rows current after the writes above) and
+   settled (`spend_ledger.settle_for_purge`: a `reserved` one released, the counters `-r` and a funded
+   allocation credited; a `dispatched` one `ambiguous`). Every later reader of an online entry joins its
+   call, so one left unsettled when its call goes could never be settled or recovered; the coroutine's late
+   `settle` or `release_never_dispatched` finds it alone, a no-op. The hook's read exists for one race: a try
+   of a target of T reserved after the first read, which committed before step 1 took its target. Its locks
+   are held already, but for that try's month row and funded bulk row when no entry of step 2 shared them:
+   those it takes first here, after rows of step 10 (T's targets and attempts), the one place the chunk
+   leaves the schedule. Their partners: that try's own late `settle` (its month row, then its attempt, which
+   the cancel ended under this chunk's lock), and a funded writer that holds that bulk row while it waits for
+   a month or target row this chunk holds.
 `delete_target_set` then deletes T with its items and calls; the ledger rows stay. `ranking.bump` is the
-caller's, last. A score attempt reserving a try for a target of T meanwhile holds its target `FOR SHARE` and
-waits for the month row this chunk holds, while the chunk waits for that target: PostgreSQL aborts one of the
-pair, as with every non-owner mover of a target (`targets._cancel`), and either outcome is whole.
+caller's, last.
+
+**The chunk can lose a deadlock** (40P01), which its order (the month and bulk rows before the target rows,
+which a non-owner takes at step 10) keeps possible, so **the caller retries the whole chunk transaction on a
+retryable database error** (`graphs.sanitize.is_retryable_db_error`: a deadlock, a serialization failure, a
+lost connection; Task 12's `PurgeRun.chunk`, which then requeues `lock_conflict`). The partners:
+- a score attempt reserving a try for a target of T (`spend_ledger.reserve`, which takes no job row): it holds
+  its target `FOR SHARE` (the owner row, step 5) and waits for a month row this chunk holds, while the chunk
+  waits for that target (step 10, as a non-owner), as with every non-owner mover of a target
+  (`targets._cancel`); `llm_ledger_unsettled`'s recovery is the same pair (the owner `FOR UPDATE`, then the
+  month);
+- a funded writer on a bulk row: a funded reservation, settlement or follow-up hold release that holds a
+  target or month row and waits for a bulk row this chunk holds (the pair M3's `delete_target_set` has with
+  its `bulk.lock_for_targets`);
+- the late locks of step 7 above.
+PostgreSQL aborts one of the pair. Either outcome is whole: an aborted try retries and meets the cancel
+(`ClaimLost`); an aborted chunk wrote nothing, and its retry finds what is left (over targets deleted already
+it is a no-op).
 
 Ids, counts and states only reach a log line.
 """
@@ -150,7 +173,11 @@ async def purge_target_set(
 ) -> PurgedTargets:
     """Delete the targets `target_ids` (at most `targets.TARGET_SET_CHUNK`) for the purge of manifest
     `manifest_id`, settling and recording first what their batches and online tries still hold (module
-    docstring), in the caller's transaction; `ValueError` for a larger set."""
+    docstring), in the caller's transaction; `ValueError` for a larger set.
+
+    The chunk can lose a deadlock (40P01) to a concurrent score reservation, which takes its target before
+    its month row, or to a funded writer on a bulk row (module docstring): the caller retries the whole chunk
+    transaction on a retryable database error (`graphs.sanitize.is_retryable_db_error`)."""
     ids = sorted(set(target_ids))
     if len(ids) > targets.TARGET_SET_CHUNK:
         raise ValueError(f"a purge chunk takes at most {targets.TARGET_SET_CHUNK} targets, not {len(ids)}")
@@ -173,8 +200,9 @@ async def purge_target_set(
     )
     online = await _ids(conn, _ONLINE_ENTRIES, {"ids": ids})
     abandoned_entries = await _ids(conn, _ENTRIES_OF_SUBMISSIONS, {"subs": preparing}) if preparing else []
-    # 2. steps 6 and 7, before any row of step 10
-    entries = [*abandoned_entries, *(int(item.ledger_id) for item in in_flight), *online]
+    # 2. steps 6 and 7, before any row of step 10: the accounts of the entries settled below, and no other
+    dispatched = [int(item.ledger_id) for item in in_flight if item.entry_state == "dispatched"]
+    entries = [*abandoned_entries, *dispatched, *online]
     await spend_ledger.lock_for_purge(conn, entries, now=now)
     await bulk.lock_for_targets(conn, ids)
     for submission_id in preparing:  # 3.
@@ -196,7 +224,7 @@ async def purge_target_set(
     recorded = (await conn.execute(_RECORD_PURGED, params)).rowcount  # 6.
     settled = PurgeSettled(0, 0)
 
-    async def settle_online(cancelled: AsyncConnection) -> None:  # 7., T cancelled
+    async def settle_online(cancelled: AsyncConnection) -> None:  # 7., T cancelled (module docstring)
         nonlocal settled
         current = sorted({*online, *await _ids(cancelled, _ONLINE_ENTRIES, {"ids": ids})})
         rows = await spend_ledger.lock_for_purge(cancelled, current, now=now)

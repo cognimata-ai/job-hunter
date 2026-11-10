@@ -314,6 +314,22 @@ async def _purged_line(engine: AsyncEngine, submission_id: int, custom_id: str) 
         return found.first() is not None
 
 
+async def _purged_since(engine: AsyncEngine, submission_id: int, item_id: int, custom_id: str) -> bool:
+    """Whether the purge evidence names the line of an item whose processing raised (`_process`); `False`
+    when the evidence cannot be read (logged with its class only), so the item is a failed one of the pass
+    and the error never ends it (Ruling T17-a)."""
+    try:
+        return await _purged_line(engine, submission_id, custom_id)
+    except Exception as exc:  # noqa: BLE001 - Ruling T17-a: the item is failed, the pass goes on; logged
+        log.warning(
+            "batch_purge_evidence_unread",
+            submission_id=submission_id,
+            item_id=item_id,
+            error_class=type(exc).__name__,
+        )
+        return False
+
+
 @dataclass(frozen=True)
 class _Failed:
     """An item whose processing raised this pass (Ruling T17-a): the error's class only."""
@@ -354,7 +370,7 @@ async def _process(
     except FencedOut:
         raise
     except Exception as exc:  # noqa: BLE001 - Ruling T17-a: one item's error must not stop the lane; logged, counted
-        if await _purged_line(engine, submission.id, result.custom_id):
+        if await _purged_since(engine, submission.id, item.id, result.custom_id):
             log.info("batch_item_purged", submission_id=submission.id, item_id=item.id)
             return _PURGED
         failed = _Failed(type(exc).__name__)

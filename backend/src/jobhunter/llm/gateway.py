@@ -76,7 +76,9 @@ it reserves the enlarged stage's worst case, and the logical call counts the tri
   still in its stream that no cancellation reached, and waits for one already settling) before it closes the
   engine (§3.3.5 step 4; M3 Task 28).
 
-Every `completed` call without an `output_json` therefore carries an `error_code` (receipts, Task 13). The
+Every `completed` call without an `output_json` therefore carries an `error_code` (receipts, Task 13), but
+one: a batch item whose target was fenced or cancelled is `completed` with neither (P2, M5 Task 11:
+`scoring.batch_items` bills its usage and stores no output). The
 first-stage `max_tokens` code is not a terminal one: that logical call went on to its enlarged stage. A retry
 whose wait would leave less than `RETRY_MIN_REMAINING_S`, or the last try, is `LLMTransient(code)`.
 

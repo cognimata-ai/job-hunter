@@ -38,7 +38,7 @@ from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.spend_ledger import Reservation, TargetAttemptOwner
 from jobhunter.privacy.deletion_graph import PurgedTargets, purge_target_set
 from jobhunter.privacy.fences import FenceSpec, insert_fence, lock_jobs_shared
-from jobhunter.scoring import batch_results, batches, cycles
+from jobhunter.scoring import batch_items, batch_results, batches, cycles
 from jobhunter.scoring.targets import REVISION_SUPERSEDED, cancel_targets, delete_target_set
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
@@ -54,6 +54,7 @@ from tests.support.batches import (
     decisions,
     eligible_for_batching,
     entries_by_custom_id,
+    item_ids,
     item_rows,
     items_of,
     open_alert_codes,
@@ -779,6 +780,58 @@ async def test_a_dispatched_online_entry_ends_ambiguous_and_its_late_response_is
     assert await no_drift(engine, res)
 
 
+async def test_a_try_reserved_after_the_first_read_is_settled_by_the_hook(
+    engine: AsyncEngine, gateway: LLMGateway, setup: BulkTargets, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G04 (fix round 1, M2): the purged target's coroutine reserves a try after the chunk's first read of the
+    online entries, in its own transaction, which commits before the chunk takes the target (here while the
+    chunk records its cancels; the target has no other entry, so the chunk holds no month row yet). The
+    hook's read after the cancel finds it and releases it before its call goes: never stranded."""
+    t = utcnow()
+    target = setup.targets[0]
+    owner = await online_owner(engine, target)
+    late: list[Reservation] = []
+    real = batches.record_cancel
+
+    async def reserving_first(conn: AsyncConnection, **kw: Any) -> list[int]:
+        late.append(await online_try(engine, owner, now=t))  # another connection: it commits
+        return await real(conn, **kw)
+
+    monkeypatch.setattr(batches, "record_cancel", reserving_first)
+    purged = await purge(engine, [target], now=t)
+    (res,) = late
+    assert purged == purged_targets(1, online_released=1)
+    assert await stranded(engine) == 0
+    entry = await ledger(engine, res.ledger_id)
+    assert (entry.state, entry.evidence, entry.has_call) == ("not_billed", "never_dispatched", False)
+    assert await no_drift(engine, res)
+
+
+async def test_a_settlement_finding_its_entry_stranded_logs_an_error(
+    engine: AsyncEngine, gateway: LLMGateway, setup: BulkTargets, infos: pytest.LogCaptureFixture
+) -> None:
+    """G04 (fix round 1, M3): a ledger row still `dispatched` whose call another deleter removed unsettled
+    (here M3's `targets.delete_target_set` alone, the path the purge replaces) is a breach no reader finds
+    again. The coroutine's late `settle` and `release_never_dispatched` still write and raise nothing (a late
+    response never crashes its caller), but each logs the error `llm_entry_stranded`, never the info
+    `llm_settle_call_purged` of an entry a purge settled."""
+    t = utcnow()
+    target = setup.targets[0]
+    res = await online_try(engine, await online_owner(engine, target), now=t, dispatch=True)
+    await m3_delete(engine, [target])
+    assert await stranded(engine) == 1
+    async with engine.begin() as conn:
+        await spend_ledger.settle(
+            conn, res, outcome="billed", evidence=None, usage=USAGE, call=completed_call(), now=t
+        )
+    async with engine.begin() as conn:
+        await spend_ledger.release_never_dispatched(conn, res, now=t)
+    errors = [(e["ledger_id"], e["state"], e["level"]) for e in logged(infos, "llm_entry_stranded")]
+    assert errors == [(res.ledger_id, "dispatched", "error")] * 2
+    assert logged(infos, "llm_settle_call_purged") == []
+    assert (await ledger(engine, res.ledger_id)).state == "dispatched"
+
+
 async def test_ledger_unsettled_finds_nothing_stranded_after_a_purge(
     engine: AsyncEngine,
     gateway: LLMGateway,
@@ -900,3 +953,40 @@ async def test_a_purge_meeting_the_poll_mid_stream_counts_its_line_purged(
     assert len(logged(infos, "llm_settle_call_purged")) == 1
     (row,) = await submission_rows(engine)
     assert row.state == "reconciled" and "failed_items" not in (row.reconcile_report or {})
+
+
+async def test_an_unreadable_purge_evidence_leaves_the_item_failed_not_the_pass(
+    engine: AsyncEngine,
+    gateway: LLMGateway,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+    infos: pytest.LogCaptureFixture,
+) -> None:
+    """Ruling T17-a (fix round 1, M5): an item whose processing raises is checked against the purge evidence
+    on a connection of its own; when that read raises too, the item is a failed one of the pass (logged with
+    its processing error's class, counted in `failed_items`) and the pass goes on with the next item: the
+    error never ends it."""
+    batch = await sent(
+        engine, fake_llm, await prepared(engine, gateway, setup), BatchScript(polls_until_ended=0)
+    )
+    failing, _ = setup.targets
+    failing_item = (await item_ids(engine))[batch.custom_id(failing)]
+    real = batch_items.process_item
+
+    async def raising(conn: AsyncConnection, **kw: Any) -> batch_items.Decision:
+        if kw["item"].id == failing_item:
+            raise RuntimeError("synthetic processing failure")
+        return await real(conn, **kw)
+
+    async def unreadable(*args: object) -> bool:
+        raise ConnectionError("synthetic: the evidence cannot be read")
+
+    monkeypatch.setattr(batch_items, "process_item", raising)
+    monkeypatch.setattr(batch_results, "_purged_line", unreadable)
+    report = await poll_once(engine, fake_llm)
+    assert (report.decided, report.purged, report.reconciled) == (1, 0, 0)
+    (row,) = await submission_rows(engine)
+    assert row.state == "ended" and row.reconcile_report["failed_items"] == {str(failing_item): 1}
+    assert [e["error_class"] for e in logged(infos, "batch_item_failed")] == ["RuntimeError"]
+    assert [e["error_class"] for e in logged(infos, "batch_purge_evidence_unread")] == ["ConnectionError"]

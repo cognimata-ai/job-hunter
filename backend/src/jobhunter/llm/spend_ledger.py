@@ -73,7 +73,8 @@ order and their funded bulk rows in id order (steps 6 and 7, before the purge's 
 cancelled their targets, releases a `reserved` one (`not_billed('never_dispatched')`) and makes a
 `dispatched` one `ambiguous`. A batch item's entry is its submission's, settled by the purge itself
 (`privacy.deletion_graph`). `settle` and `release_never_dispatched` of an entry whose call is gone find its
-ledger row alone, settled by the purge: a no-op logged `llm_settle_call_purged`.
+ledger row alone, settled by the purge: a no-op logged `llm_settle_call_purged` (the error
+`llm_entry_stranded` for a row found alone still `reserved` or `dispatched`: G04 breached elsewhere).
 
 **Reconcilers.** `llm_ledger_unsettled` (tick, plan Deviation 5) fails the abandoned `eval_runs` (no live
 `eval_run` operation and, for a run that never had one, more than an hour old; M3 Task 19), releases
@@ -724,6 +725,17 @@ class _Alone:
     settled_usd: Decimal | None
 
 
+def _log_alone(entry: _Alone, outcome: str) -> None:
+    """A settlement or release that found its ledger row alone writes nothing (a late response never crashes
+    its caller). A purge settled the row first: `llm_settle_call_purged` (info). A row still `reserved` or
+    `dispatched` lost its call to another deleter unsettled, a breach of G04 that no reader can find again:
+    the error `llm_entry_stranded`."""
+    if entry.state in ("reserved", "dispatched"):
+        log.error("llm_entry_stranded", ledger_id=entry.id, state=entry.state, outcome=outcome)
+    else:
+        log.info("llm_settle_call_purged", ledger_id=entry.id, state=entry.state, outcome=outcome)
+
+
 async def _reserved_entry(conn: AsyncConnection, res: Reservation) -> _Entry | _Alone:
     """The entry of `res`, or its ledger row alone (`_Alone`) when a purge deleted its call; a `LookupError`
     without a ledger row, a `ValueError` for a reservation that does not describe it (another call or month):
@@ -1310,12 +1322,12 @@ async def release_never_dispatched(conn: AsyncConnection, res: Reservation, *, n
     `not_billed('never_dispatched')`, the call `cancelled` and the counters (and a funded entry's allocation)
     adjusted. A try that is no longer `reserved` is left as it is, with nothing written (logged
     `llm_release_skipped`), and so is one whose call a purge deleted (logged `llm_settle_call_purged`: the
-    purge released it first, `settle_for_purge`)."""
+    purge released it first, `settle_for_purge`; the error `llm_entry_stranded` for one still unsettled)."""
     p = await current_params(conn)
     row = await _lock_row(conn, res.month)
     entry = await _reserved_entry(conn, res)
     if isinstance(entry, _Alone):
-        log.info("llm_settle_call_purged", ledger_id=entry.id, state=entry.state, outcome="not_billed")
+        _log_alone(entry, "not_billed")
         return
     budget.accrue_row(row, p, now)  # stored with the counters by `_release`
     if entry.state != "reserved" or not await _release(conn, entry, row, now=now):
@@ -1655,7 +1667,9 @@ async def settle(
     already `billed` or `not_billed` (or `ambiguous` again) is left as it is and logged
     `llm_settle_duplicate`; a `reserved` one is a `ValueError` (release it). An entry whose call a purge
     deleted (a purged target's late response, or a late batch line) is found alone, already settled by the
-    purge (`settle_for_purge`): nothing is written, logged `llm_settle_call_purged`, never a `LookupError`.
+    purge (`settle_for_purge`): nothing is written, logged `llm_settle_call_purged`, never a `LookupError`;
+    one found alone still `reserved` or `dispatched` (another deleter left it unsettled, G04) is the error
+    `llm_entry_stranded`, and nothing is written either.
     Returns the figures for the metrics (no metric here).
 
     The counter change goes to the bucket, or for a funded entry to its operation's `spent_usd` under the bulk
@@ -1671,7 +1685,7 @@ async def settle(
     entry = await _reserved_entry(conn, res)
     budget.accrue_row(row, p, now)
     if isinstance(entry, _Alone):  # a purge deleted its call, having settled it first (M5 Task 11)
-        log.info("llm_settle_call_purged", ledger_id=entry.id, state=entry.state, outcome=outcome)
+        _log_alone(entry, outcome)
         return await _figures(conn, entry, row, p, _counted_at(entry))  # nothing written
     if entry.state in ("billed", "not_billed") or (entry.state == "ambiguous" and outcome == "ambiguous"):
         log.warning("llm_settle_duplicate", ledger_id=entry.id, state=entry.state, outcome=outcome)
