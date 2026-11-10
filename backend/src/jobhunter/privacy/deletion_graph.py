@@ -157,6 +157,29 @@ own (`purge_target_set`): a job of G it does not hold, or a target of G left (by
 `det_results`, `llm_results` and the targets went with the targets; `score_feedback` keeps its row with the
 job and revision NULL (`ON DELETE SET NULL`). `ranking.bump` is the caller's, last.
 
+**Delete-everything's live spend** (M5 Task 16, §20.4 step 2, Deviation 51). `settle_live_spend(conn, *,
+submission_bound, ledger_bound, bulk_bound, now) -> LiveSpendSettled` maps every live batch submission and
+settles every other unsettled entry, in the caller's transaction, which holds `active_config FOR UPDATE` and
+has cancelled the entries' owners (the runs, cycles and operations; the `global` fence refuses every later
+reservation and dispatch marker, `spend_ledger`), in the schedule's order: the live submissions (`IN_FLIGHT`,
+within `submission_bound`) `FOR UPDATE` in id order (step 5) and their items with their entries; the accounts
+of every entry it settles (`spend_ledger.lock_for_purge`: month rows, step 6, then funded bulk rows, step 7);
+then
+- `preparing` → `abandoned` (`batches.abandon_preparing`: its entries `reserved → not_billed(
+  'never_dispatched')`, its targets `pending`, no follow-on);
+- `submit_started`, `submit_ambiguous` → `released`, each item's entry `dispatched → ambiguous` (`settle`,
+  counted at its reservation; the call `ambiguous` with `PURGED_CODE`);
+- `submitted`, `ended` → the cancel recorded (`batches.record_cancel`; delete-everything sends it itself after
+  the commit, `batch_results.send_purge_cancel`), each item's entry still `dispatched` → `ambiguous`;
+- the `active` bulk operations (within `bulk_bound`) `cancelled`;
+- every other request entry within `ledger_bound` still `reserved` or `dispatched` (online, its call still
+  there), its accounts read again under their locks, settled (`settle_for_purge`: `reserved →
+  not_billed('never_dispatched')`, `dispatched → ambiguous`), so no entry is left `reserved` or `dispatched`
+  when its call is deleted.
+The targets of a released or a cancelled submission stay `in_batch` until target-set deletion cancels and
+deletes them (`purge_target_set`, which also gives their follow-up holds back and records the purged items).
+Every step is idempotent: a re-execution finds no live submission and no unsettled entry.
+
 `purge_job_graph(run, root, graph, *, write_tombstone, target_bound=None) -> GraphPurged` runs it as a purge
 does (Deviation 50; job tombstoning, the Adzuna purge and delete-everything, M5 Tasks 13, 15 and 16): the
 graph's targets (by job or by revision, within the manifest's `max_ids["score_targets"]` when given) in
@@ -178,7 +201,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import transition_where
+from jobhunter.db.transitions import transition, transition_where
 from jobhunter.dedup import groups
 from jobhunter.dedup.identity import tombstone_key_hash
 from jobhunter.dedup.merge import IDENTITY_CONFLICT_ALERT
@@ -360,6 +383,106 @@ async def purge_target_set(
         target_ids=ids[:LOGGED_IDS],
     )
     return purged
+
+
+# ---- delete-everything's live spend (M5 Task 16) -----------------------------------------------------------
+
+_LIVE_SUBMISSIONS: Final = q(
+    "SELECT id, state FROM batch_submissions WHERE state = ANY(CAST(:states AS text[])) AND id <= :bound "
+    "ORDER BY id FOR UPDATE"
+)
+# The submissions' items with their entries, in id order (the columns `_reservation` reads).
+_ITEMS_OF_SUBMISSIONS: Final = q(
+    "SELECT i.id, i.submission_id, c.id AS call_id, l.id AS ledger_id, l.state AS entry_state, "  # noqa: S608
+    "l.budget_month, l.reserved_usd, l.purpose_class, l.model_requested FROM batch_items i "
+    "JOIN llm_calls c ON c.id = i.llm_call_id JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    f"WHERE i.submission_id = ANY({_SUBMISSIONS}) ORDER BY i.id"
+)
+# Every other request entry within the bound a reader could still settle: online, its call still there.
+_ONLINE_UNSETTLED: Final = q(
+    "SELECT l.id FROM llm_spend_ledger l WHERE l.kind = 'request' AND NOT l.batch "
+    "AND l.state IN ('reserved', 'dispatched') AND l.id <= :bound "
+    "AND EXISTS (SELECT 1 FROM llm_calls c WHERE c.spend_ledger_id = l.id) ORDER BY l.id"
+)
+_ACTIVE_BULKS: Final = q("SELECT id FROM bulk_operations WHERE state = 'active' AND id <= :bound ORDER BY id")
+_RELEASED_BY_PURGE: Final = ("submit_started", "submit_ambiguous")
+_CANCELLED_BY_PURGE: Final = ("submitted", "ended")
+
+
+@dataclass(frozen=True)
+class LiveSpendSettled:
+    """What `settle_live_spend` did: the submissions it abandoned, released and recorded a cancel on, the
+    batch entries it made `ambiguous`, the bulk operations it cancelled, and the online entries it released
+    and made `ambiguous`."""
+
+    abandoned: tuple[int, ...]
+    released: tuple[int, ...]
+    cancel_recorded: tuple[int, ...]
+    batch_entries_ambiguous: int
+    bulk_cancelled: tuple[int, ...]
+    online_released: int
+    online_ambiguous: int
+
+
+async def settle_live_spend(
+    conn: AsyncConnection, *, submission_bound: int, ledger_bound: int, bulk_bound: int, now: datetime
+) -> LiveSpendSettled:
+    """Delete-everything's step 2 for the batches and the ledger (module docstring, "Delete-everything's live
+    spend"), in the caller's transaction, which holds `active_config FOR UPDATE` and has cancelled the
+    entries' owners."""
+    params = {"states": list(batches.IN_FLIGHT), "bound": submission_bound}
+    locked = {int(r.id): str(r.state) for r in await conn.execute(_LIVE_SUBMISSIONS, params)}
+    items = (await conn.execute(_ITEMS_OF_SUBMISSIONS, {"subs": list(locked)})).all() if locked else []
+    preparing = sorted(s for s, state in locked.items() if state == "preparing")
+    released = sorted(s for s, state in locked.items() if state in _RELEASED_BY_PURGE)
+    cancelled = sorted(s for s, state in locked.items() if state in _CANCELLED_BY_PURGE)
+    dispatched = [
+        item
+        for item in items
+        if item.entry_state == "dispatched" and int(item.submission_id) not in preparing
+    ]
+    online = await _ids(conn, _ONLINE_UNSETTLED, {"bound": ledger_bound})
+    abandoned_entries = [int(item.ledger_id) for item in items if int(item.submission_id) in preparing]
+    await spend_ledger.lock_for_purge(  # steps 6 and 7: the accounts of every entry settled below
+        conn, [*abandoned_entries, *(int(item.ledger_id) for item in dispatched), *online], now=now
+    )
+    for submission_id in preparing:
+        await batches.abandon_preparing(conn, submission_id, now=now)
+    for submission_id in released:
+        await transition(conn, "batch_submissions", submission_id, list(_RELEASED_BY_PURGE), "released")
+    recorded = tuple(await batches.record_cancel(conn, submission_ids=cancelled, now=now))
+    call = CallOutcome("ambiguous", error_code=PURGED_CODE)
+    for item in dispatched:  # the month row, the funded bulk row, the ledger rows, the attempt
+        await spend_ledger.settle(
+            conn, _reservation(item), outcome="ambiguous", evidence=None, usage=None, call=call, now=now
+        )
+    bulks = await _ids(conn, _ACTIVE_BULKS, {"bound": bulk_bound})
+    for bulk_operation_id in bulks:
+        await bulk.cancel(conn, bulk_operation_id, now=now)
+    rows = await spend_ledger.lock_for_purge(
+        conn, online, now=now
+    )  # read again: the settles above wrote them
+    settled = await spend_ledger.settle_for_purge(conn, online, rows, now=now)
+    done = LiveSpendSettled(
+        abandoned=tuple(preparing),
+        released=tuple(released),
+        cancel_recorded=recorded,
+        batch_entries_ambiguous=len(dispatched),
+        bulk_cancelled=tuple(bulks),
+        online_released=settled.released,
+        online_ambiguous=settled.ambiguous,
+    )
+    log.info(
+        "purge_live_spend_settled",
+        abandoned=list(done.abandoned),
+        released=list(done.released),
+        cancel_recorded=list(done.cancel_recorded),
+        batch_entries_ambiguous=done.batch_entries_ambiguous,
+        bulk_cancelled=list(done.bulk_cancelled),
+        online_released=done.online_released,
+        online_ambiguous=done.online_ambiguous,
+    )
+    return done
 
 
 # ---- the exports (M5 Task 12) ------------------------------------------------------------------------------

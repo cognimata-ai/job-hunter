@@ -4,9 +4,10 @@
 - `golden_case`: `golden_case_delete` (Task 12);
 - `job_tombstone`: `job_tombstone` (Task 13);
 - `profile_purge`: `profile_purge` (Task 14);
-- `source_purge`: `source_purge` (Task 15).
+- `source_purge`: `source_purge` (Task 15);
+- `delete_everything`: `delete_everything` (Task 16).
 """
 
-from jobhunter.privacy.kinds import golden_case, job_tombstone, profile_purge, source_purge
+from jobhunter.privacy.kinds import delete_everything, golden_case, job_tombstone, profile_purge, source_purge
 
-__all__ = ["golden_case", "job_tombstone", "profile_purge", "source_purge"]
+__all__ = ["delete_everything", "golden_case", "job_tombstone", "profile_purge", "source_purge"]

@@ -39,7 +39,8 @@ caller's clock (`ctx.now`), never the database's `now()`.
 
 **Cancellation** (§7.16.4, M5 Task 15): `cancel_active_runs` ends the `queued` and `running` collections
 `cancelled(<reason>)` under `active_config FOR UPDATE` (a source purge's admission, `SOURCE_PURGE_CANCEL`, and
-its replay's re-application). A running attempt is closed `cancelled`; its execution's next owner write is
+its replay's re-application; delete-everything's phase B, `DELETE_EVERYTHING_CANCEL`, M5 Task 16). A running
+attempt is closed `cancelled`; its execution's next owner write is
 refused, so it stops (`lost`) and writes nothing more.
 
 Every run that reaches a terminal status is counted in `RUNS` (and, when it started, timed in `RUN_DURATION`)
@@ -119,8 +120,9 @@ MAX_CONCURRENCY: Final = 4  # the graph's parallel tasks: the fetch fan-out (§9
 
 REDEFERRED: Final = "redeferred"
 # The reasons a run ends `cancelled` with (§7.16.4, `cancel_active_runs`).
-CancelReason = Literal["source_purge"]
+CancelReason = Literal["source_purge", "delete_everything"]
 SOURCE_PURGE_CANCEL: Final[CancelReason] = "source_purge"
+DELETE_EVERYTHING_CANCEL: Final[CancelReason] = "delete_everything"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
 ORPHANED_QUEUE_ALERT: Final = "run.orphaned_queue"
 FAILED_ALERT: Final = "run.failed"

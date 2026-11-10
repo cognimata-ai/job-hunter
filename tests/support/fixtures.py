@@ -10,6 +10,7 @@ from typing import Any, Final, Protocol
 import httpx
 import procrastinate
 import psycopg
+import psycopg.types.json
 import pytest
 import sqlalchemy as sa
 import structlog
@@ -333,6 +334,39 @@ _CONFIGURATION_RESET: Final = (
 )
 
 
+# Settings version 1 as `migrate` seeded it, per server (its container), read by the first reset that finds
+# it: delete-everything (M5 Task 16) deletes every settings version within its bound, version 1 among them,
+# and keeps the rows it names (its derived rows are the default document's, which the purge's reset reuses),
+# so the reset inserts it again with its id and its `created_at`, the day the schedule's anchor is computed
+# from.
+_SETTINGS_V1_COLUMNS: Final = (
+    "id, version_no, schema_version, payload, scope_version_id, model_policy_id, execution_config_id, "
+    "evaluation_policy_id, base_version_id, effect_classes, acknowledged_warnings, eval_override_ack, "
+    "created_at"
+)
+_SETTINGS_V1_READ: Final = f"SELECT {_SETTINGS_V1_COLUMNS} FROM settings_versions WHERE version_no = 1"  # noqa: S608
+_SETTINGS_V1_INSERT: Final = (
+    f"INSERT INTO settings_versions ({_SETTINGS_V1_COLUMNS}) OVERRIDING SYSTEM VALUE "  # noqa: S608
+    f"VALUES ({', '.join(['%s'] * len(_SETTINGS_V1_COLUMNS.split(',')))})"
+)
+_SEEDED_SETTINGS_V1: dict[str, tuple[Any, ...]] = {}
+
+
+def _restore_settings_v1(conn: psycopg.Connection[tuple[Any, ...]], server: PgServer) -> None:
+    """Settings version 1 inserted again as `migrate` seeded it when a delete-everything deleted it (above);
+    remembered on the first reset that finds it."""
+    found = conn.execute(_SETTINGS_V1_READ).fetchone()
+    if found is not None:
+        _SEEDED_SETTINGS_V1.setdefault(server.container, tuple(found))
+        return
+    seeded = _SEEDED_SETTINGS_V1.get(server.container)
+    if seeded is None:
+        raise LookupError("settings version 1 is missing and no reset has seen it: `migrated` seeds it")
+    values = list(seeded)
+    values[3] = psycopg.types.json.Jsonb(values[3])  # the payload
+    conn.execute(_SETTINGS_V1_INSERT, values)
+
+
 def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
     """Empty the tables of `_TRUNCATE`, `_M3_DELETE` and `_M2_DELETE`, restore the seeded configuration, in
     one transaction.
@@ -342,7 +376,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
 
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); the M3 tables
-    and the M1 tables they reference deleted (`_M3_DELETE`); `active_config` as the seed wrote it
+    and the M1 tables they reference deleted (`_M3_DELETE`); settings version 1 inserted again when a
+    delete-everything deleted it (`_restore_settings_v1`, M5 Task 16); `active_config` as the seed wrote it
     (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the shipped
     prompt-schema version 2, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
     (`_M2_DELETE`); the schedule and the dead-man state reset (`_DEADMAN_RESET`: its row inserted again as
@@ -365,6 +400,7 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(DEFAULT_INSTANCES_SQL)
         for statement in _M3_DELETE:
             conn.execute(statement)
+        _restore_settings_v1(conn, server)
         seeded = _SEEDED_HASHES
         if conn.execute(_SEEDED_ROWS, seeded).fetchone() != (True,):
             raise LookupError(

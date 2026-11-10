@@ -60,7 +60,13 @@ What it holds (every text invented, ids and hashes stand-ins):
   the Adzuna-only jobs (`adzuna_only_job_ids`) are the active job, the other job (named by merge events) and
   an active job into which another was merged (the merge event names both; both revisions have Adzuna
   lineage); each golden case draws on Adzuna (`det_input_sources`). Both new jobs are active, so no tombstone
-  is due for them.
+  is due for them;
+- for delete-everything (Task 16): a second online try in flight on an active job (its call's entry
+  `reserved`) beside the claimed target's `dispatched` one; a `running` eval run with a call in flight
+  (`dispatched`, naming no case and no revision, so no other purge takes it); a scheduled run that ended
+  `succeeded` and was never pinged (the dead-man's watermark is NULL); an open warn alert never pushed
+  (`operation.failed`) and an open, unacknowledged `llm.reservation_bound_violated`, which pauses the score
+  lane, beside the resolved `retention.failed`.
 
 A scenario that needs another live submission state runs on another seeded database (`live_submission`).
 """
@@ -134,6 +140,15 @@ class SeedIds:
     adzuna_merged_job_id: int = 0
     golden_job_id: int = 0  # the active golden case's job (the case draws on Adzuna)
     batched_job_ids: tuple[int, ...] = ()  # the jobs of the live submission's `in_batch` targets
+    # Task 16: what delete-everything settles, pings and keeps (module docstring)
+    reserved_entry_id: int = 0  # an online scoring try's entry, `reserved`
+    dispatched_entry_id: int = 0  # the claimed target's online scoring try's entry, `dispatched`
+    eval_entry_id: int = 0  # a running eval run's call's entry, `dispatched`
+    running_eval_run_id: int = 0
+    unpinged_run_id: int = 0  # a scheduled run that ended `succeeded`, never pinged (the watermark NULL)
+    open_alert_id: int = 0  # warn, never pushed
+    bound_violation_alert_id: int = 0  # `llm.reservation_bound_violated`, open and unacknowledged
+    resolved_alert_id: int = 0  # resolved two years ago
 
 
 @dataclass(frozen=True)
@@ -1089,12 +1104,12 @@ async def _conflict(
     )
 
 
-async def _alert(s: _Seeder, code: str, subject: str, *, resolved: bool) -> None:
-    await s.row(
+async def _alert(s: _Seeder, code: str, subject: str, *, resolved: bool, severity: str | None = None) -> int:
+    return await s.row(
         "alerts",
         {
             "code": code,
-            "severity": "info" if code.startswith("dedup.") else "warn",
+            "severity": severity or ("info" if code.startswith("dedup.") else "warn"),
             "dedup_key": f"{code}:{subject}",
             "message": f"seeded {code}",
             "context": {},
@@ -1581,7 +1596,13 @@ async def seed_two_year_old_graph(
     shared = await _conflict(s, p_other, other, [closed, active_job], open_=True)
     await _alert(s, "dedup.identity_conflict", f"conflict:{lone}", resolved=False)
     await _alert(s, "dedup.ambiguous_grouping", f"job:{closed.id}", resolved=False)
-    await _alert(s, "retention.failed", "seed", resolved=True)
+    resolved_alert = await _alert(s, "retention.failed", "seed", resolved=True)
+    # Task 16: an open warn alert never pushed, and the bound violation that pauses the score lane until it is
+    # acknowledged (`scoring.cycles.pause_reason`)
+    open_alert = await _alert(s, "operation.failed", "operation:9000000000002", resolved=False)
+    bound_alert = await _alert(
+        s, "llm.reservation_bound_violated", _MODEL, resolved=False, severity="critical"
+    )
 
     # scoring
     cycle = await s.row(
@@ -1680,7 +1701,7 @@ async def seed_two_year_old_graph(
         lane="similarity",
     )
     attempt = await _attempt(s, sc, claimed, "running", claim_id=claim, claim_epoch=1)
-    await _call(
+    dispatched_call = await _call(
         s,
         sc.active,
         purpose="generate",
@@ -1688,6 +1709,33 @@ async def seed_two_year_old_graph(
         minutes=21,
         attempt_id=attempt,
         target_id=claimed,
+    )
+    # Task 16: another online try in flight, its call still `reserved` (an active job's claimed target)
+    in_flight = await _job(s, "in-flight", availability="active")
+    reserving_claim = uuid4()
+    reserving = await _target(
+        s,
+        sc,
+        in_flight,
+        in_flight.current,
+        act,
+        "in_progress",
+        claim_id=reserving_claim,
+        claim_epoch=1,
+        claimed_at=s.at(22),
+        claim_heartbeat_at=s.at(23),
+        attempt_no=1,
+        lane="similarity",
+    )
+    reserving_attempt = await _attempt(s, sc, reserving, "running", claim_id=reserving_claim, claim_epoch=1)
+    reserved_call = await _call(
+        s,
+        sc.active,
+        purpose="generate",
+        entry_state="reserved",
+        minutes=23,
+        attempt_id=reserving_attempt,
+        target_id=reserving,
     )
 
     # the live submission and its `in_batch` targets
@@ -1834,6 +1882,32 @@ async def seed_two_year_old_graph(
             "finished_at": s.at(60, days=1),
         },
     )
+    # Task 16: a running eval run with a call in flight (`dispatched`), naming no case
+    running_eval = await s.row(
+        "eval_runs",
+        {
+            "kind": "golden",
+            "route": "production",
+            "rubric_version_id": active.rubric_version_id,
+            "prompt_schema_version_id": active.prompt_schema_version_id,
+            "model_policy_id": active.model_policy_id,
+            "evaluation_policy_id": active.evaluation_policy_id,
+            "execution_config_id": active.execution_config_id,
+            "repetitions": 1,
+            "status": "running",
+            "metrics": {"transport_requested": "fake"},
+            "cost_usd": Decimal(0),
+            "started_at": s.at(days=2),
+        },
+    )
+    eval_call = await _call(
+        s,
+        active,
+        purpose="generate",
+        entry_state="dispatched",
+        minutes=60 * 48 + 5,
+        eval_run_id=running_eval,
+    )
     for case in golden_cases:
         call = await _call(
             s, active, purpose="generate", minutes=60 * 24 + 5, eval_run_id=eval_run, golden_case_id=case
@@ -1869,6 +1943,25 @@ async def seed_two_year_old_graph(
             "label": "good",
             "comment": "Erfundener Kommentar.",
             "created_at": s.at(days=1),
+        },
+    )
+
+    # Task 16: a scheduled run that ended `succeeded` and was never pinged (`deadman_state`'s watermark NULL)
+    unpinged = await s.row(
+        "runs",
+        {
+            "trigger": "schedule",
+            "scheduled_slot": s.at(days=2),
+            "status": "succeeded",
+            "include_paid": False,
+            "settings_version_id": active.settings_version_id,
+            "scope_version_id": active.scope_version_id,
+            "attempt_no": 1,
+            "queued_at": s.at(days=2),
+            "started_at": s.at(1, days=2),
+            "heartbeat_at": s.at(50, days=2),
+            "finished_at": s.at(60, days=2),
+            "report": {},
         },
     )
 
@@ -1996,4 +2089,17 @@ async def seed_two_year_old_graph(
         adzuna_merged_job_id=adzuna_merged.id,
         golden_job_id=golden.id,
         batched_job_ids=tuple(job.id for job in batched),
+        reserved_entry_id=await _ledger_of(s, reserved_call),
+        dispatched_entry_id=await _ledger_of(s, dispatched_call),
+        eval_entry_id=await _ledger_of(s, eval_call),
+        running_eval_run_id=running_eval,
+        unpinged_run_id=unpinged,
+        open_alert_id=open_alert,
+        bound_violation_alert_id=bound_alert,
+        resolved_alert_id=resolved_alert,
     )
+
+
+async def _ledger_of(s: _Seeder, call_id: int) -> int:
+    found = await s.conn.execute(q("SELECT spend_ledger_id FROM llm_calls WHERE id = :c"), {"c": call_id})
+    return int(found.scalar_one())

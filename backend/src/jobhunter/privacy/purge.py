@@ -46,8 +46,10 @@ deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["
    up on its co-members (`CoMemberChanged`) is requeued `co_member_changed` a minute later; a kind that meets
    a condition with an end of its own raises `PurgeWait`, and the operation waits without spending an
    attempt (`OperationContext.wait_in`);
-4. phase C, one transaction: the fences released, then the typed postconditions (`check_postconditions`; the
-   `fence` op's "no active fence" holds now) and the kind's. A violation rolls it back, so the fences stay
+4. phase C, one transaction: the kind's own writes of the completing transaction for a kind that has them
+   (`CompletingKind.complete`: delete-everything's sessions, M5 Task 16, D14), the fences released, then the
+   typed postconditions (`check_postconditions`; the `fence` op's "no active fence" holds now) and the
+   kind's. A violation rolls it back, so the fences stay
    active, and a second transaction ends the operation `failed('postcondition')`. Otherwise the manifest
    `completed`, `privacy.purge_failed` (subject `manifest:<id>`) resolved and the operation `succeeded`.
 
@@ -83,7 +85,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from sqlalchemy.exc import DBAPIError
@@ -353,6 +355,17 @@ class KindProcedure(Protocol):
 
     async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
         """Replay's re-application of A0's effects beyond the manifest, its fences and its operation."""
+        ...
+
+
+@runtime_checkable
+class CompletingKind(Protocol):
+    """A kind with writes of its own in the completing transaction (phase C), before its fences are released
+    and its postconditions checked: delete-everything's sessions (M5 Task 16, D14). Every other kind has
+    none."""
+
+    async def complete(self, conn: AsyncConnection, content: ManifestContent) -> None:
+        """The kind's writes in the completing transaction, which holds the epoch fence and the owner."""
         ...
 
 
@@ -666,6 +679,8 @@ async def _phase_c(
         async with run.engine.begin() as conn:
             await fence_epoch(conn, owner.epoch)
             await lock_operation_owner(conn, owner.claim)
+            if isinstance(proc, CompletingKind):
+                await proc.complete(conn, content)
             await release_fences(conn, manifest_id)
             found = await check_postconditions(conn, content, files=run.files)
             found += await proc.postconditions(conn, content)

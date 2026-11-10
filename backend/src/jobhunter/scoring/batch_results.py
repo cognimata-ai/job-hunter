@@ -8,7 +8,20 @@ submission state machine is `scoring.batches`, the decision of one item `scoring
 retrieved first and `messages.batches.cancel` sent only while it is `in_progress` (a `canceling` one has an
 accepted cancel already, an ended one nothing to cancel), up to `CANCEL_TRIES` (3) times, then logged; the
 handler sends it right after `record_created`'s commit, and `batch_poll` again on every pass while the
-submission is `submitted` and its batch in progress.
+submission is `submitted` and its batch in progress. A failed retrieval sends nothing: the next poll retries.
+The check and the cancel's tries with their logs are `_cancel_while_in_progress`, which the purge's sender
+shares.
+
+**The purge's cancel** (`send_purge_cancel`, M5 Task 16, §20.4 step 2: "3 tries, then logged"):
+delete-everything deletes the submission row right after, so no poll will retry, and the sender is bounded
+on its own. Each try retrieves the batch; a failed retrieval or a client that is not configured
+(`LLMNotConfigured`) is one failed try, waited after with the injected `sleep` (`PURGE_CANCEL_BACKOFF_S`,
+never `asyncio.sleep` in a test). A batch no longer `in_progress` (`canceling`: a cancel was accepted already;
+`ended`) is success with nothing sent. One that is goes to `_cancel_while_in_progress`, whose `CANCEL_TRIES`
+cancels are the tries of the send itself, each rejected one a failed try, its `batch_cancel_gave_up` logged
+after the last. After `tries` failed retrievals it logs `batch_cancel_gave_up` (submission and provider ids)
+and returns `False`; the caller deletes the row all the same: the reservations stay counted, and the provider
+ends the batch within 24 hours.
 
 **The poll** (`poll`, the body of `batch_poll`, every 5 min on `aux`, L3958), for every `submitted` and
 `ended` submission, and every `released` one with a provider id (a lost batch the user released, plan M4 Task
@@ -80,7 +93,7 @@ handler share it; M3 Task 27) and does nothing without a configured one.
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import Final
@@ -101,6 +114,7 @@ from jobhunter.llm.batches import (
     BatchStatus,
     ItemResult,
 )
+from jobhunter.llm.errors import LLMNotConfigured
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
@@ -117,6 +131,8 @@ AFTER_COMPLETION_COMMIT: Final = "batch.after_completion_commit"
 AFTER_MISSING_ITEM: Final = "batch.after_missing_item"
 AFTER_RECONCILE_COMMIT: Final = "batch.after_reconcile_commit"
 CANCEL_TRIES: Final = 3  # L6443: `messages.batches.cancel` after the commit, 3 tries, then logged
+# The purge's sender's waits after its first and its second failed try (module docstring).
+PURGE_CANCEL_BACKOFF_S: Final = (1.0, 5.0)
 # Carry T16-g: the passes whose result stream stays unreadable before its unread items are decided missing
 # (an hour at `batch_poll`'s five-minute cadence).
 RESULTS_UNREADABLE_PASSES: Final = 12
@@ -226,6 +242,18 @@ async def cancel_requested(
                 status=failure.status,
             )
             return False
+    return await _cancel_while_in_progress(
+        client, provider_batch_id, submission_id=submission_id, status=status
+    )
+
+
+async def _cancel_while_in_progress(
+    client: BatchesClient, provider_batch_id: str, *, submission_id: int, status: BatchStatus
+) -> bool:
+    """The cancel of a batch retrieved as `status` (module docstring): nothing sent unless it is
+    `in_progress` (`batch_cancel_not_sent`, `False`), else `messages.batches.cancel` up to `CANCEL_TRIES`
+    times (`batch_cancel_failed` per rejection, `batch_cancel_sent` once accepted, `batch_cancel_gave_up`
+    after the last); whether one was accepted."""
     if status.processing_status != "in_progress":
         log.info(
             "batch_cancel_not_sent",
@@ -255,6 +283,49 @@ async def cancel_requested(
             tries=tries,
         )
         return True
+    log.error("batch_cancel_gave_up", submission_id=submission_id, provider_batch_id=provider_batch_id)
+    return False
+
+
+async def send_purge_cancel(
+    client: BatchesClient,
+    provider_batch_id: str,
+    *,
+    submission_id: int,
+    tries: int = CANCEL_TRIES,
+    sleep: Callable[[float], Awaitable[None]],
+) -> bool:
+    """Delete-everything's bounded provider cancel of a recorded request (module docstring, "The purge's
+    cancel"): `True` once a cancel is accepted or the batch no longer runs, `False` after `tries` failed tries
+    (`batch_cancel_gave_up` logged, or the cancels' own gave-up). The caller holds no transaction."""
+    for attempt in range(1, tries + 1):
+        try:
+            status = await client.retrieve(provider_batch_id)
+        except (BatchApiError, LLMNotConfigured) as failure:
+            error_class = (
+                failure.error_class if isinstance(failure, BatchApiError) else type(failure).__name__
+            )
+            log.warning(
+                "batch_purge_cancel_retrieve_failed",
+                submission_id=submission_id,
+                provider_batch_id=provider_batch_id,
+                tries=attempt,
+                error_class=error_class,
+            )
+            if attempt < tries:
+                await sleep(PURGE_CANCEL_BACKOFF_S[min(attempt, len(PURGE_CANCEL_BACKOFF_S)) - 1])
+            continue
+        if status.processing_status != "in_progress":
+            log.info(
+                "batch_purge_cancel_not_needed",
+                submission_id=submission_id,
+                provider_batch_id=provider_batch_id,
+                processing_status=status.processing_status,
+            )
+            return True
+        return await _cancel_while_in_progress(
+            client, provider_batch_id, submission_id=submission_id, status=status
+        )
     log.error("batch_cancel_gave_up", submission_id=submission_id, provider_batch_id=provider_batch_id)
     return False
 
