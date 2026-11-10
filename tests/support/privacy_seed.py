@@ -392,7 +392,7 @@ async def _profiles(s: _Seeder, active: _Active) -> _Profile:
                 "sha256": s.uniq("cv"),
                 "mime": "text/plain",
                 "size_bytes": 64,
-                "storage_path": f"seed-cv-{number}.enc",
+                "storage_path": f"{uuid4()}.bin",  # a name `CvStore.write` makes
                 "raw_text_enc": b"\x00seed",
                 "stripped_text": "Erfundener Lebenslauf.",
                 "extraction_method": "pasted",

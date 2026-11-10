@@ -18,6 +18,7 @@ from typing import Any, Final
 import httpx
 import pytest
 import sqlalchemy as sa
+from jobhunter.api.errors import PROBLEM_TYPE_BASE
 from jobhunter.api.routes import profile as profile_routes
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import content_hash
@@ -26,12 +27,13 @@ from jobhunter.errors import FencedOut, InvariantViolation, Refusal
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import OperationOwner, Reservation
-from jobhunter.privacy import deletion_graph, purge
+from jobhunter.privacy import deletion_graph, purge, retained
 from jobhunter.privacy.kinds import profile_purge
 from jobhunter.privacy.manifests import ManifestRow, check_postconditions
 from jobhunter.profile import activation
 from jobhunter.queries import proposals
-from jobhunter.scoring import eval_runner, golden
+from jobhunter.scoring import eval_runner, golden, targets
+from jobhunter.settings.active import lock_active
 from jobhunter.worker import operations as ops
 from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -499,11 +501,14 @@ async def test_an_eligible_old_version_is_purged_with_its_row_and_tuples_kept(
     assert await open_due(engine, now) == 0  # purged: never eligible again
 
 
-async def test_the_active_and_previous_versions_are_never_eligible(engine: AsyncEngine) -> None:
+async def test_the_active_and_previous_versions_are_never_eligible(
+    engine: AsyncEngine, purger: Purger
+) -> None:
     """D11: the active version and the previous one (the newest confirmed before it, in activation order) are
     never selected, however eligible otherwise. The seed's previous version (old targets, an inactive case, no
-    feedback) is opened only once a new activation leaves it behind; a fresh version (no target, no case, no
-    feedback) is skipped while it is active and while it is the previous one, and opened after two more."""
+    feedback) is opened only once a new activation leaves it behind, and its purge removes its CV file through
+    the store; a fresh version (no target, no case, no feedback) is skipped while it is active and while it is
+    the previous one, and opened after two more."""
     now = utcnow()
     seed = await seeded(engine, now)
     assert await open_due(engine, now) == 1
@@ -512,6 +517,15 @@ async def test_the_active_and_previous_versions_are_never_eligible(engine: Async
     fresh = await confirm_profile(engine, "principal")  # active; the seed's active one is now the previous
     assert await open_due(engine) == 1
     assert [o.version_id for o in await opened(engine)][1:] == [seed.previous_version_id]
+    cv_of = (
+        "SELECT c.id, c.storage_path FROM profile_versions v JOIN cv_files c ON c.id = v.cv_file_id "
+        "WHERE v.id = :v"
+    )
+    cv = await one(engine, cv_of, v=seed.previous_version_id)
+    stored = purger.cfg.cv_store_dir / cv.storage_path
+    stored.write_bytes(b"sealed")
+    await run_purge(engine, purger, seed.previous_version_id)
+    assert not stored.exists() and (await one(engine, _CV_ROW, c=cv.id)).purged_at is not None
     assert await confirm_profile(engine, "lead") != fresh  # `fresh` is the previous one now
     assert await open_due(engine) == 0
     await confirm_profile(engine, "head")
@@ -567,7 +581,7 @@ async def test_unexpired_score_history_blocks_the_purge(engine: AsyncEngine, his
             t=seed.purgeable_tuple_id,
         )
     )
-    cutoff = profile_purge.months_before(now, 12)
+    cutoff = retained.months_before(now, 12)
     async with engine.begin() as conn:
         if history == "ended_recently":
             await conn.execute(
@@ -849,31 +863,74 @@ async def test_a_paused_proposal_request_cannot_reopen_the_call_set(
     assert seed.purgeable_version_id in {o.version_id for o in await opened(engine)}
 
 
-@pytest.mark.parametrize("state", ["profile_fence", "global_fence", "purged"])
+@pytest.mark.parametrize("state", ["profile_fence", "purged"])
 async def test_request_proposal_refuses_a_fenced_or_purged_version(
     engine: AsyncEngine, purger: Purger, state: str
 ) -> None:
     """`request_proposal`'s own check, called directly (the callers' rule makes it unreachable): a version
-    under an unreleased `profile` or `global` fence, or purged, is an `InvariantViolation`, nothing written;
-    the active version is proposed for as before."""
+    under an unreleased `profile` fence, or purged, is an `InvariantViolation`, nothing written; the active
+    version is proposed for as before."""
     seed = await seeded(engine)
     v = seed.purgeable_version_id
-    if state == "global_fence":
-        async with engine.begin() as conn:
-            await insert_test_fence(conn, kind="global")
-    else:
-        assert await open_due(engine) == 1
-        if state == "purged":
-            await run_purge(engine, purger, v)
+    assert await open_due(engine) == 1
+    if state == "purged":
+        await run_purge(engine, purger, v)
     calls = await scalar(engine, "SELECT count(*) FROM operations")
     with pytest.raises(InvariantViolation):
         async with engine.begin() as conn:
             await proposals.request_proposal(conn, v, defer=None)
     assert await scalar(engine, "SELECT count(*) FROM operations") == calls
-    if state != "global_fence":
-        async with engine.begin() as conn:
-            proposal_id, _, _ = await proposals.request_proposal(conn, seed.active_version_id, defer=None)
-        assert proposal_id > 0
+    async with engine.begin() as conn:
+        proposal_id, _, _ = await proposals.request_proposal(conn, seed.active_version_id, defer=None)
+    assert proposal_id > 0
+
+
+_WRITTEN: Final = sa.text(
+    "SELECT (SELECT count(*) FROM operations) AS operations, (SELECT count(*) FROM query_proposals) AS "
+    "proposals, (SELECT count(*) FROM profile_versions) AS versions, (SELECT count(*) FROM api_idempotency "
+    "WHERE route <> 'POST /api/seed') AS keys"
+)
+
+
+@pytest.mark.parametrize("caller", ["proposal_route", "confirm"])
+async def test_a_global_fence_committed_while_a_proposal_caller_waits_is_409(
+    engine: AsyncEngine,
+    migrated: PgServer,
+    logged_in_client: httpx.AsyncClient,
+    caller: str,
+) -> None:
+    """Both callers of `request_proposal` (the proposal route, and the confirm through `confirm_draft`) wait
+    at their `active_config` lock while delete-everything's A0 holds it and commits its `global` fence: their
+    transaction began before that commit, so neither the edge nor the write guard saw the fence. After the
+    lock they refuse it, 409 `delete_everything_in_progress`, nothing written; never `request_proposal`'s
+    `InvariantViolation` (a 500 and an unhandled-error alert)."""
+    await seeded(engine)
+    if caller == "proposal_route":
+        url, body, key = "/api/profile/query-proposals", None, "global-fence-proposal-01"
+    else:
+        draft = await ready_draft(engine, "principal")
+        url, body, key = (
+            f"/api/profile/drafts/{draft}/confirm",
+            {"expected_rescore_ack": True},
+            "global-fence-confirm-01",
+        )
+    before = tuple(await one(engine, _WRITTEN))
+    async with engine.connect() as holder:  # delete-everything's A0: `active_config FOR UPDATE`, its fence
+        await holder.begin()
+        await holder.execute(_LOCK_ACTIVE)
+        await insert_test_fence(holder, kind="global")
+        holder_pid = await pid_of(holder)
+        requesting = background(logged_in_client.post(url, json=body, headers=idem(key)))
+        wait = one_wait(await waits(migrated, requesting), "active_config")
+        assert (wait.key, wait.blocking_pids) == ("1", (holder_pid,))
+        await holder.commit()
+    r = await asyncio.wait_for(requesting, WAIT_S)
+    problem = r.json()
+    assert (r.status_code, problem["code"]) == (409, "delete_everything_in_progress")
+    assert problem["type"] == PROBLEM_TYPE_BASE + "delete_everything_in_progress"
+    assert tuple(await one(engine, _WRITTEN)) == before
+    if caller == "confirm":
+        assert await scalar(engine, "SELECT status FROM profile_drafts WHERE id = :d", d=draft) == "ready"
 
 
 @pytest.mark.parametrize("first", ["activation", "admission"])
@@ -956,6 +1013,32 @@ async def test_the_versions_inactive_golden_cases_are_deleted(engine: AsyncEngin
     await run_purge(engine, purger, seed.purgeable_version_id)
     assert await scalar(engine, _CASE_ROWS, g=case) == 0
     assert await scalar(engine, "SELECT state FROM llm_spend_ledger WHERE id = :l", l=ledger) == "ambiguous"
+
+
+async def test_targets_another_deleter_removed_before_their_chunk_are_skipped(
+    engine: AsyncEngine, purger: Purger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retention's `score_history` deletes the expired targets of inactive tuples without a fence, so a page
+    phase B read can be gone when its chunk has locked the page's jobs: the chunk finds none of it, the next
+    page is read, and the purge completes."""
+    seed = await seeded(engine)
+    t = seed.purgeable_tuple_id
+    assert await open_due(engine) == 1
+    expired = await ids(
+        engine, sa.text("SELECT id FROM score_targets WHERE llm_tuple_id = :t ORDER BY id"), t=t
+    )
+    assert expired
+
+    async def expire() -> None:  # retention's `score_history` chunk, between the page's read and its lock
+        async with engine.begin() as conn:
+            await lock_active(conn, share=True)
+            assert await targets.delete_target_set(conn, expired, now=utcnow()) == len(expired)
+
+    monkeypatch.setattr(
+        profile_purge, "afault_point", on_arrival(profile_purge.BEFORE_TARGET_CHUNK, 1, expire)
+    )
+    await run_purge(engine, purger, seed.purgeable_version_id)  # completed, every postcondition holding
+    assert await scalar(engine, _TARGETS_OF_TUPLE, t=t) == 0
 
 
 @pytest.mark.parametrize("shared", [False, True])

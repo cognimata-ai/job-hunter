@@ -200,6 +200,7 @@ from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.kinds import job_tombstone, profile_purge
+from jobhunter.privacy.retained import ENDED_TARGET_STATES, NEWEST_AND_PREVIOUS, months_before
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring import batches, targets
 from jobhunter.settings.active import lock_active
@@ -417,7 +418,7 @@ _PURGE_EXTRACT_OUTPUTS: Final = q(
 # newest and the previous confirmed drafts are the user's own: the adversarial seed's confirmed drafts name
 # synthetic versions (Ruling T19-a), newer than the user's but never activated.
 _PROTECTED_FILES: Final = q(
-    f"WITH {profile_purge.NEWEST_AND_PREVIOUS} "  # noqa: S608 (the constant the profile purge shares)
+    f"WITH {NEWEST_AND_PREVIOUS} "  # noqa: S608 (`privacy.retained`'s constant, the profile purge's too)
     "SELECT v.cv_file_id FROM profile_versions v WHERE v.cv_file_id IS NOT NULL "
     "AND (v.id = CAST(:active AS bigint) OR v.id IN (SELECT version FROM newest) "
     "OR v.id IN (SELECT version FROM previous)) "
@@ -465,7 +466,7 @@ _ENDED_CYCLE_THREADS: Final = q(
 )
 # `score_history` (module docstring): the targets §20.1 lets go (L6304), ended in these states before the
 # cutoff; one page after `:after`, and a chunk's candidates `:ids` checked again under `active_config`.
-_ENDED_TARGET_STATES: Final = profile_purge.ENDED_TARGET_STATES
+_ENDED_TARGET_STATES: Final = ENDED_TARGET_STATES
 _EXPIRED_HISTORY: Final = (
     "t.state = ANY(CAST(:states AS text[])) AND t.state_changed_at < :cutoff "  # noqa: S608
     "AND t.llm_tuple_id IS DISTINCT FROM (SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) "
@@ -599,7 +600,7 @@ async def _purge_score_history(engine: AsyncEngine, now: datetime, epoch: int) -
         months = (await active_settings(conn)).retention.score_history_months
     params: dict[str, object] = {
         "states": list(_ENDED_TARGET_STATES),
-        "cutoff": profile_purge.months_before(now, months),
+        "cutoff": months_before(now, months),
         "listed_since": now - batches.RELEASED_LISTED_FOR,
     }
     deleted, after = 0, 0

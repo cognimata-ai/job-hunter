@@ -37,7 +37,10 @@ fenced version).
 15 and 17), which the edge and the write guard exempt (`api.edge.fence_exempt`), call
 `refuse_under_global_fence(conn)` right after they lock `active_config` (delete-everything commits its fence
 under `active_config FOR UPDATE`): while the `global` fence stands they are refused with 409
-`delete_everything_in_progress` (`db.fence_guard.delete_everything_in_progress`).
+`delete_everything_in_progress` (`db.fence_guard.delete_everything_in_progress`). So do the two callers of
+`queries.proposals.request_proposal` (the proposal route and `profile.activation.confirm_draft`; M5 Task 14):
+a guarded request whose transaction began before the fence committed passed the write guard, then waited for
+that lock, and must answer the same 409, not meet the fence later as a broken invariant.
 
 **The fence writers** (M5 Task 9; §7.14, §19.5 step 3). A purge's A0 transaction inserts its manifest
 (`manifests.insert_manifest`) and its fences, `insert_fence(conn, manifest_id=..., spec=FenceSpec(...))`: a

@@ -23,9 +23,12 @@ parses it (`_CappedBodyRoute`: 413 `upload_rejected`, `too_large` on `text`); th
 
 `POST /api/profile/query-proposals` (Idempotency-Key, no body) → 202 `{proposal_id}` (Task 20, §5.5.1): a
 query proposal for the active profile version. In one transaction: `active_config FOR SHARE` (the lock
-schedule's step 2, before the key's row as `run_idempotent` asks; M5 Task 14, Deviation 54), the key's row
-(`run_idempotent`), the active profile version read under that lock (none, or a purged one, is 409
-`conflict_state` and stores nothing), the fault point `profile.proposal.before_request` (test env only), then
+schedule's step 2, before the key's row as `run_idempotent` asks; M5 Task 14, Deviation 54), then
+delete-everything's `global` fence read after that lock (`privacy.fences.refuse_under_global_fence`, 409
+`delete_everything_in_progress`: a request whose transaction began before the fence committed passed the write
+guard and waited for this lock behind delete-everything's admission), the key's row (`run_idempotent`), the
+active profile version read under that lock (none, or a purged one, is 409 `conflict_state` and stores
+nothing), the fault point `profile.proposal.before_request` (test env only), then
 `queries.proposals.request_proposal`, which returns the version's running proposal when there is one (a repeat
 with a new key gets the same id) and otherwise opens one with its `propose_queries` operation and job. The
 call counts against the non-scoring share of the budget (its spend owner is that operation, §6.9.1). The lock
@@ -47,7 +50,8 @@ never takes `FOR SHARE` first: two confirms holding the shared lock would deadlo
 way the second waits. A repeat with the key returns the stored response; a repeat with another key of a
 confirmed draft returns the draft's stored body (Deviation 2). 404 `not_found`; 409 `conflict_state` (not
 `ready`, or a stored profile that no longer fits the schema), `profile_purge_in_progress` (an identical
-version is being purged) and `idempotency_in_progress`; 422 `validation_failed` (a blocking issue or a
+version is being purged), `delete_everything_in_progress` (its fence committed while the confirm waited for
+`active_config`, M5 Task 14) and `idempotency_in_progress`; 422 `validation_failed` (a blocking issue or a
 contact in `user_entered` at its path, the missing `expected_rescore_ack` at `body.expected_rescore_ack`, an
 unknown body member) and `idempotency_key_reused`.
 `profile_confirmed` is logged with the ids after the commit, a confirmed draft's stored body under a new key
@@ -101,6 +105,7 @@ from jobhunter.errors import Refusal
 from jobhunter.faults import afault_point
 from jobhunter.llm import bounds
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import refuse_under_global_fence
 from jobhunter.profile import activation, upload
 from jobhunter.profile.estimate import rescore_estimate
 from jobhunter.profile.storage import CvStore
@@ -478,6 +483,7 @@ async def request_query_proposal(
 
     async with engine.begin() as conn:
         await conn.execute(_SHARE_ACTIVE_CONFIG)  # step 2, before the key's row (module docstring)
+        await refuse_under_global_fence(conn)  # a fence committed while this waited for the lock
         stored = await run_idempotent(
             conn,
             route=PROPOSAL_ROUTE,

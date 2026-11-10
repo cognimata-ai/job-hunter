@@ -4,13 +4,14 @@ Deviations 18, 25, 53 and 54): manifest kind `profile_purge`, a `profile` fence.
 **Eligible** (`retention_daily`'s rule `profile_purges`, `open_due`; D11): a version that is not synthetic
 (`profile_versions.synthetic_eval`, unconditionally, whatever its cases: the adversarial seed reuses a live
 synthetic version and makes its cases active again; Deviation 25), not purged, neither the active version nor
-the newest confirmed one nor the previous one (`NEWEST_AND_PREVIOUS`: the newest confirmed draft before the
-newest one that names another version, in activation order; §20.1 keeps both versions' files, as
-`retention`'s `cv_files` rule does), with no target of its tuples non-terminal or ended within
-`retention.score_history_months` calendar months (`ENDED_TARGET_STATES`, `months_before`), no active golden
-case and no `score_feedback` row naming it, and under no unreleased `profile` or `global` fence (an earlier
-pass's purge of it still running; `fences.version_fenced_sql`). One purge per eligible version, in id order,
-each admitted in a transaction of its own that starts with the epoch fence (retention's convention).
+the newest confirmed one nor the previous one (`privacy.retained.NEWEST_AND_PREVIOUS`: the newest confirmed
+draft before the newest one that names another version, in activation order; §20.1 keeps both versions' files,
+as `retention`'s `cv_files` rule does), with no target of its tuples non-terminal or ended within
+`retention.score_history_months` calendar months (`retained.ENDED_TARGET_STATES`, `retained.months_before`,
+which retention's `score_history` rule shares), no active golden case and no `score_feedback` row naming it,
+and under no unreleased `profile` or `global` fence (an earlier pass's purge of it still running;
+`fences.version_fenced_sql`). One purge per eligible version, in id order, each admitted in a transaction of
+its own that starts with the epoch fence (retention's convention).
 
 **A0** (`open_next`): `active_config FOR UPDATE` (`settings.active.lock_active`, with the active settings read
 under it), the next eligible version, read under that lock; every live `propose_queries` operation of a
@@ -54,25 +55,27 @@ no row to name is left out; every id is at or below `max_ids`.
 
 **Phase B** (`execute`), in `PurgeRun.chunk` transactions only, each statement over rows the content names or
 selects within its bound: (2) the tuples' targets within `max_ids["score_targets"]`, `TARGET_SET_CHUNK` at a
-time: a page read, its jobs locked `FOR UPDATE` (`chunk(job_ids=...)`), the page read again under the lock,
-`deletion_graph.purge_target_set`, the ranking bump last, until a page is short; (3) one chunk: the calls
-(ledger rows, step 9, in id order) `output_json := NULL` with `content_purged_at`, each proposal `running |
-ready | failed → purged` with `items := NULL` (`transition_where`), the vectors deleted, then the fault point
-`privacy.profile_purge.after_redaction` before its commit; (4) one chunk over the cases' jobs:
-`deletion_graph.settle_and_delete_cases` (their in-flight eval entries settled before their calls cascade,
-G04), an active case an `InvariantViolation`; (5, 6) one chunk: the version's `profile_json := NULL` with
-`purged_at`, its drafts' content NULL with `content_purged_at`, the CV row's file and texts NULL with
-`purged_at`; after its commit, the CV file deleted (`CvStore.delete`; one gone already is fine). A redaction
-keeps a time an earlier one set. The ids and states of the proposals, drafts and calls stay, and the version's
-row and tuples, so runs, cycles, submissions, bulk operations and the ledgers keep valid references. Every
-chunk is idempotent: a re-execution after any commit, or a phase re-run after a lost deadlock (Ruling T12-1),
-finds what is left. The kind has no postcondition of its own and nothing to re-apply in a replay: a restored
-live operation of a purged proposal finds it no longer `running` and ends obsolete.
+time: a page read, the fault point `privacy.profile_purge.before_target_chunk`, its jobs locked `FOR UPDATE`
+(`chunk(job_ids=...)`), the page read again under the lock, `deletion_graph.purge_target_set` over what is
+left of it, the ranking bump last, until a page is short. Retention's `score_history` rule needs no fence (the
+tuples are inactive), so targets of a page may be gone by its chunk: they never come back, and the next page
+is read; (3) one chunk: the calls (ledger rows, step 9, in id order) `output_json := NULL` with
+`content_purged_at`, each proposal `running | ready | failed → purged` with `items := NULL`
+(`transition_where`), the vectors deleted, then the fault point `privacy.profile_purge.after_redaction` before
+its commit; (4) one chunk over the cases' jobs: `deletion_graph.settle_and_delete_cases` (their in-flight eval
+entries settled before their calls cascade, G04), an active case an `InvariantViolation`; (5, 6) one chunk:
+the version's `profile_json := NULL` with `purged_at`, its drafts' content NULL with `content_purged_at`, the
+CV row's file and texts NULL with `purged_at`; after its commit, the CV file deleted (`CvStore.delete`; one
+gone already is fine). A redaction keeps a time an earlier one set. The ids and states of the proposals,
+drafts and calls stay, and the version's row and tuples, so runs, cycles, submissions, bulk operations and the
+ledgers keep valid references. Every chunk is idempotent: a re-execution after any commit, or a phase re-run
+after a lost deadlock (Ruling T12-1), finds what is left. The kind has no postcondition of its own and nothing
+to re-apply in a replay: a restored live operation of a purged proposal finds it no longer `running` and ends
+obsolete.
 
 Ids and counts only reach a log line.
 """
 
-import calendar
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -98,8 +101,9 @@ from jobhunter.privacy.manifests import (
     max_identity_ids,
 )
 from jobhunter.privacy.purge import OpenedPurge, PurgeRun, new_content, open_purge, register_kind
+from jobhunter.privacy.retained import ENDED_TARGET_STATES, NEWEST_AND_PREVIOUS, months_before
 from jobhunter.queries import proposals
-from jobhunter.scoring import golden, targets
+from jobhunter.scoring import golden
 from jobhunter.scoring.targets import TARGET_SET_CHUNK
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.model import Settings
@@ -111,31 +115,9 @@ from jobhunter.worker.tasks import Deferrer
 KIND: Final = "profile_purge"
 REQUEST_KEY: Final = "profile_version_id"
 CANCELLED: Final = "profile_purged"  # the reason of a proposal operation A0 cancels
-AFTER_REDACTION: Final = "privacy.profile_purge.after_redaction"  # the fault point (module docstring)
+AFTER_REDACTION: Final = "privacy.profile_purge.after_redaction"  # the fault points (module docstring)
+BEFORE_TARGET_CHUNK: Final = "privacy.profile_purge.before_target_chunk"
 LOGGED_IDS: Final = 20
-# §20.1's "ended terminally" (`retention`'s `score_history` rule deletes the targets of an inactive tuple that
-# ended so before its cutoff; a version is eligible once every target of its tuples did).
-ENDED_TARGET_STATES: Final = (
-    "published_accepted",
-    "published_contested",
-    *targets.RETRYABLE_STATES,
-    "expired_unscored",
-    "cancelled",
-)
-# The user's newest confirmed draft's version (`newest.version`) and the previous one (`previous.version`):
-# the newest confirmed draft before it that names another version. The draft ids are the confirm order; the
-# adversarial seed's drafts name synthetic versions and never count (Ruling T19-a). Common table expressions
-# for a `WITH`, which `retention`'s `cv_files` rule shares (it keeps both versions' files).
-NEWEST_AND_PREVIOUS: Final = (
-    "newest AS (SELECT d.id, d.confirmed_profile_version_id AS version FROM profile_drafts d "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1), "
-    "previous AS (SELECT d.confirmed_profile_version_id AS version FROM profile_drafts d JOIN newest n "
-    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1)"
-)
-
 # The next eligible version after `:after` (module docstring), read under A0's `active_config` lock.
 _ELIGIBLE: Final = q(
     f"WITH {NEWEST_AND_PREVIOUS} SELECT v.id FROM profile_versions v "  # noqa: S608 (the module's constants)
@@ -189,10 +171,9 @@ _TARGET_PAGE: Final = q(
     "SELECT id, job_id FROM score_targets WHERE llm_tuple_id = ANY(CAST(:tuples AS bigint[])) "
     "AND id <= :bound ORDER BY id LIMIT :limit"
 )
-_HELD_PAGE: Final = q(
-    f"SELECT id FROM score_targets WHERE id = ANY({_IDS}) AND job_id = ANY(CAST(:held AS bigint[])) "  # noqa: S608
-    "ORDER BY id"
-)
+# The page's targets that are still there, read again under the chunk's job locks: another deleter
+# (retention's `score_history`, which needs no fence) may have deleted some since the page was read, for good.
+_PAGE_AGAIN: Final = q(f"SELECT id, job_id FROM score_targets WHERE id = ANY({_IDS}) ORDER BY id")  # noqa: S608
 _REDACT_CALLS: Final = q(
     "UPDATE llm_calls SET output_json = NULL, content_purged_at = coalesce(content_purged_at, :now) "  # noqa: S608
     f"WHERE id IN (SELECT id FROM llm_calls WHERE id = ANY({_IDS}) ORDER BY id FOR NO KEY UPDATE)"
@@ -217,14 +198,6 @@ _REDACT_CV_FILES: Final = q(
 _PURGEABLE_PROPOSALS: Final = ("running", "ready", "failed")
 
 log = get_logger("jobhunter.privacy.kinds.profile_purge")
-
-
-def months_before(t: datetime, months: int) -> datetime:
-    """`t` moved back `months` calendar months, its day clamped to the last of a shorter month (31 March less
-    one month is the last day of February): the cutoff of `retention.score_history_months`."""
-    year, month = divmod(t.year * 12 + t.month - 1 - months, 12)
-    month += 1
-    return t.replace(year=year, month=month, day=min(t.day, calendar.monthrange(year, month)[1]))
 
 
 # ---- A0 ----------------------------------------------------------------------------------------------------
@@ -434,19 +407,22 @@ async def _delete_targets(run: PurgeRun, tuples: Sequence[int], bound: int) -> i
             page = (await conn.execute(_TARGET_PAGE, params)).all()
         if not page:
             return deleted
+        await afault_point(BEFORE_TARGET_CHUNK)
         async with run.chunk(job_ids=sorted({int(r.job_id) for r in page})) as chunk:
-            held = await _ids(
-                chunk.conn, _HELD_PAGE, {"ids": [int(r.id) for r in page], "held": sorted(chunk.held)}
-            )
-            if held:
+            left = (await chunk.conn.execute(_PAGE_AGAIN, {"ids": [int(r.id) for r in page]})).all()
+            # a target's job never changes, so each one left is held; one that went meanwhile stays gone
+            if unheld := sorted({int(r.job_id) for r in left} - chunk.held):
+                raise InvariantViolation(
+                    f"deletion manifest {run.manifest.id}: the jobs {unheld[:LOGGED_IDS]} of its targets are "
+                    "not locked"
+                )
+            if left:
                 purged = await deletion_graph.purge_target_set(
-                    chunk.conn, held, manifest_id=run.manifest.id, now=run.now
+                    chunk.conn, [int(r.id) for r in left], manifest_id=run.manifest.id, now=run.now
                 )
                 deleted += purged.targets
                 await ranking.bump(chunk.conn)
-        if not held:  # every job of the page held, so a target left unheld is a broken invariant
-            raise InvariantViolation(f"deletion manifest {run.manifest.id}: a page of targets held no job")
-        if len(page) < TARGET_SET_CHUNK:
+        if len(page) < TARGET_SET_CHUNK:  # else the next page: every target of this one is gone now
             return deleted
 
 
