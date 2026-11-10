@@ -337,6 +337,8 @@ async def test_c29_a_worker_killed_after_its_claim_orphans_the_cycle_and_the_nex
         )
     assert one(migrated, "SELECT severity FROM alerts WHERE code = 'score_cycle.orphaned'") == ("warn",)
     wait_for(migrated, lambda: published_by_periodic(migrated, targets), SCORED_WITHIN_S, b)
+    # the periodic cycle ends after it has published its target: wait for its end, then read it
+    wait_for(migrated, lambda: no_cycle_running(migrated), SCORED_WITHIN_S, b)
     assert cycles_of(migrated) == [
         ("manual", epoch_a, "failed", "orphaned"),
         ("periodic", epoch_b, "completed", None),
@@ -474,6 +476,8 @@ async def test_c17_a_zombie_worker_with_a_cycle_in_flight_writes_no_domain_row(
     b = spawn_ready(procs, WORKER, proc_env("worker", migrated))
     epoch_b = epoch(migrated)
     wait_for(migrated, lambda: published_by_periodic(migrated, [target]), SCORED_WITHIN_S, a, b)
+    # the periodic cycle ends after it has published its target: wait for its end, then read it
+    wait_for(migrated, lambda: no_cycle_running(migrated), SCORED_WITHIN_S, a, b)
     published = target_of(migrated, target.target_id)
     assert attempts_of(migrated, target.target_id) == [
         (1, epoch_a, "claim_lost", "worker_takeover", "manual"),
