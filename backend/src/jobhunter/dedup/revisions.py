@@ -3,18 +3,21 @@
 `recompute_job` runs in the caller's transaction, which holds the job row `FOR UPDATE` (the identity
 transaction of §8.6, a merge, the M5 purge); it takes the lock again, a no-op then. It reads the latest
 observation of every posting of the job and of the jobs merged into it (`merged_into_job_id`, transitively),
-leaving out the observations of `fenced_source_ids`, and makes the §8.8 selection (`fields.select_canonical`,
+leaving out the observations of `fenced_source_ids` and those of a `fenced_bound` (`SourceBound`: one source's
+postings up to a purge's watermark, M5 Task 15), and makes the §8.8 selection (`fields.select_canonical`,
 with the job's `first_seen_at` and, when a posting came from a watchlist board, that company's display name
 with the best-ranked such observation). Then:
 
 1. **The revision.** The job's revision with the selection's `material_hash` is reused (`UNIQUE (job_id,
-   material_hash)`), unless its lineage (`job_revision_sources`) names a fenced source. Such a tainted
-   revision is never reused, and no twin is created either, because the unique key forbids a second row with
-   that hash while it exists: the job keeps its current revision and the result says
-   `tainted_reuse_refused` (plan Deviation 24). The M5 purge deletes the tainted revision first; the same
-   recompute then creates it anew. Without a match a revision is inserted (`revision_no = max + 1` over the
-   job's revisions, `embedding_status = 'awaiting_embedding'`) with its lineage: one row per `llm_input`
-   field and source (`fields.CanonicalFields.contributors`), naming the posting and the observation.
+   material_hash)`), unless its lineage (`job_revision_sources`) names a fenced source, or the bound's source
+   with a posting or observation at or below the bound (data above it, collected after a re-enablement, is
+   the source purge's to keep: §19.5 phase B, §20.5). Such a tainted revision is never reused, and no twin is
+   created either, because the unique key forbids a second row with that hash while it exists: the job keeps
+   its current revision and the result says `tainted_reuse_refused` (plan Deviation 24). The M5 purge deletes
+   the tainted revision first; the same recompute then creates it anew. Without a match a revision is inserted
+   (`revision_no = max + 1` over the job's revisions, `embedding_status = 'awaiting_embedding'`) with its
+   lineage: one row per `llm_input` field and source (`fields.CanonicalFields.contributors`), naming the
+   posting and the observation.
 2. **The job row**, in one statement: every selected column (with `structured_seniority`, Task 16 ruling
    T16-a), `field_provenance`, `det_facts_hash`, `current_revision_id`, and `updated_at = now()`. The same
    statement compares the `LIST_COLUMNS` before and after (`list_changed`).
@@ -91,7 +94,7 @@ _JOB: Final = q(
     "WHERE id = :job FOR UPDATE"
 )
 # The latest observation of each posting of the job and of every job merged into it, by posting id; a fenced
-# source's are left out.
+# source's are left out, and so are the bounded source's postings up to its bound (NULL binds: none).
 _OBSERVATIONS: Final = q(
     "WITH RECURSIVE family (id) AS ("
     "SELECT CAST(:job AS bigint) UNION SELECT j.id FROM jobs j JOIN family f ON j.merged_into_job_id = f.id) "
@@ -101,11 +104,15 @@ _OBSERVATIONS: Final = q(
     "JOIN source_instances i ON i.id = o.source_instance_id "
     "LEFT JOIN watchlist_companies w ON w.id = i.watchlist_company_id "
     "WHERE p.job_id IN (SELECT id FROM family) AND NOT (i.source_id = ANY (CAST(:fenced AS text[]))) "
+    "AND NOT coalesce(i.source_id = CAST(:bounded AS text) "
+    "AND p.id <= CAST(:bounded_postings AS bigint), false) "
     "ORDER BY p.id"
 )
 _REVISION: Final = q(
     "SELECT r.id, EXISTS (SELECT 1 FROM job_revision_sources s WHERE s.job_revision_id = r.id "
-    "AND s.source_id = ANY (CAST(:fenced AS text[]))) AS tainted "
+    "AND (s.source_id = ANY (CAST(:fenced AS text[])) OR (s.source_id = CAST(:bounded AS text) "
+    "AND (coalesce(s.posting_id <= CAST(:bounded_postings AS bigint), false) "
+    "OR coalesce(s.observation_id <= CAST(:bounded_observations AS bigint), false))))) AS tainted "
     "FROM job_revisions r WHERE r.job_id = :job AND r.material_hash = :hash"
 )
 _INSERT_REVISION: Final = q(
@@ -148,6 +155,18 @@ _OCCURRENCE: Final = q(
 )
 
 log = get_logger("jobhunter.dedup.revisions")
+
+
+@dataclass(frozen=True)
+class SourceBound:
+    """A purged source's rows at or below a purge's watermark (M5 Task 15): its postings up to `postings` and
+    observations up to `observations` (the manifest's `max_ids`). `recompute_job` leaves those postings out
+    and counts a revision whose lineage names such a posting or observation as tainted; the source's data
+    above the bound is used and kept."""
+
+    source_id: str
+    postings: int
+    observations: int
 
 
 @dataclass(frozen=True)
@@ -277,22 +296,39 @@ async def _follow_conflicts(
         await resolve_alert(conn, code=FIELD_CONFLICT_ALERT, subject=f"job:{job_id}:{field}")
 
 
+def _bound_params(bound: SourceBound | None) -> dict[str, object]:
+    if bound is None:
+        return {"bounded": None, "bounded_postings": None, "bounded_observations": None}
+    return {
+        "bounded": bound.source_id,
+        "bounded_postings": bound.postings,
+        "bounded_observations": bound.observations,
+    }
+
+
 async def recompute_job(
-    conn: AsyncConnection, job_id: int, *, fenced_source_ids: frozenset[str] = frozenset()
+    conn: AsyncConnection,
+    job_id: int,
+    *,
+    fenced_source_ids: frozenset[str] = frozenset(),
+    fenced_bound: SourceBound | None = None,
 ) -> RecomputeResult:
     """Recompute the job's canonical fields and reuse or create its current revision (module docstring).
 
-    Raises `LookupError` for a job that does not exist or has no observation outside `fenced_source_ids`, and
-    `InvariantViolation` when a tainted revision blocks the reuse of a job that has no current revision (the
-    purge must delete the tainted revision first).
+    Raises `LookupError` for a job that does not exist or has no observation outside `fenced_source_ids` and
+    `fenced_bound`, and `InvariantViolation` when a tainted revision blocks the reuse of a job that has no
+    current revision (the purge must delete the tainted revision first).
     """
     job = (await conn.execute(_JOB, {"job": job_id})).first()
     if job is None:
         raise LookupError(f"job {job_id} does not exist")
     fenced = sorted(fenced_source_ids)
-    rows = (await conn.execute(_OBSERVATIONS, {"job": job_id, "fenced": fenced})).all()
+    bounded = _bound_params(fenced_bound)
+    rows = (await conn.execute(_OBSERVATIONS, {"job": job_id, "fenced": fenced, **bounded})).all()
     if not rows:
-        raise LookupError(f"job {job_id} has no observation outside the fenced sources {fenced}")
+        raise LookupError(
+            f"job {job_id} has no observation outside the fenced sources {fenced} and {fenced_bound}"
+        )
     views = [_view(row) for row in rows]
     names = {int(row.posting_id): row.watchlist_display for row in rows if row.watchlist_display is not None}
     fields = select_canonical(
@@ -301,9 +337,8 @@ async def recompute_job(
     source_of = {view.source_instance_id: view.source_id for view in views}
     previous: int | None = job.current_revision_id
 
-    match = (
-        await conn.execute(_REVISION, {"job": job_id, "hash": fields.material_hash, "fenced": fenced})
-    ).first()
+    params = {"job": job_id, "hash": fields.material_hash, "fenced": fenced, **bounded}
+    match = (await conn.execute(_REVISION, params)).first()
     created = refused = False
     if match is None:
         current = await _insert_revision(conn, job_id, fields, source_of)
@@ -316,7 +351,13 @@ async def recompute_job(
         )
     else:  # the reuse is refused, and the unique key forbids a twin: the job keeps its current revision
         current, refused = previous, True
-        log.warning("tainted_revision_reuse_refused", job_id=job_id, revision_id=int(match.id), fenced=fenced)
+        log.warning(
+            "tainted_revision_reuse_refused",
+            job_id=job_id,
+            revision_id=int(match.id),
+            fenced=fenced,
+            bounded=bounded["bounded"],
+        )
 
     updated = await conn.execute(_UPDATE_JOB, _job_params(job_id, fields, current))
     list_changed = bool(updated.scalar_one())

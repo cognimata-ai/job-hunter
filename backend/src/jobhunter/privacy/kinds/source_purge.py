@@ -58,23 +58,29 @@ the content names or selects within its bound:
    `dedup.identity_conflict` alert resolved), then the keys over their owners, then the fetch requests (raw
    responses and items cascade, the quota ledger keeps its rows with `fetch_request_id := NULL`); the fault
    point `privacy.source_purge.before_rebuild` (`BEFORE_REBUILD`) after their commits;
-3. (5) `rebuild_jobs(run, affected)` (Task 25's phase B calls it too): per root (every affected job followed
-   up `merged_into_job_id`) that still exists, its family being it and every job merged into it: a family left
-   with no posting (its postings were all the source's) goes through `deletion_graph.purge_job_graph(...,
-   write_tombstone=False)`, as Task 13 runs the graph deletion; any other is rebuilt in one chunk over the
-   family: the bulk rows of its targets' holds (`merge.lock_target_holds`, step 7), the family's tainted
-   revisions (lineage names the source) found, `current_revision_id := NULL` where it names one, those
-   revisions deleted (the fault point `privacy.source_purge.mid_rebuild`, `MID_REBUILD`, inside the
-   uncommitted chunk), the root's availability from its postings
-   (`merge.derive_from_postings`), `revisions.recompute_job(fenced_source_ids={source})` (an untainted
-   revision of the same `material_hash` is reused, else a new one is inserted and pointed at), a merged member
-   whose `field_provenance` still names the source given the root's rebuilt canonical values (its own row held
-   the values its moved posting gave it; unmerging recomputes it anyway), the previous current revision's
-   unpublished targets cancelled `revision_superseded` when an untainted one stopped being current (as
-   `merge.supersede_revision`, without the creation), then the det-facts hook
-   (`filters.refilter_job_live`: the hard filters and the current `det_results` instances of the active
-   tuple's published results for the active and pending scopes), the ranking bumped last. No target is
-   created: `missing_targets` creates them after the release. The jobs rebuilt are counted;
+3. (5) `rebuild_jobs(run, affected)` (Task 25's phase B calls it too), within the bound of the run's
+   manifest (its recorded `max_ids`: the source's postings and observations at or below it are the purged
+   ones; data above it, collected after a re-enablement, is used and kept, §19.5 phase B): per root (every
+   affected job followed up `merged_into_job_id`) that still exists, its family being it and every job merged
+   into it. A synthetic golden-case root is left as it is (step 3 took its cases and instances naming the
+   source; it has no posting to rebuild from and is never deleted). A family that keeps no posting (none of
+   another source, none of the source above the bound) goes through `deletion_graph.purge_job_graph(...,
+   write_tombstone=False)` with the bound `max_ids["score_targets"]`, as Task 13 runs the graph deletion; any
+   other is rebuilt in one chunk over the family: the bulk rows of its targets' holds
+   (`merge.lock_target_holds`, step 7), the family's tainted revisions (lineage naming a posting or
+   observation of the source at or below the bound) found, `current_revision_id := NULL` where it names one,
+   those revisions deleted (the fault point `privacy.source_purge.mid_rebuild`, `MID_REBUILD`, inside the
+   uncommitted chunk), the root's availability from its postings (`merge.derive_from_postings`),
+   `revisions.recompute_job(fenced_bound=...)` (the source's postings up to the bound left out, the ones above
+   it used; an untainted revision of the same `material_hash` is reused, else a new one is inserted and
+   pointed at), a merged member whose `field_provenance` still names a posting or observation of the source at
+   or below the bound given the root's rebuilt canonical values (its own row held the values its moved posting
+   gave it; unmerging recomputes it anyway), the previous current revision's unpublished targets cancelled
+   `revision_superseded` when an untainted one stopped being current (as `merge.supersede_revision`, without
+   the creation), then the det-facts hook (`filters.refilter_job_live`: the hard filters and the current
+   `det_results` instances of the active tuple's published results for the active and pending scopes), the
+   ranking bumped last. No target is created: `missing_targets` creates them after the release. It returns
+   the number of roots (families) rebuilt;
 4. the frozen embeddings: under the jobs of the revisions that still reference one (a revision outside the
    deleted set that took it since A2, same text), each such revision `embedding_status = 'awaiting_embedding'`
    with `embedding_id` NULL in one update (the CHECK allows nothing else), then every frozen embedding nobody
@@ -105,6 +111,7 @@ from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.dedup import merge, revisions
 from jobhunter.dedup.merge import IDENTITY_CONFLICT_ALERT
+from jobhunter.dedup.revisions import SourceBound
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import resolve_alert
@@ -118,6 +125,7 @@ from jobhunter.privacy.manifests import (
     Operation,
     Violation,
     max_identity_ids,
+    read_manifest,
 )
 from jobhunter.privacy.purge import (
     RETRY_AFTER,
@@ -252,23 +260,29 @@ _REQUEST_PAGE: Final = q(
 )
 _DELETE_REQUESTS: Final = q(f"DELETE FROM fetch_requests WHERE id = ANY({_IDS})")  # noqa: S608
 
-# The rebuild (step 5): each given job's root, a root's family, the family's postings and tainted revisions.
+# The rebuild (step 5): each given job's root (with whether it is a synthetic golden-case job), a root's
+# family, whether the family keeps a posting (one of another source, or of the source above the bound), and
+# the family's revisions tainted within the bound (lineage naming a posting or observation of the source at or
+# below it, as the `fence` postcondition reads lineage).
 _ROOTS: Final = q(
     "WITH RECURSIVE up(id, parent) AS (SELECT id, merged_into_job_id FROM jobs "
     "WHERE id = ANY(CAST(:jobs AS bigint[])) "
     "UNION SELECT p.id, p.merged_into_job_id FROM jobs p JOIN up ON p.id = up.parent) "
-    "SELECT DISTINCT id FROM up WHERE parent IS NULL ORDER BY id"
+    "SELECT DISTINCT up.id, j.synthetic_eval FROM up JOIN jobs j ON j.id = up.id WHERE up.parent IS NULL "
+    "ORDER BY up.id"
 )
 _FAMILY: Final = q(
     "WITH RECURSIVE g(id) AS (SELECT id FROM jobs WHERE id = :root "
     "UNION SELECT j.id FROM jobs j JOIN g ON j.merged_into_job_id = g.id) SELECT id FROM g ORDER BY id"
 )
 _POSTINGS_LEFT: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM postings WHERE job_id = ANY(CAST(:jobs AS bigint[])))"
+    "SELECT EXISTS (SELECT 1 FROM postings p WHERE p.job_id = ANY(CAST(:jobs AS bigint[])) "  # noqa: S608
+    f"AND NOT (p.id <= :postings AND {_POSTING_OF_SOURCE}))"
 )
 _TAINTED_OF_FAMILY: Final = q(
     "SELECT r.id FROM job_revisions r WHERE r.job_id = ANY(CAST(:jobs AS bigint[])) AND EXISTS "
-    "(SELECT 1 FROM job_revision_sources s WHERE s.job_revision_id = r.id AND s.source_id = :source) "
+    "(SELECT 1 FROM job_revision_sources s WHERE s.job_revision_id = r.id AND s.source_id = :source "
+    "AND (coalesce(s.posting_id <= :postings, false) OR coalesce(s.observation_id <= :observations, false))) "
     "ORDER BY r.id"
 )
 _UNPOINT: Final = q(
@@ -284,11 +298,15 @@ _COPIED: Final = (
     "field_provenance",
     "det_facts_hash",
 )
+# (Its provenance test is the `fence` postcondition's: an entry naming a posting or observation of the source
+# at or below the bound.)
 _TAKE_ROOTS_VALUES: Final = q(
     f"UPDATE jobs m SET {', '.join(f'{c} = r.{c}' for c in _COPIED)}, updated_at = now() "  # noqa: S608
     "FROM jobs r WHERE r.id = :root AND m.id = ANY(CAST(:members AS bigint[])) AND m.id <> r.id "
     "AND EXISTS (SELECT 1 FROM jsonb_each(m.field_provenance) e JOIN source_instances si "
-    "ON si.id = CAST(e.value ->> 'source_instance_id' AS bigint) WHERE si.source_id = :source) RETURNING m.id"
+    "ON si.id = CAST(e.value ->> 'source_instance_id' AS bigint) WHERE si.source_id = :source "
+    "AND (coalesce(CAST(e.value ->> 'posting_id' AS bigint) <= :postings, false) "
+    "OR coalesce(CAST(e.value ->> 'observation_id' AS bigint) <= :observations, false))) RETURNING m.id"
 )
 
 # The embeddings (step 4 of phase B).
@@ -558,16 +576,18 @@ async def _delete_instances(run: PurgeRun, instances: Sequence[int]) -> int:
 
 
 async def _delete_cases(run: PurgeRun, cases: Sequence[int]) -> int:
-    """Step 3's golden cases, active or not, in one chunk over their jobs; how many were deleted."""
-    if not cases:
-        return 0
-    async with run.engine.connect() as conn:
-        jobs = await _ids(conn, _JOBS_OF_CASES, {"ids": list(cases)})
-    if not jobs:
-        return 0  # deleted already
-    async with run.chunk(job_ids=jobs) as chunk:
-        deleted = await deletion_graph.settle_and_delete_cases(chunk.conn, cases, now=run.now, check=None)
-    return len(deleted)
+    """Step 3's golden cases, active or not, `ROW_CHUNK` per chunk over their jobs; how many were deleted."""
+    deleted = 0
+    for ids in _slices(cases):
+        async with run.engine.connect() as conn:
+            jobs = await _ids(conn, _JOBS_OF_CASES, {"ids": ids})
+        if not jobs:
+            continue  # deleted already
+        async with run.chunk(job_ids=jobs) as chunk:
+            deleted += len(
+                await deletion_graph.settle_and_delete_cases(chunk.conn, ids, now=run.now, check=None)
+            )
+    return deleted
 
 
 async def _delete_calls(run: PurgeRun, calls: Sequence[int]) -> int:
@@ -637,35 +657,79 @@ async def _delete_requests(run: PurgeRun, source: str, bound: int) -> int:
 # ---- phase B: the rebuild ----------------------------------------------------------------------------------
 
 
-async def _families(engine: AsyncEngine, job_ids: Sequence[int]) -> dict[int, list[int]]:
-    """Each existing root of `job_ids` (followed up `merged_into_job_id`) with its family, in id order."""
+@dataclass(frozen=True)
+class _Bound:
+    """The manifest's bound the rebuild works within (its `max_ids`): the source's rows at or below it are the
+    purged ones; those above it were collected after a re-enablement and are used and kept."""
+
+    source: SourceBound
+    score_targets: int
+
+
+async def _recorded_bound(run: PurgeRun, source: str) -> _Bound:
+    """The bound of the run's manifest, from its recorded content (read again when the run began before A3
+    recorded it)."""
+    scope = run.manifest.scope
+    if scope is None:
+        async with run.engine.connect() as conn:
+            manifest = await read_manifest(conn, run.manifest.id)
+        scope = None if manifest is None else manifest.scope
+    if scope is None:
+        raise InvariantViolation(
+            f"deletion manifest {run.manifest.id}: no recorded content to rebuild within"
+        )
+    max_ids = scope["max_ids"]
+    bound = SourceBound(source, max_ids["postings"], max_ids["posting_observations"])
+    return _Bound(bound, max_ids["score_targets"])
+
+
+def _bound_params(bound: _Bound) -> dict[str, object]:
+    return {
+        "source": bound.source.source_id,
+        "postings": bound.source.postings,
+        "observations": bound.source.observations,
+    }
+
+
+async def _families(engine: AsyncEngine, job_ids: Sequence[int]) -> tuple[dict[int, list[int]], list[int]]:
+    """Each existing root of `job_ids` (followed up `merged_into_job_id`) with its family, in id order, and
+    the synthetic golden-case roots apart (never rebuilt nor deleted)."""
+    families: dict[int, list[int]] = {}
+    synthetic: list[int] = []
     async with engine.connect() as conn:
-        roots = await _ids(conn, _ROOTS, {"jobs": sorted(set(job_ids))})
-        return {root: await _ids(conn, _FAMILY, {"root": root}) for root in roots}
+        for row in (await conn.execute(_ROOTS, {"jobs": sorted(set(job_ids))})).all():
+            if row.synthetic_eval:
+                synthetic.append(int(row.id))
+            else:
+                families[int(row.id)] = await _ids(conn, _FAMILY, {"root": int(row.id)})
+    return families, synthetic
 
 
-async def _postings_left(engine: AsyncEngine, family: Sequence[int]) -> bool:
+async def _postings_left(engine: AsyncEngine, family: Sequence[int], bound: _Bound) -> bool:
+    """Whether the family keeps a posting: one of another source, or of the source above the bound."""
+    params = {"jobs": list(family), **_bound_params(bound)}
     async with engine.connect() as conn:
-        return bool((await conn.execute(_POSTINGS_LEFT, {"jobs": list(family)})).scalar_one())
+        return bool((await conn.execute(_POSTINGS_LEFT, params)).scalar_one())
 
 
-async def _rebuild(run: PurgeRun, root: int, family: list[int], source: str) -> bool:
+async def _rebuild(run: PurgeRun, root: int, family: list[int], bound: _Bound) -> bool:
     """One family's rebuild transaction (module docstring, phase B step 3); `False` when the root is gone."""
+    params = _bound_params(bound)
     async with run.chunk(job_ids=family) as chunk:
         conn = chunk.conn
         if root not in chunk.held:
             return False
         await merge.lock_target_holds(conn, [root])  # step 7, before any target row
-        tainted = await _ids(conn, _TAINTED_OF_FAMILY, {"jobs": family, "source": source})
+        tainted = await _ids(conn, _TAINTED_OF_FAMILY, {"jobs": family, **params})
         previous = (await conn.execute(_CURRENT, {"job": root})).scalar_one()
         if tainted:
             await conn.execute(_UNPOINT, {"jobs": family, "tainted": tainted})
             await conn.execute(_DELETE_REVISIONS, {"tainted": tainted})
         await afault_point(MID_REBUILD)
         await merge.derive_from_postings(conn, root)
-        result = await revisions.recompute_job(conn, root, fenced_source_ids=frozenset({source}))
-        params = {"root": root, "members": family, "source": source}
-        members = [int(m) for m in (await conn.execute(_TAKE_ROOTS_VALUES, params)).scalars()]
+        result = await revisions.recompute_job(conn, root, fenced_bound=bound.source)
+        rewrite = {"root": root, "members": family, **params}
+        members = [int(m) for m in (await conn.execute(_TAKE_ROOTS_VALUES, rewrite)).scalars()]
         superseded = 0
         if previous is not None and int(previous) not in tainted and int(previous) != result.revision_id:
             if (await conn.execute(_REVISION_EXISTS, {"r": int(previous)})).scalar_one():
@@ -691,18 +755,29 @@ async def _rebuild(run: PurgeRun, root: int, family: list[int], source: str) -> 
 
 
 async def rebuild_jobs(run: PurgeRun, job_ids: Sequence[int]) -> int:
-    """§20.5 step 5 for the affected `job_ids` that still exist (module docstring, phase B step 3): each
-    root's family rebuilt in one transaction, or deleted whole without a tombstone when no posting is left;
-    how many jobs were rebuilt. The live purge's phase B and Task 25's replay (phase B) call it."""
+    """§20.5 step 5 for the affected `job_ids` that still exist (module docstring, phase B step 3), within the
+    bound of the run's manifest: each root's family rebuilt in one transaction, or deleted whole without a
+    tombstone when no posting is left; a synthetic golden-case root is left as it is. Returns how many roots
+    (families) were rebuilt. The live purge's phase B and Task 25's replay (phase B) call it."""
     source = _source_of(run.manifest)
+    bound = await _recorded_bound(run, source)
+    families, synthetic = await _families(run.engine, job_ids)
     rebuilt = deleted = 0
-    for root, family in (await _families(run.engine, job_ids)).items():
-        if not await _postings_left(run.engine, family):
-            gone = await deletion_graph.purge_job_graph(run, root, family, write_tombstone=False)
-            deleted += len(gone.job_ids)
-        elif await _rebuild(run, root, family, source):
+    for root, family in families.items():
+        if not await _postings_left(run.engine, family, bound):
+            purged = await deletion_graph.purge_job_graph(
+                run, root, family, write_tombstone=False, target_bound=bound.score_targets
+            )
+            deleted += len(purged.graph.job_ids)
+        elif await _rebuild(run, root, family, bound):
             rebuilt += 1
-    log.info("source_purge_rebuilt", manifest_id=run.manifest.id, jobs_rebuilt=rebuilt, jobs_deleted=deleted)
+    log.info(
+        "source_purge_rebuilt",
+        manifest_id=run.manifest.id,
+        roots_rebuilt=rebuilt,
+        jobs_deleted=deleted,
+        synthetic_left=synthetic[:LOGGED_IDS],
+    )
     return rebuilt
 
 

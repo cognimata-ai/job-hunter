@@ -32,7 +32,7 @@ from jobhunter.graphs.score.nodes import claim as claim_node
 from jobhunter.privacy import deletion_graph, purge
 from jobhunter.privacy.kinds import source_purge
 from jobhunter.privacy.manifests import ManifestRow, check_postconditions
-from jobhunter.privacy.purge import OpenedPurge
+from jobhunter.privacy.purge import OpenedPurge, PurgeRun
 from jobhunter.scoring import filters
 from jobhunter.scoring import reconcilers as scoring_reconcilers  # registers `missing_targets`
 from jobhunter.scoring.admission import Picked
@@ -46,7 +46,7 @@ from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import JobWithPostings, add_posting, ctx, make_deps, queued_run
-from tests.support.eval import case_rows, eval_deps, execute, run_row, start_eval
+from tests.support.eval import case_rows, eval_deps, execute, run_row, seed_adversarial, start_eval
 from tests.support.faults import SimulatedCrash, no_fault, raising_at
 from tests.support.fences import insert_test_fence
 from tests.support.groups import FULL_TEXT, canonical_job
@@ -178,6 +178,23 @@ _ITEMS_OF_JOB: Final = sa.text(
     "WHERE t.job_id = :j ORDER BY i.custom_id"
 )
 _LOCK_CONFIG: Final = sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
+_CONFLICT: Final = sa.text("SELECT id FROM identity_conflicts WHERE id = :c")
+_LINEAGE_POSTINGS: Final = sa.text("SELECT posting_id FROM job_revision_sources WHERE job_revision_id = :r")
+_SYNTHETIC_CASES: Final = sa.text(
+    "SELECT g.id, r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "
+    "JOIN jobs j ON j.id = r.job_id WHERE j.synthetic_eval ORDER BY g.id"
+)
+_DRAWS_ON_ADZUNA: Final = sa.text("UPDATE golden_cases SET det_input_sources = '{adzuna}' WHERE id = :g")
+_CASE_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM golden_cases WHERE id = :g)")
+# What an A0 writes: the settings versions and the active one, `purge_fence_at`, the source purges and fences.
+_A0_TRACES: Final = sa.text(
+    "SELECT (SELECT count(*) FROM settings_versions) AS versions, "
+    "(SELECT settings_version_id FROM active_config WHERE id = 1) AS active, "
+    "(SELECT purge_fence_at FROM sources WHERE id = 'adzuna') AS fence_at, "
+    "(SELECT count(*) FROM deletion_manifests WHERE kind = 'source_purge') AS manifests, "
+    "(SELECT count(*) FROM purge_fences) AS fences"
+)
+_ALERT_RESOLVED: Final = sa.text("SELECT resolved_at IS NOT NULL FROM alerts WHERE dedup_key = :k")
 _POINT_SETTINGS: Final = sa.text("UPDATE active_config SET settings_version_id = :v WHERE id = 1")
 _UNFENCE_SOURCE: Final = sa.text("UPDATE sources SET purge_fence_at = NULL WHERE id = 'adzuna'")
 _TOUCH: Final = sa.text("UPDATE jobs SET updated_at = now() WHERE id = :j")
@@ -374,6 +391,30 @@ async def test_request_source_purge_is_refused_under_a_global_fence(engine: Asyn
     assert await scalar(engine, _FENCE_AT) is None
 
 
+async def test_a0_is_refused_when_adzuna_is_the_only_enabled_source(engine: AsyncEngine) -> None:
+    """The settings rule "at least one source must be enabled" refuses the version that would disable Adzuna:
+    A0 answers 422 `validation_failed` on `payload.sources.enabled` and leaves nothing behind (no settings
+    version, `purge_fence_at` as it was, the queued collection still queued, no manifest, no fence)."""
+    async with engine.begin() as conn:
+        active = await lock_active(conn)
+        payload = cast(dict[str, Any], active.payload)
+        only = {name: name == ADZUNA for name in payload["sources"]["enabled"]}
+        request_ = SaveRequest(
+            payload={**payload, "sources": {**payload["sources"], "enabled": only}},
+            base_version_id=active.settings_version_id,
+            acknowledged_warnings=frozenset(),
+        )
+        await save_settings(conn, request_, now=utcnow(), defer=defer_in_tx, internal=True)
+        run_id = int((await conn.execute(_QUEUED_RUN, {"at": utcnow()})).scalar_one())
+    before = await one(engine, _A0_TRACES)
+    with pytest.raises(Refusal) as refused:
+        await request(engine)
+    assert (refused.value.status, refused.value.code) == (422, "validation_failed")
+    assert "payload.sources.enabled" in {field.field for field in refused.value.fields or ()}
+    assert tuple(await one(engine, _A0_TRACES)) == tuple(before)
+    assert tuple(await one(engine, _RUN, r=run_id))[:2] == ("queued", None)
+
+
 # ---- the stored affected set -------------------------------------------------------------------------------
 
 
@@ -556,6 +597,104 @@ async def test_a_merged_job_drawing_on_adzuna_keeps_none_of_its_values(
     assert rows[merged.job_id].current_revision_id is None  # its tainted revision went
 
 
+async def test_a_rebuild_keeps_adzuna_data_above_the_bound(
+    engine: AsyncEngine, purger: Purger, job_with_postings: JobWithPostings
+) -> None:
+    """§19.5 phase B: data above the manifest's watermark is used and kept. After a completed purge, Adzuna is
+    enabled again and a fresh Adzuna posting (above the bound) gives the mixed job a salary and a revision
+    whose lineage names it; a replay's rebuild of the stored set (`rebuild_jobs` on the completed manifest)
+    reuses that revision and keeps the salary, and every postcondition still holds."""
+    seed = await seeded(engine)
+    manifest = await purged(engine, purger, await request(engine))
+    assert manifest.scope is not None
+    async with engine.begin() as conn:
+        await reenable(conn)
+        fresh, _ = await add_posting(
+            conn,
+            seed.closed_job_id,
+            ADZUNA,
+            observed_at=utcnow(),
+            salary=stated(55_000, 65_000),
+            employment_types=("full_time",),  # in the revision's text: its lineage names the posting
+            employment_source="structured",
+        )
+    assert fresh > manifest.scope["max_ids"]["postings"]
+    revision = await recomputed(engine, seed.closed_job_id)
+    assert await lineage(engine, revision) == [ADZUNA, "greenhouse"]
+    before = await one(engine, _JOB, j=seed.closed_job_id)
+    assert before.salary is not None
+
+    run = replay_run(engine, purger, manifest)
+    assert await source_purge.rebuild_jobs(run, affected(manifest)) == 1  # the mixed job's family
+    after = await one(engine, _JOB, j=seed.closed_job_id)
+    assert after.current_revision_id == revision and after.salary == before.salary
+    assert await lineage(engine, revision) == [ADZUNA, "greenhouse"]
+    assert ADZUNA in await provenance_sources(engine, seed.closed_job_id)
+    async with engine.connect() as conn:
+        assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
+        assert await source_purge.SourcePurge().postconditions(conn, manifest.scope) == []
+
+
+def replay_run(engine: AsyncEngine, purger: Purger, manifest: ManifestRow) -> PurgeRun:
+    """A replay's run of the manifest (Task 25's phase B calls `rebuild_jobs` with one): no epoch, no
+    owner."""
+    return PurgeRun(
+        engine=engine,
+        cfg=purger.cfg,
+        now=utcnow(),
+        cv_store=purger.deps.cv_store,
+        manifest=manifest,
+        mode="replay",
+        effects=None,
+        owner=None,
+    )
+
+
+async def test_a_family_left_with_only_an_adzuna_posting_above_the_bound_is_rebuilt(
+    engine: AsyncEngine, purger: Purger, monkeypatch: pytest.MonkeyPatch, job_with_postings: JobWithPostings
+) -> None:
+    """An Adzuna-only job gets a fresh Adzuna posting above the bound after A2, inserted directly as a
+    replay after a re-enablement would find it. The purge deletes the posting within the bound and the
+    revision tainted within it, keeps the fresh posting, and rebuilds the job from it (neither deleted nor a
+    `LookupError`); every postcondition holds."""
+    made = await job_with_postings({ADZUNA: {}})
+    tainted = await recomputed(engine, made.job_id)
+    opened = await request(engine)
+    monkeypatch.setattr(purge, "afault_point", raising_at(purge.AFTER_RECORD))
+    await purger.run(opened.operation_id)  # the bound recorded, nothing deleted yet
+    async with engine.begin() as conn:
+        fresh, _ = await add_posting(conn, made.job_id, ADZUNA, observed_at=utcnow())
+    monkeypatch.setattr(purge, "afault_point", no_fault)
+    await purger.again(opened.operation_id)
+    manifest = await completed(purger, opened.manifest_id, opened.operation_id)
+    assert manifest.scope is not None and fresh > manifest.scope["max_ids"]["postings"]
+    assert await existing(engine, [made.job_id]) == [made.job_id]
+    assert tainted in operations(manifest, "row_delete", "job_revisions")
+    rebuilt = await seed_revision(engine, made.job_id)
+    assert rebuilt != tainted and await lineage(engine, rebuilt) == [ADZUNA]
+    async with engine.connect() as conn:
+        named = await conn.execute(_LINEAGE_POSTINGS, {"r": rebuilt})
+        assert set(named.scalars()) == {fresh}  # the fresh posting's, kept
+        assert await source_purge.SourcePurge().postconditions(conn, manifest.scope) == []
+
+
+async def test_a_synthetic_golden_case_job_is_never_deleted(engine: AsyncEngine, purger: Purger) -> None:
+    """A synthetic golden-case job (no posting) whose case draws on Adzuna is affected through the case: the
+    case is deleted in step 3, and the job, which the rebuild never deletes or rebuilds, survives with its
+    other cases."""
+    await seed_adversarial(engine)
+    async with engine.begin() as conn:
+        rows = (await conn.execute(_SYNTHETIC_CASES)).all()
+        drawing, *others = rows
+        await conn.execute(_DRAWS_ON_ADZUNA, {"g": int(drawing.id)})
+    manifest = await purged(engine, purger, await request(engine))
+    assert int(drawing.job_id) in affected(manifest)
+    assert await scalar(engine, _CASE_ROWS, g=int(drawing.id)) == 0
+    assert await existing(engine, [int(drawing.job_id)]) == [int(drawing.job_id)]
+    for case in others:
+        assert await scalar(engine, _CASE_EXISTS, g=int(case.id)) is True
+
+
 async def test_after_completion_missing_targets_creates_the_rebuilt_targets(
     engine: AsyncEngine, purger: Purger, queue_app: procrastinate.App, current_epoch: int
 ) -> None:
@@ -604,6 +743,11 @@ async def test_an_adzuna_only_job_is_deleted_without_a_tombstone(
     status, elected, joined = tuple(await one(engine, _GROUP, g=group))
     assert status == "active" and joined == [m.job_id for m in members] and elected in joined
     assert await existing(engine, kept) == kept
+    # the open conflict on the active job's Adzuna posting went with the posting; its alert is resolved
+    assert await scalar(engine, _CONFLICT, c=seed.lone_conflict_id) is None
+    assert await scalar(
+        engine, _ALERT_RESOLVED, k=f"dedup.identity_conflict:conflict:{seed.lone_conflict_id}"
+    )
     async with engine.connect() as conn:
         rows = (await conn.execute(_ADZUNA_ROWS)).one()
     assert tuple(rows) == (0, 0, 0, 0)  # no posting, key, request or lineage of Adzuna is left
@@ -709,6 +853,7 @@ _RUNNING_ATTEMPT: Final = sa.text(
     "'running') RETURNING id"
 )
 RESERVED: Final = Decimal("0.1")
+_CASE_OF_CALL: Final = sa.text("UPDATE llm_calls SET golden_case_id = :g WHERE id = :c")
 
 
 async def counted_entry(conn: AsyncConnection, *, month: date, state: str, purpose_class: str) -> int:
@@ -746,13 +891,22 @@ async def online_call(
 
 
 async def eval_call(
-    conn: AsyncConnection, *, revision_id: int, state: str, eval_run_id: int, month: date
+    conn: AsyncConnection,
+    *,
+    revision_id: int,
+    state: str,
+    eval_run_id: int,
+    month: date,
+    golden_case_id: int | None = None,
 ) -> tuple[int, int]:
-    """An eval run's online call of `month` naming the revision in its `input_refs` (no golden case: an
-    eval call no case deletion takes), its entry in `state`; `(ledger, call)`."""
+    """An eval run's online call of `month` naming the revision in its `input_refs` (no golden case unless
+    `golden_case_id`: an eval call no case deletion takes), its entry in `state`; `(ledger, call)`."""
     ledger = await counted_entry(conn, month=month, state=state, purpose_class="nonscoring")
     refs = f'{{"job_revision_id": {revision_id}, "repetition": 1}}'
-    return ledger, await online_call(conn, ledger, state=state, refs=refs, eval_run_id=eval_run_id)
+    call = await online_call(conn, ledger, state=state, refs=refs, eval_run_id=eval_run_id)
+    if golden_case_id is not None:
+        await conn.execute(_CASE_OF_CALL, {"g": golden_case_id, "c": call})
+    return ledger, call
 
 
 async def online_try(conn: AsyncConnection, job: Job, tuple_id: int, *, state: str, month: date) -> int:
@@ -786,7 +940,8 @@ async def test_golden_cases_drawing_on_adzuna_are_deleted_active_or_not(
     a case on an untainted revision whose frozen inputs hold an Adzuna salary are deleted with their eval
     results and eval calls (the agreement overrides the exemption); a case of the same job drawing on no
     Adzuna value stays. The manifest lists the deleted cases."""
-    seed = await seeded(engine)
+    now = utcnow()
+    seed = await seeded(engine, now)
     job = await mixed_job(job_with_postings, engine, salary=stated(50_000, 55_000))
     assert await lineage(engine, job.revision_id) == ["greenhouse"]
     async with engine.begin() as conn:
@@ -797,13 +952,22 @@ async def test_golden_cases_drawing_on_adzuna_are_deleted_active_or_not(
             conn, job, other_chain.profile_version_id, det_input_sources=["greenhouse"]
         )
         run = await insert_eval_run(conn, "completed")
-        for case in (salaried, kept):
+        _, salaried_call = await eval_call(
+            conn,
+            revision_id=job.revision_id,
+            state="dispatched",
+            eval_run_id=run,
+            month=seed_month(now),
+            golden_case_id=salaried,
+        )
+        for case, calls in ((salaried, [salaried_call]), (kept, [])):
             await conn.execute(
                 sa.text(
                     "INSERT INTO eval_case_results (eval_run_id, golden_case_id, repetition, outcome, "
-                    "critic_ran, llm_call_ids, output) VALUES (:run, :g, 1, 'accepted', false, '{}', '{}')"
+                    "critic_ran, llm_call_ids, output) VALUES (:run, :g, 1, 'accepted', false, "
+                    "CAST(:calls AS bigint[]), '{}')"
                 ),
-                {"run": run, "g": case},
+                {"run": run, "g": case, "calls": calls},
             )
         seeded_cases = [
             int(c)
@@ -819,6 +983,7 @@ async def test_golden_cases_drawing_on_adzuna_are_deleted_active_or_not(
     for case in seeded_cases:
         assert await scalar(engine, _CASE_ROWS, g=case) == 0
     assert await scalar(engine, _CASE_ROWS, g=kept) == 2  # the case and its eval result
+    assert await scalar(engine, _CALL_EXISTS, c=salaried_call) is False  # its eval call went with it
     assert seed.closed_job_id in affected(manifest)
 
 

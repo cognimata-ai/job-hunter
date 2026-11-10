@@ -26,16 +26,17 @@ or profile purge), and no export op (`deletes_exports = False`: a tombstone keep
 within 7 days, M5-R3, Deviation 18).
 
 **Phase B** (`execute`), per root J in id order and its graph G (the content's jobs, J the one whose
-`merged_into_job_id` is NULL): first G's targets, in chunks `PurgeRun.chunk(job_ids=G)` of at most
-`targets.TARGET_SET_CHUNK` (200) target ids each, read `ORDER BY id LIMIT 200` under the lock and within
-`max_ids["score_targets"]`, deleted by `deletion_graph.purge_target_set` (its refusal of more than 200 is
-never met), until a chunk finds fewer than 200 (the fence keeps new ones from being created); then one graph
-chunk, `PurgeRun.chunk(job_ids=G, with_groups_of=G)`, which holds every co-member of G's duplicate groups
-before the operation owner (a member that joined under the lock starts the chunk again), and
-`deletion_graph.delete_job_graph(write_tombstone=True)`; each chunk bumps the ranking last. Every chunk is
-idempotent: a re-execution after any commit, or a phase re-run after a lost deadlock (Ruling T12-1), finds the
-targets left, or J gone (Deviation 50). The kind has no postcondition of its own (the typed `row_delete jobs`
-and `fence` cover it) and nothing to re-apply in a replay.
+`merged_into_job_id` is NULL): `deletion_graph.purge_job_graph(write_tombstone=True)` with the bound
+`max_ids["score_targets"]` (Deviation 50, shared with the Adzuna purge): first G's targets (by job or by
+revision), in chunks `PurgeRun.chunk(job_ids=G)` of at most `targets.TARGET_SET_CHUNK` (200) target ids each,
+read `ORDER BY id LIMIT 200` under the lock and within the bound, deleted by `deletion_graph.purge_target_set`
+(its refusal of more than 200 is never met), until a chunk finds fewer than 200 (the fence keeps new ones from
+being created); then one graph chunk, `PurgeRun.chunk(job_ids=G, with_groups_of=G)`, which holds every
+co-member of G's duplicate groups before the operation owner (a member that joined under the lock starts the
+chunk again), and `deletion_graph.delete_job_graph(write_tombstone=True)`; each chunk bumps the ranking last.
+Every chunk is idempotent: a re-execution after any commit, or a phase re-run after a lost deadlock (Ruling
+T12-1), finds the targets left, or J gone (Deviation 50). The kind has no postcondition of its own (the typed
+`row_delete jobs` and `fence` cover it) and nothing to re-apply in a replay.
 
 Ids and counts only reach a log line.
 """
@@ -47,7 +48,6 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy import deletion_graph
@@ -61,7 +61,6 @@ from jobhunter.privacy.manifests import (
     max_identity_ids,
 )
 from jobhunter.privacy.purge import OpenedPurge, PurgeRun, new_content, open_purge, register_kind
-from jobhunter.scoring.targets import TARGET_SET_CHUNK
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer
@@ -111,10 +110,6 @@ _EXEMPT_ROOTS: Final = q(
 )
 _JOBS_OF_CONTENT: Final = q(
     "SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
-)
-_TARGET_PAGE: Final = q(
-    "SELECT id FROM score_targets WHERE job_id = ANY(CAST(:jobs AS bigint[])) AND id <= :bound "
-    "ORDER BY id LIMIT :limit"
 )
 
 log = get_logger("jobhunter.privacy.kinds.job_tombstone")
@@ -225,33 +220,6 @@ def _forest(rows: Sequence[tuple[int, int | None]]) -> dict[int, list[int]]:
     return dict(sorted(graphs.items()))
 
 
-async def _delete_targets(run: PurgeRun, graph: list[int], bound: int) -> int:
-    """G's targets within `bound`, `TARGET_SET_CHUNK` per chunk (module docstring); how many."""
-    deleted = 0
-    while True:
-        async with run.chunk(job_ids=graph) as chunk:
-            params = {"jobs": graph, "bound": bound, "limit": TARGET_SET_CHUNK}
-            page = [int(t) for t in (await chunk.conn.execute(_TARGET_PAGE, params)).scalars()]
-            if page:
-                purged = await deletion_graph.purge_target_set(
-                    chunk.conn, page, manifest_id=run.manifest.id, now=run.now
-                )
-                deleted += purged.targets
-                await ranking.bump(chunk.conn)
-        if len(page) < TARGET_SET_CHUNK:
-            return deleted
-
-
-async def _delete_graph(run: PurgeRun, root: int, graph: list[int]) -> deletion_graph.JobGraphDeleted:
-    async with run.chunk(job_ids=graph, with_groups_of=graph) as chunk:
-        deleted = await deletion_graph.delete_job_graph(
-            chunk.conn, root, write_tombstone=True, held=chunk.held, now=run.now
-        )
-        if deleted.job_ids:
-            await ranking.bump(chunk.conn)
-    return deleted
-
-
 class JobTombstone:
     """The `job_tombstone` procedure (module docstring)."""
 
@@ -285,15 +253,16 @@ class JobTombstone:
             ]
         bound = content["max_ids"]["score_targets"]
         for root, graph in _forest(rows).items():
-            targets = await _delete_targets(run, graph, bound)
-            deleted = await _delete_graph(run, root, graph)
+            purged = await deletion_graph.purge_job_graph(
+                run, root, graph, write_tombstone=True, target_bound=bound
+            )
             log.info(
                 "job_tombstoned",
                 manifest_id=run.manifest.id,
                 job_id=root,
-                tombstone_id=deleted.tombstone_id,
-                jobs=len(deleted.job_ids),
-                targets=targets,
+                tombstone_id=purged.graph.tombstone_id,
+                jobs=len(purged.graph.job_ids),
+                targets=purged.targets,
             )
 
     async def postconditions(self, conn: AsyncConnection, content: ManifestContent) -> list[Violation]:

@@ -105,9 +105,9 @@ no golden case's deletion takes). `settle_and_delete_calls(conn, call_ids, *, no
 in the caller's transaction: the calls' entries still `reserved` or `dispatched` read, their accounts locked
 (`spend_ledger.lock_for_purge`, steps 6 and 7), the calls `FOR UPDATE` in id order (step 10), the entries read
 again under them (the accounts of a new one taken after step 10, as for the cases) and settled
-(`settle_for_purge`), then the calls deleted. The eval run's late `settle` of such a call finds its ledger row
-alone, settled already (`llm_settle_call_purged`), and its dispatch marker finds no call (`FencedOut`). A call
-gone already is skipped; it returns the ids it deleted.
+(`settle_for_purge`; the one sequence `_settle_entries` both share), then the calls deleted. The eval run's
+late `settle` of such a call finds its ledger row alone, settled already (`llm_settle_call_purged`), and its
+dispatch marker finds no call (`FencedOut`). A call gone already is skipped; it returns the ids it deleted.
 
 **Job-graph deletion** (M5 Task 13; §20.2's tombstoning steps 4-7, Deviation 50). `delete_job_graph(conn,
 job_id, *, write_tombstone, held, now) -> JobGraphDeleted` is the one complete cleanup before a job goes,
@@ -157,11 +157,12 @@ own (`purge_target_set`): a job of G it does not hold, or a target of G left (by
 `det_results`, `llm_results` and the targets went with the targets; `score_feedback` keeps its row with the
 job and revision NULL (`ON DELETE SET NULL`). `ranking.bump` is the caller's, last.
 
-`purge_job_graph(run, root, graph, *, write_tombstone)` runs it as a purge does (Deviation 50; the Adzuna
-purge and delete-everything, M5 Tasks 15 and 16): the graph's targets in `PurgeRun.chunk(job_ids=graph)`
-transactions of at most `TARGET_SET_CHUNK` targets each (`purge_target_set`), until a chunk finds fewer, then
-one `PurgeRun.chunk(job_ids=graph, with_groups_of=graph)` that runs `delete_job_graph`; each chunk bumps the
-ranking last.
+`purge_job_graph(run, root, graph, *, write_tombstone, target_bound=None) -> GraphPurged` runs it as a purge
+does (Deviation 50; job tombstoning, the Adzuna purge and delete-everything, M5 Tasks 13, 15 and 16): the
+graph's targets (by job or by revision, within the manifest's `max_ids["score_targets"]` when given) in
+`PurgeRun.chunk(job_ids=graph)` transactions of at most `TARGET_SET_CHUNK` targets each (`purge_target_set`),
+until a chunk finds fewer, then one `PurgeRun.chunk(job_ids=graph, with_groups_of=graph)` that runs
+`delete_job_graph`; each chunk bumps the ranking last. It returns the targets deleted with the graph.
 
 Ids, counts and states only reach a log line.
 """
@@ -459,22 +460,44 @@ async def settle_and_delete_cases(
     ids = sorted(set(case_ids))
     if not ids:
         return ()
-    entries = await _ids(conn, _CASE_ENTRIES, {"cases": ids})
-    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
-    locked = {  # step 10
-        int(row.id): golden.CaseFlags(active=bool(row.active), is_canary=bool(row.is_canary))
-        for row in await conn.execute(_LOCK_CASES, {"cases": ids})
-    }
-    if check is not None:
-        await check(conn, locked)
-    present = sorted(locked)
-    current = await _ids(conn, _CASE_ENTRIES, {"cases": present}) if present else []
-    if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
-        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
-    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+
+    async def lock_cases() -> list[int]:  # step 10, then the caller's check
+        locked = {
+            int(row.id): golden.CaseFlags(active=bool(row.active), is_canary=bool(row.is_canary))
+            for row in await conn.execute(_LOCK_CASES, {"cases": ids})
+        }
+        if check is not None:
+            await check(conn, locked)
+        return sorted(locked)
+
+    present = await _settle_entries(conn, _CASE_ENTRIES, "cases", ids, lock_cases, now=now)
     for case_id in present:
         await golden.delete_case(conn, case_id)
     return tuple(present)
+
+
+async def _settle_entries(
+    conn: AsyncConnection,
+    entries_of: TextClause,
+    key: str,
+    ids: list[int],
+    lock: Callable[[], Awaitable[list[int]]],
+    *,
+    now: datetime,
+) -> list[int]:
+    """The settle sequence of the cases' and the eval calls' deletion (module docstring, "Golden cases"):
+    the entries of `ids` still `reserved` or `dispatched` (`entries_of`, bound `key`), their accounts locked
+    (steps 6 and 7), the rows locked by `lock` (step 10; it returns the ids present and may raise), the
+    entries read again under those locks, the accounts of an entry reserved after the first read taken (after
+    step 10: the one place it leaves the schedule), and each settled (`settle_for_purge`). The ids present."""
+    entries = await _ids(conn, entries_of, {key: ids})
+    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
+    present = await lock()
+    current = await _ids(conn, entries_of, {key: present}) if present else []
+    if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
+        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
+    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+    return present
 
 
 # ---- eval calls (M5 Task 15) -------------------------------------------------------------------------------
@@ -499,13 +522,11 @@ async def settle_and_delete_calls(
     ids = sorted(set(call_ids))
     if not ids:
         return ()
-    entries = await _ids(conn, _CALL_ENTRIES, {"calls": ids})
-    rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
-    present = await _ids(conn, _LOCK_CALLS, {"calls": ids})  # step 10
-    current = await _ids(conn, _CALL_ENTRIES, {"calls": present}) if present else []
-    if not set(current) <= set(entries):  # an entry reserved after the first read
-        rows = await spend_ledger.lock_for_purge(conn, current, now=now)
-    await spend_ledger.settle_for_purge(conn, current, rows, now=now)
+
+    async def lock_calls() -> list[int]:  # step 10
+        return await _ids(conn, _LOCK_CALLS, {"calls": ids})
+
+    present = await _settle_entries(conn, _CALL_ENTRIES, "calls", ids, lock_calls, now=now)
     if present:
         await conn.execute(_DELETE_CALLS, {"calls": present})
     return tuple(present)
@@ -699,30 +720,51 @@ async def delete_job_graph(
     return deleted
 
 
-# The targets of a job graph (by job or by revision), `TARGET_SET_CHUNK` at a time in id order.
+# The targets of a job graph (by job or by revision) within the caller's bound (none: NULL),
+# `TARGET_SET_CHUNK` at a time in id order.
 _GRAPH_TARGET_PAGE: Final = q(
-    f"SELECT id FROM score_targets WHERE job_id = ANY({_JOBS}) "  # noqa: S608
-    f"OR job_revision_id IN (SELECT id FROM job_revisions WHERE job_id = ANY({_JOBS})) "
-    "ORDER BY id LIMIT :limit"
+    f"SELECT id FROM score_targets WHERE (job_id = ANY({_JOBS}) "  # noqa: S608
+    f"OR job_revision_id IN (SELECT id FROM job_revisions WHERE job_id = ANY({_JOBS}))) "
+    "AND (CAST(:bound AS bigint) IS NULL OR id <= :bound) ORDER BY id LIMIT :limit"
 )
 
 
+@dataclass(frozen=True)
+class GraphPurged:
+    """What `purge_job_graph` did: the targets its chunks deleted and the graph `delete_job_graph` deleted."""
+
+    targets: int
+    graph: JobGraphDeleted
+
+
 async def purge_job_graph(
-    run: "PurgeRun", root: int, graph: Sequence[int], *, write_tombstone: bool
-) -> JobGraphDeleted:
+    run: "PurgeRun",
+    root: int,
+    graph: Sequence[int],
+    *,
+    write_tombstone: bool,
+    target_bound: int | None = None,
+) -> GraphPurged:
     """The job-graph deletion as a purge runs it (module docstring, "Job-graph deletion", Deviation 50):
-    the graph's targets in chunks of their own (`run.chunk(job_ids=graph)`, at most `TARGET_SET_CHUNK` a
-    transaction, `purge_target_set`) until a chunk finds fewer, then one graph chunk that holds the graph and
-    every co-member of its groups (`run.chunk(job_ids=graph, with_groups_of=graph)`) and runs
-    `delete_job_graph` for `root`; each chunk bumps the ranking last. The fence over the graph keeps its
-    targets closed, so the pages need no bound of their own (Ruling T13-3). Every chunk is idempotent."""
+    the graph's targets within `target_bound` (the manifest's `max_ids["score_targets"]`) in chunks of their
+    own (`run.chunk(job_ids=graph)`, at most `TARGET_SET_CHUNK` a transaction, `purge_target_set`) until a
+    chunk finds fewer, then one graph chunk that holds the graph and every co-member of its groups
+    (`run.chunk(job_ids=graph, with_groups_of=graph)`) and runs `delete_job_graph` for `root`, whose check
+    makes a target left above the bound an `InvariantViolation`; each chunk bumps the ranking last. Every
+    chunk is idempotent."""
     jobs = sorted(set(graph))
+    deleted_targets = 0
     while True:
         async with run.chunk(job_ids=jobs) as chunk:
-            params = {"jobs": jobs, "limit": targets.TARGET_SET_CHUNK}
+            params: dict[str, object] = {
+                "jobs": jobs,
+                "bound": target_bound,
+                "limit": targets.TARGET_SET_CHUNK,
+            }
             page = await _ids(chunk.conn, _GRAPH_TARGET_PAGE, params)
             if page:
-                await purge_target_set(chunk.conn, page, manifest_id=run.manifest.id, now=run.now)
+                purged = await purge_target_set(chunk.conn, page, manifest_id=run.manifest.id, now=run.now)
+                deleted_targets += purged.targets
                 await ranking.bump(chunk.conn)
         if len(page) < targets.TARGET_SET_CHUNK:
             break
@@ -732,4 +774,4 @@ async def purge_job_graph(
         )
         if deleted.job_ids:
             await ranking.bump(chunk.conn)
-    return deleted
+    return GraphPurged(deleted_targets, deleted)
