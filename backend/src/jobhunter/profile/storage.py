@@ -86,7 +86,7 @@ class CvStore:
                 out.write(blob)
                 out.flush()
                 os.fsync(out.fileno())
-            _fsync_directory(self.root)
+            fsync_directory(self.root)
         except BaseException:
             path.unlink(missing_ok=True)
             raise
@@ -128,8 +128,9 @@ class CvStore:
         return crypto.decrypt(keys, blob, aad=_text_aad(cv_file_id)).decode("utf-8")
 
 
-def _fsync_directory(directory: Path) -> None:
-    """Flush the directory entry of a new file, so a row that names it never outlives it in a power loss."""
+def fsync_directory(directory: Path) -> None:
+    """Flush `directory`'s entries (a new file, a rename) to the disk, so a row that names a file never
+    outlives it in a power loss. The deletion manifests' writer shares it (`privacy.manifests`, M5 Task 9)."""
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         os.fsync(fd)

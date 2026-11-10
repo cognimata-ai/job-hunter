@@ -12,13 +12,13 @@ wrote compares with `fenced_at`.
 **The file** is `canonical_bytes(content)` (D2: sorted keys, compact separators, UTF-8), so the file `migrate`
 rewrites from the row's `scope` (a `jsonb` column, which keeps no key order) hashes to the `file_sha256` its
 shipment matched. `write_manifest_file` writes `<uuid>.json.tmp`, fsyncs it, renames it to `<uuid>.json` and
-fsyncs the directory; it returns the sha256. A file already there with equal bytes is adopted (its hash is
-returned: a retry after a crash past the rename, Deviation 17); one with other bytes raises
-`ManifestConflict`, and a manifest's file is never overwritten. One purge runs at a time and `migrate` runs
-alone, so no second writer of a uuid races the check before the rename. `parse_manifest` reads a file of the
-stream and raises `ManifestInvalid(reason)` for one a replay must not trust: `not_json`, `unknown_format`,
-`unknown_op`, `invalid` (any other shape than the format's, an extra field included) and `name_mismatch` (a
-file name other than `<manifest_uuid>.json`).
+fsyncs the directory (`profile.storage.fsync_directory`); it returns the sha256. A file already there with
+equal bytes is adopted (its hash is returned: a retry after a crash past the rename, Deviation 17); one with
+other bytes raises `ManifestConflict`, and a manifest's file is never overwritten. One purge runs at a time
+and `migrate` runs alone, so no second writer of a uuid races the check before the rename. `parse_manifest`
+reads a file of the stream and raises `ManifestInvalid(reason)` for one a replay must not trust:
+`not_json`, `unknown_format`, `unknown_op`, `invalid` (any other shape than the format's, an extra field
+included) and `name_mismatch` (a file name other than `<manifest_uuid>.json`).
 
 **The rows.** `insert_manifest` inserts the `executing` row with a UUIDv7, the request (ids only) and an empty
 `scope`, `created_at` the caller's `now` (A0, with its fences: `fences.insert_fence`). `record_manifest` (A3)
@@ -48,7 +48,8 @@ source instance, and on `ad_keys`, its `key_ns`), and is evaluated only within t
   `MARKER_SET` means the column is not NULL (a time the redaction set: checked relative, never as an exact
   value a later save may change), any other value its text; for `exports.status` any content-free state of the
   table (`EXPORT_CONTENT_FREE`). For `jobs.current_revision_id`, which the rebuild sets again, the column
-  instead names none of the revisions the manifest deletes (by id, or within the bound of an `all` selector).
+  instead names none of the revisions the manifest deletes (by id, or within the bound of an `all` selector
+  and not among its kept ids).
 - `file_remove`: no named file on the volume (`FileRoots`); a key that is no plain file name is a violation.
 - `fence`: no fence of the manifest is active (a final-state condition: the completing transaction releases
   the fences first, then checks, and rolls back on a violation); for a `source` fence, for the stored affected
@@ -81,7 +82,10 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.graphs.profile.threads import NUMBER
+from jobhunter.graphs.profile.threads import THREAD_PATTERN as PROFILE_THREAD_PATTERN
 from jobhunter.ids import uuid7
+from jobhunter.profile.storage import fsync_directory
 from jobhunter.types import JSONValue
 
 MANIFEST_FORMAT: Final = 1
@@ -253,14 +257,6 @@ _WRITE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os
 _READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _existing(path: Path) -> bytes | None:
     try:
         fd = os.open(path, _READ_FLAGS)
@@ -286,7 +282,7 @@ def write_manifest_file(directory: Path, content: ManifestContent) -> bytes:
     if existing is not None:
         if existing != data:
             raise ManifestConflict(f"manifest {manifest_uuid}: its file holds other bytes")
-        _fsync_directory(directory)  # its rename may not have reached the disk before a crash
+        fsync_directory(directory)  # its rename may not have reached the disk before a crash
         return digest
     tmp = directory / f"{name}.tmp"
     fd = os.open(tmp, _WRITE_FLAGS, _FILE_MODE)
@@ -300,7 +296,7 @@ def write_manifest_file(directory: Path, content: ManifestContent) -> bytes:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    _fsync_directory(directory)
+    fsync_directory(directory)
     return digest
 
 
@@ -449,17 +445,18 @@ class FileRoots:
 class ThreadForm:
     """A checkpoint thread name one writer gives (`runs.thread_id`, the score graph's and the profile graph's
     `thread_id`): its owner's table and a pattern, the same in Python's `re` and PostgreSQL's regular
-    expressions, whose first group is the owner's id."""
+    expressions, whose first group is the owner's id. A profile execution's form is its writer's own grammar
+    (`graphs.profile.threads.THREAD_PATTERN`, built from the writer's prefix map), so a new thread kind there
+    is a known form here; the run's and the cycle's have one shape each, pinned against their writers."""
 
     owner: str
     pattern: str
 
 
-_NUMBER: Final = "(?:0|[1-9][0-9]*)"
 THREAD_FORMS: Final = (
-    ThreadForm("runs", f"run-(0|[1-9][0-9]*)-a{_NUMBER}"),
-    ThreadForm("score_cycles", "cycle-(0|[1-9][0-9]*)"),
-    ThreadForm("operations", f"(?:profile-{_NUMBER}-[tp]|queries-{_NUMBER}-q)(0|[1-9][0-9]*)-a{_NUMBER}"),
+    ThreadForm("runs", f"run-({NUMBER})-a{NUMBER}"),
+    ThreadForm("score_cycles", f"cycle-({NUMBER})"),
+    ThreadForm("operations", PROFILE_THREAD_PATTERN),
 )
 # The `source:<id>` selector of each table it may name: an immutable property of the row (module docstring).
 _SOURCE_SELECTORS: Final[Mapping[str, str]] = MappingProxyType(
@@ -635,9 +632,20 @@ async def _row_delete(
     return [Violation(index, "row_delete", table, detail) for detail in found]
 
 
-def _deleted_revisions(content: ManifestContent) -> tuple[list[int], int | None] | str:
-    """The revisions the manifest deletes (ids, the bound of an `all` selector), or why they are unknown."""
+@dataclass(frozen=True)
+class _DeletedRevisions:
+    """The revisions a manifest deletes: `ids` by id, and with an `all` selector every one up to `bound`
+    except the `kept` ones."""
+
+    ids: list[int]
+    bound: int | None
+    kept: list[int]
+
+
+def _deleted_revisions(content: ManifestContent) -> _DeletedRevisions | str:
+    """The revisions the manifest deletes, or why they are unknown."""
     ids: set[int] = set()
+    kept: set[int] = set()
     bound: int | None = None
     for op in content["operations"]:
         if op["op"] != "row_delete" or op["table"] != "job_revisions":
@@ -649,7 +657,8 @@ def _deleted_revisions(content: ManifestContent) -> tuple[list[int], int | None]
             if "job_revisions" not in content["max_ids"]:
                 return "no max_ids bound for job_revisions"
             bound = content["max_ids"]["job_revisions"]
-    return sorted(ids), bound
+            kept.update(op.get("keep", []))
+    return _DeletedRevisions(sorted(ids), bound, sorted(kept))
 
 
 async def _field_redact(
@@ -668,11 +677,14 @@ async def _field_redact(
         deleted = _deleted_revisions(content)
         if isinstance(deleted, str):
             return [Violation(index, "field_redact", table, deleted)]
-        params["deleted_ids"], deleted_max = deleted
+        params["deleted_ids"] = deleted.ids
         names = ["coalesce(t.current_revision_id = ANY(CAST(:deleted_ids AS bigint[])), false)"]
-        if deleted_max is not None:
-            params["deleted_max"] = deleted_max
-            names.append("coalesce(t.current_revision_id <= :deleted_max, false)")
+        if deleted.bound is not None:
+            params["deleted_max"], params["kept_revisions"] = deleted.bound, deleted.kept
+            names.append(
+                "(coalesce(t.current_revision_id <= :deleted_max, false) "
+                "AND NOT coalesce(t.current_revision_id = ANY(CAST(:kept_revisions AS bigint[])), false))"
+            )
         conditions.append(f"NOT ({' OR '.join(names)})")
     for i, (column, value) in enumerate(sorted(op.get("marker", {}).items())):
         if (table, column) == ("exports", "status"):

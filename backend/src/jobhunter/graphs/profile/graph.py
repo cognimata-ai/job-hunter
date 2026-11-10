@@ -24,7 +24,8 @@ operation or attempt reaches a later one through an omitted key or a reducer (`s
 before a crash is found through the receipts in the database (§9.1), not through the thread.
 `thread_operation_id(thread)` reads the operation id back from a name `thread_id` wrote (`None` for any
 other name), and `THREAD_PREFIXES` are its prefixes: the `profile_checkpoints` retention rule deletes a
-thread by its own operation's end (Task 23, §20.1).
+thread by its own operation's end (Task 23, §20.1). The names live in `threads` (M5 Task 9: a deletion
+manifest's `thread` bound reads them without LangGraph), and this module re-exports them.
 
 **The policies** (§9.1). A node without an LLM call takes `DB_RETRY` and its `TimeoutPolicy` (`NODE_TIMEOUTS`:
 `parse` and `check_pdf` 120 s, `strip_contacts`, `validate` and `draft` 30 s; `add_node`). An LLM node
@@ -54,7 +55,6 @@ stripped. The stand-in of a retryable database error (`NodeFailed.retryable_db_e
 """
 
 import itertools
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -80,6 +80,10 @@ from jobhunter.graphs.profile.nodes import strip_contacts as strip_node
 from jobhunter.graphs.profile.nodes import validate as validate_node
 from jobhunter.graphs.profile.state import ProfileState as ProfileState
 from jobhunter.graphs.profile.state import ProposalState
+from jobhunter.graphs.profile.threads import THREAD_PREFIXES as THREAD_PREFIXES
+from jobhunter.graphs.profile.threads import ThreadKind as ThreadKind
+from jobhunter.graphs.profile.threads import thread_id as thread_id
+from jobhunter.graphs.profile.threads import thread_operation_id as thread_operation_id
 from jobhunter.graphs.sanitize import DB_RETRY
 from jobhunter.graphs.sanitize import sanitized as shared_sanitized
 from jobhunter.llm.errors import LLMError
@@ -88,7 +92,6 @@ from jobhunter.worker.operations import OperationContext
 
 type ProfileGraph = CompiledStateGraph[ProfileState, None, ProfileState, ProfileState]
 type ProposalGraph = CompiledStateGraph[ProposalState, None, ProposalState, ProposalState]
-type ThreadKind = Literal["t", "p", "q"]
 
 RECURSION_LIMIT: Final = 200  # §9.1
 # §9.1's `max_concurrency`: every profile graph is a chain, one node at a time.
@@ -110,20 +113,6 @@ LLM_NODE_TRACE: Final = TracePolicy(process_inputs=omit_payload, process_outputs
 # The errors whose text is a code (module docstring); `asyncio.CancelledError` is no `Exception` at all.
 PASS_THROUGH: Final = (FencedOut, GraphBubbleUp, LLMError, UploadRejected, TransitionConflict)
 
-_THREAD_PREFIX: Final[Mapping[ThreadKind, str]] = MappingProxyType(
-    {"t": "profile", "p": "profile", "q": "queries"}
-)
-THREAD_PREFIXES: Final = frozenset(_THREAD_PREFIX.values())
-# The names `thread_id` writes: `<prefix>-<subject_id>-<kind><operation_id>-a<attempts>`, one alternative per
-# prefix with its kinds; each number as `str(int)` writes it, the operation id the group `op`.
-_NUMBER: Final = "(?:0|[1-9][0-9]*)"
-_THREAD_NAME: Final = re.compile(
-    "|".join(
-        f"{re.escape(prefix)}-{_NUMBER}-[{''.join(k for k, p in _THREAD_PREFIX.items() if p == prefix)}]"
-        for prefix in sorted(THREAD_PREFIXES)
-    ).join(("(?:", f")(?P<op>{_NUMBER})-a{_NUMBER}"))
-)
-
 
 @dataclass(frozen=True)
 class ProfileGraphs:
@@ -132,18 +121,6 @@ class ProfileGraphs:
     text: ProfileGraph
     extract: ProfileGraph
     propose: ProposalGraph
-
-
-def thread_id(kind: ThreadKind, subject_id: int, operation_id: int, attempts: int) -> str:
-    """The checkpoint thread of one execution (module docstring): the subject is the draft (`t`, `p`) or the
-    proposal (`q`); `operation_id` and `attempts` are the claim's."""
-    return f"{_THREAD_PREFIX[kind]}-{subject_id}-{kind}{operation_id}-a{attempts}"
-
-
-def thread_operation_id(thread: str) -> int | None:
-    """The operation id in the name of a thread `thread_id` wrote; `None` for any other name."""
-    named = _THREAD_NAME.fullmatch(thread)
-    return None if named is None else int(named["op"])
 
 
 def invoke_config(kind: ThreadKind, subject_id: int, op: OperationContext) -> RunnableConfig:

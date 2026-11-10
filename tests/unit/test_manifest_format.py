@@ -13,10 +13,11 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, cast, get_args
 
 import pytest
 from jobhunter.db.sql import q
+from jobhunter.graphs.profile.graph import ThreadKind
 from jobhunter.graphs.profile.graph import thread_id as profile_thread_id
 from jobhunter.graphs.score.graph import thread_id as cycle_thread_id
 from jobhunter.ids import uuid7
@@ -253,12 +254,16 @@ def owner_ids(thread: str) -> list[tuple[str, int]]:
 
 def test_the_thread_forms_are_the_writers_own() -> None:
     """Each checkpoint thread a writer names is of exactly one form, whose first group is its owner's id (the
-    `thread` bound); a name of any other form matches none."""
+    `thread` bound); a name of any other form matches none. Every profile `ThreadKind` is covered, so a kind
+    the writer gains is either a known form or fails here."""
     assert owner_ids(run_thread_id(17, 2)) == [("runs", 17)]
     assert owner_ids(cycle_thread_id(905)) == [("score_cycles", 905)]
-    assert owner_ids(profile_thread_id("t", 31, 4410, 0)) == [("operations", 4410)]
-    assert owner_ids(profile_thread_id("p", 31, 12, 3)) == [("operations", 12)]
-    assert owner_ids(profile_thread_id("q", 8, 77, 1)) == [("operations", 77)]
+    kinds = get_args(ThreadKind.__value__)
+    assert "t" in kinds and "q" in kinds  # read from the alias itself, not a copy of it
+    for kind in kinds:
+        for subject, operation, attempts in ((31, 4410, 0), (1, 12, 3), (10**12, 2**62, 10)):
+            name = profile_thread_id(kind, subject, operation, attempts)
+            assert owner_ids(name) == [("operations", operation)], name
     for other in (
         "run-1",
         "run-01-a1",

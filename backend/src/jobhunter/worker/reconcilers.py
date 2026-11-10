@@ -74,7 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
-from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, resolve_alert
+from jobhunter.observability.alerts import open_subjects, raise_alert, refresh_alert_gauge, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.profile import parse_client
@@ -107,9 +107,6 @@ QUEUE_TABLE: Final = "procrastinate_jobs"
 _QUEUE_ROWS: Final = q(
     "SELECT CAST(greatest(reltuples, 0) AS bigint) FROM pg_class "
     "WHERE oid = to_regclass('procrastinate_jobs')"
-)
-_OPEN_SUBJECTS: Final = q(
-    "SELECT substr(dedup_key, length(code) + 2) FROM alerts WHERE code = :code AND resolved_at IS NULL"
 )
 
 log = get_logger("jobhunter.worker.reconcilers")
@@ -342,9 +339,9 @@ async def _table_growth(conn: AsyncConnection, sizes: Mapping[str, int], queue_r
     kept = {f"table:{table}" for table in over}
     if queue_rows is None:
         kept.add(f"table:{QUEUE_TABLE}")
-    for subject in (await conn.execute(_OPEN_SUBJECTS, {"code": TABLE_GROWTH_ALERT})).scalars().all():
+    for subject in await open_subjects(conn, code=TABLE_GROWTH_ALERT):
         if subject not in kept:
-            await resolve_alert(conn, code=TABLE_GROWTH_ALERT, subject=str(subject))
+            await resolve_alert(conn, code=TABLE_GROWTH_ALERT, subject=subject)
 
 
 async def _disk_pressure(conn: AsyncConnection, used: float) -> None:

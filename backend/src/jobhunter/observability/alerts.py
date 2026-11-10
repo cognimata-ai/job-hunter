@@ -20,10 +20,12 @@ the score lane's pause on an unacknowledged `llm.reservation_bound_violated` or 
 it too, so its next occurrence opens a new row that pauses the lane and is pushed again (M5 Task 2, O-ops O6).
 
 `resolve_quiet_alerts` (M3 Task 18) resolves the open alerts of a code whose last occurrence is older than
-a given time: the quiet period after which a condition counts as cleared. `ever_raised` tells whether an alert
+a given time: the quiet period after which a condition counts as cleared. `open_subjects` (M5 Task 9) lists
+the subjects of a code's open alerts, read back from their keys, for a check that resolves every open alert
+whose condition no longer holds. `ever_raised` tells whether an alert
 was raised for a subject at all, open or resolved: an alert raised at most once per subject.
 
-All eight functions run on the caller's connection and leave the transaction to the caller: an alert is
+All nine functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
@@ -82,6 +84,10 @@ _RESOLVE_QUIET = q(
     "RETURNING id"
 )
 _EVER_RAISED = q("SELECT EXISTS (SELECT 1 FROM alerts WHERE dedup_key = :dedup_key)")
+# Every key of one code is `<code>:<subject>` (`_dedup_key`), so the subject follows the code and its colon.
+_OPEN_SUBJECTS = q(
+    "SELECT substr(dedup_key, length(code) + 2) FROM alerts WHERE code = :code AND resolved_at IS NULL"
+)
 # The first acknowledgement's time is kept: a repeated one changes nothing. A code of `RESOLVE_ON_ACK`
 # (`:resolve_on_ack`) is resolved at the same time.
 _ACKNOWLEDGE = q(
@@ -176,6 +182,11 @@ async def resolve_quiet_alerts(conn: AsyncConnection, *, code: str, since: datet
     last raise, is older): an alert that auto-resolves after a quiet period (`scoring.stuck_target_repaired`
     after an hour without reclaims; M3 Task 18). The number resolved."""
     return len((await conn.execute(_RESOLVE_QUIET, {"code": code, "since": since})).all())
+
+
+async def open_subjects(conn: AsyncConnection, *, code: str) -> list[str]:
+    """The subjects of the open alerts of `code`, in no particular order."""
+    return [str(subject) for subject in (await conn.execute(_OPEN_SUBJECTS, {"code": code})).scalars()]
 
 
 async def ever_raised(conn: AsyncConnection, *, code: str, subject: str) -> bool:

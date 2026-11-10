@@ -24,7 +24,10 @@ stack ships with an on-demand shipper (D19), and the UI reports a deletion as do
 - none of its purge operations `pending`, `running` or `failed` (none at all, or each cancelled, say by a
   superseding purge): a new one, `create_operation(kind="purge", payload={"manifest_id": id},
   dedup_key="purge:<uuid>")` with its job deferred, which resumes from the stored affected set, and the alert
-  raised (reason `requeued`).
+  raised (reason `requeued`); but only while no unreleased `global` fence of another manifest stands (D5,
+  controller ruling T9-2): delete-everything cancels the purges it supersedes, and their manifests are
+  re-queued once its fence is released, when each finds nothing left and completes. The gate holds back the
+  re-queue and its alert only; a failed or stale purge is alerted on as above.
 
 The alert is resolved once its manifest leaves `executing`. Ids only: no alert, context or log line carries
 anything but ids and counts.
@@ -37,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition_where
-from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
+from jobhunter.observability.alerts import open_alert, open_subjects, raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.operations import PURGE_KIND, create_operation
@@ -61,16 +64,14 @@ _OVERDUE: Final = q(
     "SELECT id, manifest_uuid FROM deletion_manifests "
     "WHERE status = 'completed' AND completed_at < :cutoff ORDER BY id"
 )
-# Every key of one code shares the `<code>:` prefix, so the subject follows it.
-_OPEN_SUBJECTS: Final = q(
-    "SELECT substr(dedup_key, length(code) + 2) FROM alerts WHERE code = :code AND resolved_at IS NULL"
-)
-# Each executing manifest with its newest purge operation and whether any of them is pending, running or
-# failed; the operations of a manifest are its payload's.
+# Each executing manifest with its newest purge operation, whether any of them is pending, running or failed,
+# and whether another manifest's global fence stands (the D5 gate); a manifest's operations are its payload's.
 _EXECUTING: Final = q(
     "SELECT m.id, m.manifest_uuid, n.id AS operation_id, n.status, n.heartbeat_at, "
     "EXISTS (SELECT 1 FROM operations o WHERE o.kind = :kind AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
-    "AND o.status IN ('pending', 'running', 'failed')) AS blocks_requeue "
+    "AND o.status IN ('pending', 'running', 'failed')) AS blocks_requeue, "
+    "EXISTS (SELECT 1 FROM purge_fences f WHERE f.kind = 'global' AND f.released_at IS NULL "
+    "AND f.manifest_id <> m.id) AS under_global_fence "
     "FROM deletion_manifests m LEFT JOIN LATERAL (SELECT o.id, o.status, o.heartbeat_at FROM operations o "
     "WHERE o.kind = :kind AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
     "ORDER BY o.id DESC LIMIT 1) n ON true "
@@ -82,10 +83,6 @@ log = get_logger("jobhunter.privacy.reconcilers")
 
 def _manifest_subject(key: object) -> str:
     return f"manifest:{key}"
-
-
-async def _open_subjects(conn: AsyncConnection, code: str) -> list[str]:
-    return [str(subject) for subject in (await conn.execute(_OPEN_SUBJECTS, {"code": code})).scalars()]
 
 
 @reconciler("manifest_shipping", "tick")
@@ -118,7 +115,7 @@ async def manifest_shipping(ctx: ReconcileContext) -> int:
             )
             changed += opened is not None
         unshipped = {_manifest_subject(manifest.manifest_uuid) for manifest in overdue}
-        for subject in await _open_subjects(conn, MANIFEST_UNSHIPPED_ALERT):
+        for subject in await open_subjects(conn, code=MANIFEST_UNSHIPPED_ALERT):
             if subject not in unshipped:
                 changed += await resolve_alert(conn, code=MANIFEST_UNSHIPPED_ALERT, subject=subject)
     if shipped:
@@ -161,16 +158,19 @@ def _stuck_reason(manifest: Any, now: datetime) -> str | None:
 
 @reconciler("purge_fences", "heavy")
 async def purge_fences(ctx: ReconcileContext) -> int:
-    """Alert on the stuck purges of the executing manifests, re-queue the ones without an operation, and
-    resolve the alerts of the manifests that left `executing`, at `ctx.now` (module docstring); the
-    operations created and the alerts opened, raised or resolved."""
+    """Alert on the stuck purges of the executing manifests, re-queue the ones without an operation (unless
+    another manifest's global fence stands), and resolve the alerts of the manifests that left `executing`, at
+    `ctx.now` (module docstring); the operations created and the alerts opened, raised or resolved."""
     changed = 0
     async with ctx.engine.begin() as conn:
         await fence_epoch(conn, ctx.epoch)
         executing = (await conn.execute(_EXECUTING, {"kind": PURGE_KIND})).all()
         for manifest in executing:
             if not manifest.blocks_requeue:
-                changed += await _requeue(conn, ctx.defer, manifest)
+                if (
+                    not manifest.under_global_fence
+                ):  # D5: re-queued once delete-everything's fence is released
+                    changed += await _requeue(conn, ctx.defer, manifest)
                 continue
             reason = _stuck_reason(manifest, ctx.now)
             if reason is None:
@@ -189,7 +189,7 @@ async def purge_fences(ctx: ReconcileContext) -> int:
             )
             changed += opened is not None
         live = {_manifest_subject(manifest.id) for manifest in executing}
-        for subject in await _open_subjects(conn, PURGE_FAILED_ALERT):
+        for subject in await open_subjects(conn, code=PURGE_FAILED_ALERT):
             if subject not in live:
                 changed += await resolve_alert(conn, code=PURGE_FAILED_ALERT, subject=subject)
     return changed

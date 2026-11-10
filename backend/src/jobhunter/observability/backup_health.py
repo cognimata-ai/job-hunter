@@ -50,7 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
-from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
+from jobhunter.observability.alerts import open_alert, open_subjects, raise_alert, resolve_alert
 from jobhunter.observability.catalogue import CATALOGUE, Severity
 from jobhunter.observability.metrics import BACKUP_AGE
 from jobhunter.wire import UtcDatetime
@@ -102,10 +102,6 @@ _FAILED_RESTORE_TESTS: Final = q(
     "SELECT id FROM backup_runs WHERE kind = 'restore_test' AND status = 'failed' "
     "AND id > coalesce((SELECT max(id) FROM backup_runs "
     "WHERE kind = 'restore_test' AND status = 'succeeded'), 0) ORDER BY id"
-)
-# Every key of one code shares the `<code>:` prefix, so the subject follows it.
-_OPEN_SUBJECTS: Final = q(
-    "SELECT substr(dedup_key, length(code) + 2) FROM alerts WHERE code = :code AND resolved_at IS NULL"
 )
 
 
@@ -267,9 +263,9 @@ async def _judge_failures(conn: AsyncConnection) -> int:
             )
             changed += opened is not None
         kept = {f"{failure.prefix}:{row_id}" for row_id in failing}
-        for subject in (await conn.execute(_OPEN_SUBJECTS, {"code": failure.code})).scalars().all():
+        for subject in await open_subjects(conn, code=failure.code):
             if subject not in kept:
-                changed += await resolve_alert(conn, code=failure.code, subject=str(subject))
+                changed += await resolve_alert(conn, code=failure.code, subject=subject)
     return changed
 
 

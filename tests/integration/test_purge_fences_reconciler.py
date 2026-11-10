@@ -224,6 +224,54 @@ async def test_an_executing_manifest_without_an_operation_is_requeued(
     assert len(await purges(engine)) == 2
 
 
+async def test_no_requeue_while_another_manifests_global_fence_stands(
+    engine: AsyncEngine, current_epoch: int, queue_app: Any
+) -> None:
+    """T9-2 (D5): delete-everything cancels the purges it supersedes; their manifests are re-queued, and
+    alerted on, only once its global fence is released. The gate holds back nothing else: delete-everything's
+    own manifest is re-queued under its own fence, and a failed purge is alerted on at once."""
+    superseded = await fenced_manifest(engine)
+    cancelled = await purge_operation(engine, superseded)
+    async with engine.begin() as conn:
+        assert await cancel_operation(conn, cancelled, reason="superseded")
+        everything = await insert_manifest(conn, kind="delete_everything", request={}, now=utcnow())
+        await insert_fence(conn, manifest_id=everything.id, spec=FenceSpec(kind="global"))
+    stuck = await fenced_manifest(engine)
+    stuck_operation = await failed(engine, stuck)
+    now = utcnow()
+
+    assert await reconcile(engine, now) == 3  # delete-everything's operation and its alert, the failed one's
+    [first, failed_one, own] = await purges(engine)
+    assert (first.id, first.status, failed_one.id, failed_one.status) == (
+        cancelled,
+        "cancelled",
+        stuck_operation,
+        "failed",
+    )
+    assert (own.status, own.payload) == ("pending", {"manifest_id": everything.id})
+    assert {a.dedup_key: a.context["reason"] for a in await failed_alerts(engine)} == {
+        f"{PURGE_FAILED_ALERT}:manifest:{everything.id}": "requeued",
+        f"{PURGE_FAILED_ALERT}:manifest:{stuck.id}": "failed",
+    }
+
+    # Delete-everything's fence released: the superseded manifest is re-queued at the next pass.
+    async with engine.begin() as conn:
+        assert await release_fences(conn, everything.id) == 1
+    assert await reconcile(engine, now + timedelta(minutes=10)) == 2
+    [*_, requeued] = await purges(engine)
+    assert (requeued.status, requeued.payload, requeued.dedup_key) == (
+        "pending",
+        {"manifest_id": superseded.id},
+        f"purge:{superseded.manifest_uuid}",
+    )
+    alerts = {a.dedup_key: a.context for a in await failed_alerts(engine)}
+    assert alerts[f"{PURGE_FAILED_ALERT}:manifest:{superseded.id}"] == {
+        "manifest_id": superseded.id,
+        "operation_id": requeued.id,
+        "reason": "requeued",
+    }
+
+
 async def test_retention_keeps_purge_operations_of_executing_manifests(
     engine: AsyncEngine,
     current_epoch: int,
@@ -251,4 +299,6 @@ async def test_retention_keeps_purge_operations_of_executing_manifests(
         )
     assert report["operations"] == 2
     assert [(p.id, p.status) for p in await purges(engine)] == [(kept, "failed")]
-    assert gone != kept
+    async with engine.connect() as conn:
+        left = (await conn.execute(sa.text("SELECT id FROM operations ORDER BY id"))).scalars().all()
+    assert gone not in left and other not in left and left == [kept]

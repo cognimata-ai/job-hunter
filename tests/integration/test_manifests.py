@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
+import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
@@ -47,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.m2 import insert_llm_call, insert_profile_chain
 from tests.support.m3 import Job, insert_golden_case, insert_id, insert_job, insert_published
+from tests.support.pg import PgServer
 
 pytestmark = pytest.mark.integration
 
@@ -55,7 +57,7 @@ _MANIFEST: Final = sa.text(
     "FROM deletion_manifests WHERE id = :i"
 )
 _FENCES: Final = sa.text(
-    "SELECT manifest_id, kind, job_ids, released_at FROM purge_fences WHERE manifest_id = :m ORDER BY id"
+    "SELECT manifest_id, kind, job_ids, released_at, id FROM purge_fences WHERE manifest_id = :m ORDER BY id"
 )
 
 
@@ -257,8 +259,11 @@ async def test_record_appends_the_affected_jobs_to_the_source_fence(
     async with engine.connect() as conn:
         fences = (await conn.execute(_FENCES, {"m": manifest.id})).all()
         others = (await conn.execute(_FENCES, {"m": other.id})).all()
-    assert [(f.kind, f.job_ids, f.released_at) for f in fences] == [("source", [3, 5, 7, 9], None)]
-    assert [(f.kind, f.job_ids) for f in others] == [("jobs", [3])]
+    # `insert_fence` returned each fence's own id; the record changed the source fence only.
+    assert [(f.id, f.kind, f.job_ids, f.released_at) for f in fences] == [
+        (fence, "source", [3, 5, 7, 9], None)
+    ]
+    assert [(f.id, f.kind, f.job_ids) for f in others] == [(other_fence, "jobs", [3])]
 
     async with engine.begin() as conn:
         assert await release_fences(conn, manifest.id) == 1
@@ -266,8 +271,8 @@ async def test_record_appends_the_affected_jobs_to_the_source_fence(
     async with engine.connect() as conn:
         released = (await conn.execute(_FENCES, {"m": manifest.id})).one()
         still = (await conn.execute(_FENCES, {"m": other.id})).one()
+    assert (released.id, still.id) == (fence, other_fence)
     assert released.released_at is not None and still.released_at is None
-    assert fence != other_fence
 
 
 # --- the postconditions (§19.5's column), each violated, then satisfied ------------------------------------
@@ -488,6 +493,49 @@ async def test_a_manifest_that_deletes_calls_checks_their_ledger_entries(
     assert await checked(engine, content, files) == set()
 
 
+async def test_a_kept_revision_is_none_the_manifest_deletes(engine: AsyncEngine, files: FileRoots) -> None:
+    """A `job_revisions` delete by the `all` selector keeps the revisions it lists: a job whose pointer names
+    a kept one is no violation of the `jobs.current_revision_id` redaction; one naming a deleted one is."""
+    manifest = await a_manifest(engine, "job_tombstone")
+    async with engine.begin() as conn:
+        kept, other = await insert_job(conn), await insert_job(conn)
+    content = content_of(
+        manifest,
+        [
+            {
+                "op": "row_delete",
+                "table": "job_revisions",
+                "selector": "all",
+                "keep": [kept.revision_id],
+                "bound": {"by": "id"},
+            },
+            {
+                "op": "field_redact",
+                "table": "jobs",
+                "ids": [kept.job_id, other.job_id],
+                "columns": ["current_revision_id"],
+            },
+        ],
+        max_ids={"job_revisions": max(kept.revision_id, other.revision_id)},
+    )
+    async with engine.connect() as conn:
+        violations = await check_postconditions(conn, content, files=files)
+    assert [(v.op_index, v.op, v.table, v.detail) for v in violations] == [
+        (0, "row_delete", "job_revisions", "1 row within the bound remains"),
+        (1, "field_redact", "jobs", "1 row not redacted"),  # the other job's pointer only
+    ]
+
+    # The other job rebuilt on a revision above the bound, its old one deleted.
+    async with engine.begin() as conn:
+        rebuilt = await a_revision(conn, other.job_id, 2)
+        await conn.execute(
+            sa.text("UPDATE jobs SET current_revision_id = :r WHERE id = :j"),
+            {"r": rebuilt, "j": other.job_id},
+        )
+        await conn.execute(sa.text("DELETE FROM job_revisions WHERE id = :r"), {"r": other.revision_id})
+    assert await checked(engine, content, files) == set()
+
+
 # --- the `fence` postcondition of a source purge: bounded to the affected jobs and the watermark -----------
 
 _INSTANCE: Final = q("SELECT id FROM source_instances WHERE source_id = :s AND instance_key = 'default'")
@@ -635,3 +683,29 @@ async def test_quiesce_waits_for_an_older_app_transaction_and_times_out(engine: 
         await wait_for_quiesce(engine, since=await fence_committed_at(engine), clock=utcnow, sleep=never)
         is True
     )
+
+
+async def test_quiesce_ignores_a_transaction_in_another_database(
+    engine: AsyncEngine, migrated: PgServer
+) -> None:
+    """T9-1: a transaction of the application role in another database of the server cannot touch this one's
+    rows, so the wait does not wait for it, however old."""
+    async with await psycopg.AsyncConnection.connect(migrated.dsn("app", "postgres")) as elsewhere:
+        await elsewhere.execute("SELECT 1")  # its transaction began before the fence committed
+        assert elsewhere.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        since = await fence_committed_at(engine)
+        async with engine.connect() as conn:
+            older = await conn.execute(
+                sa.text(
+                    "SELECT datname FROM pg_stat_activity WHERE usename = 'jobhunter_app' "
+                    "AND pid <> pg_backend_pid() AND xact_start < :since"
+                ),
+                {"since": since},
+            )
+            assert "postgres" in older.scalars().all()  # visible to the poll: only its database excludes it
+
+        async def never(seconds: float) -> None:
+            raise AssertionError("a transaction in another database held the wait")
+
+        assert await wait_for_quiesce(engine, since=since, clock=utcnow, sleep=never) is True
+        await elsewhere.rollback()
