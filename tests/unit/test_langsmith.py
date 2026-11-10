@@ -16,6 +16,7 @@ from typing import Any, Final
 import pytest
 import requests
 from jobhunter.config import LANGSMITH_EU_ENDPOINT, AppConfig, load_config
+from jobhunter.errors import NodeFailed
 from jobhunter.observability.langsmith import (
     METADATA_ALLOWLIST,
     TracingState,
@@ -24,6 +25,7 @@ from jobhunter.observability.langsmith import (
     install_tracing,
     make_client,
 )
+from langchain_core.tracers.core import _TracerCore
 from langsmith import Client, run_trees
 from requests.adapters import BaseAdapter
 
@@ -191,13 +193,24 @@ def test_usage_metadata_keeps_token_counts_only(client: Any) -> None:
             "NodeFailed:RateLimitError",
             id="repr_then_traceback",
         ),
+        # Ruling T6-5: a `NodeFailed` repr gives its code only in exactly the form `NodeFailed` makes
         pytest.param(
-            # langchain-core's form (`_get_stacktrace`): the repr, then the traceback on the same line; the
-            # real `NodeFailed` repr names its class and its message only, so no code
-            "NodeFailed('node generate failed: RateLimitError')Traceback (most recent call last):\n"
-            f"  {CONTENT}",
+            "NodeFailed('node generate failed: RateLimitError extra words')",
             "NodeFailed:unknown",
-            id="langchain_core_form",
+            id="node_failed_extra_words",
+        ),
+        pytest.param(
+            "NodeFailed('node generate failed: RateLimitError') and more",
+            "NodeFailed:unknown",
+            id="node_failed_text_after",
+        ),
+        pytest.param(
+            'NodeFailed("node generate failed: RateLimitError")',
+            "NodeFailed:unknown",
+            id="node_failed_quotes",
+        ),
+        pytest.param(
+            "ValueError('node x failed: Secret')", "ValueError:unknown", id="fixed_form_other_class"
         ),
         pytest.param("Authorization: Bearer x", "Unknown:unknown", id="header"),
         pytest.param(
@@ -235,6 +248,29 @@ def test_the_error_string_becomes_class_and_code(client: Any, error: str, tag: s
     assert client._hide_run_error(error) == tag
     assert anonymize({"error": error}) == {"error": tag}
     assert "Bearer" not in tag and CONTENT not in tag
+
+
+def test_a_node_failure_gives_the_class_of_its_message_as_its_code(client: Any) -> None:
+    """Ruling T6-5: the real `NodeFailed`'s repr, `NodeFailed('node <node> failed: <ErrorClass>')`, built from
+    the class itself, so a change of its message breaks this test. The message holds a class name only
+    (`graphs.sanitize`)."""
+    error = f"{NodeFailed('generate', 'RateLimitError')!r}\nTraceback (most recent call last):\n  {CONTENT}"
+    assert error_tag(error) == "NodeFailed:RateLimitError"
+    assert anonymize({"error": error}) == {"error": "NodeFailed:RateLimitError"}
+    assert client._hide_run_error(error) == "NodeFailed:RateLimitError"
+
+
+def test_a_node_failure_as_langchain_core_traces_it_gives_its_code(client: Any) -> None:
+    """langchain-core's own error string (`_get_stacktrace`): the repr, then the formatted traceback with no
+    line break before its `Traceback (most recent call last):` header."""
+    with pytest.raises(NodeFailed) as caught:
+        raise NodeFailed("generate", "RateLimitError")
+    error = _TracerCore._get_stacktrace(caught.value)
+    assert error.startswith(
+        "NodeFailed('node generate failed: RateLimitError')Traceback (most recent call last):"
+    )
+    assert error_tag(error) == "NodeFailed:RateLimitError"
+    assert client._hide_run_error(error) == "NodeFailed:RateLimitError"
 
 
 def test_an_error_that_is_no_string_keeps_nothing(client: Any) -> None:

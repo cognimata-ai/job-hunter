@@ -32,6 +32,12 @@ at once (`Unknown` otherwise); the code is the first `code=`, `error_code=` or `
 string's first line (the `repr`), its quotes stripped, when it is an identifier of at most 64 characters
 (`unknown` otherwise). A value runs to the next `,` or `)` unless it is quoted, so nothing of a value that is
 no identifier survives: `error_class='Bearer x'` gives `unknown`, and `Authorization: Bearer x` names neither.
+When no keyword is found, a `NodeFailed` gives the code of its fixed message (Ruling T6-5): its repr is
+`NodeFailed('node <node> failed: <ErrorClass>')`, where `graphs.sanitize` puts the failed error's class name
+(no content), and when the repr is exactly that, both names identifiers of at most 64 characters, the code is
+`<ErrorClass>`. langchain-core appends the formatted traceback to the repr without a line break, so the
+traceback's fixed `Traceback (most recent call last):` header is taken off the first line's end before the
+repr is matched; any other text, quoting or class gives `unknown`, as before.
 
 **The tracing state** (`install_tracing`, `publish_tracing_state`): the worker installs the client
 process-wide (`run_trees.configure`, with tracing enabled) at step 7 of its start, before it compiles any
@@ -79,6 +85,13 @@ _CODE_VALUE: Final = re.compile(
     r"(\"[^\"]*\"(?=\s*(?:[,)]|$))|'[^']*'(?=\s*(?:[,)]|$))|[^,)]*)",
     re.ASCII,
 )
+# Ruling T6-5: the repr of `errors.NodeFailed(node, error_class)`, whose message is `node <node> failed:
+# <error_class>`; and the header of the traceback langchain-core appends to a repr (`_get_stacktrace`).
+_NODE_FAILED_CLASS: Final = "NodeFailed"
+_NODE_FAILED_REPR: Final = re.compile(
+    r"NodeFailed\('node [A-Za-z_][A-Za-z0-9_]{0,63} failed: ([A-Za-z_][A-Za-z0-9_]{0,63})'\)"
+)
+_TRACEBACK_HEADER: Final = "Traceback (most recent call last):"
 _DETAILS_SUFFIX: Final = "_token_details"
 _PUBLISH: Final = q("UPDATE worker_heartbeat SET tracing = :tracing WHERE id = 1", jsonb=["tracing"])
 
@@ -102,12 +115,25 @@ def _unquoted(value: str) -> str:
 
 
 def error_tag(error: str) -> str:
-    """`"<ErrorClass>:<code>"` of a run's error string; nothing else of it survives (module docstring)."""
+    """`"<ErrorClass>:<code>"` of a run's error string; nothing else of it survives (module docstring).
+
+    The code comes from the first line, the repr: the value of its first `code=`, `error_code=` or
+    `error_class=` keyword; or, with no such keyword, for a `NodeFailed`, the error class its fixed message
+    names (Ruling T6-5); else it is `unknown`.
+    """
     leading = _LEADING_CLASS.match(error)
     name = leading.group(1).rpartition(".")[2] if leading else ""
     error_class = name if _IDENTIFIER.fullmatch(name) else UNKNOWN_CLASS
-    found = _CODE_VALUE.search(error.partition("\n")[0])
-    value = _unquoted(found.group(1)) if found else ""
+    first_line = error.partition("\n")[0]
+    found = _CODE_VALUE.search(first_line)
+    if found:
+        value = _unquoted(found.group(1))
+    elif error_class == _NODE_FAILED_CLASS and (
+        node_failed := _NODE_FAILED_REPR.fullmatch(first_line.removesuffix(_TRACEBACK_HEADER))
+    ):
+        value = node_failed.group(1)
+    else:
+        value = ""
     code = value if _CODE.fullmatch(value) else UNKNOWN_CODE
     return f"{error_class}:{code}"
 
