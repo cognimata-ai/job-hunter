@@ -28,6 +28,10 @@ A login runs in phases, so that what it writes persists whatever the answer is (
 A TOTP secret that no configured data key opens (a misconfiguration) fails the login like a wrong code and
 raises the critical alert `auth.totp_key_mismatch` (subject `totp`), for a right and a wrong password alike.
 
+The checks the re-authentication of the privacy routes shares with the login live in `auth.credentials`
+(M5 Task 18, Ruling T18-3): the lockout pre-check, the TOTP secret's read, the success check of phase 2 and
+the alert above.
+
 A successful login replaces the session whose cookie the request carried (rotation, §16.4): that session is
 deleted in the transaction that creates the new one.
 
@@ -60,12 +64,17 @@ from jobhunter.api.openapi import (
     SESSION_RESPONSES,
 )
 from jobhunter.auth import sessions, throttle, totp, users
+from jobhunter.auth.credentials import (
+    credentials_hold,
+    lockout_in_force,
+    raise_totp_key_alert,
+    read_totp_secret,
+)
 from jobhunter.auth.passwords import check_password, dummy_verify, hash_password
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.crypto import DecryptError, data_keys
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.crypto import data_keys
 from jobhunter.observability.logging import get_logger
 
 # Where a request without a usable client address is counted: one shared bucket, so such clients cannot
@@ -75,7 +84,6 @@ INVALID_CREDENTIALS: Final = "Invalid credentials"
 TOTP_REQUIRED: Final = "TOTP code required"
 # What a login refused by the full Argon2 gate is told to wait: a slot frees within one verification or two.
 BUSY_RETRY_AFTER_S: Final = 1
-TOTP_KEY_ALERT_CODE: Final = "auth.totp_key_mismatch"
 
 router = APIRouter(prefix="/api/auth")
 log = get_logger("jobhunter.auth")
@@ -150,7 +158,8 @@ async def decide_login(
     2. a lockout in force → `Locked`, whatever the credentials (nothing is recorded);
     3. a success also needs the user row unchanged (`users.confirm_unchanged`: the hash, the TOTP state and
        the sealed secret) and, with TOTP, a step later than the last one used (`users.claim_totp_step`,
-       ruling T16-a): otherwise it counts as a failure;
+       ruling T16-a): otherwise it counts as a failure (`auth.credentials.credentials_hold`, which the
+       re-authentication of the privacy routes decides with too);
     4. `record_attempt`, which may lock out and raise `auth.lockout`; a failure → `Rejected`;
     5. a success stores the rehash (only over the verified hash), deletes the session of `previous_token`
        (rotation) and creates a new one → `Accepted`.
@@ -159,16 +168,12 @@ async def decide_login(
     retry_after = await throttle.active_lockout(conn, ip, now=now)
     if retry_after is not None:
         return Locked(retry_after)
-    success = (
-        credentials_ok
-        and verified_hash is not None
-        and await users.confirm_unchanged(
-            conn,
-            expected_hash=verified_hash,
-            totp_enabled=totp_step is not None,
-            totp_secret_enc=verified_totp_secret_enc,
-        )
-        and (totp_step is None or await users.claim_totp_step(conn, totp_step))
+    success = await credentials_hold(
+        conn,
+        credentials_ok=credentials_ok,
+        verified_hash=verified_hash,
+        totp_step=totp_step,
+        totp_secret_enc=verified_totp_secret_enc,
     )
     await throttle.record_attempt(conn, ip=ip, username_hmac=username_hmac, success=success, now=now)
     if not success:
@@ -216,13 +221,7 @@ async def _verify_credentials(
     if user is None:
         await gate.run(dummy_verify, body.password)
         return _Verified(ok=False)
-    secret, key_mismatch = None, False
-    if user.totp_enabled:
-        try:
-            secret = users.totp_secret(user, keys=data_keys(cfg))
-        except DecryptError as exc:
-            log.error("totp_secret_unreadable", error_class=type(exc).__name__)
-            key_mismatch = True
+    secret, key_mismatch = read_totp_secret(user, keys=data_keys(cfg))
     ok, needs_rehash = await gate.run(check_password, user.password_hash, body.password)
     if not ok or key_mismatch:
         return _Verified(ok=False, totp_key_mismatch=key_mismatch)
@@ -272,8 +271,7 @@ def _locked(ip: str, retry_after: timedelta) -> Problem:
 
 async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) -> None:
     """The read-only lockout pre-check: raise the 429 of a lockout in force (nothing is recorded)."""
-    async with engine.connect() as conn:  # read-only, rolled back when the block ends
-        retry_after = await throttle.peek_lockout(conn, ip, now=now)
+    retry_after = await lockout_in_force(engine, ip, now=now)
     if retry_after is not None:
         raise _locked(ip, retry_after)
 
@@ -346,13 +344,7 @@ async def login(
             previous_token=request.cookies.get(sessions.SESSION_COOKIE),
         )
         if verified.totp_key_mismatch:  # after the throttle lock, the first statement (ruling T16-c)
-            await raise_alert(
-                conn,
-                code=TOTP_KEY_ALERT_CODE,
-                severity="critical",
-                subject="totp",
-                message="the TOTP secret does not open with the configured data keys",
-            )
+            await raise_totp_key_alert(conn)
     # Committed: the attempt, any lockout and alert, the rehash and the session persist from here on.
     match outcome:
         case Locked(retry_after=retry_after):

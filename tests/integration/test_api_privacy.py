@@ -22,6 +22,7 @@ container's shipper writes them. Nothing sleeps: the export's expiry is a retent
 Every datum is invented.
 """
 
+import asyncio
 import copy
 import io
 import logging
@@ -37,6 +38,7 @@ from jobhunter import crypto
 from jobhunter.api.app import JobHunterApp, create_app
 from jobhunter.api.pagination import GOLDEN_CASES_SORT, cursor_key, encode_list_cursor
 from jobhunter.api.routes import privacy as privacy_routes
+from jobhunter.auth import sessions
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.transitions import transition
@@ -48,6 +50,7 @@ from jobhunter.worker.operations import claim_operation, finish_operation
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx, task_app
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.types import Message
 
 from tests.support.fixtures import TEST_PASSWORD, TEST_USERNAME, ConfigFactory
 from tests.support.logs import logged
@@ -359,6 +362,95 @@ async def test_a_started_download_completes_after_its_file_is_unlinked(
     assert set(EXPORT_FILES) <= set(zipfile.ZipFile(io.BytesIO(r.content)).namelist())
 
 
+def segment_offsets(data: bytes) -> list[int]:
+    """Where each segment's frame of a stored archive starts: a 4-byte big-endian length, then the blob."""
+    offsets, offset = [], 0
+    while offset < len(data):
+        offsets.append(offset)
+        offset += 4 + int.from_bytes(data[offset : offset + 4], "big")
+    return offsets
+
+
+async def raw_get(app: JobHunterApp, client: httpx.AsyncClient, path: str, query: bytes) -> list[Message]:
+    """A GET of `client`'s session to `app`, driven with raw ASGI messages (an in-process client cannot
+    return a response its app never ended); what the app sent."""
+    token = client.cookies.get(sessions.SESSION_COOKIE)
+    assert token is not None
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": query,
+        "headers": [(b"cookie", f"{sessions.SESSION_COOKIE}={token}".encode())],
+        "client": ("198.51.100.20", 50000),
+        "server": ("testserver", 443),
+    }
+    sent: list[Message] = []
+    requested = asyncio.Event()
+    never = asyncio.Event()  # the client stays: no disconnect
+
+    async def receive() -> Message:
+        if requested.is_set():
+            await never.wait()
+        requested.set()
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await asyncio.wait_for(app(scope, receive, send), 60)
+    return sent
+
+
+async def test_a_damaged_segment_aborts_a_started_download_without_its_bytes(
+    logged_in_client: httpx.AsyncClient,
+    api_app: JobHunterApp,
+    engine: AsyncEngine,
+    exports_configured: Purger,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A segment that does not open (here the third, one byte of its sealed blob flipped) is met once the
+    response has started: the stream stops before it, so the client gets the segments before it and none of
+    its bytes, short of `Content-Length`; the failure is logged with the export's id and the error's class
+    only, and nothing of a traceback or of the error's text reaches the body (Ruling T18-3, M4)."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(export, "SEGMENT_BYTES", 512)
+    export_id, row = await ready_export(logged_in_client, engine, exports_configured)
+    archive = exports_configured.cfg.exports_dir / row.storage_path
+    keys = crypto.data_keys(exports_configured.cfg)
+    with archive.open("rb") as stored:
+        segments = list(iter_decrypted(stored, keys, export_id=export_id))
+    assert len(segments) > 4
+    data = bytearray(archive.read_bytes())
+    third = segment_offsets(bytes(data))[2]
+    data[third + 4 + 20] ^= 0xFF  # inside the third segment's blob: its tag no longer matches
+    archive.write_bytes(bytes(data))
+    sent = await raw_get(api_app, logged_in_client, f"/api/privacy/exports/{export_id}", b"download=1")
+    start, *body = sent
+    assert (start["type"], start["status"]) == ("http.response.start", 200)  # the first segment opened
+    assert dict(start["headers"])[b"content-length"] == str(row.size_bytes).encode()
+    assert all(m["type"] == "http.response.body" and m.get("more_body") for m in body)  # never ended
+    received = b"".join(m["body"] for m in body)
+    assert received == b"".join(segments[:2])  # not one byte of the damaged segment or after it
+    for leaked in (b"Traceback", b"ExportCorrupt", b"does not open"):
+        assert leaked not in received
+    [aborted] = logged(caplog, "unhandled_exception_after_start")  # the edge's: the class only
+    assert aborted["error_class"] == "ExportCorrupt"
+    [failed] = logged(caplog, "export_download_failed")
+    assert (failed["export_id"], failed["error_class"], failed["level"]) == (
+        export_id,
+        "ExportCorrupt",
+        "error",
+    )
+    assert set(failed) <= {"event", "export_id", "error_class", "level", "logger", "ts", "request_id"}
+
+
 # ---- delete everything and the source purge ---------------------------------------------------------------
 
 
@@ -590,6 +682,41 @@ async def test_needs_attention_lists_failed_purges(
         },
     ]
     assert all(item["created_at"] for item in section["items"])
+
+
+async def test_every_privacy_write_refuses_a_missing_or_wrong_csrf_check(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """A logged-in session's write without `X-JH-Request: 1`, with another value, or from another origin is
+    403 `csrf_failed` at the edge, before its route: the export, delete everything, the source purge, the
+    purge retry and the golden-case deletion, each with what would otherwise pass (Ruling T18-3, M4)."""
+    case_id = await golden_case(engine)
+    before = await counts(engine)
+    writes: list[tuple[str, str, dict[str, Any] | None]] = [
+        ("POST", EXPORT, None),
+        ("POST", DELETE_EVERYTHING, delete_everything_body()),
+        ("POST", PURGE_SOURCE, purge_source_body()),
+        ("POST", "/api/system/purges/1/retry", None),
+        ("DELETE", f"/api/golden-cases/{case_id}", None),
+    ]
+    refusals: list[dict[str, str] | None] = [
+        None,  # the header left out
+        {"X-JH-Request": "0"},
+        {"Origin": "https://evil.example"},
+    ]
+    for method, path, body in writes:
+        for override in refusals:
+            request = logged_in_client.build_request(
+                method, path, json=body, headers={**idem(fresh_key("csrf")), **(override or {})}
+            )
+            if override is None:
+                del request.headers["X-JH-Request"]
+            r = await logged_in_client.send(request)
+            assert code_of(r) == (403, "csrf_failed"), (method, path, override, r.text)
+    assert await counts(engine) == before
+    async with engine.connect() as conn:
+        assert (await conn.execute(_CASE_EXISTS, {"g": case_id})).scalar_one() is True
+        assert (await conn.execute(sa.text("SELECT count(*) FROM deletion_manifests"))).scalar_one() == 0
 
 
 async def test_the_privacy_routes_need_a_session_and_the_writes_csrf(api_client: httpx.AsyncClient) -> None:

@@ -6,18 +6,19 @@ The request carries the password and, with TOTP on, a code; the session says who
 user), so no username is sent. It runs as the login runs its own (`api.routes.auth`), in phases, so what it
 records persists whatever the request does next:
 
-0. a read-only lockout pre-check (`throttle.peek_lockout`): an address locked out gets the login's 429
-   `throttled` (`auth.lockout_problem`) before any Argon2 work;
+0. a read-only lockout pre-check (`auth.credentials.lockout_in_force`): an address locked out gets the
+   login's 429 `throttled` (`auth.lockout_problem`) before any Argon2 work;
 1. holding a slot of the process's Argon2 gate (a full gate is 429 `throttled` with `Retry-After: 1`, before
    any Argon2 work; the pre-check is repeated once the slot is held), without a transaction: the user read on
-   a connection returned before the hash, the TOTP secret decrypted (a secret no configured data key opens
-   fails it and raises `auth.totp_key_mismatch`, as at the login), one Argon2 verification of the password
+   a connection returned before the hash, the TOTP secret decrypted (`auth.credentials.read_totp_secret`: a
+   secret no configured data key opens fails it and raises `auth.totp_key_mismatch`, as at the login,
+   `raise_totp_key_alert`), one Argon2 verification of the password
    (`check_password`; `dummy_verify` without a user), then the code, which must match a step of the window
    (`totp.matched_step`). No rehash: it is no login;
 2. one transaction of its own, committed before the answer: `throttle.serialize` first, then the lockout
-   again under it (`active_lockout`, which decides: 429), then, for verified credentials, the user row as the
-   verification saw it (`users.confirm_unchanged`) and the code's step claimed (`users.claim_totp_step`: a
-   step at or before the last one used fails, RFC 6238 §5.2). A failure records one failed attempt
+   again under it (`active_lockout`, which decides: 429), then the login's own success check
+   (`auth.credentials.credentials_hold`: the user row as the verification saw it, then the code's step
+   claimed; a step at or before the last one used fails, RFC 6238 §5.2). A failure records one failed attempt
    (`throttle.record_attempt(success=False)`, the HMAC of the user's name), which may lock the address out
    (five within 15 min) or everyone (`auth.lockout`), and answers 403 `reauth_failed`; a success records no
    attempt (only the step it used).
@@ -34,17 +35,17 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
 from jobhunter.api.errors import Problem
-from jobhunter.api.routes.auth import (
-    BUSY_RETRY_AFTER_S,
-    TOTP_KEY_ALERT_CODE,
-    lockout_problem,
-    throttled_problem,
-)
+from jobhunter.api.routes.auth import BUSY_RETRY_AFTER_S, lockout_problem, throttled_problem
 from jobhunter.auth import throttle, totp, users
+from jobhunter.auth.credentials import (
+    credentials_hold,
+    lockout_in_force,
+    raise_totp_key_alert,
+    read_totp_secret,
+)
 from jobhunter.auth.passwords import check_password, dummy_verify
 from jobhunter.config import AppConfig
-from jobhunter.crypto import DecryptError, data_keys
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.crypto import data_keys
 from jobhunter.observability.logging import get_logger
 
 REAUTH_FAILED: Final = "Re-authentication failed"
@@ -70,8 +71,7 @@ def _failed(ip: str) -> Problem:
 
 async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) -> None:
     """Phase 0: the 429 of a lockout in force, read-only (nothing is recorded)."""
-    async with engine.connect() as conn:  # read-only, rolled back when the block ends
-        retry_after = await throttle.peek_lockout(conn, ip, now=now)
+    retry_after = await lockout_in_force(engine, ip, now=now)
     if retry_after is not None:
         log.warning("reauth", outcome="locked", ip=ip)
         raise lockout_problem(retry_after)
@@ -92,13 +92,7 @@ async def _verify(
     if user is None:
         await gate.run(dummy_verify, password)
         return _Verified(ok=False)
-    secret, key_mismatch = None, False
-    if user.totp_enabled:
-        try:
-            secret = users.totp_secret(user, keys=data_keys(cfg))
-        except DecryptError as exc:
-            log.error("totp_secret_unreadable", error_class=type(exc).__name__)
-            key_mismatch = True
+    secret, key_mismatch = read_totp_secret(user, keys=data_keys(cfg))
     ok, _ = await gate.run(check_password, user.password_hash, password)
     step = None
     if user.totp_enabled and secret is not None and totp_code is not None:
@@ -123,16 +117,12 @@ async def _decide(
     if retry_after is not None:
         log.warning("reauth", outcome="locked", ip=ip)
         return lockout_problem(retry_after)
-    success = (
-        verified.ok
-        and verified.verified_hash is not None
-        and await users.confirm_unchanged(
-            conn,
-            expected_hash=verified.verified_hash,
-            totp_enabled=verified.totp_step is not None,
-            totp_secret_enc=verified.totp_secret_enc,
-        )
-        and (verified.totp_step is None or await users.claim_totp_step(conn, verified.totp_step))
+    success = await credentials_hold(
+        conn,
+        credentials_ok=verified.ok,
+        verified_hash=verified.verified_hash,
+        totp_step=verified.totp_step,
+        totp_secret_enc=verified.totp_secret_enc,
     )
     if not success:
         name_hmac = throttle.username_hmac(verified.username, session_secret)
@@ -165,14 +155,8 @@ async def verify_reauth(
         outcome = await _decide(
             conn, verified, ip=ip, session_secret=cfg.secret_b64("session_secret"), now=now
         )
-        if verified.totp_key_mismatch:  # after the throttle lock, the transaction's first statement
-            await raise_alert(
-                conn,
-                code=TOTP_KEY_ALERT_CODE,
-                severity="critical",
-                subject="totp",
-                message="the TOTP secret does not open with the configured data keys",
-            )
+        if verified.totp_key_mismatch:  # after the throttle lock (ruling T16-c)
+            await raise_totp_key_alert(conn)
     if isinstance(outcome, Problem):
         raise outcome
     if not outcome:

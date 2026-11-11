@@ -438,7 +438,7 @@ _CASE_VERSION: Final = q(
     "JOIN job_revisions r ON r.id = g.job_revision_id JOIN profile_versions v ON v.id = g.profile_version_id "
     "WHERE g.id = :i"
 )
-# A running eval run includes the case (`delete_case_unless_running`): it has a call naming the case, or its
+# A running eval run includes the case (`in_running_run`): it has a call naming the case, or its
 # kind selects it (a golden run every active case, a canary run every active canary; `eval_runner`'s list).
 _IN_RUNNING_RUN: Final = q(
     "SELECT EXISTS (SELECT 1 FROM eval_runs r WHERE r.status = 'running' AND ("
@@ -529,31 +529,13 @@ async def list_cases(
 
 async def delete_case(conn: AsyncConnection, case_id: int) -> bool:
     """Delete golden case `case_id` and, by cascade, its `eval_case_results` and eval calls; `False` when it
-    did not exist. The job's inputs lose their retention exemption at once (§20.1); the deletion manifest of
-    §14.2 L4979 is M5's (Deviation 21). A running eval run skips a case deleted meanwhile (`eval_runner`)."""
+    did not exist. The job's inputs lose their retention exemption at once (§20.1). The user's deletion is the
+    golden-case purge (`privacy.kinds.golden_case`, M5 Tasks 12 and 18), whose phase B calls this once no
+    running eval run includes the case. A running eval run skips a case deleted meanwhile (`eval_runner`)."""
     deleted = (await conn.execute(_DELETE, {"i": case_id})).first() is not None
     if deleted:
         log.info("golden_case_deleted", golden_case_id=case_id)
     return deleted
-
-
-async def delete_case_unless_running(conn: AsyncConnection, case_id: int) -> bool:
-    """The user's deletion of golden case `case_id` (`DELETE /api/golden-cases/{id}`): `delete_case`, refused
-    with a 409 `conflict_state` while a `running` eval run includes the case, nothing deleted (Carry T19-d:
-    the cascade would remove an in-flight call row and leave its ledger entry `dispatched` for good); `False`
-    when it did not exist. A run includes it when one of its calls names it, or when its kind selects it (a
-    golden run every active case, a canary run every active canary). The case row is locked `FOR UPDATE`
-    first, so a call a run reserves for it meanwhile (its foreign key's `FOR KEY SHARE`) waits for this
-    transaction: after a refusal it goes on, after a deletion it fails, and the runner skips the case as
-    deleted. The refusal is `eval_run_running()`, which the purge's request shares
-    (`privacy.kinds.golden_case`, M5 Task 12)."""
-    flags = await lock_case(conn, case_id)
-    if flags is None:
-        return False
-    if await in_running_run(conn, case_id, flags):
-        log.info("golden_case_delete_refused", golden_case_id=case_id, reason=EVAL_RUN_RUNNING)
-        raise eval_run_running()
-    return await delete_case(conn, case_id)
 
 
 async def set_flags(

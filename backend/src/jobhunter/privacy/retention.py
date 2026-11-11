@@ -135,8 +135,9 @@ body that the newest response still needs. The controller records this as a plan
   keys).
 The eval rows: `eval_case_results` and their calls go with `eval_runs` (cascade), and a `running` run is
 never deleted, so no call of a running run, nor the `dispatched` entry it holds, loses its row (Carry T19-d,
-the reason of `golden.delete_case_unless_running`). No M3 rule deletes a job, a revision or a profile version,
-so the synthetic rows of the golden set (Ruling T19-a) and the inputs of every golden case stay.
+the reason a golden case's deletion waits for the runs that include it, `golden.in_running_run`). No M3 rule
+deletes a job, a revision or a profile version, so the synthetic rows of the golden set (Ruling T19-a) and
+the inputs of every golden case stay.
 
 **The M5 rules**, after `score_history`; neither deletes anything itself:
 - `job_tombstones` (Task 13, §20.1 L6397) opens the tombstoning of the closed or stale root jobs whose

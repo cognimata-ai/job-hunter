@@ -275,9 +275,13 @@ async def test_login_logout_privacy_and_purge_retry_are_exempt_before_routing(
         "/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD + "x"}
     )
     assert r.status_code == 401, r.text
-    for path in ("/api/system/purges/1/retry", "/api/privacy/exports"):  # their routes come in Task 18
-        r = await logged_in_client.post(path, json={})
-        assert code_of(r) == (404, "not_found"), (path, r.text)
+    # Each answer is its route's own, after the edge let the request through (the edge's would be 409
+    # `delete_everything_in_progress`): the retry of an operation that does not exist, a privacy request
+    # without its `Idempotency-Key`.
+    r = await logged_in_client.post("/api/system/purges/1/retry")
+    assert code_of(r) == (404, "not_found"), r.text
+    r = await logged_in_client.post("/api/privacy/export", json={})
+    assert code_of(r) == (400, "idempotency_key_required"), r.text
     r = await logged_in_client.post("/api/auth/logout")
     assert r.status_code == 204, r.text
 

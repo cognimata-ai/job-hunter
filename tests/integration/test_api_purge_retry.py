@@ -97,6 +97,16 @@ async def golden_case(engine: AsyncEngine) -> int:
         return await insert_golden_case(conn, job, chain.profile_version_id)
 
 
+async def test_retry_needs_a_session(api_client: httpx.AsyncClient, engine: AsyncEngine) -> None:
+    """Without a session the retry is 401 `unauthenticated` (with the CSRF check passed), and nothing is
+    created (Ruling T18-3, M4)."""
+    manifest = await fenced_manifest(engine)
+    first = await failed(engine, await purge_operation(engine, manifest.id, manifest.manifest_uuid))
+    r = await api_client.post(retry_url(first), headers={"X-JH-Request": "1"})
+    assert code_of(r) == (401, "unauthenticated"), r.text
+    assert [(o.id, o.status) for o in await rows(engine, _OPERATIONS)] == [(first, "failed")]
+
+
 async def test_retry_creates_a_new_operation_for_the_same_manifest(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:

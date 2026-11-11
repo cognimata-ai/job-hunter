@@ -14,7 +14,9 @@ The route's clock (`jobhunter.api.routes.privacy.utcnow`) is pinned to one secon
 is that step's. Nothing runs the purges here: A0 is the route's work. Every datum is invented.
 """
 
+import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -22,6 +24,7 @@ import httpx
 import pyotp
 import pytest
 import sqlalchemy as sa
+from jobhunter.api import reauth
 from jobhunter.api.routes import privacy as privacy_routes
 from jobhunter.auth import totp, users
 from jobhunter.clock import utcnow
@@ -264,6 +267,91 @@ async def test_a_retry_with_a_new_code_is_the_same_action(
         assert (again.status_code, again.json()) == (202, first.json())
     assert await last_step(engine) == step
     assert (await traces(engine))[0] == 1
+
+
+async def double_submit(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> tuple[httpx.Response, httpx.Response]:
+    """The same key and body sent twice at once, both past the stored-response check before either commits:
+    each waits for the other at the re-authentication. The two answers, the 202 first."""
+    real = reauth.verify_reauth  # the route's, from its module
+    arrived: list[int] = []
+    both = asyncio.Event()
+
+    async def together(*args: Any, **kwargs: Any) -> None:
+        arrived.append(1)
+        if len(arrived) == 2:
+            both.set()
+        await asyncio.wait_for(both.wait(), 60)
+        await real(*args, **kwargs)
+
+    monkeypatch.setattr(privacy_routes, "verify_reauth", together)
+    key = fresh_key("double")
+    answers = await asyncio.gather(
+        post(client, DELETE_EVERYTHING, body, key), post(client, DELETE_EVERYTHING, body, key)
+    )
+    assert len(arrived) == 2
+    winner, loser = sorted(answers, key=lambda r: r.status_code)
+    assert winner.status_code == 202, winner.text
+    return winner, loser
+
+
+async def test_two_first_requests_at_once_without_totp_run_one_action(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A double submit without TOTP (Ruling T18-3, M1): both re-authenticate; the second then waits for A0's
+    `active_config` lock and finds the first's key answered, so it gets the stored 202. One action runs."""
+    failed, _ = await attempts(engine)
+    winner, loser = await double_submit(logged_in_client, monkeypatch, delete_everything())
+    assert (loser.status_code, loser.json()) == (202, winner.json())
+    assert (await attempts(engine))[0] == failed
+    assert await traces(engine) == (1, 1, 1)  # one manifest, one key, one fence
+
+
+async def test_two_first_requests_at_once_with_one_totp_code_run_one_action(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    totp_on: TotpClock,
+) -> None:
+    """A double submit with TOTP on and one code (Ruling T18-3, M1): the first to decide claims the code's
+    step, the second's claim fails, so it is a reused code: 403 `reauth_failed` and one failed attempt
+    counted. One action runs."""
+    failed, _ = await attempts(engine)
+    _, loser = await double_submit(logged_in_client, monkeypatch, delete_everything(totp=totp_on.code()))
+    assert code_of(loser) == (403, "reauth_failed"), loser.text
+    assert (await attempts(engine))[0] == failed + 1
+    assert await last_step(engine) == totp_on.step
+    assert await traces(engine) == (1, 1, 1)
+
+
+async def test_an_unreadable_totp_secret_fails_and_raises_the_login_s_alert(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """The re-authentication reads the TOTP secret as the login does (`auth.credentials`): a secret no
+    configured key opens fails it, for the right password too, counts, and raises `auth.totp_key_mismatch`."""
+    secret = totp.new_secret()
+    async with engine.begin() as conn:  # sealed with a key the api does not have
+        await users.enable_totp(conn, secret, data_key=os.urandom(32))
+    failed, _ = await attempts(engine)
+    r = await post(
+        logged_in_client,
+        DELETE_EVERYTHING,
+        delete_everything(totp=pyotp.TOTP(secret).now()),
+        fresh_key("reauth"),
+    )
+    assert code_of(r) == (403, "reauth_failed"), r.text
+    assert (await attempts(engine))[0] == failed + 1
+    async with engine.connect() as conn:
+        alert = await conn.execute(
+            sa.text(
+                "SELECT severity, occurrences FROM alerts "
+                "WHERE dedup_key = 'auth.totp_key_mismatch:totp' AND resolved_at IS NULL"
+            )
+        )
+        assert tuple(alert.one()) == ("critical", 1)
+    assert await traces(engine) == (0, 0, 0)
+    assert reauth.REAUTH_FAILED == r.json()["title"]
 
 
 async def test_a_different_action_under_the_key_is_422_reused(

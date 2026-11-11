@@ -301,7 +301,7 @@ class BannerFacts:
     paid_search: PaidSearchOut
     scope: ScopeStatusOut
     rescore: RescoreOut | None
-    deletion_unshipped: bool = False
+    deletion_unshipped: bool
 
 
 # ---- the pure parts ---------------------------------------------------------------------------------------

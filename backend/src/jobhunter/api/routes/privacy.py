@@ -26,9 +26,15 @@ them, sent with another, is 422 `idempotency_key_reused`. The two destructive on
 6. one transaction: `active_config FOR UPDATE` (A0's lock, before the key's row), then `run_idempotent` with
    the same fingerprint around A0 (`request_delete_everything`, which is given the id of the key's own row,
    claimed in this transaction, and keeps it; `request_source_purge`, whose cancelled collections are
-   observed after the commit). A refusal rolls everything back, the key's row included. Of two first
-   requests at once, the second waits for the first's key and gets its stored 202, or 409
-   `idempotency_in_progress`.
+   observed after the commit). A refusal rolls everything back, the key's row included.
+
+Two first requests at once with one key (a double submit) run one action (Ruling T18-3). Both pass step 4
+before either commits, since a key's row is uncommitted until its request ends. Without TOTP both
+re-authenticate; the second then waits for A0's `active_config` lock and finds the first's key answered: its
+stored 202 (a wait on the key's row longer than `IN_PROGRESS_LOCK_TIMEOUT` would be 409
+`idempotency_in_progress`). With TOTP on and one code, the second is a reused code: the first to decide claims
+the step and the second's claim fails, so it answers 403 `reauth_failed` and counts one failed attempt. The
+claim cannot come later without releasing a step on every failure that follows it.
 
 The source purge's refusal when Adzuna is the only enabled source is the settings rule's 422
 `validation_failed` on `payload.sources.enabled` (Ruling T15-4 (3)), which reaches the client as it is.
@@ -44,8 +50,11 @@ directory (`cfg.exports_dir`, which the api reads from its configuration, never 
 starts, so a file gone meanwhile (a purge's export op or the expiry, between the status read and the open)
 is answered from the row read again: `expired` or `purged` is 410 `gone`, anything else (a `ready` row whose
 file is missing) a 500. Once the 200 has started, the stream reads from the open file, so an unlink cannot
-truncate a download under way. A download is logged `export_downloaded` with the id. `running` or `failed`
-is 409 `conflict_state`, `expired` or `purged` 410 `gone`, an unknown id 404.
+truncate a download under way; a later segment that does not open (`ExportCorrupt`, each segment's tag is
+checked before any of its bytes is sent) ends the response short of its `Content-Length`, logged
+`export_download_failed` with the id and the error's class (the edge logs it too, by class only). A download
+is logged `export_downloaded` with the id. `running` or `failed` is 409 `conflict_state`, `expired` or
+`purged` 410 `gone`, an unknown id 404.
 
 **The manifests** (D18): `GET /manifests?cursor&limit` → `{items, next_cursor}`, newest first, keyset-paged
 with §14.3's signed cursor (sort `MANIFESTS_SORT`, `desc`, `last_key = [id]`, no filters), limit 1 to 100
@@ -92,7 +101,7 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
-from jobhunter.privacy.export import iter_decrypted, request_export
+from jobhunter.privacy.export import ExportCorrupt, iter_decrypted, request_export
 from jobhunter.privacy.kinds.delete_everything import request_delete_everything
 from jobhunter.privacy.kinds.source_purge import request_source_purge
 from jobhunter.privacy.manifests import ManifestKind, ManifestStatus
@@ -363,12 +372,17 @@ def _gone(export_id: int, status: str) -> Problem:
     return Problem(410, "gone", "The export is no longer available", detail=status)
 
 
-def _stream(source: BinaryIO, first: bytes, rest: Iterator[bytes]) -> Iterator[bytes]:
+def _stream(source: BinaryIO, first: bytes, rest: Iterator[bytes], export_id: int) -> Iterator[bytes]:
     """The zip: the segment decrypted before the response started, then the others, read from the open file,
-    which is closed at the end."""
+    which is closed at the end. A segment that does not open stops the stream before any of its bytes: the
+    failure is logged with the error's class, and raised, which ends the response short of its
+    `Content-Length`."""
     try:
         yield first
         yield from rest
+    except ExportCorrupt as exc:
+        log.error("export_download_failed", export_id=export_id, error_class=type(exc).__name__)
+        raise
     finally:
         source.close()
 
@@ -383,7 +397,7 @@ def _open_archive(path: Path, keys: Sequence[bytes], export_id: int) -> Iterator
     except BaseException:
         source.close()
         raise
-    return _stream(source, first, segments)
+    return _stream(source, first, segments, export_id)
 
 
 async def _download(
