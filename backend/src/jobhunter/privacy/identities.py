@@ -10,9 +10,11 @@ gives an `executing` row together with its `scope`. An `executing` row without i
 was deleted under it yet: it has no bounds. Before 0010 the table does not exist, and no manifest is recorded.
 
 - `rewrite_missing_files` (step 1's first half) writes the file of each recorded manifest the stream lacks,
-  from its `scope`, through `write_manifest_file`: the file it shipped, or would have. A scope whose canonical
-  bytes do not hash to `file_sha256`, or that names another uuid, stops `migrate` with `ManifestConflict`
-  before anything is written or advanced. A file the stream holds is left as it is.
+  from its `scope`, through `write_manifest_file`: the file it shipped, or would have. The scope's canonical
+  bytes are parsed first as the file `<manifest_uuid>.json` (`parse_manifest`): a scope of any other shape or
+  format, or one that names another uuid, stops `migrate` with `ManifestInvalid`; one whose bytes do not hash
+  to `file_sha256` stops it with `ManifestConflict`; either before anything is written or advanced. A file the
+  stream holds is left as it is.
 - `manifest_bounds`: per table, the largest of every `max_ids` and watermark value and every id that an
   operation lists (`ids` and `keep`), over the stream and every recorded scope. A `row_delete` under a
   `parent` bound lists ids of its parent table (`bound.table`); any other list names ids of the operation's
@@ -71,18 +73,20 @@ async def _recorded(conn: AsyncConnection) -> list[Row[Any]]:
 
 async def rewrite_missing_files(conn: AsyncConnection, manifest_dir: Path) -> list[UUID]:
     """Write the file of each recorded manifest that `manifest_dir` lacks from its `scope` (module docstring);
-    the uuids written, in stream order. `ManifestConflict` for a scope that is not its file's content."""
+    the uuids written, in stream order. `ManifestInvalid` for a scope that is no manifest of the format named
+    for its row, `ManifestConflict` for one that is not its file's content."""
     written: list[UUID] = []
     for row in await _recorded(conn):
         if read_manifest_file(manifest_dir, row.manifest_uuid) is not None:
             continue
         content = cast(ManifestContent, row.scope)
-        if hashlib.sha256(canonical_bytes(content)).digest() != bytes(row.file_sha256):
+        data = canonical_bytes(content)
+        # A manifest of the format named for this row (`ManifestInvalid` otherwise), before the hash check
+        parse_manifest(data, file_name=manifest_file_name(row.manifest_uuid))
+        if hashlib.sha256(data).digest() != bytes(row.file_sha256):
             raise ManifestConflict(
                 f"manifest {row.manifest_uuid}: its scope does not hash to its file_sha256"
             )
-        if content["manifest_uuid"] != str(row.manifest_uuid):
-            raise ManifestConflict(f"manifest {row.manifest_uuid}: its scope is another manifest's")
         write_manifest_file(manifest_dir, content)
         written.append(row.manifest_uuid)
     return written

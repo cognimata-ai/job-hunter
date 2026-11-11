@@ -23,6 +23,7 @@ from typing import Any, Final
 import procrastinate
 import pytest
 from alembic import command
+from alembic.script import ScriptDirectory
 from jobhunter.db.alembic_runner import alembic_config, code_head
 from jobhunter.db.migrate import BACKUP_GRANT_TABLES, MIGRATE_ORDER, StepGroup, run_migrate_async
 from jobhunter.db.session import make_null_engine
@@ -239,9 +240,10 @@ async def test_a_first_installation_advances_the_queue_past_listed_job_ids(
     server = fresh_pg_server
     cfg = make_config("migrate", server)
     listed = [17, 23, 42]
+    # Its `max_ids` bound on the queue lies below the ids it lists: the listed ids themselves must count.
     write_manifest_file(
         cfg.manifests_dir,
-        content(kind="delete_everything", max_ids={"procrastinate_jobs": 42}, operations=listed_jobs(listed)),
+        content(kind="delete_everything", max_ids={"procrastinate_jobs": 10}, operations=listed_jobs(listed)),
     )
     with capture_logs() as logs:
         await run_migrate_async(cfg, now=NOW)
@@ -299,8 +301,11 @@ async def test_upgrade_from_0009_with_data(
 
     assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
 
-    assert code_head() == "0010_m5_operations"
+    # At the code head, which is 0010 or a later revision on the chain through it.
     assert pg_one(server, "migrator", "SELECT version_num FROM alembic_version") == (code_head(),)
+    scripts = ScriptDirectory.from_config(alembic_config(server.dsn("migrator", driver="sqlalchemy")))
+    chain = [script.revision for script in scripts.walk_revisions(base="0009_m4_ui", head=code_head())]
+    assert "0010_m5_operations" in chain and chain[-1] == "0009_m4_ui"
     assert backup_grants(server)
     # The data is kept; every id the run allocated (the seed's rows above all) lies above the bound.
     assert pg_rows(server, "migrator", "SELECT id FROM alerts ORDER BY id") == [(1,), (2,), (3,)]

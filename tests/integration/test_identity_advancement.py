@@ -19,7 +19,7 @@ import stat
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import procrastinate
 import psycopg
@@ -33,6 +33,7 @@ from jobhunter.privacy.identities import advance_identities, manifest_bounds, re
 from jobhunter.privacy.manifests import (
     ManifestConflict,
     ManifestContent,
+    ManifestInvalid,
     ManifestKind,
     ManifestRow,
     Operation,
@@ -408,6 +409,38 @@ async def test_a_scope_whose_hash_differs_stops_migrate(
     assert [e["step"] for e in logs if e["event"] == "migrate_step"] == ["reconstruct_and_advance"]
     assert names(stream) == []  # no file written from it
     assert sequence_state(migrated, "alerts") == alerts  # and nothing advanced before the stop
+
+
+@pytest.mark.parametrize("defect", ["unknown_format", "invalid", "name_mismatch"])
+async def test_a_scope_that_is_no_manifest_of_its_row_stops_migrate_before_any_file(
+    migrated: PgServer, migrator: AsyncEngine, make_config: ConfigFactory, stream: Path, defect: str
+) -> None:
+    async with migrator.begin() as conn:
+        row = await insert_manifest(conn, kind="source_purge", request={}, now=NOW)
+    scope: dict[str, Any] = dict(content(str(row.manifest_uuid), max_ids={"alerts": 1}))
+    if defect == "unknown_format":
+        scope["format"] = 2
+    elif defect == "invalid":
+        del scope["manifest_uuid"]  # no uuid at all
+    else:
+        scope["manifest_uuid"] = str(uuid7())  # another manifest's
+    # Recorded with the hash of its own bytes, as no purge records it: only the parse can refuse it.
+    pg_rows(
+        migrated,
+        "migrator",
+        "UPDATE deletion_manifests SET scope = %s, file_sha256 = %s WHERE id = %s",
+        Jsonb(scope),
+        hashlib.sha256(canonical_bytes(cast(ManifestContent, scope))).digest(),
+        row.id,
+    )
+    with capture_logs() as logs, pytest.raises(ManifestInvalid) as refused:
+        await run_migrate_async(
+            make_config("migrate"), now=NOW, steps=frozenset({"sequences"}), manifest_dir=stream
+        )
+    assert refused.value.reason == defect
+    (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
+    assert (failed["step"], failed["error_type"]) == ("reconstruct_and_advance", "ManifestInvalid")
+    assert names(stream) == []  # stopped before its file was written
 
 
 async def test_an_executing_row_without_a_hash_has_no_bounds(

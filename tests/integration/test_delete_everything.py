@@ -13,8 +13,10 @@ state between two steps is observed at a `PausePoint`. Every datum is invented.
 
 import asyncio
 import dataclasses
+import hashlib
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Final, get_args
 
 import httpx
@@ -42,7 +44,7 @@ from jobhunter.privacy.export import request_export
 from jobhunter.privacy.kinds import delete_everything
 from jobhunter.privacy.kinds.delete_everything import DELETE_EVERYTHING_KEEPS, DeleteEverything
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
-from jobhunter.privacy.manifests import ManifestRow, check_postconditions
+from jobhunter.privacy.manifests import ManifestRow, check_postconditions, manifest_file_name
 from jobhunter.privacy.purge import KINDS, OpenedPurge, PurgeRun
 from jobhunter.quota.ledger import lock_run_owner
 from jobhunter.scoring import batch_results, cycles
@@ -154,6 +156,11 @@ _EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e
 _EXPORT_OPERATION: Final = sa.text(
     "SELECT id FROM operations WHERE kind = 'export' "
     "AND payload -> 'export_id' = to_jsonb(CAST(:e AS bigint))"
+)
+# The manifests the database records with their content (`migrate` rewrites a missing file from the scope).
+_RECORDED_MANIFESTS: Final = sa.text(
+    "SELECT manifest_uuid, kind, file_sha256 FROM deletion_manifests "
+    "WHERE file_sha256 IS NOT NULL ORDER BY kind"
 )
 # The settings versions, `active_config`'s pointers and `schedule_state`, as one comparable listing.
 _CONFIGURATION: Final = sa.text(
@@ -318,6 +325,11 @@ async def scalar(engine: AsyncEngine, statement: sa.TextClause, **params: object
 async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
     async with engine.connect() as conn:
         return (await conn.execute(statement, params)).one()
+
+
+def files_in(directory: Path) -> dict[str, bytes]:
+    """Each file of `directory` with its bytes."""
+    return {path.name: path.read_bytes() for path in sorted(directory.iterdir())}
 
 
 async def rows(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> list[Any]:
@@ -1086,13 +1098,31 @@ async def test_runs_are_deleted_within_their_bound_only(engine: AsyncEngine, liv
 
 
 async def test_migrate_after_delete_everything_adds_no_settings_version_and_moves_no_pointer(
-    engine: AsyncEngine, live: Purger, make_config: ConfigFactory
+    engine: AsyncEngine, live: Purger, make_config: ConfigFactory, tmp_path: Path
 ) -> None:
     """Delete-everything deletes settings version 1; the next `migrate` seeds no settings version again
     (only an empty `settings_versions` gets the defaults) and leaves `active_config` and `schedule_state`
-    as the purge left them."""
+    as the purge left them.
+
+    Its manifest stream is a directory of the test's own that holds no file yet (M5 Task 23), so step 1
+    rewrites there, from their scopes, the files of both manifests the database records: the
+    delete-everything's, byte for byte the file its purge wrote, and the seed's shipped golden-case one. The
+    shared server's manifests directory is left as it was."""
     await seeded(engine)
-    await finished(live, await request(engine))
+    manifest = await finished(live, await request(engine))
     before = [tuple(r) for r in await rows(engine, _CONFIGURATION)]
-    await run_migrate_async(make_config("migrate"), now=utcnow())
+    cfg = make_config("migrate")
+    shared = files_in(cfg.manifests_dir)
+    stream = tmp_path / "migrate_manifests"
+    stream.mkdir(mode=0o700)
+    await run_migrate_async(cfg, now=utcnow(), manifest_dir=stream)
     assert [tuple(r) for r in await rows(engine, _CONFIGURATION)] == before
+    recorded = await rows(engine, _RECORDED_MANIFESTS)
+    assert [row.kind for row in recorded] == ["delete_everything", "golden_case_delete"]
+    rewritten = files_in(stream)
+    assert {name: hashlib.sha256(data).digest() for name, data in rewritten.items()} == {
+        manifest_file_name(row.manifest_uuid): bytes(row.file_sha256) for row in recorded
+    }
+    purge_file = files_in(live.cfg.manifests_dir)[manifest_file_name(manifest.manifest_uuid)]
+    assert rewritten[manifest_file_name(manifest.manifest_uuid)] == purge_file
+    assert files_in(cfg.manifests_dir) == shared
