@@ -418,6 +418,50 @@ def test_the_widened_langsmith_check_keeps_its_place_in_the_order(tmp_path: Path
     assert langsmith_failure(tmp_path / "t", {}, short_key).check == "langsmith_config"
 
 
+EXIT_VARS = ("LANGSMITH_USE_DAEMON", "LANGSMITH_DISABLE_RUN_COMPRESSION")
+
+
+@pytest.mark.parametrize(
+    ("values", "refused"),
+    [
+        ({}, ["LANGSMITH_USE_DAEMON", "LANGSMITH_DISABLE_RUN_COMPRESSION"]),
+        ({"LANGSMITH_USE_DAEMON": "true"}, ["LANGSMITH_DISABLE_RUN_COMPRESSION"]),
+        ({"LANGSMITH_DISABLE_RUN_COMPRESSION": "true"}, ["LANGSMITH_USE_DAEMON"]),
+        ({"LANGSMITH_USE_DAEMON": "True", "LANGSMITH_DISABLE_RUN_COMPRESSION": "1"}, list(EXIT_VARS)),
+        ({"LANGSMITH_USE_DAEMON": "", "LANGSMITH_DISABLE_RUN_COMPRESSION": "true"}, ["LANGSMITH_USE_DAEMON"]),
+    ],
+)
+def test_a_prod_worker_that_traces_needs_daemon_threads_and_no_compression(
+    tmp_path: Path, values: dict[str, str], refused: list[str]
+) -> None:
+    """Ruling T21-3 I3: the SDK's threads are daemons and its compression's pool is unused, so an unreachable
+    LangSmith never holds a prod worker's exit. `true` exactly: the SDK compares `USE_DAEMON` with it."""
+    env = {**BASE_ENV, **TRACING_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL, **values}
+    secrets = {**PROD_WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
+    assert (exc.value.check, exc.value.detail) == (
+        "langsmith_config",
+        f"tracing in prod needs {', '.join(refused)} true",
+    )
+    run_startup_assertions(
+        load_config(
+            "worker", {**env, **dict.fromkeys(EXIT_VARS, "true")}, write_secrets(tmp_path / "t", **secrets)
+        )
+    )
+
+
+def test_the_exit_settings_bind_a_prod_worker_that_traces_only(tmp_path: Path) -> None:
+    """Without tracing, or outside prod, neither variable is needed (no other role may trace: the api, for
+    one, is never given the key)."""
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    run_startup_assertions(load_config("worker", prod, write_secrets(tmp_path / "a", **PROD_WORKER_SECRETS)))
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    for env_name in ("dev", "test"):
+        env = {**BASE_ENV, **TRACING_ENV, "JOBHUNTER_ENV": env_name}
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / env_name, **secrets)))
+
+
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:
     hc = {"healthchecks_ping_url": HC_PING_URL.encode(), "healthchecks_api_key": b"k"}
     env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": "https://ntfy.example/jh-topic"}

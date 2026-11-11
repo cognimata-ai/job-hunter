@@ -113,9 +113,11 @@ OWN_BODY_LIMITS: Final = frozenset({("POST", "/api/profile/cv"), ("POST", "/api/
 # The login limit (module docstring, step 3), each as (logins, seconds): from one client address, and in all.
 LOGIN_LIMIT_PER_IP: Final = (10, 60.0)
 LOGIN_LIMIT_GLOBAL: Final = (100, 60.0)
-# Where a request without a usable client address is counted, as the login records it
-# (`routes.auth.UNKNOWN_CLIENT_IP`): one shared bucket, so such clients cannot escape the per-address limit.
-UNKNOWN_CLIENT: Final = "0.0.0.0"  # noqa: S104 - an address counted, not one bound to
+# Where a request without a usable client address is counted, by this limit and by the login's throttle
+# (`client_address`): one shared bucket, so such clients cannot escape the per-address limits (uvicorn over
+# TCP always has an address; a misconfiguration may not).
+UNKNOWN_CLIENT_IP: Final = "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
+LOGIN_LIMITED: Final = "Too many logins"
 
 log = get_logger("jobhunter.api.edge")
 
@@ -135,13 +137,14 @@ def route_label(scope: Scope) -> str:
 
 
 def client_address(scope: Scope) -> str:
-    """The request's client address in canonical form (an IPv4-mapped IPv6 address as IPv4), as the login
-    records it (`routes.auth.client_ip`), else `UNKNOWN_CLIENT`."""
+    """The request's client address in canonical form (an IPv4-mapped IPv6 address as IPv4), else
+    `UNKNOWN_CLIENT_IP`: the one key of this limit and of the login's throttle and records (`routes.auth`
+    reads it through `client_ip`)."""
     client = scope.get("client")
     try:
         address = ipaddress.ip_address(client[0] if client else "")
     except ValueError:
-        return UNKNOWN_CLIENT
+        return UNKNOWN_CLIENT_IP
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         return str(address.ipv4_mapped)
     return str(address)
@@ -199,6 +202,10 @@ class LoginLimiter:
         self._all.append(now)
         return None
 
+    def __len__(self) -> int:
+        """How many addresses it holds login times of (swept ones excluded)."""
+        return len(self._by_address)
+
     def _sweep(self, now: float) -> None:
         if self._next_sweep is not None and now < self._next_sweep:
             return
@@ -209,13 +216,13 @@ class LoginLimiter:
             del self._by_address[key]
 
 
-def _login_limited(retry_after_s: int) -> Problem:
-    """The edge's 429 of a login past its limit: the shape of the login's own 429s (`throttled`,
-    `Retry-After` and `retry_after_s`)."""
+def throttled_problem(title: str, *, retry_after_s: int) -> Problem:
+    """A 429 `throttled` telling the client to wait `retry_after_s` seconds (`Retry-After` and the member
+    `retry_after_s`): this limit's, and the login's and the re-authentication's (`routes.auth`)."""
     return Problem(
         429,
         "throttled",
-        "Too many logins",
+        title,
         headers={"Retry-After": str(retry_after_s)},
         extra={"retry_after_s": retry_after_s},
     )
@@ -348,7 +355,7 @@ class EdgeMiddleware:
         if retry_after_s is None:
             return None
         log.warning("login", outcome="rate_limited", ip=address)
-        return _login_limited(retry_after_s)
+        return throttled_problem(LOGIN_LIMITED, retry_after_s=retry_after_s)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":

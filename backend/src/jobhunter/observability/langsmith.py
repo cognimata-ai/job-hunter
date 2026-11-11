@@ -58,6 +58,15 @@ When no keyword is found, a `NodeFailed` gives the code of its fixed message (Ru
 traceback's fixed `Traceback (most recent call last):` header is taken off the first line's end before the
 repr is matched; any other text, quoting or class gives `unknown`, as before.
 
+**At the worker's exit** (M5 Task 21, Ruling T21-3 I3): an unreachable LangSmith never holds it. In prod
+the SDK's threads are daemons (`LANGSMITH_USE_DAEMON=true`; the SDK reads it once, at its first client, so it
+is set in the compose environment, not here) and runs are sent uncompressed
+(`LANGSMITH_DISABLE_RUN_COMPRESSION=true`: the compressed path sends through a module-level thread pool that
+the interpreter joins at exit whatever the daemon setting says); `langsmith_config` refuses a prod worker that
+traces without both. Once its shutdown is complete, the worker gives the client's queue at most
+`FLUSH_TIMEOUT_S` to drain (`flush_tracing`, off the event loop); what is still queued then is dropped with
+the daemon threads. Neither call cancels a request in flight: the daemon threads are what bound the exit.
+
 **The tracing state** (`install_tracing`, `publish_tracing_state`): the worker installs the client
 process-wide (`run_trees.configure`, with tracing enabled) at step 7 of its start, before it compiles any
 graph, and publishes the state the install returned, `{"tracing": bool, "region": "eu" | null}`, on
@@ -117,6 +126,11 @@ _NODE_FAILED_REPR: Final = re.compile(
 _TRACEBACK_HEADER: Final = "Traceback (most recent call last):"
 _DETAILS_SUFFIX: Final = "_token_details"
 _PUBLISH_SQL: Final = "UPDATE worker_heartbeat SET tracing = :tracing WHERE id = 1"
+# The longest the worker's exit waits for the queued runs to be sent (module docstring, "At the worker's
+# exit").
+FLUSH_TIMEOUT_S: Final = 5.0
+# The client `install_tracing` installed in this process, which `flush_tracing` flushes (none while off).
+_INSTALLED: list[Client] = []
 
 
 @dataclass(frozen=True)
@@ -226,7 +240,15 @@ def install_tracing(cfg: AppConfig) -> TracingState:
         return TRACING_OFF
     # `enabled`: the SDK traces exactly when this configuration says so, whatever the variable's case.
     run_trees.configure(client=client, enabled=True)
+    _INSTALLED[:] = [client]
     return TracingState(tracing=True, region="eu")
+
+
+def flush_tracing(timeout_s: float = FLUSH_TIMEOUT_S) -> None:
+    """Give the installed client's queue at most `timeout_s` to be sent; nothing when tracing is off. It
+    blocks, so the worker calls it off its event loop, after `worker_shutdown_complete` (module docstring)."""
+    for client in _INSTALLED:
+        client.flush(timeout=timeout_s)
 
 
 def disable_tracing() -> None:

@@ -8,13 +8,14 @@ Offline: the edge around a recording ASGI app, driven with raw ASGI messages, at
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Final, cast
 
 import pytest
 from jobhunter.api import edge
-from jobhunter.api.edge import LOGIN_LIMIT_GLOBAL, LOGIN_LIMIT_PER_IP, EdgeMiddleware
+from jobhunter.api.edge import LOGIN_LIMIT_GLOBAL, LOGIN_LIMIT_PER_IP, EdgeMiddleware, LoginLimiter
 from jobhunter.config import AppConfig
 from starlette.types import Message, Receive, Scope, Send
 
@@ -154,10 +155,12 @@ async def test_the_eleventh_login_in_a_minute_from_one_address_is_429_before_the
     assert (await call(api, "::ffff:198.51.100.7")).status == 429  # the same address, IPv4-mapped
     clock.now = 1059.9
     assert_throttled(await call(api, "198.51.100.7"), retry_after_s=1)  # at least one second
-    clock.now = 1060.0  # the first login's minute is over: one more, and the window is full again
+    # The first login's minute is over: one more gets through, and the window is full again. The three refused
+    # logins of that minute (at 1012.5 and 1059.9) were not counted: had they been, it would still be full.
+    clock.now = 1060.0
     assert (await call(api, "198.51.100.7")).status == 204
     assert (await call(api, "198.51.100.7")).status == 429
-    # The refused logins were not counted: once the minute of the first ten is over, ten more get through.
+    # A minute later the window is empty: ten logins, and the eleventh refused again.
     clock.now = 1130.0
     for _ in range(10):
         assert (await call(api, "198.51.100.7")).status == 204
@@ -189,3 +192,36 @@ async def test_other_routes_are_not_limited(
     for _ in range(10):  # and none of them counted towards the login's window
         assert (await call(api, "198.51.100.7")).status == 204
     assert (await call(api, "198.51.100.7")).status == 429
+
+
+def test_the_windows_of_quiet_addresses_are_dropped() -> None:
+    """The memory stays bounded: once a window has passed, the addresses with no login in it are dropped (at
+    the first login after the window, at most once per window)."""
+    limiter = LoginLimiter()
+    for n in range(50):
+        assert limiter.admit(f"10.0.0.{n + 1}", 1000.0 + n * 0.1) is None
+    assert limiter.admit("10.0.1.1", 1059.0) is None
+    assert len(limiter) == 51  # within the window: nothing is dropped
+    assert limiter.admit("10.0.1.2", 1065.0) is None
+    assert len(limiter) == 2  # the fifty quiet ones went; 10.0.1.1 (at 1059) and the new one stay
+    assert limiter.admit("10.0.1.3", 1070.0) is None and len(limiter) == 3  # no sweep before 1125
+
+
+async def test_each_refusal_is_logged_with_its_address_and_nothing_else_is(
+    api: EdgeMiddleware, clock: Clock, log_events: Callable[[], list[dict[str, Any]]]
+) -> None:
+    """A refused login is a sign-in event: logged at warning as `login`, outcome `rate_limited`, with the
+    client address (as the login logs its own outcomes, ruling T16-b). An admitted one is logged by its route,
+    not here."""
+    for _ in range(10):
+        assert (await call(api, "198.51.100.7")).status == 204
+    assert [e for e in log_events() if e["logger"] == "jobhunter.api.edge"] == []
+    assert (await call(api, "::ffff:198.51.100.7")).status == 429
+    [refusal] = [e for e in log_events() if e["logger"] == "jobhunter.api.edge"]
+    assert {k: refusal[k] for k in ("event", "outcome", "ip", "level")} == {
+        "event": "login",
+        "outcome": "rate_limited",
+        "ip": "198.51.100.7",  # canonical: the IPv4-mapped form as IPv4
+        "level": "warning",
+    }
+    assert set(refusal) <= {"event", "outcome", "ip", "level", "logger", "ts", "request_id"}

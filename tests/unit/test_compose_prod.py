@@ -15,7 +15,9 @@ The last test starts the prod-configured worker's LangSmith tracing against an e
 import json
 import os
 import re
+import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -142,13 +144,16 @@ OPTIONAL_ENV: Final[Mapping[str, frozenset[str]]] = {
     "backup": APP_OPTIONAL | BACKUP_OPTIONAL,
     "restore": APP_OPTIONAL,
 }
-# Fixed in the compose itself: §17.8's worker values, and where the bootstrap password is read from.
+# Fixed in the compose itself: §17.8's worker values with the two that keep an unreachable LangSmith from
+# holding the worker's exit (Ruling T21-3 I3), and where the bootstrap password is read from.
 TRACING: Final = {
     "LANGSMITH_TRACING": "true",
     "LANGSMITH_ENDPOINT": LANGSMITH_EU_ENDPOINT,
     "LANGSMITH_PROJECT": "jobhunter-prod",
     "LANGSMITH_HIDE_INPUTS": "true",
     "LANGSMITH_HIDE_OUTPUTS": "true",
+    "LANGSMITH_USE_DAEMON": "true",
+    "LANGSMITH_DISABLE_RUN_COMPRESSION": "true",
 }
 FIXED_ENV: Final[Mapping[str, Mapping[str, str]]] = {
     "worker": TRACING,
@@ -501,6 +506,50 @@ def test_restore_has_its_profile_and_waits_for_postgres() -> None:
     assert probe[0] == "CMD-SHELL" and "pg_isready -h 127.0.0.1" in probe[1]  # over TCP
 
 
+def test_the_start_order_the_restarts_and_the_one_worker() -> None:
+    """§3.3 and §19.1: one worker, with two minutes to drain; each service starts once what it needs is up
+    (migrate once postgres answers, the api and the worker once migrate is done, the worker once the embedder
+    answers, Caddy once the api does); the long-running services come back, the one-off ones do not."""
+    services = prod_config()["services"]
+    worker = services["worker"]
+    assert worker["deploy"]["replicas"] == 1 and worker["stop_grace_period"] == "2m0s"
+    healthy, done = "service_healthy", "service_completed_successfully"
+    assert {
+        name: {dep: c["condition"] for dep, c in s.get("depends_on", {}).items()}
+        for name, s in services.items()
+    } == {
+        "caddy": {"api": healthy},
+        "migrate": {"postgres": healthy},
+        "api": {"migrate": done},
+        "worker": {"migrate": done, "embedder": healthy},
+        "docparse": {},
+        "embedder": {},
+        "postgres": {},
+        "backup": {},
+        "restore": {"postgres": healthy},
+    }
+    assert {name: s["restart"] for name, s in services.items()} == {
+        **dict.fromkeys(SECRETS, "unless-stopped"),
+        "migrate": "no",
+        "restore": "no",
+    }
+
+
+def test_postgres_runs_the_repository_s_configuration_and_init() -> None:
+    """§19.1, §19.3: the server reads deploy/postgres/postgresql.conf, and its first start runs the init
+    scripts that create the roles, both mounted read-only; the data on its volume."""
+    postgres = prod_config()["services"]["postgres"]
+    assert postgres["command"] == ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    mounts = {(m["type"], m["source"], m["target"], m.get("read_only", False)) for m in postgres["volumes"]}
+    assert mounts == {
+        ("volume", "pgdata", "/var/lib/postgresql/data", False),
+        ("bind", str(DEPLOY / "postgres/postgresql.conf"), "/etc/postgresql/postgresql.conf", True),
+        ("bind", str(DEPLOY / "postgres/init"), "/docker-entrypoint-initdb.d", True),
+    }
+    assert postgres["environment"]["POSTGRES_PASSWORD_FILE"] == "/run/secrets/pg_bootstrap"
+    assert postgres["shm_size"] == str(1024**3)
+
+
 def test_secrets_example_lists_exactly_the_secret_names(tmp_path: Path) -> None:
     lines = [
         line
@@ -648,3 +697,74 @@ def test_the_prod_worker_starts_tracing_without_waiting_for_langsmith(
         endpoint.release.set()
         for made in configured:
             made["client"].close(timeout=0)
+
+
+# Ruling T21-3 I3: the prod worker's exit, with LangSmith unreachable. In a process of its own, with the prod
+# compose's worker environment: the client `install_tracing` makes, pointed at an endpoint that accepts
+# connections and never answers; runs enqueued by a traced function; the worker's own flush, then the end of
+# the program. Prints `returned` once its main code is done.
+EXIT_SCRIPT: Final = """
+import sys
+from pathlib import Path
+from jobhunter.config import load_config
+from jobhunter.observability import langsmith as tracing
+from langsmith import traceable
+
+tracing.LANGSMITH_EU_ENDPOINT = sys.argv[1]  # the endpoint that never answers, in place of the EU one
+state = tracing.install_tracing(load_config("worker", secrets_dir=Path(sys.argv[2])))
+assert state.tracing, state
+
+@traceable(name="node")
+def node(i):
+    return i
+
+for i in range(25):
+    node(i)
+tracing.flush_tracing()  # what the worker does once its shutdown is complete
+print("returned", flush=True)
+"""
+# The flush's 5 s and the start of a Python process that imports the SDK, with room to spare.
+EXIT_WITHIN_S: Final = 15.0
+
+
+def run_until(env: dict[str, str], endpoint: str, secrets: Path) -> tuple[float | None, str]:
+    """`EXIT_SCRIPT` in a `python -I` process with `env` alone: the seconds it took to exit, or `None` when it
+    was still running after `EXIT_WITHIN_S` (it is killed then); and what it printed."""
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", EXIT_SCRIPT, endpoint, str(secrets)],
+        env={**env, "PATH": os.environ["PATH"]},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=EXIT_WITHIN_S)
+        return time.monotonic() - started, output
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+        return None, output
+
+
+@pytest.mark.slow
+def test_an_unreachable_langsmith_never_holds_the_prod_worker_s_exit(tmp_path: Path) -> None:
+    """With the prod compose's `LANGSMITH_USE_DAEMON` and `LANGSMITH_DISABLE_RUN_COMPRESSION`, a worker whose
+    LangSmith accepts connections and never answers exits within seconds, its queued runs unsent: the flush
+    gives up after its 5 s and the SDK's daemon threads do not hold the exit. The control, without the daemon
+    setting, is still running when that time is up (its thread waits out LangSmith's minute-long timeouts)."""
+    env = prod_worker_env()
+    assert (env["LANGSMITH_USE_DAEMON"], env["LANGSMITH_DISABLE_RUN_COMPRESSION"]) == ("true", "true")
+    secrets = secrets_dir(tmp_path / "secrets")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as silent:
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(64)  # the kernel completes each connection; nothing ever reads or answers it
+        endpoint = f"http://127.0.0.1:{silent.getsockname()[1]}"
+        took, output = run_until(env, endpoint, secrets)
+        assert took is not None, f"the worker was still running after {EXIT_WITHIN_S} s:\n{output}"
+        assert "returned" in output, output
+        held, control = run_until(
+            {k: v for k, v in env.items() if k != "LANGSMITH_USE_DAEMON"}, endpoint, secrets
+        )
+        assert held is None, f"without the daemon threads it exited after {held} s:\n{control}"
+        assert "returned" in control, control  # its main code was done: only the exit was held

@@ -868,7 +868,8 @@ async def test_confirm_unchanged_and_claim_totp_step(engine, make_user) -> None:
 
 
 def test_client_ip_is_canonical_or_the_shared_unknown_bucket() -> None:
-    from jobhunter.api.routes.auth import UNKNOWN_CLIENT_IP, client_ip
+    from jobhunter.api.edge import UNKNOWN_CLIENT_IP
+    from jobhunter.api.routes.auth import client_ip
     from starlette.requests import Request
 
     def ip_of(client: tuple[str, int] | None) -> str:
@@ -884,7 +885,7 @@ async def test_a_client_without_an_address_is_counted_in_the_shared_bucket(
     engine, make_config, make_user
 ) -> None:
     from jobhunter.api.app import create_app
-    from jobhunter.api.routes.auth import UNKNOWN_CLIENT_IP
+    from jobhunter.api.edge import UNKNOWN_CLIENT_IP
 
     await make_user()
     app = create_app(cfg=make_config("api"), engine=engine)

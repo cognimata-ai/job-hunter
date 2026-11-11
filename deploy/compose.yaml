@@ -148,6 +148,12 @@ services:
       LANGSMITH_PROJECT: jobhunter-prod
       LANGSMITH_HIDE_INPUTS: "true"
       LANGSMITH_HIDE_OUTPUTS: "true"
+      # Ruling T21-3 I3: an unreachable LangSmith never holds the worker's exit. The SDK's threads are daemons
+      # (it reads this once, at its first client), and runs are sent without its compression, whose thread pool
+      # the interpreter would join at exit whatever this says. The worker flushes for at most 5 s once its
+      # shutdown is complete; `langsmith_config` refuses a prod worker that traces without both.
+      LANGSMITH_USE_DAEMON: "true"
+      LANGSMITH_DISABLE_RUN_COMPRESSION: "true"
     secrets:
       - data_key
       - data_key_previous

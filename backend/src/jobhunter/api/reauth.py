@@ -34,8 +34,9 @@ from typing import Final
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
+from jobhunter.api.edge import throttled_problem
 from jobhunter.api.errors import Problem
-from jobhunter.api.routes.auth import BUSY_RETRY_AFTER_S, lockout_problem, throttled_problem
+from jobhunter.api.routes.auth import BUSY_RETRY_AFTER_S, lockout_problem
 from jobhunter.auth import throttle, totp, users
 from jobhunter.auth.credentials import (
     credentials_hold,

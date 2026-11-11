@@ -89,6 +89,9 @@ _TRACING_UNSET_VARS: Final = (
     "LANGSMITH_TRACING_SAMPLING_RATE",
     "LANGCHAIN_TRACING_SAMPLING_RATE",
 )
+# M5 Task 21 (Ruling T21-3 I3): what a prod worker that traces must have `true`, so an unreachable LangSmith
+# never holds its exit: the SDK's threads as daemons, and no run compression (its pool is joined at exit).
+_TRACING_EXIT_VARS: Final = ("LANGSMITH_USE_DAEMON", "LANGSMITH_DISABLE_RUN_COMPRESSION")
 # Every fake mode and test control, refused in prod (`fake_mode_in_prod`, §16.8 check 3), M4 Task 18's two
 # stack controls of the fake LLM included.
 _FAKE_MODE_VARS: Final = (
@@ -595,8 +598,9 @@ def tracing_enabled(cfg: AppConfig) -> bool:
 def _check_langsmith(cfg: AppConfig) -> None:
     """§16.8 check 4 (`langsmith_config`), when tracing is on: the hide flags are `true` and the endpoint
     is the EU one (the legacy endpoint variable too, when set); then (M5 Task 6, O15, Q15) the `langsmith_key`
-    secret is present, and no write replica, API key or sampling rate is set in the environment. The detail
-    names the variables or the secret, never a value."""
+    secret is present, and no write replica, API key or sampling rate is set in the environment; then (M5 Task
+    21, Ruling T21-3 I3), for a prod worker, `LANGSMITH_USE_DAEMON` and `LANGSMITH_DISABLE_RUN_COMPRESSION`
+    are `true`. The detail names the variables or the secret, never a value."""
     if not tracing_enabled(cfg):
         return
     env = cfg.environ
@@ -613,6 +617,11 @@ def _check_langsmith(cfg: AppConfig) -> None:
     # Set at all, the empty string included: how the SDK reads an empty value is not this check's to rely on.
     if present := {name for name in _TRACING_UNSET_VARS if name in env}:
         raise StartupCheckFailed("langsmith_config", f"tracing needs {_names(present)} unset")
+    # M5 Task 21 (Ruling T21-3 I3): an unreachable LangSmith must not hold a prod worker's exit, so the SDK's
+    # threads are daemons and its compression (whose thread pool the interpreter joins at exit) is off.
+    if cfg.env == "prod" and cfg.role == "worker":
+        if off := [name for name in _TRACING_EXIT_VARS if env.get(name) != "true"]:
+            raise StartupCheckFailed("langsmith_config", f"tracing in prod needs {', '.join(off)} true")
 
 
 def _check_ntfy_token(cfg: AppConfig) -> None:

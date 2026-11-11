@@ -43,7 +43,6 @@ Logs carry the outcome and the client address only (ruling T16-b): never the use
 token, cookie or username HMAC.
 """
 
-import ipaddress
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -56,6 +55,7 @@ from starlette.responses import Response
 
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
 from jobhunter.api.deps import get_argon2_gate, get_config, get_engine, require_session
+from jobhunter.api.edge import client_address, throttled_problem
 from jobhunter.api.errors import Problem
 from jobhunter.api.openapi import (
     BODY_LIMIT_RESPONSES,
@@ -77,9 +77,6 @@ from jobhunter.config import AppConfig
 from jobhunter.crypto import data_keys
 from jobhunter.observability.logging import get_logger
 
-# Where a request without a usable client address is counted: one shared bucket, so such clients cannot
-# escape the per-address throttle (uvicorn over TCP always has an address; a misconfiguration may not).
-UNKNOWN_CLIENT_IP: Final = "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
 INVALID_CREDENTIALS: Final = "Invalid credentials"
 TOTP_REQUIRED: Final = "TOTP code required"
 # What a login refused by the full Argon2 gate is told to wait: a slot frees within one verification or two.
@@ -187,15 +184,9 @@ async def decide_login(
 
 
 def client_ip(request: Request) -> str:
-    """The client address of `request` in canonical form (an IPv4-mapped IPv6 address as IPv4)."""
-    host = request.client.host if request.client is not None else None
-    try:
-        address = ipaddress.ip_address(host or "")
-    except ValueError:
-        return UNKNOWN_CLIENT_IP
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        return str(address.ipv4_mapped)
-    return str(address)
+    """The client address of `request` in canonical form (an IPv4-mapped IPv6 address as IPv4), or
+    `api.edge.UNKNOWN_CLIENT_IP`: the edge's own reading, so its login limit and this throttle key alike."""
+    return client_address(request.scope)
 
 
 @dataclass(frozen=True)
@@ -237,18 +228,6 @@ async def _verify_credentials(
         verified_hash=user.password_hash,
         totp_step=step,
         totp_secret_enc=user.totp_secret_enc,
-    )
-
-
-def throttled_problem(title: str, *, retry_after_s: int) -> Problem:
-    """A 429 `throttled` telling the client to wait `retry_after_s` seconds (`Retry-After` and the member
-    `retry_after_s`)."""
-    return Problem(
-        429,
-        "throttled",
-        title,
-        headers={"Retry-After": str(retry_after_s)},
-        extra={"retry_after_s": retry_after_s},
     )
 
 

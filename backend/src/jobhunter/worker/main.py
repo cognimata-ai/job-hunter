@@ -81,7 +81,9 @@
     the dispatcher's, the dead-man's, the embedder's and the gateway's HTTP clients and the engine closed, and
     the lock session closed last, which releases the lock; then `worker_shutdown_complete`. Each of its waits
     takes at most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits
-    in `shutdown.STOP_BUDGET_S`.
+    in `shutdown.STOP_BUDGET_S`. Last, when tracing is on, LangSmith's queue gets at most
+    `observability.langsmith.FLUSH_TIMEOUT_S` (5 s) to be sent, off the event loop; the SDK's threads are
+    daemons in prod, so nothing of LangSmith holds the exit after it (M5 Task 21, Ruling T21-3 I3).
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -153,7 +155,12 @@ from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability import deadman
 from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
-from jobhunter.observability.langsmith import install_tracing, publish_tracing_state
+from jobhunter.observability.langsmith import (
+    FLUSH_TIMEOUT_S,
+    flush_tracing,
+    install_tracing,
+    publish_tracing_state,
+)
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
@@ -667,4 +674,10 @@ async def worker_main(cfg: AppConfig) -> int:
     if not clean and code != WATCHDOG_EXIT_CODE:  # superseded stays 70 (Ruling FR-i)
         code = 1
     log.info("worker_shutdown_complete", exit_code=code)
+    try:
+        # Best effort and bounded, off the event loop (Ruling T21-3 I3): what LangSmith has not taken by then
+        # is dropped with the SDK's daemon threads. Nothing to do while tracing is off.
+        await asyncio.to_thread(flush_tracing, FLUSH_TIMEOUT_S)
+    except Exception as exc:
+        log.warning("tracing_flush_failed", error_class=type(exc).__name__)
     return code
