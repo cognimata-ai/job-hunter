@@ -1,0 +1,15 @@
+# The loader of the egress rule deploy/firewall/docker-user.nft (spec §16.9; plan M5 Task 22, Deviation 35).
+# It runs before Docker starts, so no container runs without the rule. scripts/host-setup.sh installs it into
+# /etc/systemd/system and enables it; stopping the unit deletes the rule's table.
+[Unit]
+Description=jobhunter egress rule (nft table inet jobhunter_egress)
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /opt/jobhunter/deploy/firewall/docker-user.nft
+ExecStop=/usr/sbin/nft delete table inet jobhunter_egress
+
+[Install]
+WantedBy=multi-user.target

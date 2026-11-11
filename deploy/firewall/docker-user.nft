@@ -1,0 +1,29 @@
+# The production host's egress rule (spec §16.9; plan M5 Task 22, Deviation 35, R9), defence in depth behind
+# the compose networks. It drops new connections from the `proxy`, `internal` and `edge` subnets to any address
+# outside the compose networks (172.30.0.0/16). The `egress` subnet (the worker, the backup, the one-off
+# restore) and Caddy's `edge` address (ACME) still go out. deploy/compose.yaml pins every subnet and Caddy's
+# address; tests/unit/test_firewall_files.py checks that this file names them.
+#
+# The rule is a table of its own with a chain on the `forward` hook at priority -10, ahead of Docker's own
+# chains (priority 0). So it works with Docker's iptables-nft and native nftables backends alike, and needs no
+# Docker chain at load time; the file keeps §16.9's name though it no longer uses Docker's DOCKER-USER chain.
+# A reload is idempotent: in one atomic transaction the table is declared (a no-op when it exists), deleted
+# and defined anew. The networks run without IPv6 (an A record only, Deviation 36), so `ip` matches cover them.
+#
+# deploy/firewall/jobhunter-egress.service loads it at boot, before docker.service. By hand:
+#   nft -f /opt/jobhunter/deploy/firewall/docker-user.nft
+#   nft delete table inet jobhunter_egress
+
+table inet jobhunter_egress
+delete table inet jobhunter_egress
+
+table inet jobhunter_egress {
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		ct state established,related accept
+		# `egress`, and Caddy's address on `edge`
+		ip saddr { 172.30.3.0/24, 172.30.1.2 } accept
+		# `proxy`, `internal` and `edge`: nothing new leaves the compose networks; counted
+		ip saddr { 172.30.0.0/24, 172.30.2.0/24, 172.30.1.0/24 } ip daddr != 172.30.0.0/16 ct state new counter drop
+	}
+}
