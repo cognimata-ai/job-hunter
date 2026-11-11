@@ -43,6 +43,7 @@ COMPOSE: Final = (
 )
 NOTE: Final = "host-setup: "
 GETENT: Final = "getent group 10010"
+PASSWD: Final = "getent passwd"
 SWAPON: Final = "swapon --show=NAME --noheadings --raw"
 SWAP_PASSED: Final = f"{NOTE}the swap check passed: no swap, or encrypted swap only"
 NOT_ENCRYPTED: Final = (
@@ -51,8 +52,17 @@ NOT_ENCRYPTED: Final = (
 )
 # A probe's answers: its last argument → (stdout, exit status). Unanswered, it fails with status 99.
 Answers = dict[str, dict[str, tuple[str, int]]]
-NO_GROUP: Final[Answers] = {"getent": {"10010": ("", 2)}}  # getent's status when there is no such group
-NO_SWAP: Final[Answers] = {"swapon": {"--raw": ("", 0)}}
+# Host users whose primary gid is not 10010; `service` has uid 10010 (the third field), which does not count.
+OTHER_USERS: Final = (
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+    "service:x:10010:100::/home/service:/bin/sh\n"
+)
+# By default no group 10010 (getent's status 2: no such entry), no host user with primary gid 10010, no swap.
+DEFAULTS: Final[Answers] = {
+    "getent": {"10010": ("", 2), "passwd": (OTHER_USERS, 0)},
+    "swapon": {"--raw": ("", 0)},
+}
 
 
 @dataclass(frozen=True)
@@ -76,7 +86,7 @@ def probe_stub(command: str, answers: dict[str, tuple[str, int]], log: Path) -> 
 
 def dry_run(tmp_path: Path, present: tuple[str, ...], *flags: str, answers: Answers | None = None) -> DryRun:
     """The script's dry run on a new source directory holding `present`, each file a planted value, the probes
-    answering from `answers` over "no group 10010" and "no swap"; it fails the test when the run executed any
+    answering from `answers` over `DEFAULTS`, answer by answer; it fails the test when the run executed any
     command of `CHANGES`."""
     source = tmp_path / "secrets-src"
     source.mkdir()
@@ -87,7 +97,7 @@ def dry_run(tmp_path: Path, present: tuple[str, ...], *flags: str, answers: Answ
     record, log = tmp_path / "changed", tmp_path / "probed"
     for command in CHANGES:
         (shims / command).write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{record}"\nexit 97\n')
-    given = {**NO_GROUP, **NO_SWAP, **(answers or {})}
+    given = {command: {**DEFAULTS.get(command, {}), **(answers or {}).get(command, {})} for command in PROBES}
     for command in PROBES:
         (shims / command).write_text(probe_stub(command, given.get(command, {}), log))
     for shim in shims.iterdir():
@@ -144,8 +154,8 @@ def test_the_steps_run_in_order(tmp_path: Path) -> None:
     run = dry_run(tmp_path, NAMES, "--delete-sources")
     assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
     assert commands(run.done.stdout) == expected(run.source, deleted=True)
-    # The preflight read the group database, then the swap areas; nothing else.
-    assert run.probed == [GETENT, SWAPON]
+    # The preflight read the group, then the host users, then the swap areas; nothing else.
+    assert run.probed == [GETENT, PASSWD, SWAPON]
     # A dry run deletes nothing: every source is still there, as it was.
     assert {path.name: path.read_text(encoding="utf-8") for path in run.source.iterdir()} == {
         name: f"{PLANTED}-{name}\n" for name in NAMES
@@ -222,7 +232,48 @@ def test_the_secrets_group(tmp_path: Path, entry: tuple[str, int], stop: str | N
         return
     assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
     assert commands(run.done.stdout) == expected(run.source, group=entry[1] == 2)
-    assert run.probed == [GETENT, SWAPON]
+    assert run.probed == [GETENT, PASSWD, SWAPON]
+
+
+MEMBERS: Final = ": no host user may be a member of jobhunter-secrets (§19.2)"
+
+
+@pytest.mark.parametrize("group", [("", 2), ("jobhunter-secrets:x:10010:\n", 0)], ids=["absent", "ours"])
+@pytest.mark.parametrize(
+    ("passwd", "stop"),
+    [
+        ((OTHER_USERS, 0), None),
+        (
+            (f"{OTHER_USERS}alice:x:1001:10010::/home/alice:/bin/bash\n", 0),
+            f"host users with gid 10010 as their primary group (alice){MEMBERS}",
+        ),
+        (
+            (
+                f"alice:x:1001:10010::/home/alice:/bin/bash\n{OTHER_USERS}bob:x:1002:10010::/home/bob:/bin/sh\n",
+                0,
+            ),
+            f"host users with gid 10010 as their primary group (alice,bob){MEMBERS}",
+        ),
+        (("", 1), "getent passwd failed (1)"),
+    ],
+    ids=["other-gids", "one-with-gid-10010", "two-with-gid-10010", "getent-fails"],
+)
+def test_no_host_user_has_the_secrets_gid_as_primary_group(
+    tmp_path: Path, group: tuple[str, int], passwd: tuple[str, int], stop: str | None
+) -> None:
+    """§19.2: a host user whose primary group is gid 10010 is a member of the secrets group too, so the
+    preflight stops on one, before any change, whether the group exists yet or not; users with other gids
+    pass (a uid of 10010 does not count)."""
+    run = dry_run(tmp_path, NAMES, answers={"getent": {"10010": group, "passwd": passwd}})
+    if stop is None:
+        assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
+        assert f"{NOTE}no host user has gid 10010 as its primary group" in run.done.stdout.splitlines()
+        assert commands(run.done.stdout) == expected(run.source, group=group[1] == 2)
+        assert run.probed == [GETENT, PASSWD, SWAPON]
+        return
+    assert run.done.returncode == 1
+    assert run.done.stderr == f"host-setup: {stop}; nothing was changed\n"
+    assert (commands(run.done.stdout), run.probed) == ([], [GETENT, PASSWD])
 
 
 @dataclass(frozen=True)
@@ -307,7 +358,7 @@ def test_the_swap_check(tmp_path: Path, case: Swap) -> None:
     if case.findmnt is not None:
         answers["findmnt"] = {str(swap_file): case.findmnt}
     run = dry_run(tmp_path, NAMES, answers=answers)
-    assert run.probed == [GETENT, SWAPON, *(fill(call) for call in case.calls)]
+    assert run.probed == [GETENT, PASSWD, SWAPON, *(fill(call) for call in case.calls)]
     if case.stop is None:
         assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
         assert SWAP_PASSED in run.done.stdout.splitlines()

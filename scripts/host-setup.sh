@@ -9,8 +9,8 @@
 # - a real run only: it runs as root, from the checkout at /opt/jobhunter, and deploy/release.lock and
 #   /etc/jobhunter/jobhunter.env exist (step 5 needs them);
 # - every secret file of deploy/secrets.example is in <dir>, except the two optional ones (step 3);
-# - gid 10010 is absent, or is the group jobhunter-secrets with no members: no host user may read the secrets
-#   (§19.2);
+# - gid 10010 is absent, or is the group jobhunter-secrets with no members, and no host user has gid 10010 as
+#   its primary group: no host user may read the secrets (§19.2);
 # - the swap check: no swap, or encrypted swap only, so the parse_jobs tmpfs never pages a decrypted CV to a
 #   plain disk (§19.8 step 5). A swap area counts as encrypted when a dm-crypt device is in its block device
 #   stack; a swap file is judged by the device of its filesystem. Any other swap stops it, zram included.
@@ -91,6 +91,20 @@ check_group() {
     note "gid $GID is the group $GROUP, with no members"
 }
 
+# A host user whose primary group is gid 10010 is a member of the group too (§19.2), whether the group exists
+# yet or not: any such user stops the script.
+check_primary_group() {
+    local users primary status=0
+    users=$(getent passwd) || status=$?
+    [ "$status" -eq 0 ] || die "getent passwd failed ($status); nothing was changed"
+    primary=$(awk -F: -v gid="$GID" '$4 == gid { names = names (names ? "," : "") $1 } END { print names }' \
+        <<<"$users")
+    [ -z "$primary" ] ||
+        die "host users with gid $GID as their primary group ($primary): no host user may be a member of" \
+            "$GROUP (§19.2); nothing was changed"
+    note "no host user has gid $GID as its primary group"
+}
+
 # Every active swap area must have a dm-crypt device in its block device stack.
 check_swap() {
     local areas area device
@@ -153,6 +167,7 @@ for name in $names; do
     fi
 done
 check_group
+check_primary_group
 check_swap
 if [ "$dry_run" -eq 1 ]; then
     note "dry run: the commands are printed, none is run"
