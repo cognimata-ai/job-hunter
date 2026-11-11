@@ -51,9 +51,11 @@ directory and data keys, the CV store, the clock):
    lock), the owner row, the export row `FOR UPDATE`. An export no longer `running` (a purge ended it first,
    D9) → `succeeded`, its `<id>-*` files removed (no row names them). An active purge fence, or a manifest
    with an id above `g` (a purge opened after the snapshot, fenced or not) → `running → purged`, the file
-   removed. Else `running → ready` with `storage_path`, `sha256` (of the stored file), `size_bytes` (the
-   zip's) and `purge_generation = g`, and `succeeded`. A purge opened after this commit names the `ready`
-   export at its A2 and deletes it (§20.2: the export became `ready` before the fence, or it saw it).
+   removed. Else, once the archive is found still on the volume (a missing one raises, and the attempt is
+   retried: "The guard" below), `running → ready` with `storage_path`, `sha256` (of the stored file),
+   `size_bytes` (the zip's) and `purge_generation = g`, and `succeeded`. A purge opened after this commit
+   names the `ready` export at its A2 and deletes it (§20.2: the export became `ready` before the fence, or
+   it saw it).
 
 **The guard** (Ruling T17-1 (c): no `<id>-` name is ever made for an export a purge has ended, else that
 purge's `file_remove` postcondition could fail). Every name the handler makes, the `.tmp`'s creation (step 3)
@@ -64,10 +66,16 @@ committed first, and the guard finds the row `purged` and makes no name, or it w
 transaction, and the name exists before the purge's commit, hence before its listing. The rename is guarded
 too, not only the creation: an unguarded rename could fall between the purge's listing (which saw the
 `.tmp`) and its unlink (which then misses the new `.jhx`). The handler keeps writing into its open file
-whatever happens to its name. The failure hook's removal holds the operation row, which a guard takes too, and
-ends the claim the guard checks; retention removes only files a day old. Every content-free row's files are
-removed inside the transaction that ends it here: none of them is named, so a rolled-back transaction loses
-nothing.
+whatever happens to its name. The other removers of `<id>-*` are ordered the same way. The failure hook's
+removal holds the operation row, which a guard takes too, and ends the claim the guard checks. Retention's
+expiry and lost steps remove `<id>-*` at any age, but only after their `UPDATE` moved the row out of `ready`
+or `running`, which a guard's `FOR SHARE` orders; and no guard of theirs passes again (an expired export's
+operation ended long ago, a lost one has none live). Only the orphan sweep goes by age (a day). Every
+content-free row's files are removed inside the transaction that ends it here: none of them is named. A file
+removal never rolls back, though: a failure hook whose transaction rolls back (a stale reclaim of several rows
+that fails on a later one) has still removed an unpublished archive, while its handler, whose claim the
+rollback left valid, goes on. So the publication checks that its archive still exists (step 6): a missing one
+fails the attempt, and the retry rebuilds it.
 
 **The archive** (`write_archive(conn, sink, *, export_id, cv_store, keys)`, in the caller's snapshot): the
 files of `EXPORT_FILES` and the `cv_files/` directory. Each JSON file is an array, in id order, streamed row
@@ -89,8 +97,9 @@ tampered file raises `ExportCorrupt`.
 **The failure hook** (`export_failed`, registered with the handler): in every transaction that ends the
 operation `failed` (a `failed` finish, an exhausting requeue, reclaim or takeover), the payload's export
 `running → failed`, a row in any other state left as it is (a purge or the publication moved it first), and
-its files removed unless it is `ready` (an attempt's `.tmp` and an unpublished archive: nothing names them).
-So no `running` row outlives its operation, and `exports_one_running` never blocks the next export.
+its files removed unless it is `ready` (an attempt's `.tmp` and an unpublished archive: nothing names them;
+should its transaction roll back, the publication's existence check catches the removal, "The guard"). So no
+`running` row outlives its operation, and `exports_one_running` never blocks the next export.
 
 **Retention** (`retain_exports`, the rule `exports` of `privacy.retention`, each step a transaction of its own
 that starts with the epoch fence): a `ready` export past `expires_at` → `expired`, `storage_path` NULL, its
@@ -421,7 +430,9 @@ Job Hunter: your data export {export_id}
 This archive is a copy of your data as Job Hunter held it when the export ran. Each JSON file is a list of
 records in the order they were created; times are UTC (ISO 8601).
 
-profile_versions.json   your confirmed profile versions that are still kept, without your contact details
+profile_versions.json   your confirmed profile versions that are still kept, without your contact details,
+                        and the synthetic versions of the scoring's evaluation, each marked
+                        "synthetic_eval": true
 cv_files/               the CV files you uploaded that still exist, decrypted (a pasted CV as a .txt file)
 settings_versions.json  every saved version of your settings
 jobs.json               the job ads collected for you: their canonical fields, your actions (seen, saved,
@@ -433,10 +444,12 @@ golden_cases.json       the cases you labelled for the evaluation of the scoring
 runs.json               the collection runs with their reports
 README.txt              this file
 
-The export is available for 7 days after you requested it and is deleted then, or at once when data is
-deleted (a purge), because it may hold that data; a job that a deletion was still removing when the export
-ran is left out of it. How Job Hunter keeps, deletes and exports your data is described in its privacy
-statement, PRIVACY.md (Settings, Privacy & data).
+The export is available for 7 days after you requested it and is deleted then. Every privacy deletion (a
+purge: a deletion you request, delete everything included, or the removal of an old profile version) deletes
+it at once, because it may hold the deleted data. The nightly removal of old job ads does not: until the
+export expires, it can still hold an ad removed after it was made. A job that a deletion was still removing
+when the export ran is left out of it. How Job Hunter keeps, deletes and exports your data is described in its
+privacy statement, PRIVACY.md (Settings, Privacy & data).
 """
 
 
@@ -727,6 +740,9 @@ async def _publish(
             await ctx.finish_in(conn, status="succeeded")
             outcome = "purged"
         else:
+            # The archive must still be there: a rolled-back hook's removal is not undone (module docstring,
+            # "The guard"). A missing one raises `FileNotFoundError`; the attempt is retried and rebuilds it.
+            os.stat(volume / archive)
             await transition(
                 conn,
                 "exports",

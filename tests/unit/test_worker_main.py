@@ -304,6 +304,18 @@ class World:
         monkeypatch.setattr(LLMGateway, "settle_in_flight", recording_settle_in_flight)
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
+        # M5 Task 17: step 4's exports volume (the real configuration, its process-wide state restored on
+        # teardown), recorded so that its place before the takeover sweep is pinned.
+        from jobhunter.privacy import export
+
+        real_export_configure = export.configure
+
+        def recording_export_configure(cfg: object) -> None:
+            events.append("export_configure")
+            real_export_configure(cfg)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(export, "_volume", export._volume)  # restored on teardown
+        monkeypatch.setattr(export, "configure", recording_export_configure)
 
         for name, fake in {
             "LockSession": FakeLockSession,
@@ -369,6 +381,7 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
         "tracing_install",
@@ -415,6 +428,21 @@ async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_in
     assert world.clients and all(client.is_closed for client in world.clients.values())  # type: ignore[attr-defined]
 
 
+async def test_step_4_configures_the_exports_volume_before_the_takeover_sweep(monkeypatch, tmp_path) -> None:
+    """M5 Task 17 (fix round 1, M2): the exports volume of the `export` failure hook is configured in step 4,
+    after the registering imports and before `claim_epoch_and_sweep`, whose takeover sweep can end an export
+    operation `failed` and so run that hook; it is the configuration's exports directory."""
+    from jobhunter.privacy import export
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    events = world.events
+    assert events.count("export_configure") == 1
+    assert events.index("lock_acquire") < events.index("export_configure") < events.index("claim")
+    assert export._volume == world.cfg.exports_dir
+
+
 async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
     monkeypatch, tmp_path
 ) -> None:
@@ -443,6 +471,7 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
         "tracing_install",
@@ -657,6 +686,7 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
         "tracing_install",
@@ -719,6 +749,7 @@ def fake_dispatchers(
 START = [
     "lock_connect",
     "lock_acquire",
+    "export_configure",
     "claim",
     "watchdog_start",
     "tracing_install",

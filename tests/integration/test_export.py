@@ -56,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import PausePoint, PausePoints, no_fault, raising_at
 from tests.support.fences import insert_test_fence, insert_test_manifest
+from tests.support.logs import logged
 from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import insert_golden_case, insert_job
 from tests.support.pg import PgServer, blocked_or_done
@@ -94,6 +95,7 @@ _NOTE: Final = sa.text(
     "INSERT INTO user_job_actions (job_id, saved_at, note) VALUES (:j, now(), :note) "
     "ON CONFLICT (job_id) DO UPDATE SET note = EXCLUDED.note"
 )
+_LOCK_CONFIG: Final = sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
 _FENCE_OF: Final = sa.text(
     "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), :m)"
 )
@@ -408,6 +410,27 @@ async def test_request_export_is_refused_under_a_global_fence(engine: AsyncEngin
     assert (await scalar(engine, _COUNT_EXPORTS), await scalar(engine, _COUNT_EXPORT_OPERATIONS)) == (0, 0)
 
 
+async def test_the_request_waits_for_a_fence_committing_under_active_config_and_is_refused(
+    engine: AsyncEngine, migrated: PgServer
+) -> None:
+    """§20.3 L6508, the request's side (fix round 1, M3): delete-everything commits its `global` fence under
+    `active_config FOR UPDATE`. A request that arrives while that transaction is open waits on its
+    `active_config FOR SHARE`, reads the fence once it has committed, and is refused 409
+    `delete_everything_in_progress`, writing nothing."""
+    async with engine.connect() as holder:
+        await holder.begin()
+        await holder.execute(_LOCK_CONFIG)
+        await insert_test_fence(holder, kind="global")
+        requesting = asyncio.create_task(requested(engine))
+        await await_until(lambda: blocked_or_done(migrated, requesting), timeout_s=30)
+        assert not requesting.done()  # a lock wait, on `active_config`
+        await holder.commit()
+    with pytest.raises(Refusal) as refused:
+        await asyncio.wait_for(requesting, 30)
+    assert (refused.value.status, refused.value.code) == (409, "delete_everything_in_progress")
+    assert (await scalar(engine, _COUNT_EXPORTS), await scalar(engine, _COUNT_EXPORT_OPERATIONS)) == (0, 0)
+
+
 # ---- purges and fences -------------------------------------------------------------------------------------
 
 
@@ -509,6 +532,59 @@ async def test_an_export_meeting_a_fence_ends_purged(
     assert await scalar(engine, _MAX_MANIFEST) == manifest_id  # no manifest newer than the snapshot's
     assert exporter.files(export_id) == []
     assert (await operation_of(engine, operation_id)).status == "succeeded"
+
+
+async def test_the_publication_waits_for_a_manifest_committing_under_active_config_and_ends_purged(
+    engine: AsyncEngine, exporter: Exporter, migrated: PgServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§20.3 L6508, the publication's side (fix round 1, M3): every purge's A0 commits its manifest under
+    `active_config FOR UPDATE`. A publication that arrives while that transaction is open waits on its
+    `active_config FOR SHARE`, reads the manifest (above its generation) once it has committed, and ends the
+    export `purged`, its file removed, never `ready`."""
+    export_id, operation_id = await requested(engine)
+    pause = PausePoint(AFTER_RENAME)
+    monkeypatch.setattr(export, "afault_point", pause)
+    running = asyncio.create_task(exporter.run(operation_id))
+    await asyncio.wait_for(pause.reached.wait(), 30)
+    async with engine.connect() as holder:
+        await holder.begin()
+        await holder.execute(_LOCK_CONFIG)
+        await insert_test_manifest(holder, kind="golden_case_delete")  # an A0's manifest, uncommitted
+        pause.resume()
+        await await_until(lambda: blocked_or_done(migrated, running), timeout_s=30)
+        assert not running.done()  # a lock wait, on `active_config`
+        assert await status_of(engine, export_id) == "running"
+        await holder.commit()
+    await asyncio.wait_for(running, 30)
+    row = await export_of(engine, export_id)
+    assert row is not None and (row.status, row.storage_path, row.purge_generation) == ("purged", None, None)
+    assert exporter.files(export_id) == []
+    assert (await operation_of(engine, operation_id)).status == "succeeded"
+
+
+async def test_a_publication_never_names_a_missing_archive(
+    engine: AsyncEngine, exporter: Exporter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix round 1, M1: a file removal does not roll back, so a failure hook whose transaction rolled back
+    (a stale reclaim of several rows that fails on a later one) can have removed the unpublished archive of a
+    handler that goes on. The publication checks that its archive still exists: a missing one fails the
+    attempt (`bug`, the row still `running`, no `storage_path`), and the retry rebuilds and publishes it."""
+    export_id, operation_id = await requested(engine)
+    pause = PausePoint(AFTER_RENAME)
+    monkeypatch.setattr(export, "afault_point", pause)
+    running = asyncio.create_task(exporter.run(operation_id))
+    await asyncio.wait_for(pause.reached.wait(), 30)
+    [archive] = exporter.files(export_id)
+    (exporter.volume / archive).unlink()  # what the rolled-back hook's removal leaves
+    pause.resume()
+    await asyncio.wait_for(running, 30)
+    retried = await operation_of(engine, operation_id)
+    assert (retried.status, retried.attempts, retried.last_error_code) == ("pending", 1, "bug")
+    row = await export_of(engine, export_id)
+    assert row is not None and (row.status, row.storage_path) == ("running", None)
+    await exporter.again(operation_id)
+    row = await export_of(engine, export_id)
+    assert row is not None and row.status == "ready" and exporter.files(export_id) == [row.storage_path]
 
 
 @pytest.mark.parametrize("stage", ["opened", "completed"])
@@ -792,6 +868,26 @@ async def test_an_export_reclaimed_on_its_last_attempt_fails_through_the_hook(
     exported = await export_of(engine, export_id)
     assert exported is not None and exported.status == "failed"
     assert not any(path.exists() for path in files) and decoy.exists()
+
+
+async def test_without_a_configured_volume_the_hook_ends_the_row_and_logs_the_files_left(
+    engine: AsyncEngine, purger: Purger, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fix round 1, M2: in a process that never configured the exports volume (`export.configure`, which only
+    the worker's start calls), the failure hook still moves the export `failed`, leaves its files to the next
+    configured pass and logs `export_files_left` with the export's id."""
+    monkeypatch.setattr(export, "_volume", None)
+    export_id, operation_id = await requested(engine)
+    left = purger.cfg.exports_dir / f"{export_id}-{uuid.uuid4()}.jhx.tmp"
+    left.write_bytes(b"\x00 an attempt's segments")
+    async with engine.begin() as conn:
+        claim = await ops.claim_operation(conn, operation_id, epoch=1)
+        assert claim is not None
+        await ops.finish_operation(conn, claim, status="failed", error_code="bug")  # its hook runs here
+    assert await status_of(engine, export_id) == "failed"
+    assert left.exists()
+    left_logged = [(e["export_id"], e["level"]) for e in logged(caplog, "export_files_left")]
+    assert left_logged == [(export_id, "warning")]
 
 
 # ---- retention ---------------------------------------------------------------------------------------------
