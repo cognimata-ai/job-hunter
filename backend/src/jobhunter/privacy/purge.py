@@ -72,6 +72,8 @@ committed.
 
 **A live purge's external effects** (`LiveEffects`, Deviation 56): the process's Message Batches client and
 its dead-man pinger, from the worker's `OperationDeps`; a replay has none (`PurgeRun.effects` is `None`).
+A replay's run (`PurgeRun.replay`, `migrate` step 7, M5 Task 25) has neither effects nor an owner, and works
+on the volumes `migrate` was given (its `--cv-dir` and `--exports-dir`).
 
 Fault points (test env only): `privacy.purge.before_file`, `after_file`, `after_record`, `mid_delete` (after
 the kind's chunks, before the export ops) and `before_complete`. Ids, counts, kinds and codes only reach a log
@@ -126,6 +128,7 @@ from jobhunter.privacy.manifests import (
     write_manifest_file,
 )
 from jobhunter.privacy.reconcilers import PURGE_FAILED_ALERT
+from jobhunter.profile.storage import CvStore
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.operations import PURGE_DEDUP_PREFIX as PURGE_DEDUP_PREFIX
@@ -143,7 +146,6 @@ if TYPE_CHECKING:
     from jobhunter.config import AppConfig
     from jobhunter.llm.batches import BatchesClient
     from jobhunter.observability.deadman import DeadmanPinger
-    from jobhunter.profile.storage import CvStore
 
 # Read-then-lock rounds of a chunk whose co-members keep changing (as `dedup.groups._LOCK_ROUNDS`).
 CHUNK_LOCK_ROUNDS: Final = 3
@@ -271,7 +273,7 @@ class PurgeRun:
     engine: AsyncEngine
     cfg: "AppConfig"
     now: datetime
-    cv_store: "CvStore"
+    cv_store: CvStore
     manifest: ManifestRow
     mode: Literal["live", "replay"]
     effects: LiveEffects | None
@@ -281,6 +283,26 @@ class PurgeRun:
         live = self.mode == "live"
         if live != (self.effects is not None) or live != (self.owner is not None):
             raise ValueError("a live purge has its effects and its owner, a replay neither")
+
+    @classmethod
+    def replay(
+        cls, engine: AsyncEngine, cfg: "AppConfig", *, manifest: ManifestRow, now: datetime, files: FileRoots
+    ) -> "PurgeRun":
+        """A replay's run of `manifest` (`migrate` step 7, M5 Task 25): no effects and no owner, and its file
+        operations on the volumes `migrate` was given (`files`: `--cv-dir`, `--exports-dir`), which become the
+        run's configuration's, so `files`, `cv_store` and the export ops (`deletion_graph.purge_exports`) all
+        name them and never an unmounted image directory."""
+        volumes = dataclasses.replace(cfg, cv_store_dir=files.cv_store, exports_dir=files.exports)
+        return cls(
+            engine=engine,
+            cfg=volumes,
+            now=now,
+            cv_store=CvStore(files.cv_store),
+            manifest=manifest,
+            mode="replay",
+            effects=None,
+            owner=None,
+        )
 
     @property
     def files(self) -> FileRoots:

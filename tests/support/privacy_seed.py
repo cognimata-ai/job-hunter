@@ -153,6 +153,9 @@ class SeedIds:
     open_alert_id: int = 0  # warn, never pushed
     bound_violation_alert_id: int = 0  # `llm.reservation_bound_violated`, open and unacknowledged
     resolved_alert_id: int = 0  # resolved two years ago
+    # Task 25: the inactive golden case on `closed_job`'s current revision (the old version's), which a
+    # golden-case deletion takes while no running eval run includes it
+    closed_case_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -2090,6 +2093,7 @@ async def seed_two_year_old_graph(
         purgeable_draft_id=purgeable.draft,
         purgeable_cv_file_id=purgeable.cv_file,
         purgeable_case_id=golden_cases[2],
+        closed_case_id=golden_cases[1],
         ready_proposal_id=purgeable.ready,
         failed_proposal_id=purgeable.failed,
         running_proposal_id=purgeable.running,

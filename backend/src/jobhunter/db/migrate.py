@@ -7,8 +7,14 @@ the database records, step 1 after writing the files of recorded manifests the s
 checkpointer's schemas exist: on a first installation the queue's `bigserial` sequences are created only
 there, after steps 1 and 3, and a queue job must never take an id an earlier delete-everything lists. Nothing
 allocates an id between their creation and that pass: both setups create schema only, and the checkpointer's
-`checkpoint_migrations` has no sequence. The replay (step 7) still only logs that it did nothing; it arrives
-with the two-phase replay (M5 Task 25).
+`checkpoint_migrations` has no sequence.
+
+Step 7 replays the deletion-manifest stream in two phases (`privacy.replay.replay_stream`, M5 Task 25): the
+manifests classified by §19.5's table, then, when one is to be replayed, every destructive operation of the
+stream with every fence active, one rebuild over the stored affected jobs, and one transaction that verifies
+every postcondition and releases the fences. A file of the stream that does not parse or is named for another
+uuid (`ManifestInvalid`) or a postcondition that fails (`ReplayFailed`, the fences kept) stops `migrate` like
+any failing step. Its file operations use the volumes of the run (`cv_dir`, `exports_dir`).
 
 The flags (M5 Task 23, Deviation 38) serve the restore code and the restore test (§19.5): `steps` runs a
 subset of step groups (`STEP_GROUPS`), always in `MIGRATE_ORDER`; `database` and `db_role` select the database
@@ -42,6 +48,7 @@ from jobhunter.graphs.checkpointer import setup_checkpointer
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.identities import advance_identities, manifest_bounds, rewrite_missing_files
 from jobhunter.privacy.manifests import FileRoots
+from jobhunter.privacy.replay import replay_stream
 
 log = get_logger("jobhunter.migrate")
 
@@ -74,7 +81,6 @@ STEP_GROUPS: Final[Mapping[StepGroup, tuple[MigrateStep, ...]]] = MappingProxyTy
 )
 # Tables of later milestones that the backup role writes (the backup role has no default privileges).
 BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")
-_REPLAY_NOOP_REASON: Final = "replay_arrives_later_in_M5"
 # Session-level advisory lock that serialises `migrate` runs. The project's advisory keys: a session lock and
 # a transaction lock on the same key conflict, so each use has a key of its own. PostgreSQL keeps the one-key
 # form (one bigint; `objsubid = 1` in `pg_locks`) and the two-key form (two integers; `objsubid = 2`) apart,
@@ -118,8 +124,9 @@ def selected_steps(steps: frozenset[StepGroup] | None) -> tuple[MigrateStep, ...
 @dataclass(frozen=True)
 class _Target:
     """What a run works on: the database as one login (`dsn` for psycopg, `sqlalchemy_dsn`), the manifest
-    stream, and the volumes whose files the replay removes (step 7)."""
+    stream, the volumes whose files the replay removes (step 7), and the configuration it runs with."""
 
+    cfg: AppConfig
     dsn: str
     sqlalchemy_dsn: str
     manifest_dir: Path
@@ -159,7 +166,16 @@ async def _run_step(step: MigrateStep, target: _Target, engine: AsyncEngine, now
             async with engine.begin() as conn:
                 await _advance(conn, step, target.manifest_dir)
         case "replay":
-            log.info("migrate_step_noop", step=step, reason=_REPLAY_NOOP_REASON)
+            report = await replay_stream(
+                engine, target.cfg, manifest_dir=target.manifest_dir, files=target.files, now=now
+            )
+            log.info(
+                "migrate_replayed",
+                step=step,
+                replayed=report.replayed,
+                pending_completed=report.pending_completed,
+                rebuilt_jobs=report.rebuilt_jobs,
+            )
         case "alembic":
             # The rollback compatibility floors of the chain (M5): validated before the schema moves, so a
             # mis-declared floor fails here, and recorded once the schema is at the head
@@ -246,6 +262,7 @@ async def run_migrate_async(
     phase = "lock"  # what `migrate_failed` names when the failure comes before the first step
     try:
         target = _Target(
+            cfg=cfg,
             dsn=cfg.dsn("psycopg", db_role=db_role, database=database),
             sqlalchemy_dsn=cfg.dsn("sqlalchemy", db_role=db_role, database=database),
             manifest_dir=cfg.manifests_dir if manifest_dir is None else manifest_dir,

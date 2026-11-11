@@ -80,7 +80,16 @@ the content names or selects within its bound:
    the creation), then the det-facts hook (`filters.refilter_job_live`: the hard filters and the current
    `det_results` instances of the active tuple's published results for the active and pending scopes), the
    ranking bumped last. No target is created: `missing_targets` creates them after the release. It returns
-   the number of roots (families) rebuilt;
+   the number of roots (families) rebuilt. **In a replay** (`run.mode == "replay"`, `migrate` step 7's phase
+   A, M5 Task 25) `execute` leaves the rebuild to the replay's phase B, which runs `rebuild_jobs` once over
+   the whole stream (§19.5): here, the content's tainted revisions (`row_delete job_revisions`) are deleted
+   instead, `ROW_CHUNK` a chunk over their jobs, `current_revision_id := NULL` first wherever one names them
+   (the `field_redact`, as tombstoning step 6 does), so each chunk commits with no dangling deferred key
+   (Fable N6) and no later manifest of the stream meets a revision a rebuild would have created. A golden case
+   on one of them that the content does not name goes first (`deletion_graph.settle_and_delete_cases`): a
+   later manifest of the stream deleted it before this one's A2 (completions out of stream order, after a
+   requeued first run), and a dump from before both still holds it, whose key would refuse the revision's
+   deletion;
 4. the frozen embeddings: under the jobs of the revisions that still reference one (a revision outside the
    deleted set that took it since A2, same text), each such revision `embedding_status = 'awaiting_embedding'`
    with `embedding_id` NULL in one update (the CHECK allows nothing else), then every frozen embedding nobody
@@ -290,6 +299,14 @@ _UNPOINT: Final = q(
     f"AND current_revision_id = ANY({_TAINTED_IDS})"
 )
 _DELETE_REVISIONS: Final = q(f"DELETE FROM job_revisions WHERE id = ANY({_TAINTED_IDS})")  # noqa: S608
+# A replay's phase A (module docstring, phase B step 3): the jobs of the content's tainted revisions left, and
+# the golden cases still on them.
+_JOBS_OF_REVISIONS: Final = q(
+    f"SELECT DISTINCT job_id FROM job_revisions WHERE id = ANY({_TAINTED_IDS}) ORDER BY job_id"  # noqa: S608
+)
+_CASES_ON: Final = q(
+    f"SELECT id FROM golden_cases WHERE job_revision_id = ANY({_TAINTED_IDS}) ORDER BY id"  # noqa: S608
+)
 _CURRENT: Final = q("SELECT current_revision_id FROM jobs WHERE id = :job")
 _REVISION_EXISTS: Final = q("SELECT EXISTS (SELECT 1 FROM job_revisions WHERE id = :r)")
 # A merged member whose `field_provenance` names the source takes the root's rebuilt canonical values.
@@ -781,6 +798,26 @@ async def rebuild_jobs(run: PurgeRun, job_ids: Sequence[int]) -> int:
     return rebuilt
 
 
+async def _delete_tainted_revisions(run: PurgeRun, tainted: Sequence[int]) -> int:
+    """A replay's phase A in place of the rebuild (module docstring, phase B step 3): the content's tainted
+    revisions, `ROW_CHUNK` a chunk over their jobs, the golden cases still on them deleted and the revisions
+    unpointed first; how many were deleted."""
+    deleted = 0
+    for ids in _slices(tainted):
+        async with run.engine.connect() as conn:
+            jobs = await _ids(conn, _JOBS_OF_REVISIONS, {"tainted": ids})
+        if not jobs:
+            continue  # deleted already
+        async with run.chunk(job_ids=jobs) as chunk:
+            if cases := await _ids(chunk.conn, _CASES_ON, {"tainted": ids}):
+                await deletion_graph.settle_and_delete_cases(chunk.conn, cases, now=run.now, check=None)
+                log.info("source_purge_replay_cases_deleted", manifest_id=run.manifest.id, case_ids=cases)
+            await chunk.conn.execute(_UNPOINT, {"jobs": sorted(chunk.held), "tainted": ids})
+            deleted += (await chunk.conn.execute(_DELETE_REVISIONS, {"tainted": ids})).rowcount
+            await ranking.bump(chunk.conn)
+    return deleted
+
+
 # ---- phase B: the embeddings -------------------------------------------------------------------------------
 
 
@@ -844,8 +881,12 @@ class SourcePurge:
             "fetch_requests": await _delete_requests(run, source, bounds["fetch_requests"]),
         }
         await afault_point(BEFORE_REBUILD)
-        affected = content.get("affected")
-        counts["jobs_rebuilt"] = await rebuild_jobs(run, [] if affected is None else affected["job_ids"])
+        if run.mode == "replay":  # the rebuild is the replay's phase B (module docstring)
+            tainted_revisions = _named(content, "row_delete", "job_revisions")
+            counts["revisions"] = await _delete_tainted_revisions(run, tainted_revisions)
+        else:
+            affected = content.get("affected")
+            counts["jobs_rebuilt"] = await rebuild_jobs(run, [] if affected is None else affected["job_ids"])
         counts["embeddings"] = await _delete_embeddings(run, _named(content, "row_delete", "embeddings"))
         log.info("source_purge_executed", manifest_id=run.manifest.id, source_id=source, **counts)
 

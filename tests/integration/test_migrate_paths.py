@@ -9,12 +9,15 @@ any manifest's bound. On a first installation the queue's sequences exist only f
 advancement of its own (Codex plan round 11).
 
 Each test has a server of its own; the bounds that cover every table take the identity tables of the code head
-from the shared migrated server. The replay of the stream (step 7) is Task 25's. Every manifest and row is
-invented.
+from the shared migrated server. Step 7 replays the stream (M5 Task 25): every manifest here is of a kind
+whose procedure deletes only the rows its operations name (a golden-case deletion, a tombstone), so a
+manifest the database has no row for is inserted, replayed and completed without touching the rows of the
+test, and the next `migrate` finds it `satisfied`. Every manifest and row is invented.
 """
 
 import asyncio
 import hashlib
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +32,7 @@ from jobhunter.db.migrate import BACKUP_GRANT_TABLES, MIGRATE_ORDER, StepGroup, 
 from jobhunter.db.session import make_null_engine
 from jobhunter.ids import uuid7
 from jobhunter.privacy.manifests import (
+    FileRoots,
     ManifestContent,
     ManifestKind,
     Operation,
@@ -40,6 +44,7 @@ from jobhunter.privacy.manifests import (
     record_manifest,
     write_manifest_file,
 )
+from jobhunter.privacy.replay import Classified, classify_stream
 from procrastinate import PsycopgConnector
 from structlog.testing import capture_logs
 
@@ -77,8 +82,8 @@ def content(
 
 
 def listed_jobs(job_ids: Sequence[int]) -> list[Operation]:
-    """A delete-everything's deletion of the queue jobs it lists by id, their events first (under the jobs'
-    bound: the events' `job_id`)."""
+    """The deletion of the queue jobs a manifest lists by id, their events first (under the jobs' bound: the
+    events' `job_id`), as delete-everything lists them."""
     return [
         {
             "op": "row_delete",
@@ -203,10 +208,10 @@ async def test_first_installation_with_and_without_manifests_on_the_volume(
     head = await columns_of(migrated)
     bounds: dict[str, int] = {}
     if with_manifests:
-        # An earlier installation's delete-everything with a bound on every table, and a later purge that
-        # lists a queue job above them.
+        # An earlier installation's manifest with a bound on every table, and a later one that lists a queue
+        # job above them.
         bounds = {table: 1000 + 10 * i for i, (table, _) in enumerate(head)}
-        write_manifest_file(cfg.manifests_dir, content(kind="delete_everything", max_ids=bounds))
+        write_manifest_file(cfg.manifests_dir, content(kind="golden_case_delete", max_ids=bounds))
         write_manifest_file(
             cfg.manifests_dir, content(kind="job_tombstone", max_ids={}, operations=listed_jobs([5000]))
         )
@@ -241,12 +246,16 @@ async def test_a_first_installation_advances_the_queue_past_listed_job_ids(
     cfg = make_config("migrate", server)
     listed = [17, 23, 42]
     # Its `max_ids` bound on the queue lies below the ids it lists: the listed ids themselves must count.
-    write_manifest_file(
-        cfg.manifests_dir,
-        content(kind="delete_everything", max_ids={"procrastinate_jobs": 10}, operations=listed_jobs(listed)),
+    listing = content(
+        kind="job_tombstone", max_ids={"procrastinate_jobs": 10}, operations=listed_jobs(listed)
     )
+    write_manifest_file(cfg.manifests_dir, listing)
     with capture_logs() as logs:
         await run_migrate_async(cfg, now=NOW)
+    # The database had no row of it: step 7 inserted, replayed and completed it.
+    assert [(e["replayed"], e["pending_completed"]) for e in logs if e["event"] == "migrate_replayed"] == [
+        (1, 0)
+    ]
     # The queue's sequence exists only from step 5, whose own advancement moves it past the listed ids.
     advanced = advanced_by_step(logs)
     assert "procrastinate_jobs" not in advanced["reconstruct_and_advance"] | advanced["advance_again"]
@@ -260,6 +269,14 @@ async def test_a_first_installation_advances_the_queue_past_listed_job_ids(
         server, "migrator", "SELECT id, CAST(status AS text), task_name FROM procrastinate_jobs ORDER BY id"
     )
     before = maxima(server, columns)
+    roots = FileRoots(cv_store=cfg.cv_store_dir, exports=cfg.exports_dir)
+    engine = make_null_engine(server.dsn("migrator", driver="sqlalchemy"))
+    try:
+        async with engine.connect() as conn:
+            classified = await classify_stream(conn, cfg.manifests_dir, files=roots)
+    finally:
+        await engine.dispose()
+    assert classified == [Classified(uuid.UUID(listing["manifest_uuid"]), "satisfied")]
     with capture_logs() as again:
         await run_migrate_async(cfg, now=NOW)
     # The second migrate changes no row and allocates no id at or below the largest listed one.
@@ -273,6 +290,9 @@ async def test_a_first_installation_advances_the_queue_past_listed_job_ids(
         == queue
     )
     assert advanced_by_step(again) == {step: {} for step in ADVANCING_STEPS}
+    # Step 7 replays nothing: the manifest is satisfied.
+    assert [e["outcomes"] for e in again if e["event"] == "replay_classified"] == [{"satisfied": 1}]
+    assert not [e for e in again if e["event"].startswith("replay_phase")]
     assert allocated_at_or_below(server, columns, {"procrastinate_jobs": max(listed)}, before) == {}
     assert await enqueue(server, 1) == [max(jobs) + 1]
 
@@ -297,7 +317,7 @@ async def test_upgrade_from_0009_with_data(
     assert "deletion_manifests" not in before  # 0010 creates it
     head = await columns_of(migrated)
     bounds = {table: 400 for table, _ in head}
-    write_manifest_file(cfg.manifests_dir, content(kind="source_purge", max_ids=bounds))
+    write_manifest_file(cfg.manifests_dir, content(kind="golden_case_delete", max_ids=bounds))
 
     assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
 
@@ -342,16 +362,16 @@ async def test_a_restored_database_with_a_newer_stream_advances_above_it(
             "exports_dir": scratch["exports"],
         }
 
-    # The database the dump captured: migrated, three alerts, and a completed source purge whose file was
-    # never shipped (the restored stream lacks it).
+    # The database the dump captured: migrated, three alerts, and a completed manifest whose file was never
+    # shipped (the restored stream lacks it).
     await run_migrate_async(cfg, now=NOW, manifest_dir=stream, **flags)
     assert insert_alerts(server, 3, role, db) == [1, 2, 3]
     engine = make_null_engine(server.dsn(role, db, driver="sqlalchemy"))
     try:
         async with engine.begin() as conn:
-            unshipped = await insert_manifest(conn, kind="source_purge", request={}, now=NOW)
+            unshipped = await insert_manifest(conn, kind="golden_case_delete", request={}, now=NOW)
             body = content(
-                kind="source_purge", max_ids={"alerts": 3}, manifest_uuid=str(unshipped.manifest_uuid)
+                kind="golden_case_delete", max_ids={"alerts": 3}, manifest_uuid=str(unshipped.manifest_uuid)
             )
             await record_manifest(conn, unshipped, body, hashlib.sha256(canonical_bytes(body)).digest())
             await complete_manifest(conn, unshipped.id)
@@ -369,10 +389,12 @@ async def test_a_restored_database_with_a_newer_stream_advances_above_it(
     bounds = {"alerts": 70, "login_attempts": 50, "jobs": 90, "procrastinate_jobs": 60}
     write_manifest_file(
         stream,
-        content(kind="source_purge", max_ids={t: bounds[t] for t in ("alerts", "login_attempts", "jobs")}),
+        content(
+            kind="golden_case_delete", max_ids={t: bounds[t] for t in ("alerts", "login_attempts", "jobs")}
+        ),
     )
     write_manifest_file(
-        stream, content(kind="delete_everything", max_ids={"alerts": 65}, operations=listed_jobs([60]))
+        stream, content(kind="job_tombstone", max_ids={"alerts": 65}, operations=listed_jobs([60]))
     )
     columns = await columns_of(server, role, db)
     before = maxima(server, columns, role, db)

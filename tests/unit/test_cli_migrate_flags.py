@@ -207,3 +207,16 @@ def test_database_and_db_role_select_the_dsn(
         for key, value in conninfo_to_dict(conninfo).items()
         if key in ("user", "password", "dbname")
     } == {"user": user, "password": password, "dbname": dbname}
+
+
+def test_manifests_replay_runs_steps_1_3_and_7(started: list[Role], run_calls: list[dict[str, Any]]) -> None:
+    """`jobhunter manifests replay` (§19.4) is `migrate` steps 1, 3 and 7 alone, as the migrator, on the
+    configured stream or the one `--manifest-dir` names."""
+    assert cli.main(["manifests", "replay"]) == 0
+    assert cli.main(["manifests", "replay", "--manifest-dir", "/restored/manifests"]) == 0
+    assert run_calls == [
+        {"steps": frozenset({"sequences", "replay"}), "manifest_dir": None},
+        {"steps": frozenset({"sequences", "replay"}), "manifest_dir": Path("/restored/manifests")},
+    ]
+    assert selected_steps(run_calls[0]["steps"]) == ("reconstruct_and_advance", "advance_again", "replay")
+    assert started == ["migrate", "migrate"]

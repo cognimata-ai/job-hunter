@@ -33,6 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     startup_check.add_argument("--role", required=True, choices=get_args(Role))
     _add_migrate_command(commands)
+    _add_manifests_command(commands)
     _add_api_command(commands)
     commands.add_parser(
         "worker",
@@ -132,6 +133,21 @@ def _add_migrate_command(commands: "argparse._SubParsersAction[argparse.Argument
         choices=tuple(MIGRATE_CONFIG_ROLES),
         default="migrator",
         help="the login: migrator (default) or restore (the restore test, with the backup role's secrets)",
+    )
+
+
+def _add_manifests_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    manifests = commands.add_parser("manifests", help="the deletion-manifest stream (§19.5)")
+    manifests_commands = manifests.add_subparsers(dest="manifests_command", required=True)
+    replay = manifests_commands.add_parser(
+        "replay",
+        help="migrate steps 1, 3 and 7 alone: advance the identities, then replay the stream (§19.5)",
+    )
+    replay.add_argument(
+        "--manifest-dir",
+        type=Path,
+        metavar="DIR",
+        help="the deletion-manifest stream (default JOBHUNTER_MANIFESTS_DIR)",
     )
 
 
@@ -353,6 +369,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             cv_dir=args.cv_dir,
             exports_dir=args.exports_dir,
             db_role=db_role,
+        )
+        return 0
+    if args.command == "manifests":
+        # Imported here, like `migrate`: `manifests replay` is its steps 1, 3 and 7 (§19.4), as the migrator.
+        from jobhunter.db.migrate import run_migrate
+
+        run_migrate(
+            startup_or_exit("migrate"),
+            steps=frozenset({"sequences", "replay"}),
+            manifest_dir=args.manifest_dir,
         )
         return 0
     if args.command == "api":

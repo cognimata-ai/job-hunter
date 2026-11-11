@@ -409,11 +409,16 @@ async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_conf
         assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
     steps = [entry["step"] for entry in logs if entry["event"] == "migrate_step"]
     assert steps == list(MIGRATE_ORDER)
-    # Steps 1, 3 and 5 end with the identity advancement (M5 Task 23); the replay arrives with Task 25.
+    # Steps 1, 3 and 5 end with the identity advancement (M5 Task 23); step 7 replays the manifest stream
+    # (M5 Task 25), which holds nothing here.
     advancing = [entry["step"] for entry in logs if entry["event"] == "migrate_identities_advanced"]
     assert advancing == ["reconstruct_and_advance", "advance_again", "queue_and_checkpointer"]
-    noops = {entry["step"]: entry["reason"] for entry in logs if entry["event"] == "migrate_step_noop"}
-    assert noops == {"replay": "replay_arrives_later_in_M5"}
+    replayed = [
+        (entry["step"], entry["replayed"], entry["pending_completed"], entry["rebuilt_jobs"])
+        for entry in logs
+        if entry["event"] == "migrate_replayed"
+    ]
+    assert replayed == [("replay", 0, 0, 0)]
     assert cfg.secret("db_migrator").decode() not in repr(logs)
 
 

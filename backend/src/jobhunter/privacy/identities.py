@@ -4,10 +4,14 @@ allocated again, so a later replay never deletes a row created after the manifes
 
 **The stream** is every `*.json` file of the manifests directory (a `*.json.tmp` being written ends otherwise
 and is never one), each parsed by `parse_manifest`: a file that does not parse, or is named for another uuid,
-stops `migrate` (`ManifestInvalid`), as §19.5 says. **A recorded manifest** is a `deletion_manifests` row with
-its content: one with `file_sha256`, which the §7.14 CHECK gives every `completed` and `shipped` row, and A3
-gives an `executing` row together with its `scope`. An `executing` row without it has no content, and nothing
-was deleted under it yet: it has no bounds. Before 0010 the table does not exist, and no manifest is recorded.
+stops `migrate` (`ManifestInvalid`), as §19.5 says. `read_stream` is its one reader: step 1's bounds and step
+7's classification (`privacy.replay`, M5 Task 25) both read it, in stream (file name, so `manifest_uuid`)
+order; a directory that does not exist stops `migrate` too (`FileNotFoundError`).
+
+**A recorded manifest** is a `deletion_manifests` row with its content: one with `file_sha256`, which the
+§7.14 CHECK gives every `completed` and `shipped` row, and A3 gives an `executing` row together with its
+`scope`. An `executing` row without it has no content, and nothing was deleted under it yet: it has no bounds.
+Before 0010 the table does not exist, and no manifest is recorded.
 
 - `rewrite_missing_files` (step 1's first half) writes the file of each recorded manifest the stream lacks,
   from its `scope`, through `write_manifest_file`: the file it shipped, or would have. The scope's canonical
@@ -92,7 +96,9 @@ async def rewrite_missing_files(conn: AsyncConnection, manifest_dir: Path) -> li
     return written
 
 
-def _stream(manifest_dir: Path) -> Iterator[ManifestContent]:
+def read_stream(manifest_dir: Path) -> Iterator[ManifestContent]:
+    """The manifests of the stream in `manifest_dir`, in stream order (module docstring); `ManifestInvalid`
+    for a file that does not parse or is named for another uuid."""
     names = sorted(path.name for path in manifest_dir.iterdir() if path.name.endswith(_STREAM_SUFFIX))
     for name in names:
         data = read_manifest_file(manifest_dir, name.removesuffix(_STREAM_SUFFIX))
@@ -118,7 +124,7 @@ def _named_ids(content: ManifestContent) -> Iterator[tuple[str, int]]:
 async def manifest_bounds(conn: AsyncConnection, manifest_dir: Path) -> dict[str, int]:
     """Per table, the largest id that a manifest of `manifest_dir` or a recorded manifest bounds or names
     (module docstring). `ManifestInvalid` for a file or a scope that does not parse."""
-    contents = list(_stream(manifest_dir))
+    contents = list(read_stream(manifest_dir))
     for row in await _recorded(conn):
         scope = canonical_bytes(cast(ManifestContent, row.scope))
         contents.append(parse_manifest(scope, file_name=manifest_file_name(row.manifest_uuid)))
