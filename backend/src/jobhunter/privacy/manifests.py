@@ -575,6 +575,27 @@ def _thread_forms() -> dict[str, object]:
     return {f"form_{i}": f"^(?:{form.pattern})$" for i, form in enumerate(THREAD_FORMS)}
 
 
+def thread_bound_sql(
+    max_ids: Mapping[str, int], *, column: str = "thread_id"
+) -> tuple[str, dict[str, object]]:
+    """The predicate "the checkpoint thread `column` (a SQL expression of the caller's code, never content)
+    lies within the bound": its name has a form of `THREAD_FORMS` whose owner id is at or below
+    `max_ids[form.owner]`; any other name is false. With its binds (`form_<i>`, `owner_<i>`). The `thread`
+    bound's postcondition and delete-everything's deletion of the threads share it (M5 Task 16).
+    `ValueError` when `max_ids` has no bound for an owner table."""
+    if missing := [form.owner for form in THREAD_FORMS if form.owner not in max_ids]:
+        raise ValueError(f"no max_ids bound for {missing[0]}")
+    params = _thread_forms()
+    cases: list[str] = []
+    for i, form in enumerate(THREAD_FORMS):
+        params[f"owner_{i}"] = max_ids[form.owner]
+        cases.append(
+            f"WHEN {column} ~ :form_{i} "
+            f"THEN CAST((regexp_match({column}, :form_{i}))[1] AS numeric) <= :owner_{i}"
+        )
+    return f"CASE {' '.join(cases)} ELSE false END", params
+
+
 def _within(
     bound: Bound, table: str, content: ManifestContent, quote: Quote
 ) -> tuple[str, dict[str, object]] | str:
@@ -595,17 +616,10 @@ def _within(
             return "fenced_at is no time with its zone"
         return "t.created_at <= :bound_fenced_at", {"bound_fenced_at": fenced_at}
     if by == "thread":
-        params = _thread_forms()
-        cases: list[str] = []
-        for i, form in enumerate(THREAD_FORMS):
-            if form.owner not in max_ids:
-                return f"no max_ids bound for {form.owner}"
-            params[f"owner_{i}"] = max_ids[form.owner]
-            cases.append(
-                f"WHEN t.thread_id ~ :form_{i} "
-                f"THEN CAST((regexp_match(t.thread_id, :form_{i}))[1] AS numeric) <= :owner_{i}"
-            )
-        return f"CASE {' '.join(cases)} ELSE false END", params
+        try:
+            return thread_bound_sql(max_ids, column="t.thread_id")
+        except ValueError as unbounded:
+            return str(unbounded)
     assert_never(by)
 
 

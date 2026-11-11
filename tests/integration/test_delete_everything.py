@@ -23,6 +23,7 @@ import pytest
 import respx
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.migrate import run_migrate_async
 from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before, load_settings_v1
 from jobhunter.errors import FencedOut, Refusal
 from jobhunter.llm.batches import BatchApiError, BatchesClient, BatchStatus, RequestCounts
@@ -32,8 +33,11 @@ from jobhunter.observability import deadman, ntfy
 from jobhunter.observability.alerts import acknowledge_alert, raise_alert, resolve_alert
 from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
 from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
-from jobhunter.privacy import purge
-from jobhunter.privacy import reconcilers as privacy_reconcilers  # registers `purge_fences`
+from jobhunter.privacy import (
+    fences,
+    purge,
+    reconcilers,  # noqa: F401 (registers `purge_fences`)
+)
 from jobhunter.privacy.kinds import delete_everything
 from jobhunter.privacy.kinds.delete_everything import DELETE_EVERYTHING_KEEPS, DeleteEverything
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
@@ -47,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import queued_run
 from tests.support.faults import PausePoint, no_fault, raising_at
+from tests.support.fixtures import ConfigFactory
 from tests.support.healthchecks import API_KEY, API_URL, PING_URL, fake_healthchecks
 from tests.support.llm import FakeLLM
 from tests.support.logs import logged
@@ -133,6 +138,7 @@ _JOB: Final = sa.text(
     "INSERT INTO procrastinate_jobs (queue_name, task_name, args, status) "
     "VALUES ('aux', 'delete_everything_test', '{}', CAST(:status AS procrastinate_job_status)) RETURNING id"
 )
+_QUEUE_STATES: Final = ("todo", "doing", "succeeded")  # one job in each, in id order
 _FINISH_JOB: Final = sa.text("UPDATE procrastinate_jobs SET status = 'succeeded' WHERE id = :j")
 _JOB_EVENTS: Final = sa.text("SELECT count(*) FROM procrastinate_events WHERE job_id = :j")
 _PURGE_FENCES_LEFT: Final = sa.text(
@@ -144,6 +150,18 @@ _PURGE_OPERATIONS: Final = sa.text(
     "ORDER BY id"
 )
 _EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e")
+# The settings versions, `active_config`'s pointers and `schedule_state`, as one comparable listing.
+_CONFIGURATION: Final = sa.text(
+    "SELECT 'version' AS kind, id, version_no, NULL::timestamptz AS at FROM settings_versions "
+    "UNION ALL SELECT 'active', settings_version_id, scope_version_id, updated_at FROM active_config "
+    "UNION ALL SELECT 'schedule', settings_version_id, interval_s, last_evaluated_slot FROM schedule_state "
+    "ORDER BY 1, 2"
+)
+_A0_WRITES: Final = sa.text(
+    "SELECT (SELECT count(*) FROM deletion_manifests) AS manifests, "
+    "(SELECT count(*) FROM purge_fences WHERE kind = 'global') AS fences, "
+    "(SELECT count(*) FROM operations WHERE kind = 'purge') AS operations"
+)
 _QUERY: Final = sa.text(
     "INSERT INTO queries (text, lang, origin, created_at) VALUES ('nach dem bound', 'de', 'user', now()) "
     "RETURNING id"
@@ -350,7 +368,21 @@ async def test_a0_commits_the_manifest_its_global_fence_and_operation_and_refuse
         "conflict_state",
         "purge_in_progress",
     )
-    assert await scalar(engine, sa.text("SELECT count(*) FROM deletion_manifests")) == 1
+    written = await one(engine, _A0_WRITES)
+    assert tuple(written) == (1, 1, 1)  # one manifest, one `global` fence, one purge operation
+    # the second request's idempotency row rolled back with its transaction
+    assert await rows(engine, sa.text("SELECT id FROM api_idempotency")) == [(first.idempotency_row_id,)]
+
+
+async def test_a0_refuses_an_idempotency_row_that_does_not_exist(engine: AsyncEngine) -> None:
+    """The request names its idempotency row by an id that must name a row (the route's own, in A0's
+    transaction): an id naming none is a `ValueError`, and nothing is written."""
+    async with engine.begin() as conn:
+        with pytest.raises(ValueError, match="idempotency row"):
+            await delete_everything.request_delete_everything(
+                conn, now=utcnow(), idempotency_row_id=987_654_321, defer=None
+            )
+    assert tuple(await one(engine, _A0_WRITES)) == (0, 0, 0)
 
 
 # ---- the whole graph ---------------------------------------------------------------------------------------
@@ -374,14 +406,24 @@ async def test_it_runs_to_completion_without_fk_or_check_violation_and_keeps_the
     assert live.manifest_file(manifest.manifest_uuid).exists()
 
 
-async def test_every_table_outside_the_keep_list_is_empty(engine: AsyncEngine, live: Purger) -> None:
+async def test_every_table_outside_the_keep_list_is_empty(
+    engine: AsyncEngine, live: Purger, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Every table of `public` (from the live catalog: a table a later task adds is caught) either is in
     `DELETE_EVERYTHING_KEEPS` or is empty after the purge, and the kept tables that a step deletes from hold
     only their kept rows: this purge's operation, this request's idempotency row, the default source
-    instances, the new default settings version, the alerts open at A2 and content-free exports."""
+    instances, the new default settings version, the scope versions of `retained` and those above the bound,
+    the alerts open at A2, content-free exports, and the procrastinate jobs not listed at A2 (`todo` or
+    `doing` then) or above the bound."""
     seed = await seeded(engine)
+    async with engine.begin() as conn:
+        queue = [int((await conn.execute(_JOB, {"status": status})).scalar_one()) for status in _QUEUE_STATES]
     requested = await request(engine)
+    await recorded(live, requested, monkeypatch)
+    async with engine.begin() as conn:
+        later_job = int((await conn.execute(_JOB, {"status": "todo"})).scalar_one())
     manifest = await finished(live, requested)
+    assert manifest.scope is not None
     async with engine.connect() as conn:
         tables = [str(name) for name in (await conn.execute(_TABLES)).scalars()]
         assert DELETE_EVERYTHING_KEEPS <= set(tables)
@@ -402,6 +444,8 @@ async def test_every_table_outside_the_keep_list_is_empty(engine: AsyncEngine, l
         active = (await conn.execute(_ACTIVE)).one()
         assert await ids("SELECT id FROM settings_versions") == [active.settings_version_id]
         alerts = await ids("SELECT id FROM alerts ORDER BY id")
+        scopes = await ids("SELECT id FROM scope_versions ORDER BY id")
+        jobs = await ids("SELECT id FROM procrastinate_jobs ORDER BY id")
         exports = await conn.execute(sa.text("SELECT DISTINCT status FROM exports"))
         assert set(exports.scalars()) <= {"purged", "expired", "failed"}
         content_free = await conn.execute(
@@ -409,7 +453,13 @@ async def test_every_table_outside_the_keep_list_is_empty(engine: AsyncEngine, l
         )
         assert content_free.scalar_one() == 0
     assert holding == []
-    assert manifest.scope is not None
+    bound = manifest.scope["max_ids"]
+    retained_scopes = manifest.scope["retained"]["scope_versions"]
+    assert [i for i in scopes if i <= bound["scope_versions"]] == retained_scopes and retained_scopes
+    listed_jobs = [i for op in operations_of(manifest, "procrastinate_jobs") for i in op["ids"]]
+    todo, doing, ended = queue
+    assert listed_jobs == [ended] and jobs == [todo, doing, later_job]
+    assert later_job > bound["procrastinate_jobs"]
     resolved_at_a2 = [i for op in operations_of(manifest, "alerts") for i in op["ids"]]
     assert seed.resolved_alert_id in resolved_at_a2 and not set(resolved_at_a2) & set(alerts)
     assert {seed.open_alert_id, seed.bound_violation_alert_id} <= set(alerts)
@@ -758,19 +808,26 @@ async def test_open_alerts_survive_and_are_still_pushed(
 async def test_a_job_doing_at_a2_is_kept_after_it_finishes(
     engine: AsyncEngine, live: Purger, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The procrastinate jobs not `doing` at A2 are an id list frozen there: a job `doing` at A2 is kept
-    with its events, also once it has finished before phase B; a finished one is deleted with its events."""
+    """The procrastinate jobs that had finished at A2 (a terminal status, Deviation 24) are an id list
+    frozen there: a job `doing` at A2 is kept with its events, also once it has finished before phase B, and
+    so is one still `todo` at A2 (it may be fetched before step 11); a finished one is deleted with its
+    events."""
     async with engine.begin() as conn:
-        doing = int((await conn.execute(_JOB, {"status": "doing"})).scalar_one())
-        finished_job = int((await conn.execute(_JOB, {"status": "succeeded"})).scalar_one())
+        todo, doing, finished_job = [
+            int((await conn.execute(_JOB, {"status": status})).scalar_one()) for status in _QUEUE_STATES
+        ]
     requested = await request(engine)
     manifest = await recorded(live, requested, monkeypatch)
-    listed = [op["ids"] for op in operations_of(manifest, "procrastinate_jobs")]
-    assert finished_job in listed[0] and doing not in listed[0]
+    assert [op["ids"] for op in operations_of(manifest, "procrastinate_jobs")] == [[finished_job]]
     async with engine.begin() as conn:
         await conn.execute(_FINISH_JOB, {"j": doing})
+    events = await scalar(engine, _JOB_EVENTS, j=doing)
+    assert events >= 1  # procrastinate's trigger recorded the job's end (`succeeded`)
     await finished(live, requested)
-    assert await exists(engine, "procrastinate_jobs", doing)
+    assert await exists(engine, "procrastinate_jobs", doing) and await exists(
+        engine, "procrastinate_jobs", todo
+    )
+    assert await scalar(engine, _JOB_EVENTS, j=doing) == events
     assert not await exists(engine, "procrastinate_jobs", finished_job)
     assert await scalar(engine, _JOB_EVENTS, j=finished_job) == 0
 
@@ -965,7 +1022,6 @@ async def test_another_purges_deleted_operation_is_recreated_from_its_row(
     await finished(live, requested)
     assert not await exists(engine, "operations", golden.operation_id)
     assert (await manifest_of(engine, golden.manifest_id)).status == "executing"
-    assert privacy_reconcilers is not None  # imported for the reconciler it registers
     assert await run_reconciler("purge_fences", engine, now=utcnow(), epoch=current_epoch) >= 1
     (recreated,) = await rows(engine, _PURGE_OPERATIONS, m=golden.manifest_id)
     assert recreated.status == "pending" and recreated.id != golden.operation_id
@@ -984,3 +1040,47 @@ async def test_delete_everything_purges_exports(engine: AsyncEngine, live: Purge
     await finished(live, requested)
     assert tuple(await one(engine, _EXPORT, e=seed.ready_export_id)) == ("purged", None)
     assert not path.exists()
+
+
+async def test_the_sessions_go_before_the_fence_is_released(
+    engine: AsyncEngine, live: Purger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The completing transaction deletes the sessions (`CompletingKind.complete`) before it releases the
+    global fence and checks the postconditions: when `release_fences` runs, no session created at or before
+    `fenced_at` is left in that transaction."""
+    await seeded(engine)
+    seen: list[int] = []
+    real = fences.release_fences  # the function `purge` imported
+
+    async def observed(conn: Any, manifest_id: int) -> int:
+        seen.append(int((await conn.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one()))
+        return await real(conn, manifest_id)
+
+    monkeypatch.setattr(purge, "release_fences", observed)
+    assert await scalar(engine, sa.text("SELECT count(*) FROM sessions")) >= 1
+    requested = await request(engine)
+    await finished(live, requested)
+    assert seen == [0]
+
+
+async def test_runs_are_deleted_within_their_bound_only(engine: AsyncEngine, live: Purger) -> None:
+    """§19.5: every deletion stays within `max_ids` (Ruling T16-4: the tick queues no run under the fence,
+    so no run above the bound names a deleted settings version): the content deletes `runs` by its own id
+    bound only."""
+    await seeded(engine)
+    manifest = await finished(live, await request(engine))
+    assert [op["bound"] for op in operations_of(manifest, "runs")] == [{"by": "id"}]
+    assert await scalar(engine, sa.text("SELECT count(*) FROM runs")) == 0
+
+
+async def test_migrate_after_delete_everything_adds_no_settings_version_and_moves_no_pointer(
+    engine: AsyncEngine, live: Purger, make_config: ConfigFactory
+) -> None:
+    """Delete-everything deletes settings version 1; the next `migrate` seeds no settings version again
+    (only an empty `settings_versions` gets the defaults) and leaves `active_config` and `schedule_state`
+    as the purge left them."""
+    await seeded(engine)
+    await finished(live, await request(engine))
+    before = [tuple(r) for r in await rows(engine, _CONFIGURATION)]
+    await run_migrate_async(make_config("migrate"), now=utcnow())
+    assert [tuple(r) for r in await rows(engine, _CONFIGURATION)] == before

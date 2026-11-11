@@ -306,10 +306,36 @@ async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int,
 
 
 _STORED_SETTINGS_V1 = q("SELECT id, payload FROM settings_versions WHERE version_no = 1")
+_ANY_SETTINGS_VERSION = q("SELECT EXISTS (SELECT 1 FROM settings_versions)")
+# The version `active_config` names: the singletons' source once version 1 is gone (delete-everything).
+_ACTIVE_SETTINGS = q(
+    "SELECT v.id, v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1"
+)
 
 
 async def _stored_settings_v1(conn: AsyncConnection) -> RowMapping | None:
     return (await conn.execute(_STORED_SETTINGS_V1)).mappings().first()
+
+
+async def _stored_settings(conn: AsyncConnection) -> RowMapping:
+    """The settings version the single rows are created from (module docstring of `seed_defaults`): version 1,
+    inserted from the packaged defaults when `settings_versions` is empty; else, when version 1 is gone (a
+    delete-everything deleted it, M5 Task 16), the version `active_config` names. `LookupError` when neither
+    exists."""
+    stored = await _stored_settings_v1(conn)
+    if stored is not None:
+        return stored
+    if not (await conn.execute(_ANY_SETTINGS_VERSION)).scalar_one():
+        await _insert_settings_v1(conn)
+        stored = await _stored_settings_v1(conn)
+        if stored is None:
+            raise LookupError("settings version 1 is missing right after its insert")
+        return stored
+    active = (await conn.execute(_ACTIVE_SETTINGS)).mappings().first()
+    if active is None:
+        raise LookupError("settings version 1 is gone and no active_config row names another version")
+    return active
 
 
 async def _insert_settings_v1(conn: AsyncConnection) -> None:
@@ -374,8 +400,10 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     and prompt-schema version 2), a set one is never changed (a shipped version activates through Settings
     only, §13.3).
     Settings version 1 is frozen once stored: the derived rows (scope, model policy, execution config,
-    evaluation policy) and the version are created from the packaged defaults only when version 1 does not
-    exist yet. Afterwards a release that edits `settings_v1.json`
+    evaluation policy) and the version are created from the packaged defaults only when `settings_versions`
+    is empty (a first installation). Once a delete-everything has deleted version 1 (M5 Task 16), no version
+    is inserted again: the single rows below, when absent, come from the version `active_config` names;
+    `LookupError` when neither exists. Afterwards a release that edits `settings_v1.json`
     changes nothing here, and the single rows below are created, when absent, from the STORED version 1
     and the pointers it holds (`settings_versions` carries all four: scope, model policy, execution config and
     evaluation policy), never from the file. So a second call with another `now` changes nothing. The one
@@ -385,12 +413,7 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
 
-    stored = await _stored_settings_v1(conn)
-    if stored is None:
-        await _insert_settings_v1(conn)
-        stored = await _stored_settings_v1(conn)
-        if stored is None:
-            raise LookupError("settings version 1 is missing right after its insert")
+    stored = await _stored_settings(conn)
     settings_id = int(stored["id"])
     settings = get_object(stored["payload"], "")
 

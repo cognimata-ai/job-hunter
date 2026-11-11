@@ -15,6 +15,7 @@ from jobhunter.worker.tick import insert_active_collect, run_tick
 from procrastinate.job_context import JobContext
 from sqlalchemy.exc import IntegrityError
 
+from tests.support.fences import insert_test_fence
 from tests.support.logs import logged
 
 pytestmark = pytest.mark.integration
@@ -718,3 +719,52 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
     assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)
     assert not current.shutdown.requested.is_set()
+
+
+_RELEASE_FENCES = sa.text("UPDATE purge_fences SET released_at = now() WHERE released_at IS NULL")
+
+
+async def global_fence(engine) -> None:
+    """Delete-everything's `global` fence, committed (over a manifest of its own)."""
+    async with engine.begin() as c:
+        await insert_test_fence(c, kind="global")
+
+
+async def test_a_tick_under_a_global_fence_inserts_no_run_and_moves_no_cursor(
+    engine, queue_app, caplog
+) -> None:
+    """§20.4 step 1 (M5 Task 16, Ruling T16-4): while delete-everything's `global` fence stands, the tick
+    inserts no run of any kind, neither the `missed` ones, nor a `queued` one, nor a `skipped_overlap` beside
+    an active collection, and leaves its cursor where it is."""
+    caplog.set_level(logging.INFO, logger="jobhunter.worker.tick")
+    await schedule(engine, interval=21600, cursor=A)
+    first = await tick(engine, A + timedelta(hours=6, minutes=1))  # a collection queued before the fence
+    assert first.queued_run_id is not None
+    before = await runs(engine)
+    await global_fence(engine)
+    for hours in (12, 30):  # one slot due (beside an active collection), then two missed and one due
+        rep = await tick(engine, A + timedelta(hours=hours, minutes=1))
+        assert (rep.missed, rep.queued_run_id, rep.skipped_overlap) == (0, None, False)
+        assert rep.cursor == A + timedelta(hours=6)
+    assert await runs(engine) == before and await stored_cursor(engine) == A + timedelta(hours=6)
+    assert len(logged(caplog, "tick_skipped_global_fence")) == 2
+
+
+async def test_the_first_tick_after_the_global_fence_records_its_window_missed(engine, queue_app) -> None:
+    """The fence's window is not lost: the first tick after its release records the slots it held back as
+    `missed` (one statement, the `slots_missed` warning) and queues the latest, as after any downtime."""
+    await schedule(engine, interval=21600, cursor=A)
+    await global_fence(engine)
+    for hours in (6, 12):
+        assert (await tick(engine, A + timedelta(hours=hours, minutes=1))).queued_run_id is None
+    assert await runs(engine) == [] and await stored_cursor(engine) == A
+    async with engine.begin() as c:
+        await c.execute(_RELEASE_FENCES)
+    rep = await tick(engine, A + timedelta(hours=18, minutes=1))
+    assert rep.missed == 2 and rep.queued_run_id is not None
+    assert await runs(engine) == [
+        (A + timedelta(hours=6), "missed", "schedule"),
+        (A + timedelta(hours=12), "missed", "schedule"),
+        (A + timedelta(hours=18), "queued", "schedule"),
+    ]
+    assert await stored_cursor(engine) == A + timedelta(hours=18)

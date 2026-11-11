@@ -15,9 +15,9 @@ ranking after it (the last lock):
    derived ids, no base version, `effect_classes = '{none}'`, no acknowledged warning, `created_at = now`;
 4. one `UPDATE active_config` to its ids, with `profile_version_id`, `llm_tuple_id` and
    `pending_scope_version_id` NULL; the rubric and prompt-schema versions are left as they are;
-5. `schedule_state` reset as a save's `schedule` action resets it (`settings.save`, §3.4): the anchor on
-   `now`'s date in the display zone, the interval, `enabled`, the cursor at the latest slot at or before
-   `now`, and the new version.
+5. `schedule_state` reset by the save's own `schedule` action (`settings.save.reset_schedule`, §3.4): the
+   anchor on `now`'s date in the display zone, the interval, `enabled`, the cursor at the latest slot at or
+   before `now`, and the new version.
 
 It creates no tuple, no operation and no bulk operation, and returns the new version's id. Ids only reach a
 log line.
@@ -29,13 +29,13 @@ from typing import Final
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db import seed
-from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, anchor_utc_for, latest_slot_at_or_before
+from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings.derive import derived, ensure_derived
 from jobhunter.settings.model import Settings
+from jobhunter.settings.save import reset_schedule
 
-_SECONDS_PER_HOUR: Final = 3600
 _INSERT_VERSION: Final = q(
     "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
     "execution_config_id, evaluation_policy_id, base_version_id, effect_classes, acknowledged_warnings, "
@@ -51,10 +51,6 @@ _POINT: Final = q(
     "model_policy_id = :model_policy_id, "
     "execution_config_id = :execution_config_id, evaluation_policy_id = :evaluation_policy_id, "
     "profile_version_id = NULL, llm_tuple_id = NULL, updated_at = :now WHERE id = 1"
-)
-_RESET_SCHEDULE: Final = q(
-    "UPDATE schedule_state SET anchor_utc = :anchor_utc, interval_s = :interval_s, enabled = :enabled, "
-    "last_evaluated_slot = :slot, settings_version_id = :settings_version_id, updated_at = :now WHERE id = 1"
 )
 
 log = get_logger("jobhunter.settings.reset")
@@ -83,22 +79,7 @@ async def reset_to_defaults(conn: AsyncConnection, *, now: datetime) -> int:
     )
     if (await conn.execute(_POINT, {"settings_version_id": version_id, **params})).rowcount != 1:
         raise LookupError("active_config has no row 1 (migrate seeds it)")
-    schedule = settings.schedule
-    interval_s = schedule.interval_hours * _SECONDS_PER_HOUR
-    anchor = anchor_utc_for(now, schedule.anchor_local, settings.display.timezone)
-    reset = await conn.execute(
-        _RESET_SCHEDULE,
-        {
-            "anchor_utc": anchor,
-            "interval_s": interval_s,
-            "enabled": schedule.enabled,
-            "slot": latest_slot_at_or_before(anchor, interval_s, now),
-            "settings_version_id": version_id,
-            "now": now,
-        },
-    )
-    if reset.rowcount != 1:
-        raise LookupError("schedule_state has no row 1 (migrate seeds it)")
+    await reset_schedule(conn, settings, version_id=version_id, now=now)
     log.info(
         "settings_reset_to_defaults",
         settings_version_id=version_id,

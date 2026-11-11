@@ -364,8 +364,9 @@ class CompletingKind(Protocol):
     and its postconditions checked: delete-everything's sessions (M5 Task 16, D14). Every other kind has
     none."""
 
-    async def complete(self, conn: AsyncConnection, content: ManifestContent) -> None:
-        """The kind's writes in the completing transaction, which holds the epoch fence and the owner."""
+    async def complete(self, conn: AsyncConnection, manifest: ManifestRow, content: ManifestContent) -> None:
+        """The kind's writes for `manifest` in the completing transaction, which holds the epoch fence and the
+        owner (a replay's holds neither)."""
         ...
 
 
@@ -680,7 +681,7 @@ async def _phase_c(
             await fence_epoch(conn, owner.epoch)
             await lock_operation_owner(conn, owner.claim)
             if isinstance(proc, CompletingKind):
-                await proc.complete(conn, content)
+                await proc.complete(conn, run.manifest, content)
             await release_fences(conn, manifest_id)
             found = await check_postconditions(conn, content, files=run.files)
             found += await proc.postconditions(conn, content)

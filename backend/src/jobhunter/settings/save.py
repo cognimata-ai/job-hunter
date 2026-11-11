@@ -332,23 +332,34 @@ async def _apply_budget(a: _Activation) -> None:
         )
 
 
-async def _apply_schedule(a: _Activation) -> None:
-    schedule = a.proposed.schedule
+async def reset_schedule(
+    conn: AsyncConnection, settings: Settings, *, version_id: int, now: datetime
+) -> None:
+    """`schedule_state` reset in one statement for the settings version `version_id` holding `settings`
+    (module docstring, step 6's `schedule` action): the anchor on `now`'s date in the display zone, the
+    interval, `enabled`, the cursor at the latest slot at or before `now`, and the version. The save's
+    `schedule` action and delete-everything's reset (`settings.reset`, M5 Task 16) share it. `LookupError`
+    without the row."""
+    schedule = settings.schedule
     interval_s = schedule.interval_hours * _SECONDS_PER_HOUR
-    anchor = anchor_utc_for(a.now, schedule.anchor_local, a.proposed.display.timezone)
-    result = await a.conn.execute(
+    anchor = anchor_utc_for(now, schedule.anchor_local, settings.display.timezone)
+    result = await conn.execute(
         _RESET_SCHEDULE,
         {
             "anchor_utc": anchor,
             "interval_s": interval_s,
             "enabled": schedule.enabled,
-            "slot": latest_slot_at_or_before(anchor, interval_s, a.now),
-            "settings_version_id": a.version_id,
-            "now": a.now,
+            "slot": latest_slot_at_or_before(anchor, interval_s, now),
+            "settings_version_id": version_id,
+            "now": now,
         },
     )
     if result.rowcount != 1:
         raise LookupError("schedule_state has no row 1 (migrate seeds it)")
+
+
+async def _apply_schedule(a: _Activation) -> None:
+    await reset_schedule(a.conn, a.proposed, version_id=a.version_id, now=a.now)
 
 
 async def _apply_collection(a: _Activation) -> None:

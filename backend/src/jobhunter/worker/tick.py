@@ -11,6 +11,14 @@ given, never from the database's clock:
 - when a collection is already active (`runs_one_active_collect`), that slot is recorded as
   `skipped_overlap` instead; when the slot already has a row (`runs_slot_uq`), nothing is written.
 
+**The global fence** (§20.4 step 1, M5 Task 16, Ruling T16-4): while delete-everything's `global` purge
+fence stands, read right after the `active_config` lock (A0 commits the fence under it `FOR UPDATE`, so a tick
+that waited for A0 sees it), the tick inserts no run of any kind, neither `missed` nor `queued` nor
+`skipped_overlap`, and leaves the cursor where it is (`tick_skipped_global_fence`). Nothing new starts until
+the fence is released: a run queued then would name a settings version the purge deletes, and lie above its
+bound. The first tick after the release records the slots of the fence's window as `missed`, as after any
+downtime (delete-everything's reset moves the cursor to its own `now` first).
+
 There is no check before an insert: the two unique indexes decide, and a violation is an outcome, never an
 error loop. `insert_active_collect` is the one place that inserts an active collection, shared with the
 manual run (`request_manual_run`). Every run records the settings version, the scope version and the LLM tuple
@@ -38,6 +46,7 @@ from typing import TYPE_CHECKING, Final, Literal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.seed import latest_slot_at_or_before
 from jobhunter.db.sql import is_unique_violation, pg_error, q
 from jobhunter.observability.logging import get_logger
@@ -65,6 +74,7 @@ _SCHEDULE_STATE = q(
     "SELECT anchor_utc, interval_s, enabled, last_evaluated_slot FROM schedule_state WHERE id = 1 FOR UPDATE"
 )
 _SCHEDULE_SETTINGS = q("SELECT payload -> 'schedule' FROM settings_versions WHERE id = :id")
+_CURSOR = q("SELECT last_evaluated_slot FROM schedule_state WHERE id = 1")
 _STORE_CURSOR = q("UPDATE schedule_state SET last_evaluated_slot = :slot, updated_at = :now WHERE id = 1")
 
 # The conflict target is the partial unique index `runs_slot_uq`, exactly as its DDL defines it (§7.6).
@@ -238,10 +248,16 @@ async def run_tick(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> 
     """Evaluate the slots due at `now` on `conn`'s transaction; the caller commits.
 
     Locks `active_config` (shared) and then `schedule_state` (exclusive), so a tick never overtakes a
-    configuration change that holds the former.
+    configuration change that holds the former; under delete-everything's `global` fence it writes nothing
+    (module docstring).
     """
     now = _utc(now, "now")
     config = (await conn.execute(_ACTIVE_CONFIG)).one()
+    if await global_fence_active(conn):  # the admission stop (module docstring): no run, the cursor kept
+        stored_cursor = (await conn.execute(_CURSOR)).scalar_one()
+        log.info("tick_skipped_global_fence")
+        cursor_kept = None if stored_cursor is None else _utc(stored_cursor, "last_evaluated_slot")
+        return TickReport(missed=0, queued_run_id=None, skipped_overlap=False, cursor=cursor_kept)
     state = (await conn.execute(_SCHEDULE_STATE)).one()
     anchor = _utc(state.anchor_utc, "anchor_utc")
     interval_s: int = state.interval_s

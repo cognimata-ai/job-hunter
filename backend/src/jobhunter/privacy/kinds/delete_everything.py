@@ -3,9 +3,11 @@
 
 **A0** (`request_delete_everything`, the caller's transaction; Task 18's route re-authenticates, holds its
 idempotency row in the same transaction and passes that row's `id`): `active_config FOR UPDATE`; while a
-delete-everything is `executing`, 409 `conflict_state` with `detail = "purge_in_progress"`; then
-`purge.open_purge` with the request `{"idempotency_row_id": <id>}` (ids only, immutable) and one `global`
-fence, the persisted admission stop (Task 8): from its commit no run, cycle or operation but a purge starts.
+delete-everything is `executing`, 409 `conflict_state` with `detail = "purge_in_progress"`; an id that
+names no idempotency row is a `ValueError` (nothing written); then `purge.open_purge` with the request
+`{"idempotency_row_id": <id>}` (ids only, immutable) and one `global` fence, the persisted admission stop
+(Task 8): from its commit no run (the tick queues none, `worker.tick`), cycle or operation but a purge
+starts.
 
 **What it keeps** (`DELETE_EVERYTHING_KEEPS`, every table that still holds rows when it completes, each with
 its kept rows): the user account with its TOTP enrolment (M5-U3); the quota and spend ledgers, `llm_budget`
@@ -14,17 +16,20 @@ execution configs, evaluation policies, rubric and prompt-schema versions, the s
 instances); the singletons; `backup_sets` and `backup_runs`; the manifests, shipments, shipment items and
 fences; the alerts open at A2; the new default settings version and its scope version (the scope versions
 step 10 does not list); this purge's operation and this request's idempotency row; the procrastinate jobs
-`doing` at A2 with their events; the exports, every one of them content-free (`purged`, `expired` or
-`failed`: §20.3's deletion of an export is its `purged` state, the export ops'); and the schema records
-(`alembic_version`, `schema_compat`, the transition matrix, the checkpointer's `checkpoint_migrations`) and
-procrastinate's own records of its workers and periodic defers. Every other table of `public` is empty.
+not finished at A2 (`todo` or `doing`) with their events; the exports, every one of them content-free
+(`purged`, `expired` or `failed`: §20.3's deletion of an export is its `purged` state, the export ops');
+and the schema records (`alembic_version`, `schema_compat`, the transition matrix, the checkpointer's
+`checkpoint_migrations`) and procrastinate's own records of its workers and periodic defers. Every other
+table of `public` is empty.
 
 **The content** (A2, `compute`, under the fence after the quiesce), every selector `all` bounded by
 `max_ids` (an identity column, `login_lockouts.generation`, a parent's id, `created_at <= fenced_at` or a
 checkpoint thread's owner), the memberships that can change frozen as ids (Deviations 16, 24):
 - the alerts resolved at A2 (`row_delete alerts ids=[...]`: one open at A2 is kept, also once resolved);
-- the procrastinate jobs not `doing` at A2 (`row_delete procrastinate_jobs ids=[...]`, their events with
-  them): a job `doing` at A2 is kept, also once it has finished;
+- the procrastinate jobs finished at A2, a terminal status (`succeeded`, `failed`, `cancelled`, `aborted`;
+  Deviation 24's "finished jobs"; `row_delete procrastinate_jobs ids=[...]`, their events with them): a job
+  `doing` at A2 is kept, also once it has finished, and so is one still `todo` (deleting its row once a
+  worker has fetched it would fail procrastinate's own finish of it);
 - step 10's scope versions: those within the bound but the one `settings.reset.reset_to_defaults` reuses by
   hash (the default document's, `derive.derived(..., profile=None)`, computed here). No row that survives
   references any other: the rows that name a scope version are deleted, and `active_config` is re-pointed;
@@ -40,8 +45,9 @@ The operations, in §20.4's order: (1) the score targets and every row they own;
 `purged_batch_items`), `admission_lane_credits`, `bulk_operations`; (5) the jobs' graph and every tombstone,
 `duplicate_groups` included; (6) the fetch requests (raw responses and items), ATS snapshots, coverage
 intervals and cells, queries, the source instances other than the defaults and the watchlist; (7) the score
-cycles and the runs, those within the bound and those of a settings version within it (the tick may queue a
-run under the fence: it never starts, and it names a version step 10 deletes); (9) the profile vectors,
+cycles and the runs within the bound (no run is inserted under the fence: the tick queues none while it
+stands, `worker.tick`, and the api refuses a manual one, so no run above the bound names a settings version
+step 10 deletes); (9) the profile vectors,
 query proposals, tuples, drafts and versions, CV files and embeddings; (10) the settings versions and the
 listed scope versions; (11) the alerts, the checkpoint threads, the idempotency records, every operation but
 this purge's, the login attempts and lockouts and the procrastinate jobs; (12) the sessions created at or
@@ -71,9 +77,10 @@ before `fenced_at` (deleted by the completing transaction). The export ops come 
   rows;
 - before 3.7, in a live purge with a pinger, one `run.effects.deadman.ping_pending()` with no transaction
   open: a run that ended before the purge and was not pinged yet would otherwise lose its ping with its row;
-- 3.8, one chunk with `active_config FOR UPDATE`: the runs of a settings version within the bound (queued by
-  the tick since 3.7), then, unless every pointer already holds step 8's postcondition (a re-execution, or a
-  replay of a dump taken after the reset), `settings.reset.reset_to_defaults`, the ranking bumped last;
+- 3.8, one chunk with `active_config FOR UPDATE`: unless every pointer already holds step 8's postcondition
+  (a re-execution, or a replay of a dump taken after the reset), `settings.reset.reset_to_defaults`, the
+  ranking bumped last; then, after its commit, the fault point `privacy.delete_everything.after_repoint`
+  (`AFTER_REPOINT`, test env only);
 - 3.9 to 3.11, the rest, the CV files unlinked after the commit of their rows; 3.12 is the completing
   transaction's (`complete`).
 Every chunk is idempotent: a re-execution after any commit, or a phase re-run after a lost deadlock (Ruling
@@ -107,10 +114,10 @@ from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy import deletion_graph
+from jobhunter.privacy.deletion_graph import select_ids
 from jobhunter.privacy.fences import FenceSpec, purge_in_progress
 from jobhunter.privacy.manifests import (
     SELECTOR_ALL,
-    THREAD_FORMS,
     Bound,
     ManifestContent,
     ManifestKind,
@@ -119,6 +126,7 @@ from jobhunter.privacy.manifests import (
     RowDeleteOp,
     Violation,
     max_identity_ids,
+    thread_bound_sql,
 )
 from jobhunter.privacy.purge import OpenedPurge, PurgeRun, new_content, open_purge, register_kind
 from jobhunter.queries import proposals
@@ -136,6 +144,10 @@ KIND: Final = "delete_everything"
 REQUEST_KEY: Final = "idempotency_row_id"
 # The fault point between step 2's commit and the cancels' send (module docstring).
 AFTER_CANCEL_RECORDED: Final = "privacy.delete_everything.after_cancel_recorded"
+# The fault point after step 8's commit, before step 9 (module docstring).
+AFTER_REPOINT: Final = "privacy.delete_everything.after_repoint"
+# procrastinate's terminal job statuses (its `procrastinate_job_status`, 3.10): the jobs A2 lists.
+FINISHED_JOB_STATUSES: Final = ("succeeded", "failed", "cancelled", "aborted")
 CANCELLED_CYCLE: Final = "cancelled"  # a running score cycle's reason (§7.16.8)
 CANCELLED_OPERATION: Final = "delete_everything"  # a cancelled operation's reason
 ROW_CHUNK: Final = 500  # rows per chunk of the steps that delete by id
@@ -180,7 +192,7 @@ DELETE_EVERYTHING_KEEPS: Final[frozenset[str]] = frozenset(
         "scope_versions",  # its scope version, and the others step 10 does not list
         "operations",  # this purge's
         "api_idempotency",  # this request's
-        "procrastinate_jobs",  # the jobs `doing` at A2
+        "procrastinate_jobs",  # the jobs not finished at A2 (`todo`, `doing`)
         "procrastinate_events",  # their events
         "exports",  # every one content-free (`purged`, `expired`, `failed`)
         "alembic_version",
@@ -219,6 +231,7 @@ _IDS: Final = "CAST(:ids AS bigint[])"
 # ---- A0 ----------------------------------------------------------------------------------------------------
 
 _LOCK_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
+_IDEMPOTENCY_ROW: Final = q("SELECT EXISTS (SELECT 1 FROM api_idempotency WHERE id = :id)")
 _EXECUTING: Final = q(
     "SELECT EXISTS (SELECT 1 FROM deletion_manifests WHERE kind = 'delete_everything' "
     "AND status = 'executing')"
@@ -238,7 +251,8 @@ _RESOLVED_ALERTS: Final = q(
     "SELECT id FROM alerts WHERE resolved_at IS NOT NULL AND id <= :bound ORDER BY id"
 )
 _FINISHED_JOBS: Final = q(
-    "SELECT id FROM procrastinate_jobs WHERE status <> 'doing' AND id <= :bound ORDER BY id"
+    "SELECT id FROM procrastinate_jobs WHERE CAST(status AS text) = ANY(CAST(:statuses AS text[])) "
+    "AND id <= :bound ORDER BY id"
 )
 _LISTED_SCOPES: Final = q(
     "SELECT id FROM scope_versions WHERE id <= :bound AND scope_hash <> :default_hash ORDER BY id"
@@ -278,13 +292,14 @@ _ROOT_PAGE: Final = q(
     "SELECT id FROM jobs WHERE merged_into_job_id IS NULL AND id <= :bound AND id > :after "
     "ORDER BY id LIMIT :limit"
 )
+# A root's graph follows `merged_into_job_id` without the jobs' bound: no job is created or merged under the
+# global fence (every collection and merge writer refuses it, `FencedOut("purge_fence")`), so a graph of a
+# root within the bound holds only jobs within it, and `delete_job_graph` reads the same graph under its lock.
 _GRAPH: Final = q(
     "WITH RECURSIVE g(id) AS (SELECT id FROM jobs WHERE id = :root "
     "UNION SELECT j.id FROM jobs j JOIN g ON j.merged_into_job_id = g.id) SELECT id FROM g ORDER BY id"
 )
 _JOBS_LEFT: Final = q("SELECT count(*) FROM jobs WHERE id <= :bound")
-# The runs of a settings version within the bound, whatever their id (module docstring, step 3.8).
-_SETTINGS_RUNS: Final = q("DELETE FROM runs WHERE settings_version_id <= :settings")
 _POINTER_VALUES: Final = q(
     "SELECT a.settings_version_id, a.scope_version_id, a.pending_scope_version_id, a.model_policy_id, "
     "a.execution_config_id, a.evaluation_policy_id, a.rubric_version_id, a.prompt_schema_version_id, "
@@ -296,11 +311,6 @@ _DELETE_DRAFTS: Final = q("DELETE FROM profile_drafts WHERE id <= :bound")
 _DELETE_VERSIONS: Final = q("DELETE FROM profile_versions WHERE id <= :bound")
 _DELETE_CASE_RESULTS: Final = q("DELETE FROM eval_case_results WHERE eval_run_id <= :bound")
 _DELETE_LANE_CREDITS: Final = q("DELETE FROM admission_lane_credits WHERE llm_tuple_id <= :bound")
-# The runs within the bound and those of a settings version within it, a page (step 3.7).
-_RUNS_PAGE: Final = (
-    "DELETE FROM runs WHERE id IN (SELECT id FROM runs "
-    "WHERE id <= :bound OR settings_version_id <= :settings ORDER BY id LIMIT :limit)"
-)
 _LOCKOUTS_PAGE: Final = (
     "DELETE FROM login_lockouts WHERE generation IN (SELECT generation FROM login_lockouts "
     "WHERE generation <= :bound ORDER BY generation LIMIT :limit)"
@@ -318,13 +328,14 @@ async def request_delete_everything(
 ) -> OpenedPurge:
     """A0 in the caller's transaction (module docstring): the manifest with the request
     `{"idempotency_row_id": <id>}`, its `global` fence and its `purge` operation; the opened purge.
-    `Refusal(409)` while a delete-everything is executing; `ValueError` for an id that names no row."""
-    if isinstance(idempotency_row_id, bool) or idempotency_row_id <= 0:
-        raise ValueError("the request names its idempotency row by its positive id")
+    `Refusal(409)` while a delete-everything is executing; `ValueError` for an id that names no idempotency
+    row (the caller's own, in this transaction), before anything is written."""
     await conn.execute(_LOCK_CONFIG)  # A0's lock
     if (await conn.execute(_EXECUTING)).scalar_one():
         log.info("delete_everything_refused", reason="purge_in_progress")
         raise purge_in_progress()
+    if not (await conn.execute(_IDEMPOTENCY_ROW, {"id": idempotency_row_id})).scalar_one():
+        raise ValueError("the request names no idempotency row")
     opened = await open_purge(
         conn,
         kind=KIND,
@@ -338,10 +349,6 @@ async def request_delete_everything(
 
 
 # ---- the content -------------------------------------------------------------------------------------------
-
-
-async def _ids(conn: AsyncConnection, statement: TextClause, params: Mapping[str, object]) -> list[int]:
-    return [int(i) for i in (await conn.execute(statement, dict(params))).scalars()]
 
 
 _BY_ID: Final[Bound] = {"by": "id"}
@@ -378,22 +385,26 @@ async def _operations(
 ) -> tuple[list[Operation], dict[str, list[int]]]:
     """The content's operations, in §20.4's order (module docstring), and its `retained` ids."""
     idempotency_row_id = get_int(dict(manifest.request), REQUEST_KEY)
-    own = await _ids(
+    own = await select_ids(
         conn, _OWN_OPERATIONS, {"kind": PURGE_KIND, "m": manifest.id, "bound": max_ids["operations"]}
     )
-    defaults = await _ids(
+    defaults = await select_ids(
         conn, _DEFAULT_INSTANCES, {"sources": list(DEFAULT_INSTANCES), "bound": max_ids["source_instances"]}
     )
-    resolved = await _ids(conn, _RESOLVED_ALERTS, {"bound": max_ids["alerts"]})
-    finished = await _ids(conn, _FINISHED_JOBS, {"bound": max_ids["procrastinate_jobs"]})
-    listed_scopes = await _ids(
+    resolved = await select_ids(conn, _RESOLVED_ALERTS, {"bound": max_ids["alerts"]})
+    finished = await select_ids(
+        conn,
+        _FINISHED_JOBS,
+        {"statuses": list(FINISHED_JOB_STATUSES), "bound": max_ids["procrastinate_jobs"]},
+    )
+    listed_scopes = await select_ids(
         conn, _LISTED_SCOPES, {"bound": max_ids["scope_versions"], "default_hash": default_scope_hash()}
     )
     keys = [str(k) for k in (await conn.execute(_CV_KEYS, {"bound": max_ids["cv_files"]})).scalars()]
     retained: dict[str, list[int]] = {}
     for table in (*_KEPT_WHOLE, "scope_versions"):
         statement = q(_ROWS_WITHIN.format(table=table))  # a constant table name of this module
-        retained[table] = await _ids(conn, statement, {"bound": max_ids[table]})
+        retained[table] = await select_ids(conn, statement, {"bound": max_ids[table]})
     retained["scope_versions"] = sorted(set(retained["scope_versions"]) - set(listed_scopes))
     retained.update({"settings_versions": [], "profile_versions": [], "llm_tuples": []})
     files: list[Operation] = [{"op": "file_remove", "volume": "cv_store", "keys": keys}] if keys else []
@@ -449,11 +460,10 @@ async def _operations(
         _all("queries"),
         _all("source_instances", keep=defaults),
         _all("watchlist_companies"),
-        # (7) the runs within the bound, and those of a settings version within it
+        # (7)
         _all("score_cycles"),
         _parent("run_attempts", "runs", "run_id"),
         _all("runs"),
-        _parent("runs", "settings_versions", "settings_version_id"),
         # (9)
         _parent("profile_vectors", "profile_versions", "profile_version_id"),
         _all("query_proposals"),
@@ -617,7 +627,7 @@ async def _settle_and_delete_calls(run: PurgeRun, page_of: TextClause, bound: in
     deleted = 0
     while True:
         async with run.engine.connect() as conn:
-            page = await _ids(conn, page_of, {"bound": bound, "limit": ROW_CHUNK})
+            page = await select_ids(conn, page_of, {"bound": bound, "limit": ROW_CHUNK})
         if not page:
             return deleted
         async with run.chunk() as chunk:
@@ -649,10 +659,10 @@ async def _delete_jobs(run: PurgeRun, bounds: Mapping[str, int]) -> int:
     while True:
         async with run.engine.connect() as conn:
             params = {"bound": bounds["jobs"], "after": after, "limit": ROW_CHUNK}
-            roots = await _ids(conn, _ROOT_PAGE, params)
+            roots = await select_ids(conn, _ROOT_PAGE, params)
         for root in roots:
             async with run.engine.connect() as conn:
-                graph = await _ids(conn, _GRAPH, {"root": root})
+                graph = await select_ids(conn, _GRAPH, {"root": root})
             if graph:
                 purged = await deletion_graph.purge_job_graph(
                     run, root, graph, write_tombstone=False, target_bound=bounds["score_targets"]
@@ -675,14 +685,12 @@ async def _delete_rows(run: PurgeRun, bounds: Mapping[str, int], *tables: str) -
 
 
 async def _step_8(run: PurgeRun, content: ManifestContent) -> int | None:
-    """Step 8 (module docstring) in one chunk holding `active_config FOR UPDATE`: the runs of a settings
-    version within the bound, then the reset unless every pointer holds already; the new version's id."""
-    bounds = content["max_ids"]
+    """Step 8 (module docstring) in one chunk holding `active_config FOR UPDATE`: the reset unless every
+    pointer holds already; the new version's id, `None` when it was skipped."""
     async with run.chunk(config="update") as chunk:
         conn = chunk.conn
-        stale = (await conn.execute(_SETTINGS_RUNS, {"settings": bounds["settings_versions"]})).rowcount
         if not await _pointer_violations(conn, content):
-            log.info("delete_everything_reset_skipped", manifest_id=run.manifest.id, runs_deleted=stale)
+            log.info("delete_everything_reset_skipped", manifest_id=run.manifest.id)
             return None
         version_id = await reset_to_defaults(conn, now=run.now)
         await ranking.bump(conn)  # the last lock
@@ -716,25 +724,10 @@ async def _step_9(run: PurgeRun, content: ManifestContent) -> dict[str, int]:
     return counts
 
 
-def _thread_predicate(max_ids: Mapping[str, int]) -> tuple[str, dict[str, object]]:
-    """A checkpoint row's thread within the bound (`manifests.THREAD_FORMS`: the owner its name carries,
-    within its table's bound), over `thread_id`, with its binds."""
-    params: dict[str, object] = {}
-    cases: list[str] = []
-    for i, form in enumerate(THREAD_FORMS):
-        params[f"form_{i}"] = f"^(?:{form.pattern})$"
-        params[f"owner_{i}"] = max_ids[form.owner]
-        cases.append(
-            f"WHEN thread_id ~ :form_{i} "
-            f"THEN CAST((regexp_match(thread_id, :form_{i}))[1] AS numeric) <= :owner_{i}"
-        )
-    return f"CASE {' '.join(cases)} ELSE false END", params
-
-
 async def _delete_threads(run: PurgeRun, max_ids: Mapping[str, int]) -> int:
     """Step 11's checkpoint threads within the bound, `ROW_CHUNK` threads a chunk, from the three tables;
     how many threads."""
-    predicate, params = _thread_predicate(max_ids)
+    predicate, params = thread_bound_sql(max_ids)
     tables = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")
     page_of = q(
         " UNION ".join(f"SELECT thread_id FROM {table} WHERE {predicate}" for table in tables)  # noqa: S608
@@ -861,11 +854,9 @@ class DeleteEverything:
         counts.update(await _delete_rows(run, bounds, "watchlist_companies"))
         if run.effects is not None and run.effects.deadman is not None:  # before 3.7, no transaction open
             counts["runs_pinged"] = await run.effects.deadman.ping_pending()
-        counts.update(await _delete_rows(run, bounds, "score_cycles"))  # 3.7
-        counts["runs"] = await _delete_paged(
-            run, _RUNS_PAGE, {"bound": bounds["runs"], "settings": bounds["settings_versions"]}
-        )
+        counts.update(await _delete_rows(run, bounds, "score_cycles", "runs"))  # 3.7
         await _step_8(run, content)  # 3.8
+        await afault_point(AFTER_REPOINT)
         counts.update(await _step_9(run, content))  # 3.9
         counts.update(await _delete_rows(run, bounds, "settings_versions"))  # 3.10
         counts["scope_versions"] = await _delete_listed(
@@ -888,11 +879,11 @@ class DeleteEverything:
         )
         log.info("delete_everything_executed", manifest_id=run.manifest.id, **counts)
 
-    async def complete(self, conn: AsyncConnection, content: ManifestContent) -> None:
+    async def complete(self, conn: AsyncConnection, manifest: ManifestRow, content: ManifestContent) -> None:
         """Step 12 in the completing transaction: every session created at or before `fenced_at`."""
         fenced_at = datetime.fromisoformat(content["fenced_at"])
         ended = (await conn.execute(_DELETE_SESSIONS, {"fenced_at": fenced_at})).rowcount
-        log.info("delete_everything_sessions_ended", sessions=ended)
+        log.info("delete_everything_sessions_ended", manifest_id=manifest.id, sessions=ended)
 
     async def postconditions(self, conn: AsyncConnection, content: ManifestContent) -> list[Violation]:
         index = next(

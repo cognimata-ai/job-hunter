@@ -294,8 +294,9 @@ def _reservation(item: Row[tuple[object, ...]]) -> Reservation:
     )
 
 
-async def _ids(conn: AsyncConnection, statement: TextClause, params: dict[str, object]) -> list[int]:
-    return [int(i) for i in (await conn.execute(statement, params)).scalars()]
+async def select_ids(conn: AsyncConnection, statement: TextClause, params: Mapping[str, object]) -> list[int]:
+    """The ids `statement` selects with `params`, in its order (the purge kinds share it)."""
+    return [int(i) for i in (await conn.execute(statement, dict(params))).scalars()]
 
 
 async def purge_target_set(
@@ -313,7 +314,7 @@ async def purge_target_set(
         raise ValueError(f"a purge chunk takes at most {targets.TARGET_SET_CHUNK} targets, not {len(ids)}")
     if not ids:
         return PurgedTargets(0, (), (), 0, 0, 0)
-    candidates = await _ids(conn, _SUBMISSIONS_OF_SET, {"ids": ids})
+    candidates = await select_ids(conn, _SUBMISSIONS_OF_SET, {"ids": ids})
     locked: dict[int, str] = {}
     if candidates:  # 1. the owner rows (step 5), then T's items under them
         params = {"subs": candidates, "states": list(_LOCKED_STATES)}
@@ -328,8 +329,10 @@ async def purge_target_set(
             if item.target_state == "in_batch" and item.batch_submission_id == item.submission_id
         }
     )
-    online = await _ids(conn, _ONLINE_ENTRIES, {"ids": ids})
-    abandoned_entries = await _ids(conn, _ENTRIES_OF_SUBMISSIONS, {"subs": preparing}) if preparing else []
+    online = await select_ids(conn, _ONLINE_ENTRIES, {"ids": ids})
+    abandoned_entries = (
+        await select_ids(conn, _ENTRIES_OF_SUBMISSIONS, {"subs": preparing}) if preparing else []
+    )
     # 2. steps 6 and 7, before any row of step 10: the accounts of the entries settled below, and no other
     dispatched = [int(item.ledger_id) for item in in_flight if item.entry_state == "dispatched"]
     entries = [*abandoned_entries, *dispatched, *online]
@@ -356,7 +359,7 @@ async def purge_target_set(
 
     async def settle_online(cancelled: AsyncConnection) -> None:  # 7., T cancelled (module docstring)
         nonlocal settled
-        current = sorted({*online, *await _ids(cancelled, _ONLINE_ENTRIES, {"ids": ids})})
+        current = sorted({*online, *await select_ids(cancelled, _ONLINE_ENTRIES, {"ids": ids})})
         rows = await spend_ledger.lock_for_purge(cancelled, current, now=now)
         settled = await spend_ledger.settle_for_purge(cancelled, current, rows, now=now)
 
@@ -441,7 +444,7 @@ async def settle_live_spend(
         for item in items
         if item.entry_state == "dispatched" and int(item.submission_id) not in preparing
     ]
-    online = await _ids(conn, _ONLINE_UNSETTLED, {"bound": ledger_bound})
+    online = await select_ids(conn, _ONLINE_UNSETTLED, {"bound": ledger_bound})
     abandoned_entries = [int(item.ledger_id) for item in items if int(item.submission_id) in preparing]
     await spend_ledger.lock_for_purge(  # steps 6 and 7: the accounts of every entry settled below
         conn, [*abandoned_entries, *(int(item.ledger_id) for item in dispatched), *online], now=now
@@ -456,7 +459,7 @@ async def settle_live_spend(
         await spend_ledger.settle(
             conn, _reservation(item), outcome="ambiguous", evidence=None, usage=None, call=call, now=now
         )
-    bulks = await _ids(conn, _ACTIVE_BULKS, {"bound": bulk_bound})
+    bulks = await select_ids(conn, _ACTIVE_BULKS, {"bound": bulk_bound})
     for bulk_operation_id in bulks:
         await bulk.cancel(conn, bulk_operation_id, now=now)
     # the online entries' accounts read again: the settles above wrote them (their locks are held)
@@ -612,10 +615,10 @@ async def _settle_entries(
     (steps 6 and 7), the rows locked by `lock` (step 10; it returns the ids present and may raise), the
     entries read again under those locks, the accounts of an entry reserved after the first read taken (after
     step 10: the one place it leaves the schedule), and each settled (`settle_for_purge`). The ids present."""
-    entries = await _ids(conn, entries_of, {key: ids})
+    entries = await select_ids(conn, entries_of, {key: ids})
     rows = await spend_ledger.lock_for_purge(conn, entries, now=now)  # steps 6 and 7
     present = await lock()
-    current = await _ids(conn, entries_of, {key: present}) if present else []
+    current = await select_ids(conn, entries_of, {key: present}) if present else []
     if not set(current) <= set(entries):  # an entry reserved after the first read (module docstring)
         rows = await spend_ledger.lock_for_purge(conn, current, now=now)
     await spend_ledger.settle_for_purge(conn, current, rows, now=now)
@@ -646,7 +649,7 @@ async def settle_and_delete_calls(
         return ()
 
     async def lock_calls() -> list[int]:  # step 10
-        return await _ids(conn, _LOCK_CALLS, {"calls": ids})
+        return await select_ids(conn, _LOCK_CALLS, {"calls": ids})
 
     present = await _settle_entries(conn, _CALL_ENTRIES, "calls", ids, lock_calls, now=now)
     if present:
@@ -743,7 +746,7 @@ async def _refuse_active(conn: AsyncConnection, cases: Mapping[int, golden.CaseF
 async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime) -> int:
     """Step 4 (module docstring): the inactive golden cases on G's revisions, their in-flight eval entries
     settled first; an active one is an `InvariantViolation`. How many were deleted."""
-    cases = await _ids(conn, _CASES_OF_GRAPH, {"jobs": jobs})
+    cases = await select_ids(conn, _CASES_OF_GRAPH, {"jobs": jobs})
     if not cases:
         return 0
     return len(await settle_and_delete_cases(conn, cases, now=now, check=_refuse_active))
@@ -751,7 +754,7 @@ async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime
 
 async def _forget_merges_and_conflicts(conn: AsyncConnection, jobs: list[int]) -> tuple[int, int]:
     """Step 5's merge events and identity conflicts (module docstring); how many of each were deleted."""
-    events = await _ids(conn, _EVENTS_NAMING, {"jobs": jobs})
+    events = await select_ids(conn, _EVENTS_NAMING, {"jobs": jobs})
     if events:
         await conn.execute(_UNREVERSE, {"events": events})
         await conn.execute(_DELETE_EVENTS, {"events": events})
@@ -801,7 +804,7 @@ async def delete_job_graph(
     Its statements select by the graph's job ids, which the caller's content names and its fence keeps
     closed (no row naming a fenced job is written after the fence), so they need no `max_ids` bound of their
     own (Ruling T13-3)."""
-    jobs = await _ids(conn, _GRAPH_OF, {"job": job_id})
+    jobs = await select_ids(conn, _GRAPH_OF, {"job": job_id})
     if not jobs:
         return JobGraphDeleted((), 0, 0, 0, None)
     if unheld := sorted(set(jobs) - set(held)):
@@ -883,7 +886,7 @@ async def purge_job_graph(
                 "bound": target_bound,
                 "limit": targets.TARGET_SET_CHUNK,
             }
-            page = await _ids(chunk.conn, _GRAPH_TARGET_PAGE, params)
+            page = await select_ids(chunk.conn, _GRAPH_TARGET_PAGE, params)
             if page:
                 purged = await purge_target_set(chunk.conn, page, manifest_id=run.manifest.id, now=run.now)
                 deleted_targets += purged.targets

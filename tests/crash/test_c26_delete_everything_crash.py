@@ -9,6 +9,8 @@ stale, so worker B's start releases the job, and B's takeover sweep gives the op
 C36). The manifest stays `executing` with its global fence active in between. B resumes idempotently: every
 chunk of the kind finds what is left (nothing) without a foreign-key or CHECK violation, the export ops run,
 and the completing transaction deletes the sessions, releases the fence and marks the manifest `completed`.
+A second case kills A after step 8's re-pointing has committed and before step 10
+(`privacy.delete_everything.after_repoint`): B's step 8 installs no second settings version.
 
 Every datum is invented; no paid call (the worker is in fake LLM mode: the recorded cancel of the seed's
 `submitted` batch finds no such batch on the fake, and is given up after its three tries).
@@ -195,4 +197,41 @@ async def test_a_crash_mid_delete_resumes_to_completed(
         None,
     )
     assert not export.exists()
+    assert await holding(engine) == []
+
+
+async def test_a_crash_after_the_repoint_resumes_with_one_new_settings_version(
+    migrated: PgServer, engine: AsyncEngine, queue_app: procrastinate.App, workers: Workers
+) -> None:
+    """Worker A dies after step 8's commit (`privacy.delete_everything.after_repoint`), before step 10: the
+    default settings version is installed and active, the old ones not yet deleted. B resumes: its step 8
+    finds every pointer satisfied and installs no second version, so the purge completes with exactly the one
+    new settings version, the one A installed."""
+    async with engine.begin() as conn:
+        await seed_two_year_old_graph(conn, now=utcnow())
+    versions_before = one(migrated, "SELECT count(*), max(id) FROM settings_versions")
+    opened = await requested(engine)
+    workers.crash_at(delete_everything.AFTER_REPOINT)
+
+    status, released = one(
+        migrated,
+        "SELECT m.status, f.released_at FROM deletion_manifests m "
+        "JOIN purge_fences f ON f.manifest_id = m.id WHERE m.id = %s",
+        opened.manifest_id,
+    )
+    assert (status, released) == ("executing", None)
+    installed = int(one(migrated, "SELECT settings_version_id FROM active_config")[0])
+    assert installed > versions_before[1]
+    assert one(migrated, "SELECT count(*) FROM settings_versions")[0] == versions_before[0] + 1
+
+    b = workers.start()
+    workers.ended(b, opened.operation_id)
+    assert operation(migrated, opened.operation_id) == ("succeeded", None)
+    assert one(migrated, "SELECT array_agg(id) FROM settings_versions")[0] == [installed]
+    assert one(migrated, "SELECT settings_version_id FROM schedule_state")[0] == installed
+    async with engine.connect() as conn:
+        manifest = await read_manifest(conn, opened.manifest_id)
+        assert manifest is not None and manifest.status == "completed" and manifest.scope is not None
+        assert await check_postconditions(conn, manifest.scope, files=workers.volumes.roots) == []
+        assert await delete_everything.DeleteEverything().postconditions(conn, manifest.scope) == []
     assert await holding(engine) == []
