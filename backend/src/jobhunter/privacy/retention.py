@@ -85,6 +85,14 @@ body that the newest response still needs. The controller records this as a plan
   committed: no file is deleted under a protection set that a committed reactivation or reopening changed.
 - `cv_store_orphans`: a file of the CV store that no `cv_files.storage_path` names and that was written more
   than a day ago (its modification time): the file of an upload whose transaction rolled back (Task 9).
+- `exports` (M5 Task 17, Deviations 48 and 52; `privacy.export.retain_exports`, its steps each a transaction
+  of their own that starts with the epoch fence): a `ready` export past `expires_at` becomes `expired` with
+  `storage_path` NULL, its file removed after that commit; a `running` export whose operation is neither
+  `pending` nor `running` (lost without its failure hook) becomes `failed`, its files removed; an archive of
+  the exports directory written more than a day ago that no `ready` row names is removed, as
+  `cv_store_orphans` does; `expired`, `failed` and `purged` rows go 30 days after `expires_at`. Its window is
+  those 30 days. The directory is the worker's exports volume (`privacy.export.configure`, at its start);
+  a pass in a process that never configured it changes rows only.
 - `eval_runs`: a run that ended 13 months ago (`finished_at`, else `started_at`), except the latest
   completed run of each kind and a run still `running`; its calls go with it (`ON DELETE CASCADE`).
 - `profile_checkpoints`: a `profile-…` or `queries-…` thread whose operation, the one its name carries
@@ -199,6 +207,7 @@ from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
 from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy import export
 from jobhunter.privacy.kinds import job_tombstone, profile_purge
 from jobhunter.privacy.retained import ENDED_TARGET_STATES, NEWEST_AND_PREVIOUS, months_before
 from jobhunter.profile.storage import CvStore
@@ -242,6 +251,8 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("draft_content", timedelta(days=30)),  # after the draft was confirmed, discarded or failed
     RetentionRule("cv_files", timedelta(days=30)),  # a discarded or failed draft's, an abandoned upload's
     RetentionRule("cv_store_orphans", timedelta(days=1)),  # after the file was written
+    # M5 Task 17: a `ready` export expires at `expires_at`; its terminal rows go this long after it
+    RetentionRule("exports", export.EXPORT_ROWS_KEPT),
     RetentionRule("eval_runs", THIRTEEN_MONTHS),
     # The M3 rules (Task 23). `score_history`'s window is the active settings'
     # `retention.score_history_months` calendar months after the target ended, read when the rule starts.
@@ -774,6 +785,8 @@ async def _apply(
         return await _purge_cv_files(engine, cv_store, cutoff, now, epoch)
     if rule.name == "cv_store_orphans":
         return await _purge_orphans(engine, cv_store, cutoff, epoch)
+    if rule.name == "exports":
+        return await export.retain_exports(engine, now=now, epoch=epoch)
     if rule.name == "eval_runs":
         return await _delete_eval_runs(engine, cutoff, epoch)
     if rule.name == "score_history":

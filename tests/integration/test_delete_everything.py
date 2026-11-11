@@ -38,6 +38,7 @@ from jobhunter.privacy import (
     purge,
     reconcilers,  # noqa: F401 (registers `purge_fences`)
 )
+from jobhunter.privacy.export import request_export
 from jobhunter.privacy.kinds import delete_everything
 from jobhunter.privacy.kinds.delete_everything import DELETE_EVERYTHING_KEEPS, DeleteEverything
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
@@ -150,6 +151,10 @@ _PURGE_OPERATIONS: Final = sa.text(
     "ORDER BY id"
 )
 _EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e")
+_EXPORT_OPERATION: Final = sa.text(
+    "SELECT id FROM operations WHERE kind = 'export' "
+    "AND payload -> 'export_id' = to_jsonb(CAST(:e AS bigint))"
+)
 # The settings versions, `active_config`'s pointers and `schedule_state`, as one comparable listing.
 _CONFIGURATION: Final = sa.text(
     "SELECT 'version' AS kind, id, version_no, NULL::timestamptz AS at FROM settings_versions "
@@ -1014,7 +1019,7 @@ async def test_another_purges_deleted_operation_is_recreated_from_its_row(
     and deletes that operation and keeps its manifest `executing`. After its completion (its global fence
     released) the `purge_fences` reconciler creates a new operation from the manifest's request, which
     completes (its case is gone already); no fence is left active and no manifest executing, so an export
-    requested afterwards is not left waiting."""
+    requested afterwards is accepted and ends `ready` (M5 Task 17, T16-3 (7))."""
     seed = await seeded(engine)
     async with engine.begin() as conn:
         golden = await request_golden_case_delete(conn, seed.purgeable_case_id, now=utcnow(), defer=None)
@@ -1029,6 +1034,13 @@ async def test_another_purges_deleted_operation_is_recreated_from_its_row(
     await completed(purger, golden.manifest_id, int(recreated.id))
     left = await one(engine, _PURGE_FENCES_LEFT)
     assert (left.fences, left.executing) == (0, 0)
+    async with engine.begin() as conn:
+        export_id = await request_export(conn, now=utcnow(), defer=None)
+        export_operation = int((await conn.execute(_EXPORT_OPERATION, {"e": export_id})).scalar_one())
+    await purger.run(export_operation)  # the worker's `run_operation`, with the worker's dependencies
+    assert (await one(engine, _OPERATION, o=export_operation)).status == "succeeded"
+    exported = await one(engine, _EXPORT, e=export_id)
+    assert exported.status == "ready" and (purger.cfg.exports_dir / exported.storage_path).is_file()
 
 
 async def test_delete_everything_purges_exports(engine: AsyncEngine, live: Purger) -> None:

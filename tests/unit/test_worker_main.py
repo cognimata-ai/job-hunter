@@ -1185,12 +1185,14 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
       19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, and M3's
       `create_targets_for_tuple` (Task 14, `scoring.targets`), `batch_submit` (Task 16,
       `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`), M4's
-      `replay_raw_items` (M4 Task 12, `sources.replay`) and M5's `purge` (Task 12, `privacy.purge`);
+      `replay_raw_items` (M4 Task 12, `sources.replay`) and M5's `purge` (Task 12, `privacy.purge`) and
+      `export` (Task 17, `privacy.export`);
     - the failure hooks of the two profile phases, of the query proposal and of `eval_run` (written in
       `worker.operations`, Ruling P39; `embed_profile` drives no domain row; `batch_submit`'s cleanup needs
       `active_config`, which its reconciler takes, Codex r3 B2; `create_targets_for_tuple` is re-requested
       by `missing_targets`), and M5's `purge` (`privacy.purge.purge_failed`: its manifest's
-      `privacy.purge_failed` at once, M5 Task 12) only;
+      `privacy.purge_failed` at once, M5 Task 12) and `export` (`privacy.export.export_failed`: its export
+      `failed` and its files removed, M5 Task 17, Deviation 52) only;
     - the `bulk_operations` reconciler's one active step, Task 16's `rerequest` (Ruling T16-d);
     - the one gauge refresh `metrics_refresh` runs, Task 18's `score_lane`;
     - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14;
@@ -1209,6 +1211,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "create_targets_for_tuple",
             "embed_profile",
             "eval_run",
+            "export",
             "extract_profile",
             "extract_profile_text",
             "propose_queries",
@@ -1216,7 +1219,14 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "replay_raw_items",
             "watchlist_validate",
         ],
-        "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries", "purge"],
+        "failure_hooks": [
+            "eval_run",
+            "export",
+            "extract_profile",
+            "extract_profile_text",
+            "propose_queries",
+            "purge",
+        ],
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "gauge_refreshes": ["score_lane"],
         # M3 Task 14 (Codex r3 B20): `defer_operation_job` reads it at every enqueue

@@ -7,7 +7,8 @@
 3. the engine (a pool of 10);
 4. the task app (`make_queue_app`, a pool of 4) and the modules whose import registers the takeover sweeps,
    the reconcilers and the operation handlers and failure hooks (`operations`, `runs`, `profile.operations`,
-   …: `_REGISTERING_MODULES`): all of them exist before the takeover;
+   …: `_REGISTERING_MODULES`): all of them exist before the takeover; then the exports volume of the
+   `export` failure hook and retention rule (`privacy.export.configure`, M5 Task 17), which a sweep may run;
 5. the epoch claim, committed alone, then the takeover sweeps, each in a fenced transaction of its own, in
    registration order (`claim_epoch_and_sweep`, M3 Task 27; a sweep defers through its own transaction's
    connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
@@ -157,6 +158,7 @@ from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.observability.ntfy import AlertDispatcher, NtfyClient
 from jobhunter.observability.ntfy import make_http_client as make_ntfy_http_client
+from jobhunter.privacy import export
 from jobhunter.profile.parse_client import ParseClient
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring.batch_results import batches_client as make_batches_client
@@ -235,6 +237,8 @@ _REGISTERING_MODULES: Final = (
     # M5 Task 12: the `purge` handler and its failure hook, and the purge kinds' procedures (`KINDS`)
     "jobhunter.privacy.purge",
     "jobhunter.privacy.kinds",
+    # M5 Task 17: the `export` handler and its failure hook (`export_failed`)
+    "jobhunter.privacy.export",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -318,6 +322,7 @@ class _WorkerProcess:
         queue = self.queue = make_queue_app(dsn, max_size=QUEUE_POOL_MAX_SIZE)
         for module in _REGISTERING_MODULES:
             importlib.import_module(module)
+        export.configure(cfg)  # the exports volume of the export's failure hook, which a sweep may run
         # 5. The epoch claim and the takeover sweep.
         ident = WorkerIdentity(
             instance_id=uuid.uuid4(),

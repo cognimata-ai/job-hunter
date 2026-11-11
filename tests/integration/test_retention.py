@@ -124,6 +124,9 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "draft_content": timedelta(days=30),
         "cv_files": timedelta(days=30),
         "cv_store_orphans": timedelta(days=1),
+        # M5 Task 17: a `ready` export expires at `expires_at`; its terminal rows go 30 days after it (its own
+        # tests are in test_export.py)
+        "exports": timedelta(days=30),
         "eval_runs": timedelta(days=397),
         # M3 Task 23: the score tables (their own tests are in test_retention_m3.py); `score_history`'s
         # window is the active settings' `retention.score_history_months`, read at the start of the pass

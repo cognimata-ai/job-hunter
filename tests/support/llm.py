@@ -1007,6 +1007,10 @@ class FakeLLM(FakeAnthropic):
         self.sleeps = Sleeps()
         self._clients: list[httpx2.AsyncClient] = []
         self.handlers: dict[ops.OperationKind, ops.OperationHandler] = {}  # registered for this test only
+        # the kind's own handler and failure hook while this test's stand in (restored after the test)
+        self.replaced: dict[
+            ops.OperationKind, tuple[ops.OperationHandler | None, ops.FailureHook | None]
+        ] = {}
 
     def record(
         self,
@@ -1084,7 +1088,8 @@ _active_fake: list[FakeLLM] = []
 @pytest.fixture
 async def fake_llm(tmp_path: Path) -> AsyncIterator[FakeLLM]:
     """The fake over `GatewayOut` recordings under `tmp_path`, for the gateway; any operation handler that
-    `create_llm_call_operation` registered is removed after the test."""
+    `create_llm_call_operation` registered is removed after the test, and the kind's own handler and failure
+    hook are put back."""
     root = tmp_path / "anthropic"
     fake_llm = FakeLLM(fake_llm_config(root, tmp_path / "no-secrets"))
     for purpose in GATEWAY_PURPOSES:
@@ -1098,6 +1103,11 @@ async def fake_llm(tmp_path: Path) -> AsyncIterator[FakeLLM]:
         for kind, handler in fake_llm.handlers.items():
             if ops.HANDLERS.get(kind) is handler:
                 del ops.HANDLERS[kind]
+        for kind, (own, hook) in fake_llm.replaced.items():
+            if own is not None:
+                ops.HANDLERS[kind] = own
+            if hook is not None:
+                ops.FAILURE_HOOKS[kind] = hook
         await fake_llm.aclose()
 
 
@@ -1118,16 +1128,18 @@ def call_context(owner: SpendOwner, execution_config_id: int, **overrides: Any) 
     return CallContext(**values)
 
 
-# The kind of `create_llm_call_operation`'s operation: one no handler of this milestone registers (`export` is
-# M5's), so the test's handler never meets a real one (M3 Task 19, B R8: `eval_run` is the eval runner's).
+# The kind of `create_llm_call_operation`'s operation (M3 Task 19, B R8: `eval_run` is the eval runner's).
+# Since M5 Task 17 every kind has a handler of its own, `export` the export's: for the test, the test's
+# handler stands in for it and its failure hook (the export's, which drives an `exports` row this
+# operation has not) stands aside; the `fake_llm` fixture puts both back.
 LLM_CALL_KIND: Final = "export"
 
 
 async def create_llm_call_operation(engine: AsyncEngine) -> int:
     """A `pending` operation of kind `LLM_CALL_KIND` (`export`) whose handler, registered for this test only
-    (the `fake_llm` fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend
-    owner. The handler closes over its gateway and uses nothing of the operation context but the claim (no
-    `deps`)."""
+    in place of the kind's own handler and failure hook (the `fake_llm` fixture puts them back), makes one
+    gateway call of `GATEWAY_NODE` as the operation's spend owner. The handler closes over its gateway and
+    uses nothing of the operation context but the claim (no `deps`)."""
     if not _active_fake:
         raise RuntimeError("create_llm_call_operation needs the fake_llm fixture")
     fake_llm = _active_fake[-1]
@@ -1138,8 +1150,12 @@ async def create_llm_call_operation(engine: AsyncEngine) -> int:
         owner = OperationOwner(ctx.claim)
         await gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, execution_config_id))
 
-    if ops.HANDLERS.get(LLM_CALL_KIND, handler) is not handler:
-        raise RuntimeError(f"another {LLM_CALL_KIND} handler is registered")
+    if LLM_CALL_KIND in fake_llm.handlers:
+        raise RuntimeError(f"this test registered its {LLM_CALL_KIND} handler already")
+    fake_llm.replaced[LLM_CALL_KIND] = (
+        ops.HANDLERS.get(LLM_CALL_KIND),
+        ops.FAILURE_HOOKS.pop(LLM_CALL_KIND, None),
+    )
     ops.HANDLERS[LLM_CALL_KIND] = fake_llm.handlers[LLM_CALL_KIND] = handler
     async with engine.begin() as conn:
         op_id, _ = await ops.create_operation(
