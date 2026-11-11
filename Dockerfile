@@ -29,13 +29,15 @@ FROM ${UV_IMAGE} AS uv
 FROM ${RESTIC_IMAGE} AS restic
 FROM ${PGVECTOR_IMAGE} AS pgclient
 
-# The SPA (frontend/): only its `dist` leaves this stage.
+# The SPA (frontend/): only its `dist` leaves this stage. It bundles the privacy statement, docs/PRIVACY.md, which
+# the SPA imports from ../docs (M5 Task 20), so that one file is copied beside it.
 FROM ${NODE_IMAGE} AS spa
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=secret,id=build_ca,required=false \
     if [ -s /run/secrets/build_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build_ca; fi; \
     npm ci
+COPY docs/PRIVACY.md /src/docs/PRIVACY.md
 COPY frontend/ ./
 RUN npm run build
 

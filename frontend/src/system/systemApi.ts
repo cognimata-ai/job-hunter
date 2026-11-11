@@ -45,6 +45,7 @@ type TargetMovedOut = components["schemas"]["TargetMovedOut"];
 type ReleasedOut = components["schemas"]["ReleasedOut"];
 type SnapshotAcknowledgedOut = components["schemas"]["SnapshotAcknowledgedOut"];
 type AcknowledgedOut = components["schemas"]["AcknowledgedOut"];
+type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
 export type Decision = components["schemas"]["ResolveIn"]["decision"];
 export type GoldenFlags = components["schemas"]["FlagsIn"];
 
@@ -296,11 +297,12 @@ export function useSetGoldenFlags(): UseMutationResult<GoldenCaseOut, ProblemErr
   });
 }
 
-/** Delete a golden case and its eval rows (`DELETE /api/golden-cases/{id}`, 204). */
-export function useDeleteGoldenCase(): UseMutationResult<undefined, ProblemError, number> {
+/** Delete a golden case and its eval rows (`DELETE /api/golden-cases/{id}`, 202 `{manifest_id}`: the worker
+ * deletes it under a deletion manifest, plan M5 Deviation 20). */
+export function useDeleteGoldenCase(): UseMutationResult<ManifestQueuedOut, ProblemError, number> {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (caseId: number) => apiSend<undefined>(`/api/golden-cases/${String(caseId)}`, { method: "DELETE" }),
+    mutationFn: (caseId: number) => apiSend<ManifestQueuedOut>(`/api/golden-cases/${String(caseId)}`, { method: "DELETE" }),
     meta: OWN,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: GOLDEN_KEY });

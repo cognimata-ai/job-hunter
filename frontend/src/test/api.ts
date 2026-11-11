@@ -1,9 +1,9 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
 // stats, watchlist, golden-run and shipped-version reads, the System section's reads (needs attention, runs,
-// score cycles, alerts by status, golden cases, health), the settings dry-run, the logout, the login's answers
-// in the order a test gives them, and any other route a test answers itself (`routes`). A route is matched by
-// its path alone; the query string is the request's `search`.
+// score cycles, alerts by status, golden cases, health), the deletion manifests (the list and each one), the
+// settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
+// answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -37,6 +37,7 @@ type ScoreCyclesPageOut = components["schemas"]["ScoreCyclesPageOut"];
 type AlertOut = components["schemas"]["AlertOut"];
 type GoldenCaseOut = components["schemas"]["GoldenCaseOut"];
 type SystemHealthOut = components["schemas"]["SystemHealthOut"];
+type ManifestOut = components["schemas"]["ManifestOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -951,6 +952,20 @@ export function healthOut(overrides: Partial<SystemHealthOut> = {}): SystemHealt
   };
 }
 
+/** A delete-everything manifest requested at 05:00 UTC on 3 Nov 2026, completed at 05:10 and shipped at 05:15. */
+export function manifestOut(overrides: Partial<ManifestOut> = {}): ManifestOut {
+  return {
+    id: 1,
+    kind: "delete_everything",
+    status: "shipped",
+    created_at: "2026-11-03T05:00:00Z",
+    completed_at: "2026-11-03T05:10:00Z",
+    shipped_at: "2026-11-03T05:15:00Z",
+    deleted_golden_case_ids: [],
+    ...overrides,
+  };
+}
+
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -1030,6 +1045,9 @@ export interface FakeApi {
   goldenCases: GoldenCaseOut[];
   /** What `GET /api/system/health` answers. */
   health: SystemHealthOut;
+  /** The deletion manifests, newest first: `GET /api/privacy/manifests` lists them, `GET …/{id}` answers one
+   * (none, by default). */
+  manifests: ManifestOut[];
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -1069,6 +1087,7 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     alerts: [],
     goldenCases: [],
     health: healthOut(),
+    manifests: [],
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -1166,6 +1185,14 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/system/health") {
       return Promise.resolve(json(api.health));
+    }
+    if (method === "GET" && path === "/api/privacy/manifests") {
+      return Promise.resolve(json({ items: api.manifests, next_cursor: null }));
+    }
+    const manifestId = /^\/api\/privacy\/manifests\/(\d+)$/.exec(path)?.[1];
+    if (method === "GET" && manifestId !== undefined) {
+      const manifest = api.manifests.find((m) => m.id === Number(manifestId));
+      return Promise.resolve(manifest === undefined ? problem(404, "not_found") : json(manifest));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

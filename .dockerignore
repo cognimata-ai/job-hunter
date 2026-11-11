@@ -1,6 +1,7 @@
 # The build context is the repository root; the Dockerfiles copy only pyproject.toml, uv.lock,
-# .python-version, backend/ and frontend/ (Dockerfile), embedder/ (embedder/Dockerfile) or docparse/
-# (docparse/Dockerfile). Secrets, the local virtualenv, git metadata and caches never enter it.
+# .python-version, backend/, frontend/ and docs/PRIVACY.md (Dockerfile; the SPA bundles the privacy statement),
+# embedder/ (embedder/Dockerfile) or docparse/ (docparse/Dockerfile). Secrets, the local virtualenv, git metadata
+# and caches never enter it.
 .git
 .venv
 .secrets

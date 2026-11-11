@@ -1,7 +1,7 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import en from "../i18n/en.json";
-import { fakeApi, goldenCase, json, problem, requestsTo } from "../test/api";
+import { fakeApi, goldenCase, json, manifestOut, problem, requestsTo } from "../test/api";
 import tables from "../settings/tables.module.css";
 import { renderInProviders } from "../test/app";
 import { GoldenSet } from "./GoldenSet";
@@ -40,8 +40,9 @@ describe("GoldenSet", () => {
     api.routes.set("PATCH /api/golden-cases/1", () => new Promise<Response>((resolve) => { answer = resolve; }));
     api.routes.set("DELETE /api/golden-cases/2", () => {
       api.goldenCases = [goldenCase({ active: false })];
-      return new Response(null, { status: 204 });
+      return json({ manifest_id: 9 }, 202);
     });
+    api.manifests = [manifestOut({ id: 9, kind: "golden_case_delete", status: "executing", completed_at: null, shipped_at: null })];
     renderInProviders(<GoldenSet />);
     const table = await screen.findByRole("table", { name: en["settings_system.golden"] });
     const rows = within(table).getAllByRole("row").slice(1);
@@ -91,8 +92,90 @@ describe("GoldenSet", () => {
     });
     expect(requestsTo(api, "DELETE /api/golden-cases/2")[0]?.headers.get("Idempotency-Key")).toBeNull();
     await waitFor(() => {
-      expect(screen.queryByText("Softwareentwickler Java")).toBeNull();
+      expect(screen.queryByText("Softwareentwickler Java", { selector: "td" })).toBeNull();
     });
-    expect(screen.getByText(en["golden.deleted"])).toBeTruthy();
+    const requested = within(await screen.findByRole("region", { name: en["golden.deletions"] })).getByText("Softwareentwickler Java");
+    expect(requested.closest("li")?.textContent).toContain(en["golden.deletion_requested"]);
+  });
+
+  it("a delete shows the deletion status", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = fakeApi({ signedIn: true });
+      api.goldenCases = [goldenCase()];
+      let answer: (response: Response) => void = () => undefined;
+      api.routes.set("DELETE /api/golden-cases/1", () => new Promise<Response>((resolve) => { answer = resolve; }));
+      api.manifests = [manifestOut({ id: 9, kind: "golden_case_delete", status: "executing", completed_at: null, shipped_at: null })];
+      renderInProviders(<GoldenSet />);
+      await screen.findByText("Backend Engineer (Python)", { selector: "td" });
+      const remove = within(rowOf("Backend Engineer (Python)")).getByRole<HTMLButtonElement>("button", { name: /^Delete/ });
+      fireEvent.click(remove);
+      const confirm = within(screen.getByRole("alertdialog")).getByRole<HTMLButtonElement>("button", { name: en["golden.delete"] });
+      // a double confirm sends one delete; the confirm and the row's Delete are busy until the answer
+      fireEvent.click(confirm);
+      fireEvent.click(confirm);
+      await waitFor(() => {
+        expect(confirm.disabled).toBe(true);
+      });
+      expect(remove.disabled).toBe(true);
+      expect(requestsTo(api, "DELETE /api/golden-cases/1")).toHaveLength(1);
+      answer(json({ manifest_id: 9 }, 202));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+
+      // "Deletion requested", naming the case, with the manifest's status, read every 10 s until confirmed offsite
+      const status = await screen.findByRole("region", { name: en["golden.deletions"] });
+      const requested = within(status).getByText(/Backend Engineer \(Python\)/).closest("li");
+      expect(requested?.textContent).toContain(en["golden.deletion_requested"]);
+      await waitFor(() => {
+        expect(requested?.textContent).toContain(en["settings_privacy.status.executing"]);
+      });
+      const reads = () => requestsTo(api, "GET /api/privacy/manifests/9");
+      expect(reads()).toHaveLength(1);
+      // while the worker has not deleted it yet, the case is listed, cannot be deleted twice and its flags rest
+      const row = rowOf("Backend Engineer (Python)");
+      expect(within(row).queryByRole("button", { name: /^Delete/ })).toBeNull();
+      expect(within(row).getByText(en["golden.deletion_requested"])).toBeTruthy();
+      expect(within(row).getAllByRole<HTMLInputElement>("checkbox").every((box) => box.disabled)).toBe(true);
+      // once the deletion has run, the set is read again: the case is gone
+      api.goldenCases = [];
+      api.manifests = [manifestOut({ id: 9, kind: "golden_case_delete", status: "shipped" })];
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      await waitFor(() => {
+        expect(requested?.textContent).toContain(en["settings_privacy.status.shipped"]);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(reads()).toHaveLength(2);
+      for (const read of reads()) {
+        expect(read.headers.get("X-JH-Background")).toBe("1");
+      }
+      await waitFor(() => {
+        expect(screen.queryByText("Backend Engineer (Python)", { selector: "td" })).toBeNull();
+      });
+      expect(requested?.isConnected).toBe(true); // the requested deletion stays listed with its state
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a refused delete shows by its code at the row", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.goldenCases = [goldenCase()];
+    api.routes.set("DELETE /api/golden-cases/1", () => problem(409, "conflict_state", { detail: "eval_run_running", title: "An eval run is running" }));
+    renderInProviders(<GoldenSet />);
+    fireEvent.click(within(await screen.findByRole("table")).getByRole("button", { name: /^Delete/ }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["golden.delete"] }));
+    // in the row below the case's
+    const alert = await screen.findByRole("alert");
+    expect(alert.closest("tr")?.previousElementSibling).toBe(rowOf("Backend Engineer (Python)"));
+    expect(alert.textContent).toContain(en["problem.conflict_state"]);
+    expect(within(alert).getByText("eval_run_running").tagName).toBe("CODE");
+    expect(alert.textContent).not.toContain("An eval run is running");
+    expect(screen.queryByRole("region", { name: en["golden.deletions"] })).toBeNull();
   });
 });

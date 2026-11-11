@@ -1,7 +1,8 @@
 // The banners (spec §15.1): the server computes them (`StatusOut.banners`, critical first); each is shown by
 // its code, with its params, in the order received. A critical one is an alert, a warning or a notice is a
 // polite status. Each is keyed by its code, so a poll updates a banner in place and its live region
-// announces the change (`applying_settings`' n/N).
+// announces the change (`applying_settings`' n/N). "Deletion not yet confirmed offsite" (`deletion_unshipped`,
+// warn; plan M5 Task 20) links to the deletions' status on Privacy & data.
 import { Link } from "@tanstack/react-router";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
@@ -100,6 +101,12 @@ function Banner({ banner }: { banner: BannerOut }) {
         </>
       )}
       {banner.code === "scope_not_applied" && <>{" "}<RetryApply /></>}
+      {banner.code === "deletion_unshipped" && (
+        <>
+          {" "}
+          <Link to="/settings" hash="privacy" className={styles.link}>{t("banner.deletion_status")}</Link>
+        </>
+      )}
     </div>
   );
 }

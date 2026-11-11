@@ -1,4 +1,5 @@
 import react from "@vitejs/plugin-react";
+import { searchForWorkspaceRoot } from "vite";
 import { defineConfig } from "vitest/config";
 
 // The dev stack's public origin (devproxy), and the dev server's own origins.
@@ -14,11 +15,18 @@ interface ProxiedRequest {
 interface DevProxy {
   on(event: "proxyReq", listener: (proxyReq: ProxiedRequest) => void): unknown;
 }
+// The one Node global the config reads (the working directory, for the dev server's file allow-list), written out
+// for the same reason.
+declare const process: { cwd(): string };
 
 // The api serves this build same-origin (spec §15, §16.6): no inline script or style may be needed.
 export default defineConfig({
   plugins: [react()],
   server: {
+    // The privacy statement is `docs/PRIVACY.md`, outside the project, imported with `?raw` (`PrivacyStatement`,
+    // plan M5 Task 20): the files the dev server (and vitest) may serve are the workspace root's, the default, and
+    // that folder. An `allow` replaces the default, so the default is named too.
+    fs: { allow: [searchForWorkspaceRoot(process.cwd()), "../docs"] },
     // `vite` (the dev server) only; `vite build` is unchanged. The api behind devproxy answers /api. The edge's
     // CSRF check compares Origin with the public origin, so a request from the dev server's own page has its
     // Origin rewritten to that one. Any other Origin, a cross-site page's included, goes through unchanged, and

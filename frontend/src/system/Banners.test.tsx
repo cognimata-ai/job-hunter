@@ -6,6 +6,7 @@ import en from "../i18n/en.json";
 import i18n from "../i18n/index";
 import { fakeApi, json, problem, requestsTo, statusOut } from "../test/api";
 import { renderApp, settled } from "../test/app";
+import styles from "./Banners.module.css";
 
 type BannerOut = components["schemas"]["BannerOut"];
 
@@ -113,6 +114,18 @@ describe("Banners", () => {
     renderApp("/");
     expect((await banner("Ungelöste kritische Meldungen: 1.234")).getAttribute("role")).toBe("alert");
     expect((await banner("Einstellungen werden angewendet … 2/10")).getAttribute("role")).toBe("status");
+  });
+
+  it("deletion_unshipped renders as warn", async () => {
+    withBanners([{ code: "deletion_unshipped", severity: "warn", params: {} }]);
+    renderApp("/");
+    const unshipped = await banner(en["banner.deletion_unshipped"]);
+    expect(unshipped.getAttribute("role")).toBe("status");
+    expect(unshipped.classList.contains(styles.warn)).toBe(true);
+    expect(unshipped.classList.contains(styles.critical)).toBe(false);
+    // it leads to the deletions' status on Privacy & data
+    const link = within(unshipped).getByRole("link", { name: en["banner.deletion_status"] });
+    expect(link.getAttribute("href")).toBe("/settings#privacy");
   });
 
   it("an unknown banner code shows its code", async () => {

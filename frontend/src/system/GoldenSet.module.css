@@ -1,7 +1,47 @@
-/* The golden set: the shared settings tables (`settings/tables.module.css`); the flags as checkboxes. */
+/* The golden set: the shared settings tables (`settings/tables.module.css`); the flags as checkboxes; the
+ * deletions asked for below the table, each its case's title, "Deletion requested" and its state's badge. */
 .toggle {
   width: 18px;
   height: 18px;
   margin: 0;
   accent-color: var(--color-accent);
+}
+
+.requested {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+}
+
+.deletions {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.deletionsTitle {
+  font-size: var(--font-size-3);
+}
+
+.requestedList {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.requestedItem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  font-size: var(--font-size-2);
+}
+
+.requestedTitle {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }

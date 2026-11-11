@@ -4,6 +4,8 @@
 // ends with the dry-run panel and Save: Search scope, Schedule and Budget & quota are Task 28's, Queries & sources
 // and Watchlist Task 29's, Scoring & models Task 30's, Privacy & data Task 31's. System (Task 31, Ruling T31-a)
 // holds the framed Display & notifications part (`#display`), then its operational parts, which have no panel.
+// Under the sections, the privacy statement (`#privacy-statement`, plan M5 Task 20), which Privacy & data links
+// to: outside that section's frame, so its Save stays beside its fields.
 import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -18,6 +20,7 @@ import { SectionFrame } from "../settings/SectionFrame";
 import { SettingsFormProvider } from "../settings/useSettingsForm";
 import { WatchlistSection } from "../settings/WatchlistSection";
 import { PrivacySection } from "../system/PrivacySection";
+import { PrivacyStatement } from "../system/PrivacyStatement";
 import { SystemSection } from "../system/SystemSection";
 import styles from "./ProfileSettingsPage.module.css";
 
@@ -97,6 +100,7 @@ function SettingsPage() {
               </section>
             );
           })}
+          <PrivacyStatement />
         </div>
       </div>
     </div>
