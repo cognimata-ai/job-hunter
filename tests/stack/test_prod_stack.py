@@ -28,7 +28,16 @@ import httpx
 import pytest
 from jobhunter.api.edge import SECURITY_HEADERS
 
-from tests.support.prodstack import CADDY_ROOT, ORIGIN, PT, caddy_root_ca, prod_session, psql, run
+from tests.support.prodstack import (
+    ORIGIN,
+    PT,
+    caddy_root_pem,
+    create_user,
+    probe,
+    prod_session,
+    psql,
+    run,
+)
 
 pytestmark = pytest.mark.stack
 ROLES: Final = {
@@ -45,26 +54,6 @@ PROBES: Final = {"probe1": "172.30.1.11", "probe2": "172.30.1.12"}
 WITHIN_S: Final = 60.0
 TMP: Final = "/tmp"  # noqa: S108 - the containers' /tmp
 GIB: Final = 1024**3
-# Run in a probe: the requests of stdin's job, each on a TLS connection of its own to Caddy on `edge`, as
-# `localhost` (its certificate's name), verified against the root given; prints what came back, as JSON.
-PROBE_SCRIPT: Final = r"""
-import http.client, json, socket, ssl, sys
-job = json.load(sys.stdin)
-context = ssl.create_default_context(cadata=job["ca"])
-answers = []
-for method, path, headers, body in job["requests"]:
-    connection = http.client.HTTPSConnection("localhost", 443, context=context, timeout=15)
-    connection.sock = context.wrap_socket(
-        socket.create_connection(("caddy", 443), timeout=15), server_hostname="localhost"
-    )
-    data = None if body is None else json.dumps(body).encode()
-    connection.request(method, path, body=data, headers={"Host": "localhost", **headers})
-    response = connection.getresponse()
-    text = response.read().decode("utf-8", "replace")
-    answers.append({"status": response.status, "headers": dict(response.getheaders()), "body": text})
-    connection.close()
-print(json.dumps(answers))
-"""
 
 
 @pytest.fixture(scope="module")
@@ -75,16 +64,7 @@ def stack() -> Iterator[None]:
 
 @pytest.fixture(scope="module")
 def ca_pem(stack: None) -> str:
-    """Caddy's internal root (public), once Caddy has made it at its start."""
-    deadline = time.monotonic() + WITHIN_S
-    while run([*PT, "exec", "-T", "caddy", "test", "-f", CADDY_ROOT], check=False).returncode != 0:
-        assert time.monotonic() < deadline, "Caddy never made its internal root"
-        time.sleep(0.5)
-    copy = caddy_root_ca(PT)
-    try:
-        return copy.read_text(encoding="ascii")
-    finally:
-        copy.unlink()
+    return caddy_root_pem(PT)
 
 
 @pytest.fixture(scope="module")
@@ -103,20 +83,7 @@ def tls(ca_pem: str) -> ssl.SSLContext:
 
 @pytest.fixture(scope="module")
 def user(stack: None) -> None:
-    """The single user, made in the running api container by the user CLI (the password on its stdin)."""
-    create = [
-        *PT,
-        "exec",
-        "-T",
-        "api",
-        "jobhunter",
-        "user",
-        "create",
-        "--username",
-        USERNAME,
-        "--password-stdin",
-    ]
-    run(create, stdin=f"{PASSWORD}\n")
+    create_user(PT, USERNAME, PASSWORD)
 
 
 def client(context: ssl.SSLContext) -> httpx.Client:
@@ -125,14 +92,6 @@ def client(context: ssl.SSLContext) -> httpx.Client:
 
 def login_body(password: str = PASSWORD) -> dict[str, str]:
     return {"username": USERNAME, "password": password}
-
-
-def probe(name: str, ca: str, requests: list[tuple[str, str, dict[str, str], Any]]) -> list[dict[str, Any]]:
-    """`requests` (method, path, headers, JSON body or `None`) sent by the probe `name` from its address."""
-    job = json.dumps({"ca": ca, "requests": requests})
-    done = run([*PT, "run", "--rm", "-T", name, "python", "-I", "-c", PROBE_SCRIPT], stdin=job)
-    answers: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
-    return answers
 
 
 def compose_services() -> dict[str, Any]:
@@ -244,7 +203,7 @@ def test_the_login_limit_through_caddy(ca_pem: str, user: None) -> None:
     """Deviation 34: the api's edge counts the logins of each client address it reads from Caddy's header,
     10 a minute: `probe2`'s eleventh is refused, before any Argon2 work; `probe1` is a client of its own."""
     headers = {"Origin": ORIGIN, "Content-Type": "application/json"}
-    answers = probe("probe2", ca_pem, [("POST", "/api/auth/login", headers, login_body())] * 11)
+    answers = probe(PT, "probe2", ca_pem, [("POST", "/api/auth/login", headers, login_body())] * 11)
     assert [a["status"] for a in answers] == [204] * 10 + [429]
     refused = answers[-1]
     problem = json.loads(refused["body"])
@@ -253,7 +212,7 @@ def test_the_login_limit_through_caddy(ca_pem: str, user: None) -> None:
     assert {k.lower(): v for k, v in refused["headers"].items()}["retry-after"] == str(
         problem["retry_after_s"]
     )
-    [other] = probe("probe1", ca_pem, [("POST", "/api/auth/login", headers, login_body())])
+    [other] = probe(PT, "probe1", ca_pem, [("POST", "/api/auth/login", headers, login_body())])
     assert other["status"] == 204
 
 
@@ -268,6 +227,7 @@ def test_caddy_logs_hold_no_client_address(ca_pem: str, tls: ssl.SSLContext, use
     the api recorded for this module's logins through Caddy, the probes' among them."""
     headers = {"Origin": ORIGIN, "Content-Type": "application/json"}
     probe(
+        PT,
         "probe1",
         ca_pem,
         [
@@ -278,7 +238,7 @@ def test_caddy_logs_hold_no_client_address(ca_pem: str, tls: ssl.SSLContext, use
     )
     run([*PT, "stop", "api"])
     try:
-        [down] = probe("probe1", ca_pem, [("GET", "/healthz", {"X-Forwarded-For": "203.0.113.77"}, None)])
+        [down] = probe(PT, "probe1", ca_pem, [("GET", "/healthz", {"X-Forwarded-For": "203.0.113.77"}, None)])
         assert down["status"] == 502
         with client(tls) as http:
             assert http.get("/healthz").status_code == 502

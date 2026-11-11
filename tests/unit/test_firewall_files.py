@@ -80,6 +80,17 @@ def test_the_rule_names_every_pinned_subnet_and_caddys_edge_address() -> None:
     ]
 
 
+@pytest.mark.parametrize("compose_file", ["compose.yaml", "compose.test.yaml", "compose.s3stub.yaml"])
+def test_no_network_enables_ipv6(compose_file: str) -> None:
+    """Deviation 36: the networks run without IPv6 (an A record only), which the rule's `ip` matches rely on:
+    an IPv6 packet would pass its chain untouched. Docker's default is off, and neither the production stack
+    nor the test stack's files turn it on: they never name `enable_ipv6` (read as text, since compose's
+    `!override` tag is no YAML a safe loader reads)."""
+    text = (REPO / "deploy" / compose_file).read_text(encoding="utf-8")
+    assert "networks:" in text
+    assert "enable_ipv6" not in text
+
+
 @pytest.mark.skipif(
     shutil.which("nft") is None or os.geteuid() != 0,
     reason="`nft -c` needs CAP_NET_ADMIN: it runs where nft exists and this process is root (CI runs "

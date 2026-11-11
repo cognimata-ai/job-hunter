@@ -17,6 +17,10 @@ HTTP stand-ins, and the helpers every stack module of M5 shares.
   (comma-separated, e.g. `embedder`) are never built: their existing image is used as it is.
 - `caddy_root_ca`, `stub_log` and `psql` read the running stack: Caddy's internal root certificate (to verify
   TLS against `https://localhost:8443`), what `stubsvc` recorded, and a query's output as the bootstrap role.
+  `caddy_root_pem` waits for that root and returns it as text.
+- `create_user` makes the stack's single user; `probe` sends requests through Caddy from a client at a known
+  address on `edge` (`probe1` at 172.30.1.11, `probe2` at 172.30.1.12), to Caddy's name or to an address of
+  it (Ruling T22-3).
 
 No helper prints, logs or copies a secret value: the secret files are made by `scripts/test-secrets.sh` alone.
 """
@@ -25,10 +29,11 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pytest
 
@@ -70,6 +75,28 @@ BUILD_TIMEOUT_S: Final = 1800
 UP_TIMEOUT_S: Final = 900
 LOG_TAIL_LINES: Final = 80
 CADDY_ROOT: Final = "/data/caddy/pki/authorities/local/root.crt"
+CADDY_ROOT_WITHIN_S: Final = 60.0
+# Run in a probe: the requests of stdin's job, each on a TLS connection of its own to the job's `caddy`
+# (Caddy's name or an address of it), as `localhost` (the only name `tls internal` certifies), verified
+# against the root given; prints what came back, as JSON.
+PROBE_SCRIPT: Final = r"""
+import http.client, json, socket, ssl, sys
+job = json.load(sys.stdin)
+context = ssl.create_default_context(cadata=job["ca"])
+answers = []
+for method, path, headers, body in job["requests"]:
+    connection = http.client.HTTPSConnection("localhost", 443, context=context, timeout=15)
+    connection.sock = context.wrap_socket(
+        socket.create_connection((job["caddy"], 443), timeout=15), server_hostname="localhost"
+    )
+    data = None if body is None else json.dumps(body).encode()
+    connection.request(method, path, body=data, headers={"Host": "localhost", **headers})
+    response = connection.getresponse()
+    text = response.read().decode("utf-8", "replace")
+    answers.append({"status": response.status, "headers": dict(response.getheaders()), "body": text})
+    connection.close()
+print(json.dumps(answers))
+"""
 
 
 def run(
@@ -172,6 +199,55 @@ def caddy_root_ca(argv: list[str]) -> Path:
     with os.fdopen(handle, "w", encoding="ascii") as file:
         file.write(pem)
     return Path(name)
+
+
+def caddy_root_pem(argv: list[str]) -> str:
+    """Caddy's internal root (public), once Caddy has made it at its start."""
+    deadline = time.monotonic() + CADDY_ROOT_WITHIN_S
+    while run([*argv, "exec", "-T", "caddy", "test", "-f", CADDY_ROOT], check=False).returncode != 0:
+        if time.monotonic() >= deadline:
+            pytest.fail("Caddy never made its internal root")
+        time.sleep(0.5)
+    copy = caddy_root_ca(argv)
+    try:
+        return copy.read_text(encoding="ascii")
+    finally:
+        copy.unlink()
+
+
+def create_user(argv: list[str], username: str, password: str) -> None:
+    """The single user, made in the running api container by the user CLI (the password on its stdin)."""
+    run(
+        [
+            *argv,
+            "exec",
+            "-T",
+            "api",
+            "jobhunter",
+            "user",
+            "create",
+            "--username",
+            username,
+            "--password-stdin",
+        ],
+        stdin=f"{password}\n",
+    )
+
+
+def probe(
+    argv: list[str],
+    name: str,
+    ca: str,
+    requests: list[tuple[str, str, dict[str, str], Any]],
+    *,
+    caddy: str = "caddy",
+) -> list[dict[str, Any]]:
+    """`requests` (method, path, headers, JSON body or `None`) sent by the probe `name` from its address on
+    `edge`, to `caddy` (its name, or an address of it), each answer's status, headers and body."""
+    job = json.dumps({"ca": ca, "caddy": caddy, "requests": requests})
+    done = run([*argv, "run", "--rm", "-T", name, "python", "-I", "-c", PROBE_SCRIPT], stdin=job)
+    answers: list[dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
+    return answers
 
 
 def stub_log(argv: list[str]) -> list[dict[str, object]]:

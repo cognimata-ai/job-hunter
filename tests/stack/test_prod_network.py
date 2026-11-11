@@ -32,7 +32,6 @@ must not remove). The test bridge `jobhunter-prodtest-fenced` is removed after i
 import json
 import os
 import re
-import time
 from collections.abc import Callable, Iterator
 from ipaddress import IPv4Address, IPv4Network
 from pathlib import Path
@@ -40,7 +39,17 @@ from typing import Any, Final
 
 import pytest
 
-from tests.support.prodstack import CADDY_ROOT, DEPLOY, ORIGIN, PT, caddy_root_ca, prod_session, psql, run
+from tests.support.prodstack import (
+    DEPLOY,
+    ORIGIN,
+    PT,
+    caddy_root_pem,
+    create_user,
+    probe,
+    prod_session,
+    psql,
+    run,
+)
 
 pytestmark = pytest.mark.stack
 RULE: Final = DEPLOY / "firewall/docker-user.nft"
@@ -56,8 +65,8 @@ OUTSIDE: Final = (("192.0.2.1", 443), ("1.1.1.1", 443))  # TEST-NET-1, and a pub
 NO_ROUTE: Final = "OSError 101"  # ENETUNREACH: the container has no route out at all
 STUB_URL: Final = "http://stubsvc:8099/_log"
 CONNECT_TIMEOUT_S: Final = 3
-WITHIN_S: Final = 60.0
 CADDY_EDGE: Final = "172.30.1.2"
+LOGIN: Final = "/api/auth/login"
 PROBES: Final = {"probe1": "172.30.1.11", "probe2": "172.30.1.12"}
 SPOOFED: Final = "203.0.113.9"
 USERNAME: Final = "prodnet"
@@ -92,28 +101,6 @@ for url in job.get("fetch", []):
     except OSError as error:
         seen["fetch"][url] = failed(error)
 print(json.dumps(seen))
-"""
-# Run in a probe on `edge`: stdin's logins, each on a TLS connection of its own to Caddy's `edge` address as
-# `localhost` (the only name `tls internal` certifies), verified against the root given; prints the statuses.
-EDGE_LOGINS: Final = r"""
-import http.client, json, socket, ssl, sys
-job = json.load(sys.stdin)
-context = ssl.create_default_context(cadata=job["ca"])
-statuses = []
-for headers, body in job["logins"]:
-    connection = http.client.HTTPSConnection("localhost", 443, context=context, timeout=15)
-    connection.sock = context.wrap_socket(
-        socket.create_connection((job["caddy"], 443), timeout=15), server_hostname="localhost"
-    )
-    connection.request(
-        "POST", "/api/auth/login", body=json.dumps(body).encode(),
-        headers={"Host": "localhost", "Content-Type": "application/json", **headers},
-    )
-    response = connection.getresponse()
-    response.read()
-    statuses.append(response.status)
-    connection.close()
-print(json.dumps(statuses))
 """
 
 
@@ -239,34 +226,12 @@ def fenced_network(stack: None) -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def ca_pem(stack: None) -> str:
-    """Caddy's internal root (public), once Caddy has made it at its start."""
-    deadline = time.monotonic() + WITHIN_S
-    while run([*PT, "exec", "-T", "caddy", "test", "-f", CADDY_ROOT], check=False).returncode != 0:
-        assert time.monotonic() < deadline, "Caddy never made its internal root"
-        time.sleep(0.5)
-    copy = caddy_root_ca(PT)
-    try:
-        return copy.read_text(encoding="ascii")
-    finally:
-        copy.unlink()
+    return caddy_root_pem(PT)
 
 
 @pytest.fixture(scope="module")
 def user(stack: None) -> None:
-    """The single user, made in the running api container by the user CLI (the password on its stdin)."""
-    create = [
-        *PT,
-        "exec",
-        "-T",
-        "api",
-        "jobhunter",
-        "user",
-        "create",
-        "--username",
-        USERNAME,
-        "--password-stdin",
-    ]
-    run(create, stdin=f"{PASSWORD}\n")
+    create_user(PT, USERNAME, PASSWORD)
 
 
 @pytest.mark.parametrize("loaded", [False, True], ids=["without-the-rule", "with-the-rule"])
@@ -306,13 +271,15 @@ def test_the_rule_drops_new_outbound_from_fenced_subnets(
     rule(fenced_copy(tmp_path))
     target = {"connect": [OUTSIDE[0]], "timeout": CONNECT_TIMEOUT_S}
     before = dropped()
-    probe = on_network(fenced_network, target)
+    fenced = on_network(fenced_network, target)
     # Dropped in silence: the connection times out, and the drop statement counted the attempt.
-    assert probe["connect"]["192.0.2.1:443"] == "TimeoutError None", probe
+    assert fenced["connect"]["192.0.2.1:443"] == "TimeoutError None", fenced
     after = dropped()
     assert after > before
-    # The same attempt from the worker's `egress` address is not the rule's to drop.
-    in_service("worker", target)
+    # The same attempt from the worker's `egress` address is routed (it does not fail for want of a route, so
+    # its packet reaches the forward hook), and the rule lets it through: the counter stays as it was.
+    worker = in_service("worker", target)
+    assert worker["connect"]["192.0.2.1:443"] != NO_ROUTE, worker
     assert dropped() == after
 
 
@@ -355,19 +322,16 @@ def test_client_ip_through_caddy(rule: Callable[[Path], None], ca_pem: str, user
     and the api trusts that header from Caddy alone (§16.3). A few logins per probe address, well inside the
     edge's limit (10 a minute) and the throttle's lockout (5 failures)."""
     rule(RULE)
+    headers = {"Origin": ORIGIN, "Content-Type": "application/json"}
     wrong = {"username": USERNAME, "password": "not-the-password"}
+    logins = [
+        ("POST", LOGIN, headers, wrong),
+        ("POST", LOGIN, {**headers, "X-Forwarded-For": SPOOFED}, wrong),
+        ("POST", LOGIN, headers, {"username": USERNAME, "password": PASSWORD}),
+    ]
     for name in PROBES:
-        job = {
-            "ca": ca_pem,
-            "caddy": CADDY_EDGE,
-            "logins": [
-                ({"Origin": ORIGIN}, wrong),
-                ({"Origin": ORIGIN, "X-Forwarded-For": SPOOFED}, wrong),
-                ({"Origin": ORIGIN}, {"username": USERNAME, "password": PASSWORD}),
-            ],
-        }
-        done = run([*PT, "run", "--rm", "-T", name, "python", "-I", "-c", EDGE_LOGINS], stdin=json.dumps(job))
-        assert json.loads(done.stdout.strip().splitlines()[-1]) == [401, 401, 204], name
+        answers = probe(PT, name, ca_pem, logins, caddy=CADDY_EDGE)
+        assert [answer["status"] for answer in answers] == [401, 401, 204], name
     attempts = psql(PT, "SELECT host(ip), success FROM login_attempts ORDER BY id").split()
     assert attempts == [f"{address}|{flag}" for address in PROBES.values() for flag in ("f", "f", "t")]
     sessions = psql(PT, "SELECT host(ip) FROM sessions ORDER BY created_at").split()
