@@ -8,8 +8,15 @@ itself. For each HTTP request it:
    bound to the structlog contextvars for the request only (unbound again when the request ends, ruling
    T14-d);
 2. sets `X-Request-Id` and `SECURITY_HEADERS` on every `http.response.start`;
-3. refuses a state-changing `/api` request that fails the CSRF check (§14.1, §16.5) with its own 403
-   `csrf_failed` problem, before the app sees it (`csrf_failure`);
+3. refuses, first, a login past its limit (M5 Task 21, Deviation 34; M4 Ruling T17-b: stock Caddy has no
+   rate limiter, so the edge of M4's ruling is this one): a `POST` of `LOGIN_PATH` beyond `LOGIN_LIMIT_PER_IP`
+   from its client address, or beyond `LOGIN_LIMIT_GLOBAL` in all, within the windows those give, gets its own
+   429 `throttled` problem with `Retry-After` (and the member `retry_after_s`, as the login's other 429s),
+   before its body is read and before any database work; logged as a `login` with the outcome `rate_limited`
+   and the address, as the login logs its own outcomes (`LoginLimiter`, in memory: the api runs one replica).
+   The address is the one uvicorn's proxy headers middleware took from Caddy's `X-Forwarded-For`. §16.3's
+   database throttle, behind it, is unchanged. Then it refuses a state-changing `/api` request that fails the
+   CSRF check (§14.1, §16.5) with its own 403 `csrf_failed` problem, before the app sees it (`csrf_failure`);
 4. stops new work while delete-everything's `global` purge fence stands (§20.2, §20.4; M5 Task 8, P3, D15):
    a state-changing `/api` request that `fence_exempt` does not exempt (the login, the logout, the purge
    retry and every route under `/api/privacy/`, matched by method and path, since no route is matched yet
@@ -38,8 +45,12 @@ Nothing propagates to the server: uvicorn would log the exception with its trace
 must never reach a log line. This module is a task boundary (ruff `BLE001` is allowed here).
 """
 
+import ipaddress
+import math
 import re
+from collections import deque
 from collections.abc import Callable, Mapping
+from time import monotonic
 from types import MappingProxyType
 from typing import Final, Literal
 
@@ -99,6 +110,12 @@ CsrfFailure = Literal["origin_missing", "origin_mismatch", "header_missing"]
 # under their own limits (`profile.upload.MAX_UPLOAD_BYTES` and `PASTE_BODY_MAX_BYTES`).
 MAX_BODY_BYTES: Final = 2**20
 OWN_BODY_LIMITS: Final = frozenset({("POST", "/api/profile/cv"), ("POST", "/api/profile/cv-text")})
+# The login limit (module docstring, step 3), each as (logins, seconds): from one client address, and in all.
+LOGIN_LIMIT_PER_IP: Final = (10, 60.0)
+LOGIN_LIMIT_GLOBAL: Final = (100, 60.0)
+# Where a request without a usable client address is counted, as the login records it
+# (`routes.auth.UNKNOWN_CLIENT_IP`): one shared bucket, so such clients cannot escape the per-address limit.
+UNKNOWN_CLIENT: Final = "0.0.0.0"  # noqa: S104 - an address counted, not one bound to
 
 log = get_logger("jobhunter.api.edge")
 
@@ -115,6 +132,93 @@ def route_label(scope: Scope) -> str:
     if not isinstance(path, str) or (methods is not None and scope.get("method") not in methods):
         return UNMATCHED_ROUTE
     return path
+
+
+def client_address(scope: Scope) -> str:
+    """The request's client address in canonical form (an IPv4-mapped IPv6 address as IPv4), as the login
+    records it (`routes.auth.client_ip`), else `UNKNOWN_CLIENT`."""
+    client = scope.get("client")
+    try:
+        address = ipaddress.ip_address(client[0] if client else "")
+    except ValueError:
+        return UNKNOWN_CLIENT
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return str(address)
+
+
+class LoginLimiter:
+    """The edge's login limit (module docstring, step 3): at most `per_ip[0]` logins from one address in any
+    `per_ip[1]` seconds, and `overall[0]` in all in any `overall[1]` seconds.
+
+    Sliding windows of the admitted logins' times, in memory: the api runs one replica, on one event loop, and
+    `admit` never awaits, so no lock is needed. A refused login is not counted, and an address gets its window
+    only once a login of its is admitted, so at most `overall[0]` addresses gain one in any `overall[1]`
+    seconds; the windows that have run empty are dropped at most once per window.
+    """
+
+    def __init__(
+        self,
+        per_ip: tuple[int, float] = LOGIN_LIMIT_PER_IP,
+        overall: tuple[int, float] = LOGIN_LIMIT_GLOBAL,
+    ) -> None:
+        self.per_ip = per_ip
+        self.overall = overall
+        self._by_address: dict[str, deque[float]] = {}
+        self._all: deque[float] = deque()
+        self._next_sweep: float | None = None
+
+    @staticmethod
+    def _wait(hits: deque[float] | None, limit: tuple[int, float], now: float) -> float | None:
+        """The seconds until a login fits `hits`' window again, or `None` when one fits now (stale times are
+        dropped)."""
+        if hits is None:
+            return None
+        count, window_s = limit
+        while hits and hits[0] <= now - window_s:
+            hits.popleft()
+        if len(hits) < count:
+            return None
+        return hits[len(hits) - count] + window_s - now
+
+    def admit(self, address: str, now: float) -> int | None:
+        """Count a login of `address` at `now` (monotonic seconds) and return `None`; or, past either limit,
+        count nothing and return the whole seconds to wait (at least 1) for the stricter of the two."""
+        self._sweep(now)
+        waits = [
+            wait
+            for wait in (
+                self._wait(self._by_address.get(address), self.per_ip, now),
+                self._wait(self._all, self.overall, now),
+            )
+            if wait is not None
+        ]
+        if waits:
+            return max(1, math.ceil(max(waits)))
+        self._by_address.setdefault(address, deque()).append(now)
+        self._all.append(now)
+        return None
+
+    def _sweep(self, now: float) -> None:
+        if self._next_sweep is not None and now < self._next_sweep:
+            return
+        window_s = self.per_ip[1]
+        self._next_sweep = now + window_s
+        stale = [key for key, hits in self._by_address.items() if not hits or hits[-1] <= now - window_s]
+        for key in stale:
+            del self._by_address[key]
+
+
+def _login_limited(retry_after_s: int) -> Problem:
+    """The edge's 429 of a login past its limit: the shape of the login's own 429s (`throttled`,
+    `Retry-After` and `retry_after_s`)."""
+    return Problem(
+        429,
+        "throttled",
+        "Too many logins",
+        headers={"Retry-After": str(retry_after_s)},
+        extra={"retry_after_s": retry_after_s},
+    )
 
 
 def _header_values(scope: Scope, name: bytes) -> list[str]:
@@ -232,6 +336,19 @@ class EdgeMiddleware:
         # alert of the last-resort 500.
         self._config = config
         self._engine = engine
+        self._logins = LoginLimiter()
+
+    def _login_refused(self, scope: Scope) -> Problem | None:
+        """The 429 of a login past its limit, or `None`, the login counted when it is one (module docstring,
+        step 3)."""
+        if scope.get("method") != "POST" or scope.get("path") != LOGIN_PATH:
+            return None
+        address = client_address(scope)
+        retry_after_s = self._logins.admit(address, monotonic())
+        if retry_after_s is None:
+            return None
+        log.warning("login", outcome="rate_limited", ip=address)
+        return _login_limited(retry_after_s)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -256,11 +373,17 @@ class EdgeMiddleware:
 
         with structlog.contextvars.bound_contextvars(request_id=request_id):
             try:
+                refused = self._login_refused(scope)
                 cfg = self._config()
                 failure = csrf_failure(scope, None if cfg is None else cfg.public_origin)
                 engine = self._engine()
                 fenced_engine = engine if engine is not None and fence_guarded(scope) else None
-                if failure is not None:
+                if refused is not None:
+                    response = problem_response(
+                        refused, instance=request_instance(scope), request_id=request_id
+                    )
+                    await response(scope, receive, send_with_edge_headers)
+                elif failure is not None:
                     log.warning("csrf_rejected", reason=failure)
                     response = problem_response(
                         _csrf_problem(), instance=request_instance(scope), request_id=request_id

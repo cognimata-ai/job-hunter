@@ -1,0 +1,335 @@
+# The production stack (spec §19.1, §19.2, §19.7; plan M5 Task 21, Deviations 29, 33, 34, 55). On the VPS:
+#
+#   docker compose -p jobhunter --env-file deploy/images.lock --env-file deploy/release.lock \
+#     --env-file /etc/jobhunter/jobhunter.env -f deploy/compose.yaml up -d --wait
+#
+# Every image is a variable: caddy and pgvector from deploy/images.lock, the app, backup, docparse and embedder
+# images from deploy/release.lock (written by the release PR, Task 29), each a `repo:tag@sha256:<digest>`.
+# `${NAME:?}` fails loudly when a line is missing. The non-secret environment (§19.2) comes from
+# /etc/jobhunter/jobhunter.env, and each service names its own variables only, so a service sees only its own
+# (R26): `${NAME:?}` for a required one, `${NAME:-}` for an optional one (empty means the default). The
+# LangSmith values of §17.8 are fixed here, on the worker: tracing is on in prod only (compose.test.yaml turns
+# it off).
+#
+# Secrets (§19.2) are files under ${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}, root:10010, mode 0440, in a
+# root:10010 0750 directory; deploy/secrets.example lists the 20 names and their services. Compose bind-mounts
+# each with the host file's owner and mode, so the readers run with the supplementary group 10010.
+# `data_key_previous` is an empty 0440 file outside a data-key rotation (§16.8: an empty optional secret is
+# none).
+#
+# Networks (R10): every subnet is pinned. `edge` faces the internet (Caddy only, ports 80 and 443 over TCP);
+# `proxy` and `internal` are internal (no route out); `egress` is the worker's and the backup's way out.
+# Dynamic addresses come from the upper half of `proxy` and `edge`, so no container can take Caddy's .2, the
+# one forwarder the api trusts (§16.3).
+#
+# Named volumes take the owner and mode of the mount point in the image of the first container that mounts
+# them; every image that mounts one carries the same owner and mode (Task 21's table, Deviation 33), so the
+# start order never matters: cv_store, manifests and exports 10001:10001 0700 (the app `runtime` stage, and
+# the `backup` stage built on it), backup_staging 10001:10001 0700 (the `backup` stage), pgdata 999:999 (the
+# pgvector image), caddy_data and caddy_config root 0755 (the caddy image), parse_jobs a tmpfs of its own.
+name: jobhunter
+
+x-logging: &logging
+  driver: local
+  options: { max-size: 20m, max-file: "10" }
+
+# The app image's services (api, worker, migrate) and, with the backup image, backup and restore.
+x-app: &app
+  image: "${app_image:?}"
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+  group_add: ["10010"] # jobhunter-secrets: reads the 0440 secret files (§19.2)
+  logging: *logging
+  restart: unless-stopped
+  # Docker's init as PID 1 forwards signals: as PID 1 itself, a process ignores a SIGTERM it has no handler for
+  # (a standby or starting worker, migrate), so a stop would wait out the grace period and then kill it.
+  init: true
+
+# The environment every app service has (§19.2): the env, the database, the log level.
+x-app-env: &app-env
+  JOBHUNTER_ENV: ${JOBHUNTER_ENV:?}
+  JOBHUNTER_DB_HOST: ${JOBHUNTER_DB_HOST:?}
+  JOBHUNTER_DB_PORT: ${JOBHUNTER_DB_PORT:?}
+  JOBHUNTER_DB_NAME: ${JOBHUNTER_DB_NAME:?}
+  JOBHUNTER_LOG_LEVEL: ${JOBHUNTER_LOG_LEVEL:-}
+
+# The backup and restore jobs' repository (§19.2, §23): `s3:<endpoint>/<bucket>/<path>` and its region.
+x-restic-env: &restic-env
+  <<: *app-env
+  RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:?}
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?}
+
+services:
+  caddy:
+    image: "${caddy:?}"
+    # The image's user (root, which owns /data and /config, so the ACME state stays its own without a derived
+    # image), every capability dropped but binding ports 80 and 443; given no secret, in no secrets group.
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      JOBHUNTER_DOMAIN: ${JOBHUNTER_DOMAIN:?}
+      JOBHUNTER_ACME_EMAIL: ${JOBHUNTER_ACME_EMAIL:?}
+    ports: ["80:80", "443:443"] # TCP only: HTTP/3 is not advertised (the Caddyfile's `protocols h1 h2`)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/site.caddy:/etc/caddy/site.caddy:ro # the headers and the proxy, one source (Deviation 34)
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge: { ipv4_address: 172.30.1.2 }
+      proxy: { ipv4_address: 172.30.0.2 } # fixed: the only trusted forwarder (§16.3)
+    depends_on: { api: { condition: service_healthy } }
+    logging: *logging
+    mem_limit: 256m
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["jobhunter", "migrate"] # §19.3
+    restart: "no"
+    environment: *app-env
+    secrets: [db_migrator]
+    # The manifest replay (§19.5): it writes a pending-retry manifest's file, removes CV files and, for a
+    # replayed or pending-retry purge, export archives (Task 25, Deviation 55).
+    volumes: [manifests:/data/manifests, cv_store:/data/cv, exports:/data/exports]
+    networks: [internal]
+    depends_on: { postgres: { condition: service_healthy } }
+    mem_limit: 2g
+
+  api:
+    <<: *app
+    # `jobhunter api` runs the startup assertions first (exit 78), then uvicorn, taking the client address from
+    # X-Forwarded-For only when Caddy (172.30.0.2) sends it (§16.3, ruling T18-b).
+    command:
+      [
+        "jobhunter", "api", "--host", "0.0.0.0", "--port", "8000",
+        "--proxy-headers", "--forwarded-allow-ips", "172.30.0.2",
+      ]
+    environment:
+      <<: *app-env
+      JOBHUNTER_PUBLIC_ORIGIN: ${JOBHUNTER_PUBLIC_ORIGIN:?}
+    secrets: [session_secret, data_key, data_key_previous, db_app]
+    volumes: [cv_store:/data/cv, exports:/data/exports:ro] # the encrypted CV uploads (§12.1); export downloads
+    networks: [proxy, internal] # both internal: no route to the internet
+    healthcheck:
+      test: ["CMD", "jobhunter", "http-check", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      start_period: 60s
+      start_interval: 1s
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    mem_limit: 1g
+
+  worker:
+    <<: *app
+    command: ["jobhunter", "worker"]
+    deploy: { replicas: 1 } # MUST stay 1 (§3.3)
+    stop_grace_period: 120s
+    # The plaintext export zip is written to an anonymous file of /tmp before it is encrypted onto the exports
+    # volume (privacy/export.py, step 2), so /tmp stays a tmpfs and never a disk. Its pages count against the
+    # worker's memory limit: 1 GiB is about three times the zip of a year at §19.7's volume (job ads without
+    # their text, a year of scores with their evidence and critic notes, the kept CV files) and leaves the
+    # worker 1 GiB of its 2 GiB, so a full /tmp fails the export attempt (ENOSPC) before it can OOM the worker.
+    tmpfs: ["/tmp:size=1g"]
+    environment:
+      <<: *app-env
+      JOBHUNTER_PUBLIC_ORIGIN: ${JOBHUNTER_PUBLIC_ORIGIN:?}
+      JOBHUNTER_EMBEDDER_URL: ${JOBHUNTER_EMBEDDER_URL:?}
+      JOBHUNTER_HTTP_USER_AGENT: ${JOBHUNTER_HTTP_USER_AGENT:-}
+      NTFY_TOPIC_URL: ${NTFY_TOPIC_URL:?}
+      HEALTHCHECKS_API_URL: ${HEALTHCHECKS_API_URL:-}
+      # §17.8: tracing on, inputs and outputs hidden, the EU endpoint; the key is the langsmith_key secret.
+      LANGSMITH_TRACING: "true"
+      LANGSMITH_ENDPOINT: https://eu.api.smith.langchain.com
+      LANGSMITH_PROJECT: jobhunter-prod
+      LANGSMITH_HIDE_INPUTS: "true"
+      LANGSMITH_HIDE_OUTPUTS: "true"
+    secrets:
+      - data_key
+      - data_key_previous
+      - db_app
+      - anthropic_key
+      - rapidapi_key
+      - serpapi_key
+      - adzuna_app_id
+      - adzuna_app_key
+      - langsmith_key
+      - ntfy_token
+      - healthchecks_ping_url
+      - healthchecks_api_key
+    volumes: [cv_store:/data/cv, manifests:/data/manifests, exports:/data/exports, parse_jobs:/data/parse]
+    # A service-level group_add replaces the x-app list: the secrets group again, and jobhunter-parse, the
+    # group of the parse_jobs tmpfs it shares with docparse (§19.1).
+    group_add: ["10010", "10011"]
+    networks: [internal, egress]
+    healthcheck:
+      test: ["CMD", "jobhunter", "worker-health"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      embedder: { condition: service_healthy }
+    mem_limit: 2g
+
+  docparse:
+    image: "${docparse_image:?}"
+    # No network at all (§12.2): the worker hands it files on the parse_jobs tmpfs, group 10011 for both.
+    # Never in the secrets group, given no secret; it writes only the job files there and its own /tmp.
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "10002:10002"
+    group_add: ["10011"]
+    volumes: [parse_jobs:/data/parse]
+    logging: *logging
+    mem_limit: 1g # one job at a time: a child of at most 768 MiB (RLIMIT_AS)
+    # The loop, its resource tracker and one parse child (which starts no process: RLIMIT_NPROC 0), with room
+    # for an operator's `exec` (M2 Carry-forward 3, final review FR-11).
+    pids_limit: 16
+    restart: unless-stopped
+
+  embedder:
+    image: "${embedder_image:?}"
+    # Not in the secrets group and given no secret (§19.2); it writes nothing at run time. Its model is in its
+    # image, checked against embedder/model.lock at every start (§16.8).
+    read_only: true
+    user: "10004:10004"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal] # no route out
+    healthcheck:
+      test: ["CMD", "embedder-health"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+    logging: *logging
+    mem_limit: 3500m
+    cpus: 3
+    restart: unless-stopped
+
+  postgres:
+    image: "${pgvector:?}"
+    user: "999:999" # the image's postgres user; no root step, so group_add applies
+    group_add: ["10010"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_bootstrap
+    secrets: [pg_bootstrap, db_app, db_migrator, db_backup, db_restore] # role passwords: init only (§19.3)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    networks: [internal]
+    shm_size: 1g
+    # Over TCP: the image's init phase runs a temporary server that listens on the Unix socket only, so a socket
+    # probe would report ready before the init scripts have finished and the final server has started.
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      start_period: 120s
+      start_interval: 1s
+    logging: *logging
+    mem_limit: 5g
+    restart: unless-stopped
+
+  # The backup jobs (§19.5; Deviation 29): the typed `jobhunter backup` commands on their scheduler, as 10001 in
+  # group 10010 under the x-app hardening. One hostname for backup and restore, so restic sees one host (R13).
+  backup:
+    <<: *app
+    image: "${backup_image:?}"
+    hostname: jobhunter-backup
+    command: ["jobhunter", "backup", "scheduler"]
+    environment:
+      <<: *restic-env
+      JOBHUNTER_BACKUP_CRON: ${JOBHUNTER_BACKUP_CRON:-}
+      JOBHUNTER_MANIFEST_SHIP_CRON: ${JOBHUNTER_MANIFEST_SHIP_CRON:-}
+      JOBHUNTER_RESTORE_TEST_CRON: ${JOBHUNTER_RESTORE_TEST_CRON:-}
+      JOBHUNTER_BACKUP_KEEP_DAILY: ${JOBHUNTER_BACKUP_KEEP_DAILY:-}
+      JOBHUNTER_BACKUP_KEEP_WEEKLY: ${JOBHUNTER_BACKUP_KEEP_WEEKLY:-}
+      JOBHUNTER_BACKUP_KEEP_MONTHLY: ${JOBHUNTER_BACKUP_KEEP_MONTHLY:-}
+    secrets: [db_backup, db_restore, restic_password, s3_access_key_id, s3_secret_access_key]
+    volumes: [cv_store:/data/cv:ro, manifests:/data/manifests:ro, backup_staging:/data/staging]
+    networks: [internal, egress]
+    mem_limit: 1g
+
+  # The disaster restore (§19.5), one-off: the operator starts postgres first, then
+  #   docker compose … --profile restore run --rm restore
+  # `restore run` refuses a database that is not empty, and empties the exports volume (Task 26, Deviation 55).
+  restore:
+    <<: *app
+    image: "${backup_image:?}"
+    hostname: jobhunter-backup
+    profiles: [restore]
+    command: ["jobhunter", "restore", "run"]
+    restart: "no"
+    environment: *restic-env
+    secrets: [db_migrator, restic_password, s3_access_key_id, s3_secret_access_key]
+    volumes: [cv_store:/data/cv, manifests:/data/manifests, backup_staging:/data/staging, exports:/data/exports]
+    networks: [internal, egress]
+    depends_on: { postgres: { condition: service_healthy } }
+    mem_limit: 2g
+
+networks:
+  edge: # internet-facing: Caddy only
+    ipam:
+      config:
+        - { subnet: 172.30.1.0/24, ip_range: 172.30.1.128/25, gateway: 172.30.1.1 }
+  proxy:
+    internal: true
+    ipam:
+      config:
+        - { subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25, gateway: 172.30.0.1 }
+  internal:
+    internal: true
+    ipam:
+      config:
+        - { subnet: 172.30.2.0/24 }
+  egress: # the worker and the backup only (plus the one-off restore)
+    ipam:
+      config:
+        - { subnet: 172.30.3.0/24 }
+
+volumes:
+  pgdata: {}
+  cv_store: {}
+  manifests: {}
+  exports: {}
+  backup_staging: {}
+  caddy_data: {}
+  caddy_config: {}
+  parse_jobs: # RAM only: a decrypted CV never reaches a disk (§12.2); setgid, so per-job dirs inherit 10011
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=2770" }
+
+secrets:
+  session_secret: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/session_secret" }
+  data_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/data_key" }
+  data_key_previous: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/data_key_previous" }
+  db_app: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/db_app" }
+  db_migrator: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/db_migrator" }
+  db_backup: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/db_backup" }
+  db_restore: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/db_restore" }
+  pg_bootstrap: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/pg_bootstrap" }
+  anthropic_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/anthropic_key" }
+  rapidapi_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/rapidapi_key" }
+  serpapi_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/serpapi_key" }
+  adzuna_app_id: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/adzuna_app_id" }
+  adzuna_app_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/adzuna_app_key" }
+  langsmith_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/langsmith_key" }
+  ntfy_token: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/ntfy_token" }
+  healthchecks_ping_url: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/healthchecks_ping_url" }
+  healthchecks_api_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/healthchecks_api_key" }
+  restic_password: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/restic_password" }
+  s3_access_key_id: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/s3_access_key_id" }
+  s3_secret_access_key: { file: "${JOBHUNTER_SECRETS_DIR:-/etc/jobhunter/secrets}/s3_secret_access_key" }

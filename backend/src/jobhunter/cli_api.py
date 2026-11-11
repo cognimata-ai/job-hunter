@@ -10,6 +10,10 @@ environment and secret files.
 Proxy headers are off unless asked for (uvicorn's own default is on): `--proxy-headers` with
 `--forwarded-allow-ips` set to the one trusted forwarder makes uvicorn take the client address from
 `X-Forwarded-For` only when the TCP peer is that forwarder (§16.3, V20).
+
+uvicorn's access log is off (M5 Task 21, Ruling T21-1 (b)): it would log every request with its client
+address, which is personal data (§20.6 item 2), and Caddy in front keeps no access log either. The sign-in and
+re-authentication events record the address with their outcome; nothing else of a request is logged with it.
 """
 
 import argparse
@@ -32,5 +36,6 @@ def run_api(args: argparse.Namespace) -> int:
         proxy_headers=args.proxy_headers,
         forwarded_allow_ips=args.forwarded_allow_ips,
         log_config=None,
+        access_log=False,
     )
     return 0

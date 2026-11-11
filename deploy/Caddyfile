@@ -1,0 +1,26 @@
+# The production Caddyfile (spec §19.1; plan M5 Task 21, Deviation 34), mounted read-only with caddy/site.caddy
+# beside it. The domain and the ACME contact come from the caddy service's environment (§19.2).
+#
+# - HTTP/1.1 and HTTP/2 only: port 443 is published over TCP alone, so HTTP/3 is never advertised (no Alt-Svc).
+# - Caddy has no access log (caddy/site.caddy). The lines it still writes, its errors among them (a 502 while
+#   the api restarts names the request), go through a filter that deletes the client's address, port and
+#   request headers: client addresses are personal data.
+{
+	email {$JOBHUNTER_ACME_EMAIL}
+	servers {
+		protocols h1 h2
+	}
+	log default {
+		format filter {
+			wrap json
+			request>remote_ip delete
+			request>remote_port delete
+			request>client_ip delete
+			request>headers delete
+		}
+	}
+}
+
+{$JOBHUNTER_DOMAIN} {
+	import site.caddy
+}

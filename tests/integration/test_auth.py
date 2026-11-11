@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import os
 import subprocess
@@ -208,6 +209,10 @@ async def test_totp_required_when_enabled(api_client, make_user, engine, make_co
 
     monkeypatch.setattr(auth_routes, "check_password", check_password)
     monkeypatch.setattr(auth_routes, "dummy_verify", lambda p: argon2.append("dummy_verify"))
+    # The 14 logins below come from one address. The edge's limit of 10 a minute (M5 Task 21) is not what this
+    # test is about: at the edge's clock, each login comes a minute after the one before.
+    minutes = itertools.count(step=61.0)
+    monkeypatch.setattr("jobhunter.api.edge.monotonic", lambda: next(minutes))
     await make_user()
     secret = totp.new_secret()
     async with engine.begin() as c:

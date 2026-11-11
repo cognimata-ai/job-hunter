@@ -83,6 +83,7 @@ def test_the_api_serves_the_app_with_the_given_options_once_the_assertions_pass(
                 "proxy_headers": True,
                 "forwarded_allow_ips": "172.30.0.2",
                 "log_config": None,
+                "access_log": False,
             },
         )
     ]
@@ -101,7 +102,17 @@ def test_without_options_the_api_listens_on_loopback_and_trusts_no_proxy_headers
         "proxy_headers": False,
         "forwarded_allow_ips": None,
         "log_config": None,
+        "access_log": False,
     }
+
+
+def test_uvicorn_logs_no_request(monkeypatch, tmp_path, uvicorn_calls) -> None:
+    """Ruling T21-1 (b): uvicorn's access log, a line per request with the client address, stays off, as Caddy
+    keeps none (spec §20.6 item 2): the sign-in and re-authentication events alone record the address."""
+    api_env(monkeypatch, tmp_path, **API_SECRETS)
+    assert main(["api", "--proxy-headers", "--forwarded-allow-ips", "172.30.0.2"]) == 0
+    ((_, kwargs),) = uvicorn_calls
+    assert kwargs["access_log"] is False
 
 
 def test_importing_the_cli_does_not_load_uvicorn_or_the_api_command() -> None:

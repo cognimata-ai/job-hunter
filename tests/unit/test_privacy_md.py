@@ -70,10 +70,11 @@ PROFILE_PURGE_SPARES_SHORT: Final = (
     "unless it is the active version, your newest confirmed version, the version confirmed before it, or a "
     "synthetic one"
 )
-# §2: what HEAD logs and stores of the client address (T19-2 (1), T19-3 I2).
+# §2: what HEAD logs and stores of the client address (T19-2 (1), T19-3 I2): since M5 Task 21 (Ruling T21-1
+# (b)) no request log at all (uvicorn's access log off, Caddy with none and a filter on its error lines).
 LOGGED_REQUESTS: Final = (
-    "every request to the api is logged with the client address, the method, the path with its query string, "
-    "and the response status; sign-in and re-authentication events also record the client address"
+    "neither the api nor its reverse proxy logs requests with the client address; sign-in and "
+    "re-authentication events record the client address with their outcome"
 )
 LOG_ROTATION: Final = re.compile(r'max-size: (\d+)m, max-file: "(\d+)"')
 OPERATOR_FIELDS: Final = (
