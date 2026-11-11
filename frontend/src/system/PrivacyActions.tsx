@@ -14,28 +14,21 @@
 //   request's key is the action's (`privacyApi`), kept across the dialog's openings, so a retry of a lost
 //   request replays it. On 202 the dialog closes, the card says the deletion was requested, and the deletions
 //   (`DeletionStatus`) are read again; delete-everything ends the session when it completes, which leads to the
-//   login. A refusal stays in the dialog (`PrivacyProblem`).
-//
-// `PrivacyProblem` shows a refusal by its code (`problem.<code>`, Ruling T20-1 (b)): never the server's own text.
-// An unknown code is the generic "The request could not be carried out"; a code-shaped detail
-// (`purge_in_progress`) is shown as code; `throttled` says when to try again; the source purge's refusal on
-// `payload.sources.enabled` says to enable another source first; no answer at all is the network problem and,
-// for a keyed request, that submitting again repeats the same request.
+//   login. A refusal stays in the dialog, shown by its code, never by the server's own text (`PrivacyProblem`,
+//   Ruling T20-1 (b)).
 import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, type SubmitEvent, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { isProblem, NETWORK_CODE, type ProblemError } from "../api/client";
-import { isTransient } from "../api/queryClient";
+import { isProblem, type ProblemError } from "../api/client";
 import { useSession } from "../api/session";
-import box from "../components/ProblemBox.module.css";
 import dialog from "../components/ConfirmDialog.module.css";
 import { cx } from "../components/cx";
 import { ModalLayer } from "../components/ModalLayer";
 import { Spinner } from "../components/Spinner";
-import { useServerText } from "../i18n/index";
 import fields from "../settings/fields.module.css";
 import { useFormat } from "./format";
 import styles from "./PrivacyActions.module.css";
+import { PrivacyProblem } from "./PrivacyProblem";
 import {
   type DeletionKind,
   type DeletionVars,
@@ -43,7 +36,6 @@ import {
   EXPORT_KEY,
   type ManifestQueuedOut,
   PHRASES,
-  SOURCES_ENABLED_FIELD,
   useExport,
   useRequestDeletion,
   useSingleFlight,
@@ -52,44 +44,9 @@ import {
 import { useUnits } from "./units";
 
 const TOTP_CODE = /^\d{6}$/;
-// A detail that is a code (`purge_in_progress`), not a sentence (as `ProblemBox`'s `ProblemDetail`).
-const CODE_SHAPED = /^[a-z][a-z0-9_]*$/;
 
 /** The keys of each destructive action's texts. */
 const TEXTS = { delete_everything: "delete", source_purge: "purge" } as const satisfies Record<DeletionKind, string>;
-
-export interface PrivacyProblemProps {
-  error: ProblemError;
-  /** A keyed request: after no answer, submitting again repeats the same request. */
-  keyed?: boolean;
-  onRetry?: () => void;
-}
-
-/** A refusal of a privacy request by its code, never by the server's own text. */
-export function PrivacyProblem({ error, keyed = false, onRetry }: PrivacyProblemProps) {
-  const { t } = useTranslation();
-  const serverText = useServerText();
-  let text: string;
-  if (error.code === NETWORK_CODE) {
-    text = t("problem_box.network");
-  } else if (error.code === "throttled") {
-    const seconds = error.extra.retry_after_s;
-    text = typeof seconds === "number" && seconds > 0 ? t("login.throttled", { minutes: Math.ceil(seconds / 60) }) : t("problem.throttled");
-  } else if (error.code === "validation_failed" && error.errors.some((e) => e.field === SOURCES_ENABLED_FIELD)) {
-    text = t("settings_privacy.enable_another_source");
-  } else {
-    text = serverText("problem", error.code, t("settings_privacy.error_generic"));
-  }
-  return (
-    <div role="alert" className={box.box}>
-      <p className={box.title}>{text}</p>
-      {error.detail !== null && CODE_SHAPED.test(error.detail) && <p className={box.detail}><code>{error.detail}</code></p>}
-      {keyed && isTransient(error) && <p className={box.detail}>{t("settings_privacy.retry_same")}</p>}
-      {error.requestId !== null && <p className={box.requestId}>{t("problem_box.request_id", { id: error.requestId })}</p>}
-      {onRetry !== undefined && <button type="button" className={box.retry} onClick={onRetry}>{t("action.retry")}</button>}
-    </div>
-  );
-}
 
 function Card({ title, body, danger = false, children }: { title: string; body: string; danger?: boolean; children: ReactNode }) {
   const id = useId();

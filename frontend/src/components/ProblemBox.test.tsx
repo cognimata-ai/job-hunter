@@ -84,6 +84,21 @@ describe("ProblemBox", () => {
     expect(screen.getByText("Short and stout")).toBeTruthy();
   });
 
+  it("takes a caller's own title and note, and with codeDetailOnly never a prose detail", () => {
+    const refused = (detail: string) =>
+      new ProblemError({ status: 418, code: "teapot", title: "I'm a teapot", detail, requestId: "req-1", errors: [] });
+    const { unmount } = render(<ProblemBox error={refused("Short and stout")} title="Our own words" note="Try again" codeDetailOnly />);
+    const box = screen.getByRole("alert");
+    expect(box.textContent).toContain("Our own words");
+    expect(box.textContent).not.toContain("teapot");
+    expect(box.textContent).not.toContain("Short and stout"); // English UI, prose detail: not shown
+    expect(box.textContent).toContain("Try again");
+    expect(box.textContent).toContain("req-1");
+    unmount();
+    render(<ProblemBox error={refused("eval_run_running")} title="Our own words" codeDetailOnly />);
+    expect(within(screen.getByRole("alert")).getByText("eval_run_running", { selector: "code" })).toBeTruthy();
+  });
+
   it("names a network failure as such", () => {
     render(<ProblemBox error={new TypeError("Failed to fetch")} />);
     expect(screen.getByRole("alert").textContent).toContain(en["problem_box.network"]);

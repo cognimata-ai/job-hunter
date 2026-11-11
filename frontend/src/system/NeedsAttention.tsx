@@ -46,7 +46,7 @@ import fields from "../settings/fields.module.css";
 import { useRetryApply } from "./api";
 import { type Format, useFormat } from "./format";
 import styles from "./NeedsAttention.module.css";
-import { PrivacyProblem } from "./PrivacyActions";
+import { PrivacyProblem } from "./PrivacyProblem";
 import { useRetryPurge, useSingleFlight } from "./privacyApi";
 import parts from "./SystemSection.module.css";
 import {

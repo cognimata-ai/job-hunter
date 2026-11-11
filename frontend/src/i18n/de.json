@@ -1678,6 +1678,7 @@
   "settings_privacy.reauth_hint": "Ein falsches Passwort oder ein falscher Code zählt als fehlgeschlagene Anmeldung.",
   "settings_privacy.requested": "Löschung angefordert. Ihr Status steht unter „Löschungen“.",
   "settings_privacy.error_generic": "Die Anfrage konnte nicht ausgeführt werden.",
+  "settings_privacy.busy": "Der Server ist ausgelastet – gleich erneut versuchen",
   "settings_privacy.retry_same": "Erneut senden wiederholt dieselbe Anfrage; sie wird nie zweimal ausgeführt.",
   "settings_privacy.deletions": "Löschungen",
   "settings_privacy.no_deletions": "Noch keine Löschung.",

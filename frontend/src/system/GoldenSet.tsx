@@ -23,7 +23,7 @@ import tables from "../settings/tables.module.css";
 import { ManifestState } from "./DeletionStatus";
 import styles from "./GoldenSet.module.css";
 import { LoadMore } from "./lists";
-import { PrivacyProblem } from "./PrivacyActions";
+import { PrivacyProblem } from "./PrivacyProblem";
 import { useManifest, useSingleFlight } from "./privacyApi";
 import { GOLDEN_KEY, type GoldenCaseOut, useDeleteGoldenCase, useGoldenCases, useSetGoldenFlags } from "./systemApi";
 import parts from "./SystemSection.module.css";

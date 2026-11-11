@@ -25,6 +25,7 @@ import {
 import { useRef } from "react";
 import { apiSend, type ProblemError } from "../api/client";
 import { useKeyedMutation } from "../api/idempotency";
+import { isTransient } from "../api/queryClient";
 import type { components } from "../api/schema";
 import { STATUS_KEY } from "./api";
 import { ATTENTION_KEY, HEALTH_KEY } from "./systemApi";
@@ -69,12 +70,18 @@ export function useManifests(): UseQueryResult<ManifestsPageOut, ProblemError> {
   });
 }
 
-/** One deletion (`GET /api/privacy/manifests/{id}`), read again every 10 s until it is shipped. */
+/** One deletion (`GET /api/privacy/manifests/{id}`), read again every 10 s until it is shipped; a read that is
+ * answered with a refusal (a 4xx: the answer, which a poll does not change) is not read again until a Retry. */
 export function useManifest(manifestId: number): UseQueryResult<ManifestOut, ProblemError> {
   return useQuery({
     queryKey: [...MANIFEST_KEY, manifestId],
     queryFn: ({ signal }) => apiSend<ManifestOut>(`/api/privacy/manifests/${String(manifestId)}`, { signal, background: true }),
-    refetchInterval: (query) => (query.state.data === undefined || query.state.data.status !== "shipped" ? MANIFEST_POLL_MS : false),
+    refetchInterval: (query) => {
+      if (query.state.status === "error" && !isTransient(query.state.error)) {
+        return false;
+      }
+      return query.state.data?.status === "shipped" ? false : MANIFEST_POLL_MS;
+    },
   });
 }
 

@@ -269,6 +269,25 @@ describe("PrivacyActions", () => {
     expect(alert.textContent).not.toContain("at least one source");
   });
 
+  it("a busy server is no lockout: try again in a moment, in both dialogs", async () => {
+    // the full Argon2 gate answers 429 with retry_after_s 1 (api/reauth.py), as the Login page reads it
+    const api = fakeApi({ signedIn: true });
+    api.routes.set(DELETE, () => problem(429, "throttled", { retry_after_s: 1 }));
+    api.routes.set(PURGE, () => problem(429, "throttled", { retry_after_s: 1 }));
+    renderInProviders(<PrivacyActions />);
+    for (const which of ["delete", "purge"] as const) {
+      const dialog = await openDialog(which);
+      type(field(dialog, en["settings_privacy.phrase_label"]), which === "delete" ? "DELETE EVERYTHING" : "PURGE ADZUNA");
+      type(field(dialog, en["login.password"]), "correct horse");
+      fireEvent.click(submitOf(dialog, which));
+      const alert = await within(dialog).findByRole("alert");
+      expect(alert.textContent).toContain(en["settings_privacy.busy"]);
+      expect(alert.textContent).not.toContain("Too many attempts");
+      expect(alert.textContent).not.toMatch(/\bmin\b/);
+      fireEvent.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
+    }
+  });
+
   it("export polls until ready and offers the download", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = fakeApi({ signedIn: true });

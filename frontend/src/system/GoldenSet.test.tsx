@@ -163,6 +163,34 @@ describe("GoldenSet", () => {
     }
   });
 
+  it("a requested deletion whose read is refused is not read again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = fakeApi({ signedIn: true });
+      api.goldenCases = [goldenCase()];
+      api.routes.set("DELETE /api/golden-cases/1", () => json({ manifest_id: 9 }, 202));
+      // no manifest 9: its read answers 404, which no poll or retry changes
+      renderInProviders(<GoldenSet />);
+      fireEvent.click(within(await screen.findByRole("table")).getByRole("button", { name: /^Delete/ }));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["golden.delete"] }));
+      const status = await screen.findByRole("region", { name: en["golden.deletions"] });
+      expect((await within(status).findByRole("alert")).textContent).toContain(en["problem.not_found"]);
+      const reads = () => requestsTo(api, "GET /api/privacy/manifests/9");
+      expect(reads()).toHaveLength(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(reads()).toHaveLength(1);
+      // its Retry reads it again
+      fireEvent.click(within(status).getByRole("button", { name: en["action.retry"] }));
+      await waitFor(() => {
+        expect(reads()).toHaveLength(2);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a refused delete shows by its code at the row", async () => {
     const api = fakeApi({ signedIn: true });
     api.goldenCases = [goldenCase()];

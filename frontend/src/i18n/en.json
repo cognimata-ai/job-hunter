@@ -1678,6 +1678,7 @@
   "settings_privacy.reauth_hint": "A wrong password or code counts as a failed login attempt.",
   "settings_privacy.requested": "Deletion requested. Its status is shown under Deletions.",
   "settings_privacy.error_generic": "The request could not be carried out.",
+  "settings_privacy.busy": "The server is busy — try again in a moment",
   "settings_privacy.retry_same": "Submit again to retry: the same request is sent, and it is never carried out twice.",
   "settings_privacy.deletions": "Deletions",
   "settings_privacy.no_deletions": "No deletion yet.",

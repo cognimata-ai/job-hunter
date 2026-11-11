@@ -15,7 +15,7 @@ import { Skeleton } from "../components/Skeleton";
 import { intlLocale } from "../i18n/index";
 import styles from "./DeletionStatus.module.css";
 import { useFormat } from "./format";
-import { PrivacyProblem } from "./PrivacyActions";
+import { PrivacyProblem } from "./PrivacyProblem";
 import { type ManifestOut, type ManifestStatus, useManifests } from "./privacyApi";
 
 /** A deletion's state, as a badge: confirmed offsite (done), completed (not yet), deleting. */
