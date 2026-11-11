@@ -1,5 +1,3 @@
-# Privacy statement
-
 This statement describes the personal data a Job Hunter deployment processes: why, how it is minimised, who receives it, how long it is kept, and how you export or delete it. Job Hunter is a single-user application, and "you" in this statement is its one user.
 
 ## 1. Purpose and controller
@@ -13,8 +11,8 @@ This statement describes the personal data a Job Hunter deployment processes: wh
 - **CV and profile** (personal data): the CV file you upload or the text you paste; its extracted text; the text with your contact details stripped, which you review and approve; the profile extracted from that text, which you edit and confirm; and the profile vectors computed from the profile.
 - **Your actions and labels**: the jobs you mark as seen, saved, applied or hidden; your notes on jobs; your feedback on scores; and the golden cases you label for the evaluation of the scoring.
 - **Job ads**: public ads collected from the sources and from the company watchlist. They may contain recruiter names and contact details. The scores, evidence and critic notes the scoring derives from an ad and your profile are kept with the ad.
-- **Account and sign-in data**: your username; your password, as an Argon2id hash only; your TOTP secret, encrypted, when TOTP is on; your sessions, each stored as an HMAC of its token with the client address and a hash of the browser's user agent; and login attempts, each with the client address and an HMAC of the username, never the username itself.
-- **Technical logs**: they hold no CV, profile, note or ad content and no secret. Sign-in and re-authentication events record the client address.
+- **Account and sign-in data**: your username; your password, as an Argon2id hash only; your TOTP secret, encrypted, when TOTP is on; your sessions, each stored as an HMAC of its token with the client address and a hash of the browser's user agent, kept until 1 day after they expire; login attempts, each with the client address and an HMAC of the username (never the username itself), kept 30 days; and the lockout of an address after failed attempts, which names the address and is removed when that address next tries to sign in after the lockout has ended, by `jobhunter sessions unlock`, or by delete everything.
+- **Technical logs**: every request to the api is logged with the client address, the method, the path with its query string, and the response status; sign-in and re-authentication events also record the client address with their outcome. The logs hold no CV, profile, note or ad content and no secret. They are rotated at 10 files of 20 MB per service, sized to hold about 14 days at normal volume.
 - **Operational records**: runs, quotas, the LLM spend ledger, alerts, backup records and deletion manifests. They hold ids, counts, times and hashes, not your content.
 
 ## 3. Processing and minimisation
@@ -26,7 +24,7 @@ This statement describes the personal data a Job Hunter deployment processes: wh
 - **No inference of protected attributes.** The extraction prompt forbids inferring or outputting age, date of birth, gender, nationality, citizenship, ethnicity, religion, marital or family status, health, disability, photo content or political views, and the profile has no field for any of them. Work authorisation and security clearances exist only as fields you enter yourself. Language skills are taken only from explicit statements in your CV.
 - **Embeddings are computed locally.** The embedding model runs in the deployment's own embedder container, which has no route to the internet. No text goes to an embedding service.
 - **Scoring.** Claude scores each ad against your confirmed profile, which holds no contact details. The ad text and the profile are sent, not your CV. The scores, their evidence and the critic's notes form the score history, which is kept as section 5 states.
-- **Golden cases.** The ads you label for the evaluation of the scoring are kept until you delete them. While a case is active, its job, the job's version you labelled and the profile version it was labelled against are kept too, except by the Adzuna purge.
+- **Golden cases.** The ads you label for the evaluation of the scoring become golden cases. An active case is kept until you delete it, and while it is active, its job, the job's version you labelled and the profile version it was labelled against are kept too, except by the Adzuna purge. An inactive case is deleted with its job when the job is tombstoned, and with its profile version when that version's content is purged. The Adzuna purge and delete everything delete cases too (sections 6 and 7).
 
 ## 4. Third parties and transfers
 
@@ -42,11 +40,11 @@ These parties receive data from the app. The api, which serves the web interface
 | healthchecks.io | Pings only |
 | The VPS provider, the S3 backup provider | Infrastructure (§23) |
 
-The original PDF goes to Anthropic only when you opt in (section 3). LangSmith receives traces at its EU endpoint with their inputs and outputs hidden. The operator section below names the VPS provider and the S3 backup provider.
+The § references in this table, (§23), and in the retention table below point to Job Hunter's design specification, not to sections of this statement. The original PDF goes to Anthropic only when you opt in (section 3). LangSmith receives traces at its EU endpoint with their inputs and outputs hidden. The operator section below names the VPS provider and the S3 backup provider.
 
 ## 5. Retention
 
-Retention is dependency-aware: a record is removed only after everything that refers to it is removed or detached, and an exemption protects the whole chain it depends on. The table is the retention table of Job Hunter's design specification, and its § references point there; the exports row states the rule the app follows.
+Retention is dependency-aware: a record is removed only after everything that refers to it is removed or detached, and an exemption protects the whole chain it depends on. The table is the retention table of Job Hunter's design specification; the exports row states the rule the app follows.
 
 | Data | Location | Retention | Purge mechanism |
 |---|---|---|---|
@@ -88,6 +86,10 @@ Retention is dependency-aware: a record is removed only after everything that re
 
 The automatic purge of an old profile version's content deletes every export too, as every purge does except the nightly job tombstoning (section 6).
 
+The profile purge never takes the active profile version, your newest confirmed version, the version confirmed before it, or the synthetic profile versions of the scoring's evaluation, which come from the app's own evaluation fixtures: their content is kept whether or not anything retained refers to it.
+
+The names in code font are names inside the app: its database tables, columns, states and settings, its storage volumes and its jobs; "DB" is its database. `retention_daily` is the nightly clean-up job. A target is one job version to be scored with one tuple, the scoring setup of a profile version, a rubric, a prompt and a model; `missing_targets` is the check that creates the targets a tuple lacks. Det instances (`det_results`) are the scores computed from an LLM result under a version of your search scope. "C3" names a decision recorded in the design specification.
+
 ## 6. Deletion and export
 
 **Export.** You can request an export of your data from the Privacy & data page. It is a zip archive with these files:
@@ -104,8 +106,8 @@ The automatic purge of an old profile version's content deletes every export too
 | `runs.json` | The collection runs with their reports |
 | `README.txt` | What each file holds |
 
-- **Encrypted at rest.** On the server the archive exists only encrypted with the data key (AES-256-GCM, in segments of 1 MiB). Its plaintext exists only in the worker's memory-backed `/tmp` while the archive is being built.
-- **Download.** You can download it for 7 days, over TLS and while logged in, and each download is logged with the export's id. The downloaded zip itself is not encrypted or protected by a passphrase, so keep it safe. After the 7 days it is deleted.
+- **Encrypted at rest.** On the server the archive exists only encrypted with the data key (AES-256-GCM, in segments of 1 MiB). Its plaintext is written only to the worker's memory-backed `/tmp` while the archive is being built. A download decrypts it segment by segment in the api's memory as it streams.
+- **Download.** You can download it for 7 days, over TLS and while logged in, and each download is logged with the export's id. The downloaded zip itself is not encrypted or protected by a passphrase, so keep it safe. After the 7 days it expires and is deleted at the next daily clean-up, so it can stay available for up to about a day longer.
 - **Purges delete it.** Every privacy purge (delete everything, the Adzuna purge, deleting a golden case, and the automatic purge of an old profile version) deletes every existing export at once, because an export may hold the deleted data. The nightly tombstoning of old job ads does not, so an export can hold an ad tombstoned after the export was made, until the export expires. An export is not built while a purge is running: it waits, and fails if the purge has not finished within a day, so it never holds data a purge is deleting.
 - **Never in a backup.** An export archive is never copied into a backup, so a restore does not bring it back.
 
@@ -118,7 +120,7 @@ The automatic purge of an old profile version's content deletes every export too
 
 **The Adzuna purge** removes everything derived from Adzuna (section 7).
 
-**Your other deletions.** Deleting a golden case removes it, with its evaluation results, under a deletion manifest. Deleting feedback removes it. Clearing saved or applied returns a job to normal retention. Everything else follows the retention table (section 5): for example, a closed or stale job you have not saved or applied is tombstoned 90 days after it closed (its content deleted; its hashed keys and your action timestamps kept, so a re-posted ad keeps its hidden or applied state), and an old profile version's content is purged once nothing retained refers to it.
+**Your other deletions.** Deleting a golden case removes it, with its evaluation results, under a deletion manifest. Deleting feedback removes it. Clearing saved or applied returns a job to normal retention. Everything else follows the retention table (section 5): for example, a closed or stale job you have not saved or applied is tombstoned 90 days after it closed (its content deleted; its hashed keys and your action timestamps kept, so a re-posted ad keeps its hidden or applied state), and the content of an old profile version is purged once nothing retained refers to it, unless it is the active version, your newest confirmed version, the version confirmed before it, or a synthetic one (section 5).
 
 **When a deletion is done.**
 
@@ -150,7 +152,7 @@ In summary (section 16 of the design specification has the detail):
 - **Browser.** A strict Content Security Policy allows scripts, styles and connections from the app's own origin only and forbids framing. Ad HTML is sanitised when it is collected and shown as text.
 - **Passwords.** Passwords are stored as Argon2id hashes, are at least 12 characters long, and are not one of the 10,000 most common. TOTP is optional.
 - **Sessions.** A 256-bit random token in a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`), stored only as an HMAC. A session ends after 12 hours idle and after 30 days at most. Each login issues a new token, and a password change ends every session.
-- **CSRF.** Every request that changes state must come from the app's own origin and carry a custom header. No cross-origin access is allowed.
+- **CSRF.** Every request that changes state must come from the app's own origin and, except the login, carry a custom header. No cross-origin access is allowed.
 - **Throttling.** 5 failed attempts within 15 minutes lock the address out for 15 minutes, and 20 within 1 hour lock everyone out for 1 hour and raise a critical alert. A failed re-authentication for delete everything or the Adzuna purge counts as a failed attempt.
 - **The api without egress.** The api has no route to the internet, so a compromise of the internet-facing api exposes no provider key and cannot send data out directly. CV files are parsed in a container without any network.
 - **Secrets.** Each service holds only the secrets it needs: the api holds no provider, Anthropic, LangSmith, alerting or backup credential. Secrets are never written to the database, logs, traces or images.

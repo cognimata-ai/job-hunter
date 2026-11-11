@@ -4,13 +4,17 @@ T19-1).
 The SPA's Privacy & data page renders it with a Markdown subset and anchors its sections (Task 20), and the
 RUNBOOK's deploy checklist fills its operator fields (Task 31). So:
 
-- its `##` sections are §20.6's ten items and `## Operator`, in that order;
-- §5's table is §20.1's, row for row and cell for cell, but the exports' retention (Deviation 18);
+- its `##` sections are §20.6's ten items and `## Operator`, in that order, with no level-1 heading (the page
+  has its own title, Ruling T19-3 I3);
+- §5's table is §20.1's, row for row and cell for cell, but the exports' retention (Deviation 18), and the
+  sentences under it name what HEAD's profile purge does beyond the table (Rulings T19-2 (3), T19-3 I1);
 - §4's table is §20.6's, word for word;
 - §8 carries the gazetteer's GeoNames attribution, §7 the Adzuna badge's;
 - the operator fields are exactly the five markers, under `## Operator`, and nothing in it is e-mail-shaped;
 - it uses only headings, paragraphs, bullet lists, tables, `**bold**` and `` `code` ``;
-- the typed phrases, the export's period and the login throttle it states are the code's.
+- the typed phrases, the export's period and the login throttle it states are the code's;
+- §2 states the client addresses HEAD logs and stores, and how long it keeps them (Rulings T19-2 (1),
+  T19-3 I2).
 """
 
 import json
@@ -20,13 +24,17 @@ from typing import Final
 
 from jobhunter.api.routes.privacy import DELETE_EVERYTHING_PHRASE, PURGE_ADZUNA_PHRASE
 from jobhunter.auth import throttle
+from jobhunter.privacy import retention
 from jobhunter.privacy.export import EXPORT_TTL
+from jobhunter.privacy.kinds.job_tombstone import JobTombstone
+from jobhunter.privacy.kinds.profile_purge import ProfilePurge
 
 REPO: Final = Path(__file__).resolve().parents[2]
 PRIVACY: Final = REPO / "docs/PRIVACY.md"
 SPEC: Final = REPO / "docs/superpowers/specs/2026-10-16-job-hunter-design.md"
 GEONAMES: Final = REPO / "backend/src/jobhunter/geo/data/ATTRIBUTION.md"
 CATALOGUE: Final = REPO / "frontend/src/i18n/en.json"
+COMPOSE: Final = REPO / "deploy/compose.dev.yaml"
 
 SECTIONS: Final = (
     "## 1. Purpose and controller",
@@ -48,6 +56,26 @@ EXPORTS_RETENTION: Final = (
     "7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job "
     "tombstoning, so an export can hold content tombstoned after it was made until it expires"
 )
+# Under §5's table: the profile purge deletes the exports (T19-2 (3)) and spares four kinds of version
+# (T19-3 I1).
+PROFILE_PURGE_EXPORTS: Final = (
+    "The automatic purge of an old profile version's content deletes every export too, as every purge does "
+    "except the nightly job tombstoning"
+)
+PROFILE_PURGE_SPARES: Final = (
+    "The profile purge never takes the active profile version, your newest confirmed version, the version "
+    "confirmed before it, or the synthetic profile versions of the scoring's evaluation"
+)
+PROFILE_PURGE_SPARES_SHORT: Final = (
+    "unless it is the active version, your newest confirmed version, the version confirmed before it, or a "
+    "synthetic one"
+)
+# §2: what HEAD logs and stores of the client address (T19-2 (1), T19-3 I2).
+LOGGED_REQUESTS: Final = (
+    "every request to the api is logged with the client address, the method, the path with its query string, "
+    "and the response status; sign-in and re-authentication events also record the client address"
+)
+LOG_ROTATION: Final = re.compile(r'max-size: (\d+)m, max-file: "(\d+)"')
 OPERATOR_FIELDS: Final = (
     "[set at deployment: operator name]",
     "[set at deployment: contact address]",
@@ -74,6 +102,7 @@ FOREIGN_BLOCKS: Final = (
     (re.compile(r"^(```|~~~)"), "a fenced code block"),
     (re.compile(r"^\d+[.)](\s|$)"), "an ordered list"),
     (re.compile(r"^(-{3,}|\*{3,}|_{3,}|=+)\s*$"), "a rule or a setext heading"),
+    (re.compile(r"^#\s"), "a level-1 heading (the page has its own title)"),
     (re.compile(r"^#{4,}\s"), "a heading below level 3"),
     (re.compile(r"^\[[^\]]+\]:"), "a link reference definition"),
 )
@@ -123,7 +152,7 @@ def table_rows(lines: list[str]) -> list[list[str]]:
 def test_the_ten_sections_and_the_operator_section_in_order() -> None:
     lines = lines_of(PRIVACY)
     assert [line for line in lines if line.startswith("## ")] == list(SECTIONS)
-    assert [line for line in lines if line.startswith("# ")] == [lines[0]], "one title, the first line"
+    assert [line for line in lines if line.startswith("# ")] == [], "no level-1 heading"
 
 
 def test_the_retention_table_matches_spec_20_1() -> None:
@@ -198,3 +227,26 @@ def test_the_phrases_the_export_period_and_the_throttle_are_the_codes() -> None:
     assert f"lock the address out for {lock} minutes" in security
     global_window = int(throttle.GLOBAL_WINDOW.total_seconds() // 3600)
     assert f"{throttle.GLOBAL_MAX_FAILURES} within {global_window} hour" in security
+    global_lock = int(throttle.GLOBAL_LOCK.total_seconds() // 3600)
+    assert throttle.GLOBAL_LOCK.total_seconds() == global_lock * 3600
+    assert f"lock everyone out for {global_lock} hour" in security
+
+
+def test_the_profile_purges_exports_and_exceptions_are_stated() -> None:
+    assert ProfilePurge().deletes_exports and not JobTombstone().deletes_exports, "HEAD's rule (Deviation 18)"
+    lines = lines_of(PRIVACY)
+    retained = " ".join(section(lines, "## 5. Retention"))
+    assert PROFILE_PURGE_EXPORTS in retained
+    assert PROFILE_PURGE_SPARES in retained
+    assert PROFILE_PURGE_SPARES_SHORT in " ".join(section(lines, "## 6. Deletion and export"))
+
+
+def test_the_logged_client_addresses_and_their_retention_are_stated() -> None:
+    categories = " ".join(section(lines_of(PRIVACY), "## 2. Data categories"))
+    assert LOGGED_REQUESTS in categories
+    windows = {rule.name: rule.window for rule in retention.RULES}
+    assert f"kept until {windows['sessions'].days} day after they expire" in categories
+    assert f"kept {windows['login_attempts'].days} days" in categories
+    rotation = LOG_ROTATION.search(COMPOSE.read_text(encoding="utf-8"))
+    assert rotation is not None, "the services' log rotation"
+    assert f"rotated at {rotation.group(2)} files of {rotation.group(1)} MB per service" in categories
