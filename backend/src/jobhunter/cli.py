@@ -2,10 +2,15 @@
 
 import argparse
 import sys
-from collections.abc import Sequence
-from typing import Final, get_args
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, cast, get_args
 
-from jobhunter.config import Role, load_config, startup_or_exit
+from jobhunter.config import DbRole, Role, load_config, startup_or_exit
+
+if TYPE_CHECKING:  # the module loads procrastinate, langgraph and alembic: `main` imports it when it runs
+    from jobhunter.db.migrate import StepGroup
 
 HTTP_CHECK_TIMEOUT_S: Final = 3
 # The container healthchecks, which `main` leaves out of `disable_tracing` (M5 Task 6, Ruling T6-9): they
@@ -13,6 +18,11 @@ HTTP_CHECK_TIMEOUT_S: Final = 3
 # would cost each of them about a quarter of a second, every few seconds. Their import guard tests pin that
 # they load neither; a probe that comes to load one leaves this set.
 UNTRACEABLE_PROBES: Final = frozenset({"http-check", "worker-health"})
+# `migrate --db-role`: the role a `migrate` starts as, whose secrets hold that login. The restore test runs in
+# the backup container, as `jobhunter_restore` (§19.5), whose password is one of the backup role's secrets.
+MIGRATE_CONFIG_ROLES: Final[Mapping[DbRole, Role]] = MappingProxyType(
+    {"migrator": "migrate", "restore": "backup"}
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -22,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "startup-check", help="run the startup assertions of a role (exit 78 when one fails)"
     )
     startup_check.add_argument("--role", required=True, choices=get_args(Role))
-    commands.add_parser("migrate", help="bring the database to the code head and seed the defaults (§19.3)")
+    _add_migrate_command(commands)
     _add_api_command(commands)
     commands.add_parser(
         "worker",
@@ -68,6 +78,61 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ops_commands(commands)
     _add_backup_commands(commands)
     return parser
+
+
+def _step_groups(text: str) -> "frozenset[StepGroup]":
+    """`--steps`: comma-separated step groups, each one of `db.migrate.STEP_GROUPS`."""
+    # Imported here: the migrate module loads procrastinate, langgraph and alembic (see `main`).
+    from jobhunter.db.migrate import STEP_GROUPS
+
+    groups = {part.strip() for part in text.split(",")}
+    if unknown := sorted(groups - set(STEP_GROUPS)):
+        raise argparse.ArgumentTypeError(
+            f"unknown step groups {unknown}; choose from {', '.join(STEP_GROUPS)}"
+        )
+    return cast("frozenset[StepGroup]", frozenset(groups))
+
+
+def _add_migrate_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    migrate = commands.add_parser(
+        "migrate", help="bring the database to the code head and seed the defaults (§19.3)"
+    )
+    migrate.add_argument(
+        "--database",
+        metavar="DB",
+        help="the database to migrate (default JOBHUNTER_DB_NAME), e.g. a scratch one",
+    )
+    migrate.add_argument(
+        "--steps",
+        type=_step_groups,
+        metavar="GROUPS",
+        help="run only these comma-separated step groups: sequences (steps 1 and 3), alembic (step 2), "
+        "replay (step 7); default: all seven steps",
+    )
+    migrate.add_argument(
+        "--manifest-dir",
+        type=Path,
+        metavar="DIR",
+        help="the deletion-manifest stream (default JOBHUNTER_MANIFESTS_DIR)",
+    )
+    migrate.add_argument(
+        "--cv-dir",
+        type=Path,
+        metavar="DIR",
+        help="the CV store the replay removes files from (default JOBHUNTER_CV_STORE_DIR)",
+    )
+    migrate.add_argument(
+        "--exports-dir",
+        type=Path,
+        metavar="DIR",
+        help="the export archives the replay removes (default JOBHUNTER_EXPORTS_DIR, the mounted volume)",
+    )
+    migrate.add_argument(
+        "--db-role",
+        choices=tuple(MIGRATE_CONFIG_ROLES),
+        default="migrator",
+        help="the login: migrator (default) or restore (the restore test, with the backup role's secrets)",
+    )
 
 
 def _add_api_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -269,7 +334,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         # healthcheck path of every container) must not load.
         from jobhunter.db.migrate import run_migrate
 
-        run_migrate(startup_or_exit("migrate"))
+        db_role: DbRole = args.db_role
+        run_migrate(
+            startup_or_exit(MIGRATE_CONFIG_ROLES[db_role]),
+            steps=args.steps,
+            database=args.database,
+            manifest_dir=args.manifest_dir,
+            cv_dir=args.cv_dir,
+            exports_dir=args.exports_dir,
+            db_role=db_role,
+        )
         return 0
     if args.command == "api":
         # Imported here: the api command needs uvicorn, and the app it serves FastAPI and the database layer.

@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -72,6 +73,44 @@ def test_sync_wrapper_refuses_a_running_loop(make_config, monkeypatch) -> None:
     # `asyncio.run` inside a loop raises a similar error, but only after the coroutine was created: the
     # explicit check must come first, so that no coroutine exists and nothing can start.
     assert calls == []
+
+
+def test_the_sync_wrapper_passes_the_flags_through(make_config, monkeypatch) -> None:
+    import jobhunter.db.migrate as migrate_module
+
+    cfg = make_config("migrate", JOBHUNTER_DB_PORT="1")  # nothing listens there: the run itself is replaced
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def recorder(*args: object, **kwargs: object) -> list[str]:
+        calls.append((args, kwargs))
+        return ["reconstruct_and_advance", "alembic"]
+
+    monkeypatch.setattr(migrate_module, "run_migrate_async", recorder)
+    flags: dict[str, object] = {
+        "now": NOW,
+        "steps": frozenset({"sequences", "alembic"}),
+        "database": "jobhunter_restore_test",
+        "manifest_dir": Path("/scratch/manifests"),
+        "cv_dir": Path("/scratch/cv"),
+        "exports_dir": Path("/scratch/exports"),
+        "db_role": "restore",
+    }
+    assert run_migrate(cfg, **flags) == ["reconstruct_and_advance", "alembic"]  # type: ignore[arg-type]
+    assert calls == [((cfg,), flags)]
+    # Without flags, every one is passed as its default.
+    run_migrate(cfg)
+    assert calls[1] == (
+        (cfg,),
+        {
+            "now": None,
+            "steps": None,
+            "database": None,
+            "manifest_dir": None,
+            "cv_dir": None,
+            "exports_dir": None,
+            "db_role": None,
+        },
+    )
 
 
 async def test_seed_values(fresh_pg_server, make_config) -> None:
@@ -370,10 +409,11 @@ async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_conf
         assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
     steps = [entry["step"] for entry in logs if entry["event"] == "migrate_step"]
     assert steps == list(MIGRATE_ORDER)
+    # Steps 1, 3 and 5 end with the identity advancement (M5 Task 23); the replay arrives with Task 25.
+    advancing = [entry["step"] for entry in logs if entry["event"] == "migrate_identities_advanced"]
+    assert advancing == ["reconstruct_and_advance", "advance_again", "queue_and_checkpointer"]
     noops = {entry["step"]: entry["reason"] for entry in logs if entry["event"] == "migrate_step_noop"}
-    assert noops == dict.fromkeys(
-        ("reconstruct_and_advance", "advance_again", "replay"), "manifest_stream_arrives_in_M5"
-    )
+    assert noops == {"replay": "replay_arrives_later_in_M5"}
     assert cfg.secret("db_migrator").decode() not in repr(logs)
 
 

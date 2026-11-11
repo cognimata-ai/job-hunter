@@ -52,8 +52,10 @@ What it holds (every text invented, ids and hashes stand-ins):
   evidence, current and superseded instances, drafts, critic notes; the budget month's counters equal to its
   entries' (a purge's release subtracts from them);
 - the rest: a session, a login attempt and lockout, an idempotency row, alerts open and resolved, operations,
-  a shipped deletion manifest with its shipment, released fence and purged batch item, a backup set and its
-  restore test, an expired and a ready export;
+  a shipped deletion manifest with its shipment, released fence and purged batch item (its `scope` a content
+  of the format and its `file_sha256` that content's file hash, as A3 records them: `migrate` rewrites the
+  missing file of a recorded manifest from its scope, M5 Task 23), a backup set and its restore test, an
+  expired and a ready export;
 - for the source purge (Task 15): every observation holds a whole normalized posting
   (`tests.support.observations.normalized`), so a job can be rebuilt from its remaining postings.
   `closed_job` is the mixed job (an Adzuna and an ATS posting; its current revision's lineage names both);
@@ -71,6 +73,7 @@ What it holds (every text invented, ids and hashes stand-ins):
 A scenario that needs another live submission state runs on another seeded database (`live_submission`).
 """
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -82,6 +85,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup.identity import tombstone_key_hash
 from jobhunter.normalize.keys import AdKey
+from jobhunter.privacy.manifests import ManifestContent, canonical_bytes
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tests.support.m2 import MINIMAL_PROFILE
@@ -1967,7 +1971,16 @@ async def seed_two_year_old_graph(
 
     # deletion manifests, fences, backups, exports, operations
     manifest_uuid = uuid4()
-    file_sha = s.uniq("manifest-file")
+    recorded: ManifestContent = {
+        "format": 1,
+        "manifest_uuid": str(manifest_uuid),
+        "kind": "golden_case_delete",
+        "admitted_at": s.at(30).isoformat(),
+        "fenced_at": s.at(30).isoformat(),
+        "max_ids": {},
+        "operations": [],
+    }
+    file_sha = hashlib.sha256(canonical_bytes(recorded)).digest()
     shipment = await s.row(
         "manifest_shipments", {"restic_snapshot_id": "seed-manifests-snapshot", "shipped_at": s.at(120)}
     )
@@ -1976,7 +1989,7 @@ async def seed_two_year_old_graph(
         {
             "manifest_uuid": manifest_uuid,
             "kind": "golden_case_delete",
-            "scope": {},
+            "scope": recorded,
             "status": "shipped",
             "file_sha256": file_sha,
             "created_at": s.at(30),

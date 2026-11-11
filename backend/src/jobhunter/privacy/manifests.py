@@ -399,13 +399,20 @@ async def read_manifest(conn: AsyncConnection, manifest_id: int) -> ManifestRow 
     return None if row is None else _manifest_row(row)
 
 
-async def max_identity_ids(conn: AsyncConnection) -> dict[str, int]:
-    """Per table of `public` with an identity column (a serial included), its greatest value, or 0 (module
-    docstring), in one statement after the catalogue's."""
+async def identity_columns(conn: AsyncConnection) -> list[tuple[str, str]]:
+    """Every `(table, column)` of `public` whose column owns its sequence, an identity or a serial (module
+    docstring), by table; `RuntimeError` for a table with more than one."""
     columns = [(str(r.table_name), str(r.column_name)) for r in await conn.execute(_IDENTITY_COLUMNS)]
     tables = [table for table, _ in columns]
     if twice := sorted({table for table in tables if tables.count(table) > 1}):
         raise RuntimeError(f"tables with more than one identity column: {twice}")
+    return columns
+
+
+async def max_identity_ids(conn: AsyncConnection) -> dict[str, int]:
+    """Per table of `public` with an identity column (a serial included), its greatest value, or 0 (module
+    docstring), in one statement after the catalogue's."""
+    columns = await identity_columns(conn)
     if not columns:
         return {}
     quote = conn.dialect.identifier_preparer.quote_identifier
@@ -415,7 +422,7 @@ async def max_identity_ids(conn: AsyncConnection) -> dict[str, int]:
         for table, column in columns
     )
     values = (await conn.execute(q(f"SELECT {maxima}"))).one()
-    return {table: int(value) for table, value in zip(tables, values, strict=True)}
+    return {table: int(value) for (table, _), value in zip(columns, values, strict=True)}
 
 
 async def record_manifest(
