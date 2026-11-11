@@ -156,8 +156,9 @@ the inputs of every golden case stay.
 **The backup records** (M5 Task 24, §19.5), after `runs`: `backup_records` deletes the finished
 (`succeeded` or `failed`) `backup_runs`, then `backup_sets`, 13 months after `finished_at`, in one fenced
 transaction. A running row stays however old (the backup container's next start ends it), and so do the newest
-succeeded set (the backups' age reference, even when every set is older: backups that stopped working) and a
-set that a kept run still names. It deletes rows only; restic's own retention is the backup container's prune.
+succeeded set (the backups' age reference, even when every set is older: backups that stopped working), the
+newest succeeded restore test (the restore tests' age reference, likewise; M5 Task 26) and a set that a kept
+run still names. It deletes rows only; restic's own retention is the backup container's prune.
 
 **Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
 bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
@@ -374,11 +375,14 @@ _DELETES: Final[dict[str, TextClause]] = {
     ),
 }
 
-# `backup_records` (M5 Task 24): the finished runs first, then the finished sets that no run left names (a
-# restore test's `backup_set_id`), except the newest succeeded set, the age reference of the backups' health
-# (`observability.backup_health`), whatever its age.
+# `backup_records` (M5 Task 24): the finished runs first, except the newest succeeded restore test (Task 26),
+# then the finished sets that no run left names (a restore test's `backup_set_id`), except the newest
+# succeeded set: the age references of the backups' health (`observability.backup_health`), whatever their
+# age.
 _BACKUP_RUNS: Final = q(
-    "DELETE FROM backup_runs WHERE status IN ('succeeded', 'failed') AND finished_at < :cutoff"
+    "DELETE FROM backup_runs r WHERE r.status IN ('succeeded', 'failed') AND r.finished_at < :cutoff "
+    "AND r.id IS DISTINCT FROM (SELECT n.id FROM backup_runs n WHERE n.kind = 'restore_test' "
+    "AND n.status = 'succeeded' ORDER BY n.finished_at DESC, n.id DESC LIMIT 1)"
 )
 _BACKUP_SETS: Final = q(
     "DELETE FROM backup_sets s WHERE s.status IN ('succeeded', 'failed') AND s.finished_at < :cutoff "

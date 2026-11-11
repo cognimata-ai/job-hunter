@@ -507,6 +507,34 @@ def test_restore_has_its_profile_and_waits_for_postgres() -> None:
     assert probe[0] == "CMD-SHELL" and "pg_isready -h 127.0.0.1" in probe[1]  # over TCP
 
 
+def test_the_test_stack_leaves_the_backup_jobs_to_their_cli(tmp_path: Path) -> None:
+    """Ruling T26-1 (a) T24-4 M2: on the compose test stack the scheduler never starts a set, a prune or a
+    restore test during a test (the stack tests run them by their CLI): the set and the prune on 29 February
+    only, the restore test on 1 January only, crons the backup role's configuration accepts (its restore-test
+    cron must fire in a month's first seven days); it ships every minute."""
+    environment = pt_config()["services"]["backup"]["environment"]
+    crons = {name: environment[name] for name in environment if name.endswith("_CRON")}
+    assert crons == {
+        "JOBHUNTER_BACKUP_CRON": "0 0 29 2 *",
+        "JOBHUNTER_BACKUP_PRUNE_CRON": "0 0 29 2 *",
+        "JOBHUNTER_RESTORE_TEST_CRON": "0 0 1 1 *",
+        "JOBHUNTER_MANIFEST_SHIP_CRON": "* * * * *",
+    }
+    env = {
+        "JOBHUNTER_ENV": "test",
+        "JOBHUNTER_DB_HOST": "h",
+        "JOBHUNTER_DB_PORT": "5432",
+        "JOBHUNTER_DB_NAME": "j",
+    }
+    backup = load_config("backup", {**env, **crons}, tmp_path).backup
+    assert (backup.set_cron, backup.prune_cron, backup.restore_test_cron) == (
+        "0 0 29 2 *",
+        "0 0 29 2 *",
+        "0 0 1 1 *",
+    )
+    assert prod_config()["services"]["backup"]["environment"]["JOBHUNTER_BACKUP_CRON"] == ""  # the default
+
+
 def test_the_start_order_the_restarts_and_the_one_worker() -> None:
     """§3.3 and §19.1: one worker, with two minutes to drain; each service starts once what it needs is up
     (migrate once postgres answers, the api and the worker once migrate is done, the worker once the embedder

@@ -17,6 +17,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.backup.backup_set import BackupSetFailed
 from jobhunter.backup.scheduler import (
+    JOB_NAMES,
     BackupJob,
     Interrupted,
     backup_jobs,
@@ -25,6 +26,7 @@ from jobhunter.backup.scheduler import (
     run_scheduler,
     wait_for_database,
 )
+from jobhunter.cli_backup import SCHEDULED_JOBS
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, BackupSettings, StartupCheckFailed, load_config
 from jobhunter.db.session import make_engine
@@ -141,6 +143,33 @@ def test_empty_settings_take_the_defaults_and_bad_ones_are_refused(tmp_path: Pat
         JOBHUNTER_BACKUP_KEEP_MONTHLY="12",
     ).backup
     assert (kept.keep_daily, kept.keep_weekly, kept.keep_monthly) == (14, 8, 12)
+
+
+def test_env_valid_and_the_scheduler_share_one_cron_validator(tmp_path: Path) -> None:
+    """Ruling T26-1 (a) T24-4 M7: a cron the configuration accepts is one the scheduler can schedule, and one
+    it refuses is refused at the container's start (`env_valid`) for the same reason: six fields (croniter
+    would read seconds), and for the restore test a cron with no tick in a month's first seven days (the
+    scheduler would otherwise stop at its first job). The same monthly cron is fine for a job without the
+    first-week rule. The scheduler's table runs every job, the restore test included."""
+    refusals = (
+        ("JOBHUNTER_RESTORE_TEST_CRON", "30 3 15 * *", "must fire in the first seven days of a month"),
+        ("JOBHUNTER_RESTORE_TEST_CRON", "0 0 29 2 *", "must fire in the first seven days of a month"),
+        ("JOBHUNTER_BACKUP_CRON", "0 * * * * *", "must be a cron expression of five fields"),
+    )
+    for name, cron, reason in refusals:
+        with pytest.raises(StartupCheckFailed) as failed:
+            backup_config(tmp_path, **{name: cron})
+        assert (failed.value.check, failed.value.detail) == ("env_valid", f"{name} {reason}")
+        job = BackupJob("restore_test" if name == "JOBHUNTER_RESTORE_TEST_CRON" else "set", cron)
+        with pytest.raises(ValueError, match=reason):
+            next_due([job], now=at(2026, 11, 23))
+    accepted = backup_config(
+        tmp_path, JOBHUNTER_BACKUP_PRUNE_CRON="30 3 15 * *", JOBHUNTER_RESTORE_TEST_CRON="0 0 1 1 *"
+    )
+    prune, restore_test = backup_jobs(accepted, ("prune", "restore_test"))
+    assert next_due([prune], now=at(2026, 11, 23)) == (prune, at(2026, 12, 15, 3, 30))
+    assert next_due([restore_test], now=at(2026, 11, 23)) == (restore_test, at(2027, 1, 1))
+    assert tuple(SCHEDULED_JOBS) == JOB_NAMES
 
 
 async def rows(engine: AsyncEngine, statement: sa.TextClause) -> dict[int, tuple[str, str | None, bool]]:

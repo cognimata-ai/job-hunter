@@ -29,9 +29,10 @@ import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter import __version__, crypto
-from jobhunter.backup.backup_set import PG_DUMP, PG_RESTORE, BackupSetFailed, run_backup_set
+from jobhunter.backup.backup_set import PG_DUMP, PG_RESTORE, BackupJobBusy, BackupSetFailed, run_backup_set
 from jobhunter.backup.prune import PruneFailed, run_prune
 from jobhunter.backup.restic import RESTIC_BIN, Restic
+from jobhunter.backup.restore_test import run_restore_test
 from jobhunter.backup.runner import CommandResult
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
@@ -44,6 +45,7 @@ from jobhunter.privacy.retention import THIRTEEN_MONTHS, run_retention_daily
 from jobhunter.profile.storage import CvStore
 from psycopg import sql
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from tests.support.backups import backup_run, backup_set, manifest
 from tests.support.pg import PgServer, config_for, pg_rows
@@ -416,9 +418,71 @@ async def test_the_backup_role_writes_only_the_backup_tables(
         async with backup_engine.begin() as conn:
             await conn.execute(sa.text("DELETE FROM backup_sets"))
     assert pg_error(denied.value).sqlstate == "42501"  # insufficient privilege
+    # Ruling T26-1 (a) T24-4 M3: no INSERT and no UPDATE on a table of the application either.
+    for statement in (
+        "INSERT INTO alerts (code, severity, dedup_key, message) VALUES ('t', 'info', 'backup-role', 'x')",
+        "UPDATE settings_versions SET version_no = version_no",
+    ):
+        with pytest.raises(sa.exc.ProgrammingError) as refused:
+            async with backup_engine.begin() as conn:
+                await conn.execute(sa.text(statement))
+        assert pg_error(refused.value).sqlstate == "42501", statement  # insufficient privilege
     # A whole set, as that role, writes its row and moves it to `succeeded`.
     set_id = await run_set(backup_cfg, FakeCommands(migrated))
     assert (await one(engine, _SET, id=set_id)).status == "succeeded"
+
+
+async def test_two_backup_jobs_never_run_at_once(
+    migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, engine: AsyncEngine
+) -> None:
+    """Ruling T26-1 (a) T24-4 M1: a set holds the backup jobs' lock (7261006) for its whole run. A second set,
+    a prune and a restore test started while it dumps find the lock held: each writes no row, touches no
+    staging, logs `backup_job_busy` and raises `BackupJobBusy`. Once the first has ended, a set runs again."""
+    found: dict[str, Any] = {}
+
+    async def the_others_start_meanwhile() -> None:
+        marker = backup_cfg.staging_dir / "set" / "the first set's"
+        marker.write_bytes(b"")
+        with capture_logs() as logs:
+            for job in ("set", "prune", "restore_test"):
+                with pytest.raises(BackupJobBusy) as busy:
+                    if job == "set":
+                        await run_set(backup_cfg, FakeCommands(migrated))
+                    elif job == "prune":
+                        await run_prune(
+                            backup_cfg,
+                            Restic(backup_cfg, FakeCommands(migrated)),
+                            backup_engine,
+                            clock=utcnow,
+                        )
+                    else:
+                        await run_restore_test(
+                            backup_cfg,
+                            Restic(backup_cfg, FakeCommands(migrated)),
+                            FakeCommands(migrated),
+                            backup_engine,
+                            clock=utcnow,
+                        )
+                assert (busy.value.job, busy.value.error) == (job, "backup_job_busy")
+        found["busy"] = [(e["job"], e["lock_key"]) for e in logs if e["event"] == "backup_job_busy"]
+        found["marker"] = marker.exists()
+        found["rows"] = (
+            await scalar(engine, "SELECT count(*) FROM backup_sets"),
+            await scalar(engine, "SELECT count(*) FROM backup_runs"),
+        )
+        marker.unlink()
+
+    first = await run_set(backup_cfg, FakeCommands(migrated, during_dump=the_others_start_meanwhile))
+
+    assert found == {
+        "busy": [("set", 7261006), ("prune", 7261006), ("restore_test", 7261006)],
+        "marker": True,
+        "rows": (1, 0),
+    }
+    assert (await one(engine, _SET, id=first)).status == "succeeded"
+    assert (
+        await one(engine, _SET, id=await run_set(backup_cfg, FakeCommands(migrated)))
+    ).status == "succeeded"
 
 
 async def test_prune_records_a_run_and_never_forgets_manifests(
@@ -526,3 +590,37 @@ async def test_retention_keeps_the_newest_succeeded_set(
     assert sets == {named, newest_ok, young_failed, still_running}
     assert runs == {running_test, young_prune}
     assert {oldest_ok, old_failed}.isdisjoint(sets) and {old_prune, old_test}.isdisjoint(runs)
+
+
+async def test_retention_keeps_the_newest_succeeded_restore_test(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    cv_store_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T26-1 (a) T24-4 M5: `backup_records` keeps the newest succeeded restore test, however old (the
+    restore tests' age reference: restore tests that stopped working), as it keeps the newest succeeded set,
+    and so the set it names; an older succeeded one and a failed one go."""
+    now = utcnow()
+    old = now - THIRTEEN_MONTHS - timedelta(days=1)
+    newest_set = await backup_set(engine, "succeeded", old - timedelta(days=1))
+    tested = await backup_set(engine, "succeeded", old - timedelta(days=30))
+    older_test = await backup_run(engine, "succeeded", old - timedelta(days=40), set_id=tested)
+    newest_test = await backup_run(engine, "succeeded", old - timedelta(days=20), set_id=tested)
+    failed_test = await backup_run(engine, "failed", old - timedelta(days=10), set_id=newest_set)
+    rule = [rule for rule in retention.RULES if rule.name == "backup_records"]
+    monkeypatch.setattr(retention, "RULES", tuple(rule))
+
+    async with open_saver(migrated.dsn("app")) as saver:
+        report = await run_retention_daily(
+            engine, queue_app, saver, cv_store=CvStore(cv_store_dir), now=now, epoch=current_epoch
+        )
+
+    async with engine.connect() as conn:
+        sets = set((await conn.execute(sa.text("SELECT id FROM backup_sets"))).scalars())
+        runs = set((await conn.execute(sa.text("SELECT id FROM backup_runs"))).scalars())
+    assert runs == {newest_test}
+    assert sets == {newest_set, tested}  # the newest succeeded set, and the set the kept test names
+    assert {older_test, failed_test}.isdisjoint(runs) and report == {"backup_records": 2}

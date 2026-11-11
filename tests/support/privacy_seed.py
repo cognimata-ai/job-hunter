@@ -81,6 +81,7 @@ from decimal import Decimal
 from typing import Any, Final, Literal
 from uuid import uuid4
 
+import zstandard
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup.identity import tombstone_key_hash
@@ -861,7 +862,10 @@ async def _collection(s: _Seeder, active: _Active) -> _Collection:
         },
     )
     await s.update("UPDATE quota_ledger SET fetch_request_id = :r WHERE id = :l", r=request, l=ledger)
-    response_sha = s.uniq("body")
+    # A stand-in body stored as `receipts.store_response` stores one: a zstd frame and the body's sha256,
+    # which a restore's verification checks (M5 Task 26).
+    body = s.uniq("body")
+    response_sha = hashlib.sha256(body).digest()
     response = await s.row(
         "raw_responses",
         {
@@ -870,7 +874,7 @@ async def _collection(s: _Seeder, active: _Active) -> _Collection:
             "source_instance_id": adzuna,
             "http_status": 200,
             "headers": {},
-            "body_zstd": b"\x28\xb5\x2f\xfd seed",
+            "body_zstd": zstandard.ZstdCompressor(level=3).compress(body),
             "body_sha256": response_sha,
             "item_count": 2,
             "parsed_at": s.at(3),

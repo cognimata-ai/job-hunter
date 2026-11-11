@@ -135,6 +135,22 @@ async def manifest_bounds(conn: AsyncConnection, manifest_dir: Path) -> dict[str
     return bounds
 
 
+async def _allocatable(conn: AsyncConnection, table: str, column: str) -> int:
+    """The next value the sequence of `table.column` allocates (module docstring)."""
+    quote = conn.dialect.identifier_preparer.quote_identifier
+    names = {"table": f"public.{quote(table)}", "column": column}
+    sequence = (await conn.execute(_SEQUENCE, names)).scalar_one()
+    # The catalogue's name of the sequence, quoted where it needs it.
+    state = (await conn.execute(q(f"SELECT last_value, is_called FROM {sequence}"))).one()  # noqa: S608
+    return int(state.last_value) + 1 if state.is_called else int(state.last_value)
+
+
+async def next_identity_values(conn: AsyncConnection) -> dict[str, int]:
+    """Per table of `public` with an identity or serial column, the next value its sequence allocates (read as
+    `advance_identities` reads it; `restore verify --phase replayed` compares it with the bounds)."""
+    return {table: await _allocatable(conn, table, column) for table, column in await identity_columns(conn)}
+
+
 async def advance_identities(conn: AsyncConnection, bounds: Mapping[str, int]) -> dict[str, int]:
     """Move every identity of `public` whose next value is at or below its target to restart above it (module
     docstring); the tables advanced, with their targets."""
@@ -143,12 +159,8 @@ async def advance_identities(conn: AsyncConnection, bounds: Mapping[str, int]) -
     advanced: dict[str, int] = {}
     for table, column in await identity_columns(conn):
         target = max(maxima[table], bounds.get(table, 0))
-        names = {"table": f"public.{quote(table)}", "column": column}
-        sequence = (await conn.execute(_SEQUENCE, names)).scalar_one()
-        # The catalogue's name of the sequence, quoted where it needs it.
-        state = (await conn.execute(q(f"SELECT last_value, is_called FROM {sequence}"))).one()  # noqa: S608
-        allocatable = state.last_value + 1 if state.is_called else state.last_value
-        if allocatable <= target:
+        if await _allocatable(conn, table, column) <= target:
+            names = {"table": f"public.{quote(table)}", "column": column}
             await conn.execute(_SETVAL, {**names, "target": target})
             advanced[table] = target
     return advanced

@@ -28,8 +28,8 @@ from typing import Final, Literal, cast, get_args
 from urllib.parse import quote, urlsplit
 
 import httpx
-from croniter import croniter
 
+from jobhunter.backup.cron import cron_refusal
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
 from jobhunter.secret_names import SECRET_NAMES
@@ -74,7 +74,6 @@ DEFAULT_RESTORE_TEST_CRON: Final = "30 3 * * 0"
 DEFAULT_BACKUP_KEEP_DAILY: Final = 7
 DEFAULT_BACKUP_KEEP_WEEKLY: Final = 4
 DEFAULT_BACKUP_KEEP_MONTHLY: Final = 3
-_CRON_FIELDS: Final = 5
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 # M5 Task 10: `RESTIC_` for the backup and restore roles' repository and cache (`ResticSettings`).
@@ -190,6 +189,15 @@ _DB_LOGINS: Final[Mapping[DbRole, tuple[str, str]]] = MappingProxyType(
         "restore": ("jobhunter_restore", "db_restore"),
     }
 )
+
+
+def db_login(db_role: DbRole) -> tuple[str, str]:
+    """The user name of `db_role` and its password's secret file (§7.1): for a client that takes them apart,
+    as `pg_restore` does (`--username`, `PGPASSWORD`), where a DSN would put the password on its command
+    line."""
+    return _DB_LOGINS[db_role]
+
+
 DEFAULT_DB_ROLES: Final[Mapping[Role, DbRole]] = MappingProxyType(
     {"api": "app", "worker": "app", "migrate": "migrator", "backup": "backup", "restore": "migrator"}
 )
@@ -383,11 +391,13 @@ def _restic_settings(environ: Mapping[str, str], staging_dir: Path) -> ResticSet
     )
 
 
-def _cron(environ: Mapping[str, str], name: str, default: str) -> str:
-    """`name`'s cron expression, five fields that croniter reads, or `default` when unset or empty."""
+def _cron(environ: Mapping[str, str], name: str, default: str, *, first_week: bool = False) -> str:
+    """`name`'s cron expression, or `default` when unset or empty; refused as the scheduler would refuse it
+    (`backup.cron.cron_refusal`: five fields that croniter reads, and for the restore test a tick in a month's
+    first seven days)."""
     value = environ.get(name) or default
-    if len(value.split()) != _CRON_FIELDS or not croniter.is_valid(value):
-        raise StartupCheckFailed("env_valid", f"{name} must be a cron expression of five fields")
+    if (refusal := cron_refusal(value, first_week=first_week)) is not None:
+        raise StartupCheckFailed("env_valid", f"{name} {refusal}")
     return value
 
 
@@ -405,7 +415,9 @@ def _backup_settings(environ: Mapping[str, str]) -> BackupSettings:
         set_cron=_cron(environ, "JOBHUNTER_BACKUP_CRON", DEFAULT_BACKUP_CRON),
         ship_cron=_cron(environ, "JOBHUNTER_MANIFEST_SHIP_CRON", DEFAULT_MANIFEST_SHIP_CRON),
         prune_cron=_cron(environ, "JOBHUNTER_BACKUP_PRUNE_CRON", DEFAULT_BACKUP_PRUNE_CRON),
-        restore_test_cron=_cron(environ, "JOBHUNTER_RESTORE_TEST_CRON", DEFAULT_RESTORE_TEST_CRON),
+        restore_test_cron=_cron(
+            environ, "JOBHUNTER_RESTORE_TEST_CRON", DEFAULT_RESTORE_TEST_CRON, first_week=True
+        ),
         keep_daily=_keep(environ, "JOBHUNTER_BACKUP_KEEP_DAILY", DEFAULT_BACKUP_KEEP_DAILY),
         keep_weekly=_keep(environ, "JOBHUNTER_BACKUP_KEEP_WEEKLY", DEFAULT_BACKUP_KEEP_WEEKLY),
         keep_monthly=_keep(environ, "JOBHUNTER_BACKUP_KEEP_MONTHLY", DEFAULT_BACKUP_KEEP_MONTHLY),

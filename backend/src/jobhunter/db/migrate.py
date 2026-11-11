@@ -91,6 +91,8 @@ BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments"
 #   7261004  duplicate grouping's company lock: the two-key form `(7261004, hashtext(company_key))`, a
 #            transaction lock (`dedup.groups.COMPANY_LOCK_NAMESPACE`, plan Deviation 46)
 #   7261005  dead-man switch (one key, session lock; `observability.deadman.DEADMAN_LOCK_KEY`, M5 Task 5)
+#   7261006  backup jobs: a set, a prune or a restore test at a time (one key, session lock;
+#            `backup.backup_set.BACKUP_JOB_LOCK_KEY`, M5 Task 26)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 

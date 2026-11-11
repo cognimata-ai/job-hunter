@@ -83,8 +83,15 @@ services:
     build:
       <<: *app-build
       target: backup
+    # The stack tests run the set, the prune and the restore test by their CLI (Ruling T26-1 (a) T24-4 M2), so
+    # the scheduler never starts one during a test: the set and the prune on 29 February only, the restore
+    # test on 1 January only (its cron must fire in a month's first seven days, `backup.cron`). It ships every
+    # minute.
     environment:
       JOBHUNTER_MANIFEST_SHIP_CRON: "* * * * *"
+      JOBHUNTER_BACKUP_CRON: "0 0 29 2 *"
+      JOBHUNTER_BACKUP_PRUNE_CRON: "0 0 29 2 *"
+      JOBHUNTER_RESTORE_TEST_CRON: "0 0 1 1 *"
     networks: [internal, egress, s3net]
 
   restore:

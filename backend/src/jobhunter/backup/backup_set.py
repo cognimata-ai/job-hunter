@@ -27,6 +27,13 @@ T24-2 (j)): `jobhunter backup set`, and the scheduler's `set` job (`JOBHUNTER_BA
    removes.
 7. **record**: `succeeded` with the snapshot id and the inventory.
 
+**One backup job at a time** (Ruling T26-1 (a) T24-4 M1): a set, a prune (`backup.prune`) and a restore test
+(`backup.restore_test`) each hold the one-key session advisory lock `BACKUP_JOB_LOCK_KEY` (7261006, in
+`db.migrate`'s key list) for its whole run, on a dedicated autocommit connection as `jobhunter_backup`
+(`backup_job_lock`): `pg_try_advisory_lock`, so a job that finds it held writes no row, touches no
+staging, logs `backup_job_busy` and raises `BackupJobBusy` (the CLI exits 1); the scheduler's next tick
+tries again.
+
 The staging subdirectory `set/` is made fresh at the start (a dead run's leftovers removed) and removed at the
 end, after a failure too; restic's cache is kept. Any failing step makes the set `failed` with `error` =
 `<step>:<error class>` (no message, no output, no path) and raises `BackupSetFailed`; a set whose process is
@@ -44,7 +51,7 @@ import json
 import os
 import shutil
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,13 +82,16 @@ DUMP_TIMEOUT_S: Final = 2 * 3600.0
 LIST_TIMEOUT_S: Final = 1800.0
 _HASH_CHUNK: Final = 1024 * 1024
 _HEADER_BYTES: Final = 1 + crypto.KEY_ID_BYTES
+# The backup jobs' one-key session advisory lock (module docstring; `db.migrate`'s key list).
+BACKUP_JOB_LOCK_KEY: Final = 7261006
+BACKUP_JOB_BUSY: Final = "backup_job_busy"
 
 Step = Literal["snapshot", "dump", "verify", "inventory", "upload", "record"]
 
 _START: Final = q("INSERT INTO backup_sets (status, started_at) VALUES ('running', :started_at) RETURNING id")
 # The tables whose rows the set counts: every ordinary table of the application schema (the queue's and the
 # checkpointer's live there too), as `pg_dump` dumps them.
-_TABLES: Final = (
+APPLICATION_TABLES: Final = (
     "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
     "WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname"
 )
@@ -101,6 +111,15 @@ class BackupJobFailed(Exception):
     def __init__(self, error: str) -> None:
         super().__init__(error)
         self.error = error
+
+
+class BackupJobBusy(Exception):
+    """Another backup job holds `BACKUP_JOB_LOCK_KEY`: the job `job` wrote nothing and did not run."""
+
+    def __init__(self, job: str) -> None:
+        super().__init__(f"{job}: {BACKUP_JOB_BUSY}")
+        self.job = job
+        self.error = BACKUP_JOB_BUSY
 
 
 class BackupSetFailed(BackupJobFailed):
@@ -183,7 +202,7 @@ async def _read_snapshot(conn: psycopg.AsyncConnection[Any]) -> _Snapshot:
     snapshot_id = str(await _first(conn, "SELECT pg_export_snapshot()"))
     db_snapshot_at: datetime = await _first(conn, "SELECT now()")
     revision = str(await _first(conn, "SELECT version_num FROM alembic_version"))
-    tables = [str(row[0]) for row in await (await conn.execute(_TABLES)).fetchall()]
+    tables = [str(row[0]) for row in await (await conn.execute(APPLICATION_TABLES)).fetchall()]
     row_counts = {}
     for table in tables:
         query = sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier("public", table))
@@ -288,6 +307,35 @@ def _write_inventory(
     return inventory
 
 
+async def _try_job_lock(conn: psycopg.AsyncConnection[Any]) -> bool:
+    row = await (
+        await conn.execute("SELECT pg_try_advisory_lock(%s::bigint)", (BACKUP_JOB_LOCK_KEY,))
+    ).fetchone()
+    return row is not None and bool(row[0])
+
+
+@asynccontextmanager
+async def backup_job_lock(cfg: AppConfig, job: str) -> AsyncIterator[None]:
+    """`BACKUP_JOB_LOCK_KEY` held for the block, on a dedicated autocommit connection as `jobhunter_backup`;
+    `BackupJobBusy` (logged `backup_job_busy`) when another session holds it. Released and closed on every
+    path; closing the connection would drop it too."""
+    conn = await psycopg.AsyncConnection.connect(
+        cfg.dsn("psycopg", db_role="backup"), autocommit=True, application_name="jobhunter-backup-job"
+    )
+    try:
+        if not await _try_job_lock(conn):
+            log.warning(BACKUP_JOB_BUSY, job=job, lock_key=BACKUP_JOB_LOCK_KEY)
+            raise BackupJobBusy(job)
+        try:
+            yield
+        finally:
+            # A lost connection took the lock with it; do not let that hide the error that ended the job.
+            with suppress(psycopg.OperationalError):
+                await conn.execute("SELECT pg_advisory_unlock(%s::bigint)", (BACKUP_JOB_LOCK_KEY,))
+    finally:
+        await conn.close()
+
+
 def fresh_staging(cfg: AppConfig) -> Path:
     """The set's staging subdirectory, empty (whatever a dead run left there is removed), mode 0700."""
     staged = cfg.staging_dir / SET_STAGING
@@ -377,21 +425,23 @@ async def _run_steps(
 async def run_backup_set(
     cfg: AppConfig, restic: Restic, runner: CommandRunner, *, clock: Callable[[], datetime]
 ) -> int:
-    """Take one backup set (module docstring, steps 1-7); its id. `BackupSetFailed` once it is `failed`."""
-    engine = create_async_engine(
-        cfg.dsn("sqlalchemy", db_role="backup"), poolclass=NullPool, hide_parameters=True
-    )
-    try:
-        set_id = await _start(engine, clock())
-        log.info("backup_set_started", set_id=set_id)
+    """Take one backup set (module docstring, steps 1-7); its id. `BackupSetFailed` once it is `failed`,
+    `BackupJobBusy` (nothing written) while another backup job runs."""
+    async with backup_job_lock(cfg, "set"):
+        engine = create_async_engine(
+            cfg.dsn("sqlalchemy", db_role="backup"), poolclass=NullPool, hide_parameters=True
+        )
         try:
-            await _run_steps(cfg, restic, runner, engine, set_id)
-        except _StepFailed as failed:
-            await _fail(engine, set_id, failed.error)
-            log.error("backup_set_failed", set_id=set_id, error=failed.error)
-            raise BackupSetFailed(set_id, failed.error) from failed.__cause__
+            set_id = await _start(engine, clock())
+            log.info("backup_set_started", set_id=set_id)
+            try:
+                await _run_steps(cfg, restic, runner, engine, set_id)
+            except _StepFailed as failed:
+                await _fail(engine, set_id, failed.error)
+                log.error("backup_set_failed", set_id=set_id, error=failed.error)
+                raise BackupSetFailed(set_id, failed.error) from failed.__cause__
+            finally:
+                clear_staging(cfg)
+            return set_id
         finally:
-            clear_staging(cfg)
-        return set_id
-    finally:
-        await engine.dispose()
+            await engine.dispose()

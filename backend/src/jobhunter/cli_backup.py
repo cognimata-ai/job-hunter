@@ -1,4 +1,5 @@
-"""The `backup` commands of the backup container (spec §19.5; plan M5 Tasks 10 and 24, Deviations 28-30).
+"""The `backup` commands of the backup container and `restore run` of the restore container (spec §19.5; plan
+M5 Tasks 10, 24 and 26, Deviations 28-30 and 46).
 
 `cli.main` parses them and imports this module only when one runs. Each starts as the `backup` role
 (`startup_or_exit("backup")`: its secrets, and both S3 keys for an `s3:` repository), logs to stderr and
@@ -12,14 +13,23 @@ prints one JSON line on stdout:
 - `jobhunter backup set` takes one backup set (`backup_set.run_backup_set`) and prints `{"set_id"}` (exit 0).
 - `jobhunter backup prune` forgets the sets beyond the counts kept (`prune.run_prune`) and prints `{"run_id"}`
   (exit 0).
+- `jobhunter backup restore-test` runs the monthly restore test (`restore_test.run_restore_test`) and prints
+  `{"run_id"}` (exit 0).
 - `jobhunter backup scheduler`, the backup service's command (Deviation 29), first ends the rows a dead
   container left `running` (`scheduler.fail_interrupted`, once the database answers), then runs the jobs of
   `SCHEDULED_JOBS` on their crons (`scheduler.run_scheduler`) until SIGTERM or SIGINT, and prints
   `{"stopped": true}` (exit 0). A job's failure is logged and the scheduler goes on.
 
-A failure prints `{"error": "<code>"}` (exit 1): `not_configured` without `RESTIC_REPOSITORY`, a set's or a
-prune's `<step>:<error class>` with its `set_id` or `run_id`, a `ResticError` code (`backup.restic`),
-`database` for a database error, else `unexpected` with the error's class (never its message).
+A failure prints `{"error": "<code>"}` (exit 1): `not_configured` without `RESTIC_REPOSITORY`, a set's,
+a prune's or a restore test's `<step>:<error class or code>` with its `set_id` or `run_id`, `backup_job_busy`
+while another backup job runs (nothing was written; Ruling T26-1 (a) T24-4 M1), a `ResticError` code
+(`backup.restic`), `database` for a database error, else `unexpected` with the error's class (never its
+message).
+
+`jobhunter restore run [--set <id>]` (`run_restore_command`), the `restore` service's command, starts as the
+`restore` role (the migrator's login, restic) and runs `restore.run_restore`: it prints `{"restored": true}`
+(exit 0; the set restored and its data key ids are logged, `restore_set_staged`), or `{"error", "step"}` with
+the step that stopped it (exit 1).
 """
 
 import argparse
@@ -27,18 +37,20 @@ import asyncio
 import json
 import signal
 import sys
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import asdict
 from types import MappingProxyType
-from typing import Final
+from typing import Any, Final
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from jobhunter.backup.backup_set import BackupSetFailed, run_backup_set
+from jobhunter.backup.backup_set import BackupJobBusy, BackupSetFailed, run_backup_set
 from jobhunter.backup.prune import PruneFailed, run_prune
 from jobhunter.backup.restic import Restic, ResticError
+from jobhunter.backup.restore import RestoreFailed, run_restore
+from jobhunter.backup.restore_test import RestoreTestFailed, run_restore_test
 from jobhunter.backup.runner import CommandRunner, SubprocessRunner
 from jobhunter.backup.scheduler import BackupJob, JobName, fail_interrupted, run_scheduler, wait_for_database
 from jobhunter.backup.shipper import ship_manifests
@@ -67,10 +79,16 @@ async def _prune_job(cfg: AppConfig, restic: Restic, runner: CommandRunner, engi
     return await run_prune(cfg, restic, engine, clock=utcnow)
 
 
-# The scheduler's job table: what `jobhunter backup scheduler` runs (Ruling T24-2 (h); the restore test joins
-# with its own command).
+async def _restore_test_job(
+    cfg: AppConfig, restic: Restic, runner: CommandRunner, engine: AsyncEngine
+) -> int:
+    return await run_restore_test(cfg, restic, runner, engine, clock=utcnow)
+
+
+# The scheduler's job table: what `jobhunter backup scheduler` runs (Ruling T24-2 (h); the restore test since
+# Task 26, on the first Sunday of each month).
 SCHEDULED_JOBS: Final[Mapping[JobName, _Job]] = MappingProxyType(
-    {"set": _set_job, "ship": _ship_job, "prune": _prune_job}
+    {"set": _set_job, "ship": _ship_job, "prune": _prune_job, "restore_test": _restore_test_job}
 )
 
 
@@ -87,6 +105,14 @@ async def _prune(cfg: AppConfig, restic: Restic) -> Printed:
     engine = _engine(cfg)
     try:
         return {"run_id": await run_prune(cfg, restic, engine, clock=utcnow)}
+    finally:
+        await engine.dispose()
+
+
+async def _restore_test(cfg: AppConfig, restic: Restic, runner: CommandRunner) -> Printed:
+    engine = _engine(cfg)
+    try:
+        return {"run_id": await run_restore_test(cfg, restic, runner, engine, clock=utcnow)}
     finally:
         await engine.dispose()
 
@@ -139,10 +165,14 @@ async def _run(cfg: AppConfig, args: argparse.Namespace) -> tuple[Printed, bool]
             return {"set_id": await run_backup_set(cfg, restic, runner, clock=utcnow)}, True
         if command == "prune":
             return await _prune(cfg, restic), True
+        if command == "restore-test":
+            return await _restore_test(cfg, restic, runner), True
         return await _scheduler(cfg, restic, runner), True
+    except BackupJobBusy as busy:
+        return {"error": busy.error}, False
     except BackupSetFailed as failed:
         return {"error": failed.error, "set_id": failed.set_id}, False
-    except PruneFailed as failed:
+    except (PruneFailed, RestoreTestFailed) as failed:
         return {"error": failed.error, "run_id": failed.run_id}, False
     except ResticError as failed:
         return {"error": failed.code}, False
@@ -150,13 +180,36 @@ async def _run(cfg: AppConfig, args: argparse.Namespace) -> tuple[Printed, bool]
         return {"error": "database"}, False
 
 
-def run_backup_command(args: argparse.Namespace) -> int:
-    """`backup init | ship | set | prune | scheduler`; the exit status is the outcome (module docstring)."""
-    cfg = startup_or_exit("backup")
+def _outcome(cfg: AppConfig, run: Callable[[], Coroutine[Any, Any, tuple[Printed, bool]]]) -> int:
+    """`run` with the role's logging on stderr; its one JSON line printed, and its exit status."""
     configure_logging(cfg.log_level, stream=sys.stderr)
     try:
-        printed, ok = asyncio.run(_run(cfg, args))
+        printed, ok = asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 - the printed code is the outcome; never a message or traceback
         printed, ok = {"error": "unexpected", "error_class": type(exc).__name__}, False
     print(json.dumps(printed))
     return 0 if ok else 1
+
+
+def run_backup_command(args: argparse.Namespace) -> int:
+    """`backup init | ship | set | prune | restore-test | scheduler`; the exit status is the outcome (module
+    docstring)."""
+    cfg = startup_or_exit("backup")
+    return _outcome(cfg, lambda: _run(cfg, args))
+
+
+async def _restore_run(cfg: AppConfig, set_id: int | None) -> tuple[Printed, bool]:
+    if cfg.restic is None:
+        return {"error": "not_configured"}, False
+    runner = SubprocessRunner()
+    try:
+        await run_restore(cfg, Restic(cfg, runner), runner, set_id=set_id, clock=utcnow)
+    except RestoreFailed as failed:
+        return {"error": failed.error, "step": failed.step}, False
+    return {"restored": True}, True
+
+
+def run_restore_command(args: argparse.Namespace) -> int:
+    """`restore run [--set <id>]` as the `restore` role (module docstring); the exit status is the outcome."""
+    cfg = startup_or_exit("restore")
+    return _outcome(cfg, lambda: _restore_run(cfg, args.set))

@@ -12,16 +12,39 @@ password is read from its secret file inside the container (`/run/secrets`), nev
 
 `dump_listing(server, *, source_db=...)` is the `pg_restore --list` output of a dump of `source_db`, the
 listing `restore_list` filters. `drop_database(server, name)` drops a database of the test server, its
-sessions with it (a test's teardown).
+sessions with it (a test's teardown). `empty_database(server, name)` creates the database a disaster restore
+finds: made by the bootstrap superuser from `jobhunter_template` (the extensions, nothing else), owned by the
+migrator, as `deploy/postgres/init` leaves an empty `pgdata`'s. `restored_database(server, root)` is such a
+database for a test (`RestoredDatabase`: its name, the migrator's engine on it, and empty `cv_store` and
+`exports` directories under `root`), dropped at the end; with `create=False` it is only named, for
+`dump_and_restore` to create.
+
+`ContainerRunner(server)` (M5 Task 26) is the `CommandRunner` of the backup and restore jobs' PostgreSQL
+client (`/opt/pgclient/bin/pg_dump` and `pg_restore`, which exist only in the backup image): it runs the base
+name of `argv[0]` inside the server's container, the server's own build. The `--host`/`--port` pairs are
+dropped (the command reaches its server on the container's socket); every host file the command reads (an
+argument that names an existing file) is copied in first, and its `-f` output copied out after it; the
+password reaches it as `docker exec -e PGPASSWORD`, by name only, its value in the docker client's environment
+and never on a command line. `calls` records each argv as it was given; `fail` names a program that exits 1
+without running.
 """
 
 import asyncio
+import os
 import re
 import secrets
 import subprocess
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
 from typing import Final
 
 from jobhunter.backup.restore import restore_list
+from jobhunter.backup.runner import CommandResult
+from jobhunter.db.session import make_null_engine
+from jobhunter.privacy.manifests import FileRoots
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.pg import PgServer, pg_rows
 
@@ -107,3 +130,112 @@ async def dump_and_restore(server: PgServer, *, source_db: str, target_db: str) 
 def drop_database(server: PgServer, name: str) -> None:
     """Drop the database `name` of the test server, when it exists, ending its sessions."""
     pg_rows(server, "superuser", f'DROP DATABASE IF EXISTS "{_checked(name)}" WITH (FORCE)', db="postgres")
+
+
+def empty_database(server: PgServer, name: str) -> None:
+    """A database as a disaster restore finds it (module docstring)."""
+    pg_rows(
+        server,
+        "superuser",
+        f'CREATE DATABASE "{_checked(name)}" TEMPLATE jobhunter_template OWNER jobhunter_migrator',
+        db="postgres",
+    )
+
+
+@dataclass(frozen=True)
+class RestoredDatabase:
+    """A database a restore loads (module docstring)."""
+
+    name: str
+    engine: AsyncEngine
+    files: FileRoots
+
+
+@asynccontextmanager
+async def restored_database(
+    server: PgServer, root: Path, *, create: bool = True
+) -> AsyncIterator[RestoredDatabase]:
+    """An empty database of its own (created unless `create` is false) and its empty volumes (module
+    docstring); dropped at the end."""
+    name = f"jh_restore_{secrets.token_hex(4)}"
+    files = FileRoots(cv_store=root / "restored-cv", exports=root / "restored-exports")
+    for directory in (files.cv_store, files.exports):
+        directory.mkdir(mode=0o700, parents=True)
+    if create:
+        await asyncio.to_thread(empty_database, server, name)
+    engine = make_null_engine(server.dsn("migrator", name, driver="sqlalchemy"))
+    try:
+        yield RestoredDatabase(name, engine, files)
+    finally:
+        await engine.dispose()
+        drop_database(server, name)
+
+
+_CLIENT: Final = frozenset({"pg_dump", "pg_restore"})
+_SERVER_FLAGS: Final = frozenset({"--host", "--port"})
+
+
+def _docker(*argv: str, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["docker", *argv],
+        capture_output=True,
+        check=False,
+        timeout=_DOCKER_TIMEOUT_S,
+        env=None if env is None else {**os.environ, **env},
+    )
+
+
+@dataclass
+class ContainerRunner:
+    """`CommandRunner` of the PostgreSQL client in the test server's container (module docstring)."""
+
+    server: PgServer
+    fail: str | None = None
+    calls: list[list[str]] = field(default_factory=list)
+
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        timeout_s: float,
+        stdin: bytes | None = None,
+    ) -> CommandResult:
+        self.calls.append(list(argv))
+        return await asyncio.to_thread(self._run, list(argv), dict(env))
+
+    def _run(self, argv: list[str], env: dict[str, str]) -> CommandResult:
+        program = PurePath(argv[0]).name
+        assert program in _CLIENT, argv
+        if program == self.fail:
+            return CommandResult(1, b"", "failed as the test asked")
+        workdir = f"/tmp/jh-runner-{secrets.token_hex(6)}"  # noqa: S108 (the container's own /tmp)
+        assert _docker("exec", self.server.container, "mkdir", "-p", workdir).returncode == 0
+        try:
+            inside: list[str] = [program]
+            outputs: list[tuple[str, str]] = []
+            args = iter(argv[1:])
+            for arg in args:
+                if arg in _SERVER_FLAGS:
+                    next(args)  # the container's own server, on its socket
+                elif arg == "-f":
+                    host = next(args)
+                    copy = f"{workdir}/{len(outputs)}-{PurePath(host).name}"
+                    inside += [arg, copy]
+                    outputs.append((copy, host))
+                elif arg.startswith("/") and Path(arg).is_file():
+                    copy = f"{workdir}/in-{len(inside)}-{PurePath(arg).name}"
+                    copied = _docker("cp", arg, f"{self.server.container}:{copy}")
+                    assert copied.returncode == 0, copied.stderr
+                    inside.append(copy)
+                else:
+                    inside.append(arg)
+            passed = [flag for name in env for flag in ("-e", name)]  # each value from `env`, by name
+            done = _docker("exec", *passed, self.server.container, *inside, env=env)
+            for copy, host in outputs:
+                if done.returncode == 0:
+                    copied = _docker("cp", f"{self.server.container}:{copy}", host)
+                    assert copied.returncode == 0, copied.stderr
+            return CommandResult(done.returncode, done.stdout, done.stderr[-4096:].decode("utf-8", "replace"))
+        finally:
+            _docker("exec", self.server.container, "rm", "-rf", workdir)

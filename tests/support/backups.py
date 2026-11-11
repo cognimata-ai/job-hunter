@@ -8,15 +8,24 @@ Each helper commits its rows and returns the id.
 
 `FakeRestic` (M5 Task 10, shared since Task 12) is restic for the shipper in process: its `backup` records the
 file list it is given and returns a stand-in snapshot id, and nothing else ever runs a command.
+
+`FakeRepository` (M5 Task 26) is a whole restic repository in a directory of the test: `backup` copies the
+directories and the listed files it is given into a new snapshot, each under its absolute path, with its tags;
+`snapshots` lists them, oldest first, with their tags and paths; `restore(snapshot=, subfolder=, target=)`
+copies the content of the snapshot's `subfolder` into `target`, as `restic restore <id>:<subfolder> --target`
+does (a subfolder the snapshot lacks fails as restic does). `failing` names the calls that raise
+`ResticError` instead (e.g. `snapshots` for an unreachable repository); `restores` records each restore.
 """
 
+import shutil
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
-from jobhunter.backup.restic import Restic, ResticError
+from jobhunter.backup.restic import Restic, ResticError, SnapshotInfo
 from jobhunter.backup.runner import CommandResult
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
@@ -135,3 +144,63 @@ class FakeRestic(Restic):
         if self.failure is not None:
             raise self.failure
         return f"{len(self.backups):064x}"
+
+
+@dataclass(frozen=True)
+class Restored:
+    """One `FakeRepository.restore` call."""
+
+    snapshot: str
+    subfolder: str
+    target: Path
+
+
+class FakeRepository(Restic):
+    """restic on a directory of the test (module docstring)."""
+
+    _EPOCH: Final = datetime(2026, 11, 1, tzinfo=UTC)
+
+    def __init__(self, cfg: AppConfig, root: Path, *, failing: Sequence[str] = ()) -> None:
+        super().__init__(cfg, Unreachable())
+        self.root = root
+        self.failing = set(failing)
+        self.infos: list[SnapshotInfo] = []
+        self.restores: list[Restored] = []
+
+    def _fail(self, command: str) -> None:
+        if command in self.failing:
+            raise ResticError(command, "failed", 1)
+
+    @staticmethod
+    def _inside(snapshot_dir: Path, path: str | Path) -> Path:
+        return snapshot_dir / str(path).lstrip("/")
+
+    async def backup(
+        self, *, paths: Sequence[Path] = (), files_from: Path | None = None, tags: Sequence[str]
+    ) -> str:
+        self._fail("backup")
+        snapshot_id = f"{len(self.infos) + 1:064x}"
+        stored = self.root / snapshot_id
+        stored.mkdir(parents=True)
+        listed = [Path(name) for name in lines(files_from)] if files_from is not None else []
+        for path in paths:
+            shutil.copytree(path, self._inside(stored, path))
+        for file in listed:
+            self._inside(stored, file).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, self._inside(stored, file))
+        time = self._EPOCH + timedelta(minutes=len(self.infos))
+        names = tuple(str(path) for path in [*paths, *listed])
+        self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names))
+        return snapshot_id
+
+    async def snapshots(self, *, tags: Sequence[str]) -> list[SnapshotInfo]:
+        self._fail("snapshots")
+        return [info for info in self.infos if set(tags) <= set(info.tags)]
+
+    async def restore(self, *, snapshot: str, subfolder: str, target: Path) -> None:
+        self._fail("restore")
+        self.restores.append(Restored(snapshot, subfolder, target))
+        source = self._inside(self.root / snapshot, subfolder)
+        if not source.is_dir():
+            raise ResticError("restore", "failed", 1)
+        shutil.copytree(source, target, dirs_exist_ok=True)

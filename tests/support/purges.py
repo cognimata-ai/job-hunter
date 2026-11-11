@@ -26,12 +26,20 @@ M5 Task 25 adds what the replay tests (`test_replay.py`, `test_typed_replay.py`)
 - the statements `JOB`, `JOB_EXISTS`, `IS_FENCED`, `PROVENANCE_SOURCES` (the sources a job's
   `field_provenance` names), `ALERT` (an invented alert, `:key` its dedup key) and `EXPORT`.
 
+Shared with the restore test since M5 Task 26 (moved from `test_typed_replay.py`):
+- `request_delete_everything(engine)`: delete-everything's A0 as the route runs it, its idempotency row first;
+- `live`: the purger with the worker's Batches client on M3's fake (`fake_llm`), so a live delete-everything
+  can cancel a recorded batch; the waits between its cancels are recorded (`Sleeps`), never slept.
+
 It is a plugin module of the root conftest (`pytest_plugins`), so its fixtures reach every test and its
 assertions are rewritten.
 """
 
+import dataclasses
+import itertools
+import secrets
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -42,8 +50,9 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.dedup import revisions
+from jobhunter.llm.batches import BatchesClient
 from jobhunter.privacy import purge
-from jobhunter.privacy.kinds import source_purge
+from jobhunter.privacy.kinds import delete_everything, source_purge
 from jobhunter.privacy.manifests import (
     FileRoots,
     ManifestRow,
@@ -59,6 +68,7 @@ from jobhunter.worker.operations import OperationDeps
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import no_fault, raising_at
+from tests.support.llm import FakeLLM
 from tests.support.pg import PgServer
 from tests.support.privacy_seed import SeedIds, seed_two_year_old_graph
 
@@ -218,3 +228,40 @@ async def rows(engine: AsyncEngine, statement: sa.TextClause, **params: object) 
 
 def completions(replay_log: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return [entry for entry in replay_log if "counts" in entry]
+
+
+# ---- M5 Task 26: delete-everything's live run (M3's fake Batches API, as Task 16's tests run it) ----------
+
+_IDEMPOTENCY_ROW: Final = sa.text(
+    "INSERT INTO api_idempotency (route, idem_key, request_sha256, status, created_at, expires_at) "
+    "VALUES ('POST /api/privacy/delete-everything', :key, '\\x01', 'in_progress', now(), "
+    "now() + interval '1 day') RETURNING id"
+)
+_KEYS = itertools.count(1)
+
+
+async def request_delete_everything(engine: AsyncEngine) -> OpenedPurge:
+    """A0 as the route runs it: the request's idempotency row, then the request, in one transaction."""
+    async with engine.begin() as conn:
+        key = f"replay-delete-everything-{next(_KEYS):06d}-{secrets.token_hex(3)}"
+        row_id = int((await conn.execute(_IDEMPOTENCY_ROW, {"key": key})).scalar_one())
+        return await delete_everything.request_delete_everything(
+            conn, now=utcnow(), idempotency_row_id=row_id, defer=None
+        )
+
+
+@dataclass
+class Sleeps:
+    waited: list[float] = dataclasses.field(default_factory=list)
+
+    async def __call__(self, seconds: float) -> None:
+        self.waited.append(seconds)
+
+
+@pytest.fixture
+async def live(purger: Purger, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Purger]:
+    """The purger with the worker's Batches client on the fake; the waits between cancels recorded."""
+    monkeypatch.setattr(delete_everything, "CANCEL_SLEEP", Sleeps())
+    async with fake_llm.client() as http:
+        client = BatchesClient(fake_llm.cfg, http_client=http)
+        yield Purger(purger.engine, purger.cfg, dataclasses.replace(purger.deps, batches_client=client))

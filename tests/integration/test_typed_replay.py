@@ -41,7 +41,7 @@ from jobhunter.llm.batches import BatchesClient
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.observability.deadman import DeadmanPinger
 from jobhunter.privacy import deletion_graph, purge, replay
-from jobhunter.privacy.kinds import delete_everything, job_tombstone, profile_purge, source_purge
+from jobhunter.privacy.kinds import job_tombstone, profile_purge, source_purge
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.privacy.manifests import (
     FileRoots,
@@ -69,7 +69,6 @@ from structlog.testing import capture_logs
 from tests.support.collect import JobWithPostings, add_posting, queued_run
 from tests.support.faults import PausePoints, SimulatedCrash, no_fault, raising_at
 from tests.support.fixtures import ConfigFactory
-from tests.support.llm import FakeLLM
 from tests.support.observations import stated
 from tests.support.pg import PgServer
 from tests.support.privacy_seed import SeedIds
@@ -85,6 +84,7 @@ from tests.support.purges import (
     completions,
     one,
     recomputed,
+    request_delete_everything,
     request_source_purge,
     rows,
     scalar,
@@ -156,11 +156,6 @@ _CONFIGURATION: Final = sa.text(
     "UNION ALL SELECT 'pending', pending_scope_version_id, profile_version_id, NULL FROM active_config "
     "UNION ALL SELECT 'schedule', settings_version_id, interval_s, last_evaluated_slot FROM schedule_state "
     "ORDER BY 1, 2"
-)
-_IDEMPOTENCY_ROW: Final = sa.text(
-    "INSERT INTO api_idempotency (route, idem_key, request_sha256, status, created_at, expires_at) "
-    "VALUES ('POST /api/privacy/delete-everything', :key, '\\x01', 'in_progress', now(), "
-    "now() + interval '1 day') RETURNING id"
 )
 _JOB_ROW: Final = sa.text(
     "INSERT INTO procrastinate_jobs (queue_name, task_name, args, status) "
@@ -339,19 +334,6 @@ async def request_tombstones(engine: AsyncEngine, *, now: datetime) -> job_tombs
     return batch
 
 
-_KEYS = iter(range(1, 10**6))
-
-
-async def request_delete_everything(engine: AsyncEngine) -> OpenedPurge:
-    """A0 as the route runs it: the request's idempotency row, then the request, in one transaction."""
-    async with engine.begin() as conn:
-        key = f"replay-delete-everything-{next(_KEYS):06d}-{secrets.token_hex(3)}"
-        row_id = int((await conn.execute(_IDEMPOTENCY_ROW, {"key": key})).scalar_one())
-        return await delete_everything.request_delete_everything(
-            conn, now=utcnow(), idempotency_row_id=row_id, defer=None
-        )
-
-
 async def finished(purger: Purger, opened: OpenedPurge) -> ManifestRow:
     """The purge run by the worker's handler to its completion, every postcondition holding; its
     manifest."""
@@ -406,26 +388,6 @@ async def confirm_profile(engine: AsyncEngine, seniority: str) -> int:
     version = body["profile_version_id"]
     assert isinstance(version, int)
     return version
-
-
-# ---- delete-everything's live run (M3's fake Batches API, as Task 16's tests run it) ----------------------
-
-
-@dataclasses.dataclass
-class Sleeps:
-    waited: list[float] = dataclasses.field(default_factory=list)
-
-    async def __call__(self, seconds: float) -> None:
-        self.waited.append(seconds)
-
-
-@pytest.fixture
-async def live(purger: Purger, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Purger]:
-    """The purger with the worker's Batches client on the fake; the waits between cancels recorded."""
-    monkeypatch.setattr(delete_everything, "CANCEL_SLEEP", Sleeps())
-    async with fake_llm.client() as http:
-        client = BatchesClient(fake_llm.cfg, http_client=http)
-        yield Purger(purger.engine, purger.cfg, dataclasses.replace(purger.deps, batches_client=client))
 
 
 # ---- §18.2 typed replay ------------------------------------------------------------------------------------

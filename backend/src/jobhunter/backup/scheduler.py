@@ -4,9 +4,11 @@ and T24-2 (h)): the backup service's command, `jobhunter backup scheduler`, in p
 **The jobs** (`BackupJob`) are named `set`, `ship`, `prune` and `restore_test`, each with a five-field cron
 expression in UTC from `cfg.backup` (`JOBHUNTER_BACKUP_CRON`, `JOBHUNTER_MANIFEST_SHIP_CRON`,
 `JOBHUNTER_BACKUP_PRUNE_CRON`, `JOBHUNTER_RESTORE_TEST_CRON`; an empty value takes the default). `next_fire`
-is a job's first tick strictly after a time (croniter); the restore test's tick counts only on a day of the
-month of at most 7, so its weekly default (`30 3 * * 0`) runs on the first Sunday of each month. `next_due`
-is the job that fires first after `now`, the table's order breaking a tie.
+is a job's first tick strictly after a time (`backup.cron.next_tick`); the restore test's tick counts only on
+a day of the month of at most 7, so its weekly default (`30 3 * * 0`) runs on the first Sunday of each month.
+A job's cron is checked by the validator `env_valid` uses too (`backup.cron.cron_refusal`, Ruling T26-1 (a)
+T24-4 M7), so a cron the configuration accepts is one the scheduler can schedule. `next_due` is the job that
+fires first after `now`, the table's order breaking a tie.
 
 **`run_scheduler`** runs one job at a time, through `run_job`, on the injected `clock` and `sleep`:
 
@@ -30,27 +32,22 @@ database refuses it (not up, not migrated, not granted yet), for up to `DATABASE
 """
 
 import asyncio
-import calendar
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final, Literal, get_args
 
-from croniter import croniter
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.backup.backup_set import BackupJobFailed, clear_staging
+from jobhunter.backup.cron import cron_refusal, next_tick
 from jobhunter.config import AppConfig
 from jobhunter.db.transitions import transition_where
 from jobhunter.observability.logging import get_logger
 
 JobName = Literal["set", "ship", "prune", "restore_test"]
 JOB_NAMES: Final[tuple[JobName, ...]] = get_args(JobName)
-# R15: the restore test runs on the first Sunday of the month, the day of its weekly cron that is at most 7.
-FIRST_WEEK_LAST_DAY: Final = 7
-# How far `next_fire` looks for a restore-test tick in a first week before it refuses the cron.
-_SEARCH_MONTHS: Final = 24
 MAX_WAIT_S: Final = 300.0
 DATABASE_RETRY_S: Final = 5.0
 DATABASE_WAIT_S: Final = 300.0
@@ -84,22 +81,14 @@ def backup_jobs(cfg: AppConfig, names: Sequence[JobName] = JOB_NAMES) -> tuple[B
     return tuple(BackupJob(name, crons[name]) for name in names)
 
 
-def _first_of_next_month(moment: datetime) -> datetime:
-    days = calendar.monthrange(moment.year, moment.month)[1]
-    last_day = moment.replace(day=days, hour=0, minute=0, second=0, microsecond=0)
-    return last_day + timedelta(days=1)
-
-
 def next_fire(job: BackupJob, *, after: datetime) -> datetime:
     """`job`'s first tick strictly after `after` (UTC); for the restore test, the first on a day of the month
-    of at most 7. `ValueError` for a restore-test cron that never fires in a month's first seven days."""
-    start = after
-    for _ in range(_SEARCH_MONTHS):
-        fire: datetime = croniter(job.cron, start).get_next(datetime)
-        if job.name != "restore_test" or fire.day <= FIRST_WEEK_LAST_DAY:
-            return fire
-        start = _first_of_next_month(fire) - timedelta(seconds=1)  # the next month's first week
-    raise ValueError(f"the {job.name} cron never fires in the first seven days of a month")
+    of at most 7. `ValueError` for a cron the shared validator refuses (`backup.cron.cron_refusal`): not five
+    fields croniter reads, or a restore-test cron that never fires in a month's first seven days."""
+    first_week = job.name == "restore_test"
+    if (refusal := cron_refusal(job.cron, first_week=first_week)) is not None:
+        raise ValueError(f"the {job.name} cron {refusal}")
+    return next_tick(job.cron, after=after, first_week=first_week)
 
 
 def next_due(jobs: Sequence[BackupJob], *, now: datetime) -> tuple[BackupJob, datetime]:

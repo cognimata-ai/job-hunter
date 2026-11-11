@@ -7,7 +7,9 @@ prune`, and the scheduler's `prune` job (`JOBHUNTER_BACKUP_PRUNE_CRON`).
 the `set` tag, which every backup set's snapshot carries (`backup_set.SET_TAG`) and no `manifests` snapshot
 does: the manifest stream is never forgotten (it holds ids and hashes only). The run then becomes `succeeded`
 with the counts it applied as its report, or `failed` with `error` = `prune:<error class>`, and `PruneFailed`
-is raised. A prune's failure raises no alert (§17.6 has none): the health page shows the run.
+is raised. A prune's failure raises no alert (§17.6 has none): the health page shows the run. It holds the
+backup jobs' lock for its whole run (`backup_set.backup_job_lock`): while another backup job runs it writes no
+row and raises `BackupJobBusy`.
 """
 
 from collections.abc import Callable
@@ -16,7 +18,7 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from jobhunter.backup.backup_set import SET_TAG, BackupJobFailed
+from jobhunter.backup.backup_set import SET_TAG, BackupJobFailed, backup_job_lock
 from jobhunter.backup.restic import Restic
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
@@ -42,7 +44,15 @@ async def run_prune(
     cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, clock: Callable[[], datetime]
 ) -> int:
     """Forget the backup sets beyond the counts kept and prune what they alone held (module docstring); the
-    run's id. `PruneFailed` once the run is `failed`."""
+    run's id. `PruneFailed` once the run is `failed`, `BackupJobBusy` (nothing written) while another backup
+    job runs."""
+    async with backup_job_lock(cfg, "prune"):
+        return await _prune(cfg, restic, engine, clock=clock)
+
+
+async def _prune(
+    cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, clock: Callable[[], datetime]
+) -> int:
     keep = {
         "keep_daily": cfg.backup.keep_daily,
         "keep_weekly": cfg.backup.keep_weekly,
