@@ -54,7 +54,12 @@ through an index or within a bound):
   alert's context); `null` otherwise, and while the pending scope's apply is live. The operations through
   `operations_dedup_newest`.
 
-No failed-purges section (U1: M5's).
+- `failed_purges` (M5 Task 18, D8, P24; U1 deferred it to M5): one item per `executing` deletion manifest
+  whose newest purge operation (its dedup key `purge:<uuid>`, through `operations_dedup_newest`) is `failed`,
+  or which has none, with that operation's id, error code and attempts (null, null and 0 without one), for
+  its Retry (`POST /api/system/purges/{operation_id}/retry`); a manifest whose newest purge is pending,
+  running, cancelled (the `purge_fences` reconciler re-queues it) or succeeded is not listed. Newest manifest
+  first. `deletion_manifests` is read through `deletion_manifests_open` (the manifests not shipped).
 """
 
 from collections.abc import Sequence
@@ -70,6 +75,7 @@ from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
+from jobhunter.privacy.manifests import ManifestKind
 from jobhunter.scoring.batches import (
     RELEASABLE_SQL,
     RELEASED_LISTED_FOR,
@@ -79,6 +85,7 @@ from jobhunter.scoring.batches import (
 from jobhunter.scoring.targets import RETRYABLE_STATES
 from jobhunter.settings import scope_apply
 from jobhunter.sources.replay import RESPONSE_REPLAYABLE_SQL, replayable_since
+from jobhunter.worker.operations import PURGE_DEDUP_PREFIX, PURGE_KIND
 
 ITEMS_PER_SECTION: Final = 50
 NO_NAMESPACE_REASON: Final = "exclusive_conflict"
@@ -165,6 +172,16 @@ _BROKEN_SOURCES: Final = q(
 _PAUSING: Final = q(
     "/* attention.paused_lane */ SELECT id, code FROM alerts WHERE code IN (:bound, :auth) "
     "AND resolved_at IS NULL AND acknowledged_at IS NULL ORDER BY code = :bound DESC, id DESC LIMIT 1"
+)
+_FAILED_PURGES: Final = q(
+    "/* attention.failed_purges */ SELECT m.id, m.kind, m.created_at, n.id AS operation_id, "
+    "n.last_error_code, coalesce(n.attempts, 0) AS attempts, count(*) OVER () AS total "
+    "FROM deletion_manifests m "
+    "LEFT JOIN LATERAL (SELECT o.id, o.status, o.last_error_code, o.attempts FROM operations o "
+    "WHERE o.kind = :kind AND o.dedup_key = :prefix || CAST(m.manifest_uuid AS text) "
+    "ORDER BY o.id DESC LIMIT 1) n ON true "
+    "WHERE m.status = 'executing' AND (n.id IS NULL OR n.status = 'failed') "
+    "ORDER BY m.created_at DESC, m.id DESC LIMIT :limit"
 )
 _PENDING_SCOPE: Final = q(
     "/* attention.pending_scope */ SELECT pending_scope_version_id FROM active_config WHERE id = 1"
@@ -359,9 +376,28 @@ class ScopeApplyFailedOut(BaseModel):
     alert_id: int | None
 
 
+class FailedPurgeOut(BaseModel):
+    """A deletion whose purge failed or has no operation: its manifest, its kind and when it was requested,
+    and its newest purge operation (null without one), which Retry takes, with its error code and attempts."""
+
+    manifest_id: int
+    kind: ManifestKind
+    created_at: UtcDatetime
+    operation_id: int | None
+    last_error_code: str | None
+    attempts: int
+
+
+class FailedPurgesSectionOut(BaseModel):
+    """The deletions whose purge failed: how many, and the 50 requested last."""
+
+    count: int
+    items: list[FailedPurgeOut]
+
+
 class AttentionOut(BaseModel):
     """What needs the user: each list section's full count and at most 50 of its items, the score lane's
-    acknowledgeable pause and a failed scope apply (each null when there is none)."""
+    acknowledgeable pause, a failed scope apply (each null when there is none) and the failed purges."""
 
     raw_items: RawItemsSectionOut
     identity_conflicts: IdentityConflictsSectionOut
@@ -373,6 +409,7 @@ class AttentionOut(BaseModel):
     broken_sources: BrokenSourcesSectionOut
     paused_lane: PausedLaneOut | None
     scope_apply_failed: ScopeApplyFailedOut | None
+    failed_purges: FailedPurgesSectionOut
 
 
 async def _rows(
@@ -568,6 +605,24 @@ async def _scope_apply_failed(conn: AsyncConnection) -> ScopeApplyFailedOut | No
     return ScopeApplyFailedOut(version_id=int(row.scope_version_id), alert_id=int(row.id))
 
 
+async def _failed_purges(conn: AsyncConnection) -> FailedPurgesSectionOut:
+    count, rows = await _rows(conn, _FAILED_PURGES, kind=PURGE_KIND, prefix=PURGE_DEDUP_PREFIX)
+    return FailedPurgesSectionOut(
+        count=count,
+        items=[
+            FailedPurgeOut(
+                manifest_id=r.id,
+                kind=r.kind,
+                created_at=r.created_at,
+                operation_id=r.operation_id,
+                last_error_code=r.last_error_code,
+                attempts=r.attempts,
+            )
+            for r in rows
+        ],
+    )
+
+
 async def needs_attention(conn: AsyncConnection, *, now: datetime) -> AttentionOut:
     """Every section of Needs attention at `now`, read on the caller's connection (module docstring)."""
     return AttentionOut(
@@ -581,4 +636,5 @@ async def needs_attention(conn: AsyncConnection, *, now: datetime) -> AttentionO
         broken_sources=await _broken_sources(conn),
         paused_lane=await _paused_lane(conn),
         scope_apply_failed=await _scope_apply_failed(conn),
+        failed_purges=await _failed_purges(conn),
     )

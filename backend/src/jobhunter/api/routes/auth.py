@@ -241,8 +241,9 @@ async def _verify_credentials(
     )
 
 
-def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
-    log.warning("login", outcome=outcome, ip=ip)
+def throttled_problem(title: str, *, retry_after_s: int) -> Problem:
+    """A 429 `throttled` telling the client to wait `retry_after_s` seconds (`Retry-After` and the member
+    `retry_after_s`)."""
     return Problem(
         429,
         "throttled",
@@ -252,9 +253,21 @@ def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Prob
     )
 
 
-def _locked(ip: str, retry_after: timedelta) -> Problem:
+def lockout_problem(retry_after: timedelta) -> Problem:
+    """The 429 of a lockout in force for `retry_after` more (at least a second, rounded up); the privacy
+    routes' re-authentication answers it too (M5 Task 18)."""
     retry_after_s = max(1, math.ceil(retry_after.total_seconds()))
-    return _throttled(ip, outcome="locked", title="Too many failed logins", retry_after_s=retry_after_s)
+    return throttled_problem("Too many failed logins", retry_after_s=retry_after_s)
+
+
+def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
+    log.warning("login", outcome=outcome, ip=ip)
+    return throttled_problem(title, retry_after_s=retry_after_s)
+
+
+def _locked(ip: str, retry_after: timedelta) -> Problem:
+    log.warning("login", outcome="locked", ip=ip)
+    return lockout_problem(retry_after)
 
 
 async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) -> None:

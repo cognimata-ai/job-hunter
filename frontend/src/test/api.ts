@@ -802,6 +802,7 @@ export function attentionOut(overrides: Partial<AttentionOut> = {}): AttentionOu
     broken_sources: none,
     paused_lane: null,
     scope_apply_failed: null,
+    failed_purges: none,
     ...overrides,
   };
 }

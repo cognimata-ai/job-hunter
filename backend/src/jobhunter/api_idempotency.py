@@ -11,6 +11,11 @@ handler returned, its response, for `IDEMPOTENCY_TTL`:
 - a missing or malformed key → 400 `idempotency_key_required` (`check_idempotency_key`, pure, so a route can
   refuse it before it opens a transaction).
 
+`stored_response` gives the same answers for a key that already has a row, without claiming it or running
+anything: a route whose request needs work that must not run again for a request already answered (the
+re-authentication of the privacy routes, whose TOTP step the first request used, M5 Task 18) asks it first,
+and runs `run_idempotent` only when it returns `None`.
+
 The row is inserted (`in_progress`), the handler runs and the row is completed in one transaction, so a
 committed row is always `completed`. An exception from the handler rolls everything back, the row included:
 a retry with the same key runs again (ruling T17-e). Only the handler's returned status and JSON body are
@@ -26,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final
 
+from sqlalchemy.engine import Row
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import TextClause
@@ -129,6 +135,33 @@ async def _under_lock_timeout(
     return touched
 
 
+def _answer(stored: Row[Any], *, fingerprint: bytes, route: str) -> StoredResponse:
+    """The answer to a request whose key has the unexpired row `stored`: its stored response, or the 422 of
+    another fingerprint, or the 409 of a request still running."""
+    if bytes(stored.request_sha256) != fingerprint:
+        log.info("idempotency_key_reused", route=route)
+        raise _reused()
+    if stored.status != "completed":
+        log.info("idempotency_in_progress", route=route)
+        raise _in_progress()
+    log.info("idempotent_replay", route=route, status=int(stored.response_status))
+    return StoredResponse(int(stored.response_status), get_object(stored.response_body, ""))
+
+
+async def stored_response(
+    conn: AsyncConnection, *, route: str, key: str, fingerprint: bytes, now: datetime
+) -> StoredResponse | None:
+    """What `run_idempotent` would answer for `(route, key)` without running its handler (module docstring):
+    the stored response of a completed request with `fingerprint`; 422 `idempotency_key_reused` for another
+    fingerprint; 409 `idempotency_in_progress` for a request still running; `None` when the key has no row, or
+    only a row expired at `now` (`run_idempotent` then claims it). A plain read: it claims and waits for
+    nothing."""
+    stored = (await conn.execute(_STORED, {"route": route, "key": key})).first()
+    if stored is None or stored.expires_at <= now:
+        return None
+    return _answer(stored, fingerprint=fingerprint, route=route)
+
+
 async def run_idempotent(
     conn: AsyncConnection,
     *,
@@ -166,14 +199,7 @@ async def run_idempotent(
         if stored.expires_at <= now:
             await _under_lock_timeout(conn, _DELETE_EXPIRED, {**ids, "now": now}, route=route)
             continue
-        if bytes(stored.request_sha256) != fingerprint:
-            log.info("idempotency_key_reused", route=route)
-            raise _reused()
-        if stored.status != "completed":
-            log.info("idempotency_in_progress", route=route)
-            raise _in_progress()
-        log.info("idempotent_replay", route=route, status=int(stored.response_status))
-        return StoredResponse(int(stored.response_status), get_object(stored.response_body, ""))
+        return _answer(stored, fingerprint=fingerprint, route=route)
     # Twice the key had a row that went away (or expired) before it could be read: another request is busy.
     log.info("idempotency_in_progress", route=route)
     raise _in_progress()

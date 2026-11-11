@@ -1,7 +1,8 @@
 // System → Needs attention (spec §14.2 L5040-5044, §15.7; plan M4 Task 31, resolution d, U1, U3): one block per
 // section of `AttentionOut`, in `observability/attention.py`'s order. Each block shows its heading with the
 // section's full count, its items (the server sends at most 50), "and n more" when the count exceeds them, and
-// "Nothing here" when it is empty. There is no failed-purges block (U1: M5's).
+// "Nothing here" when it is empty. The failed purges are a section since M5 Task 18 (U1); their block, with
+// Retry, comes with the privacy page (Task 20), so none is shown yet.
 //
 // Each item's action disables its button while it runs; once answered, Needs attention and the header's status
 // are read again (`systemApi`); a refusal shows as a `ProblemBox` at the item.
@@ -70,6 +71,7 @@ const KNOWN: ReadonlySet<string> = new Set(closedSet<Section>({
   broken_sources: true,
   paused_lane: true,
   scope_apply_failed: true,
+  failed_purges: true,
 }));
 
 /** The sections in the module's order (`codes.json`'s `order.attention_section`). */
@@ -540,6 +542,8 @@ function blockOf(data: AttentionOut, name: Section): ReactNode {
         </Block>
       );
     }
+    case "failed_purges":
+      return null; // its block, with Retry, comes with the privacy page (M5 Task 20)
   }
 }
 

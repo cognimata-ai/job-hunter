@@ -1,11 +1,13 @@
 {
   "problem": [
     "budget_exhausted",
+    "confirmation_mismatch",
     "conflict_state",
     "csrf_failed",
     "delete_everything_in_progress",
     "eval_gate_failed",
     "filtered_requires_force",
+    "gone",
     "idempotency_in_progress",
     "idempotency_key_required",
     "idempotency_key_reused",
@@ -13,6 +15,7 @@
     "invalid_cursor",
     "not_found",
     "profile_purge_in_progress",
+    "reauth_failed",
     "run_active",
     "stale_base_version",
     "throttled",
@@ -201,6 +204,7 @@
     "applying_settings",
     "cap_reached",
     "critical_alerts",
+    "deletion_unshipped",
     "paid_search_paused",
     "rescoring",
     "reservation_bound_violated",
@@ -607,6 +611,7 @@
   ],
   "attention_section": [
     "broken_sources",
+    "failed_purges",
     "failed_targets",
     "identity_conflicts",
     "mass_disappearances",
@@ -748,7 +753,8 @@
       "unscorable_groups",
       "broken_sources",
       "paused_lane",
-      "scope_apply_failed"
+      "scope_apply_failed",
+      "failed_purges"
     ],
     "retryable_target_state": [
       "refused",

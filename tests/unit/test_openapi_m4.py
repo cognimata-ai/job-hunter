@@ -5,7 +5,8 @@ M4 adds no route that takes an `Idempotency-Key`, so there is no idempotency set
 `test_the_m3_rows_of_the_document_are_unchanged` checks that M4's changes leave every M3 row as M3
 documented it. `test_no_description_cites_an_internal_document` (Ruling T6-g, Task 10): the published
 document is public text, so no `description` or `summary` in it names the codebase's module docstrings or the
-plan's rulings, deviations, tasks, blocker ids or spec line numbers.
+plan's rulings, deviations, tasks, blocker ids or spec line numbers. Since M5 Task 18 every pin here allows
+the fence's 409 on a fenced write (`test_openapi_m3.documented_since_m5`), and nothing else.
 """
 
 import re
@@ -16,7 +17,7 @@ import pytest
 from jobhunter.api.app import create_app
 from jobhunter.observability.health import RunStatus
 
-from tests.unit.test_openapi_m3 import M3_ROUTES
+from tests.unit.test_openapi_m3 import M3_ROUTES, documented_since_m5
 
 # The error statuses of a group or merge-family write (Task 8).
 GROUP_WRITE: Final = frozenset({"401", "403", "404", "409", "413", "422", "429"})
@@ -79,14 +80,17 @@ def test_every_m4_route_is_in_the_document_with_its_error_statuses(
     document: dict[str, Any], route: tuple[str, str], statuses: set[str] | frozenset[str]
 ) -> None:
     method, path = route
-    assert error_statuses(document, method, path) == statuses
+    assert error_statuses(document, method, path) == documented_since_m5(method, path, statuses)
 
 
 def test_the_m3_rows_of_the_document_are_unchanged(document: dict[str, Any]) -> None:
     assert M3_ROUTES
     for (method, path), statuses in M3_ROUTES.items():
         assert method in document["paths"].get(path, {}), (method, path)
-        assert error_statuses(document, method, path) == statuses, (method, path)
+        assert error_statuses(document, method, path) == documented_since_m5(method, path, statuses), (
+            method,
+            path,
+        )
 
 
 def texts(node: object, path: str = "") -> Iterator[tuple[str, str]]:

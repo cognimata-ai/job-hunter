@@ -69,6 +69,7 @@ from jobhunter.api.routes import (
     health,
     jobs,
     labelling,
+    privacy,
     profile,
     profile_review,
     queries,
@@ -268,6 +269,7 @@ def create_app(
     api.include_router(labelling.router)
     api.include_router(alerts.router)
     api.include_router(cycles.router)
+    api.include_router(privacy.router)
     api.include_router(docs.router)
     for router in extra_routers:
         api.include_router(router)

@@ -17,14 +17,24 @@ state-changing method (`edge.csrf_failure`), `LOGIN_CSRF_RESPONSES` for the logi
 only, and `BODY_LIMIT_RESPONSES` for the edge's body ceiling on a route with a request body
 (`edge.MAX_BODY_BYTES`; the CV upload and the paste document their own 413). Unit tests check that every
 `/api` route documents them.
+
+`FENCE_RESPONSES` is the edge's 409 `delete_everything_in_progress`, its refusal of a state-changing request
+while delete-everything's `global` fence stands (`edge.fence_guarded`; M5 Task 18, Ruling T18-1 (b)). It
+applies to every write route but the few the edge lets through, so `with_fence_contract`, which
+`JobHunterAPI.openapi` applies after the problem contract, documents it on exactly the operations the edge's
+own predicate stops (`fenced_operation`: the route's template, each path parameter as `1`): a route without a
+409 gets the fence's, and a route's own 409 description gets the fence's appended, so neither hides the
+other.
 """
 
+import re
 from typing import Any, Final
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
 from pydantic.json_schema import models_json_schema
 
+from jobhunter.api.edge import fence_guarded
 from jobhunter.api.errors import PROBLEM_MEDIA_TYPE, ProblemCode
 
 COMPONENTS_PREFIX: Final = "#/components/schemas/"
@@ -48,6 +58,16 @@ BODY_LIMIT_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 LOGIN_CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     403: {"description": "Origin check failed (`csrf_failed`)"},
 }
+
+
+# The edge's refusal under delete-everything's `global` fence (`with_fence_contract`).
+FENCE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    409: {
+        "description": "Everything is being deleted: no change is accepted until the deletion completes "
+        "(`delete_everything_in_progress`)"
+    },
+}
+_PATH_PARAMETER: Final = re.compile(r"\{[^{}/]+\}")
 
 
 # `message` may echo the sender's input: ruling T14-h.
@@ -121,10 +141,35 @@ def with_problem_contract(document: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
+def fenced_operation(method: str, path: str) -> bool:
+    """Whether the edge refuses a request of the operation `method` `path` (a route's template) while
+    delete-everything's `global` fence stands: `edge.fence_guarded` of the template with each path parameter
+    as `1` (module docstring)."""
+    concrete = _PATH_PARAMETER.sub("1", path)
+    return fence_guarded({"type": "http", "method": method.upper(), "path": concrete})
+
+
+def with_fence_contract(document: dict[str, Any]) -> dict[str, Any]:
+    """`document` with `FENCE_RESPONSES` on every operation the edge fences, in place (module docstring);
+    applying it again changes nothing."""
+    fence = FENCE_RESPONSES[409]["description"]
+    for path, item in document.get("paths", {}).items():
+        for method, operation in item.items():
+            if not isinstance(operation, dict) or not fenced_operation(method, path):
+                continue
+            responses = operation.setdefault("responses", {})
+            own = responses.get("409")
+            if own is None:
+                responses["409"] = {"description": fence, "content": _problem_content()}
+            elif fence not in own.get("description", ""):
+                own["description"] = f"{own['description']}. {fence}"
+    return document
+
+
 class JobHunterAPI(FastAPI):
-    """The FastAPI app whose OpenAPI document carries the problem contract."""
+    """The FastAPI app whose OpenAPI document carries the problem contract and the fence's 409."""
 
     def openapi(self) -> dict[str, Any]:
-        # FastAPI caches the document and regenerates it when the routes changed; the contract is applied to
+        # FastAPI caches the document and regenerates it when the routes changed; the contracts are applied to
         # whichever it returns, which is cheap and idempotent.
-        return with_problem_contract(super().openapi())
+        return with_fence_contract(with_problem_contract(super().openapi()))

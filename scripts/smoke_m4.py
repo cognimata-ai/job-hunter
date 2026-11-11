@@ -178,6 +178,7 @@ SECTIONS: Final = (
     "broken_sources",
     "paused_lane",
     "scope_apply_failed",
+    "failed_purges",
 )
 REPLAY_STATE: Final = (
     "/* smoke_m4.replay_state */ SELECT o.status, coalesce(o.progress->>'moved', ''), "

@@ -16,8 +16,10 @@ from typing import Final, Literal
 
 from jobhunter.types import JSONValue
 
-# The problem codes of §14.4, the login's `totp_required` (§15.2) and delete-everything's admission stop
-# (`delete_everything_in_progress`, M5 Task 8: `db.fence_guard`) (`api.errors.ProblemCode` is this type).
+# The problem codes of §14.4, the login's `totp_required` (§15.2), delete-everything's admission stop
+# (`delete_everything_in_progress`, M5 Task 8: `db.fence_guard`) and the privacy routes' (M5 Task 18): a
+# phrase that is not the one asked for (`confirmation_mismatch`), a failed re-authentication (`reauth_failed`)
+# and an export that expired or was purged (`gone`) (`api.errors.ProblemCode` is this type).
 ErrorCode = Literal[
     "unauthenticated",
     "totp_required",
@@ -38,6 +40,9 @@ ErrorCode = Literal[
     "eval_gate_failed",
     "profile_purge_in_progress",
     "delete_everything_in_progress",
+    "confirmation_mismatch",
+    "reauth_failed",
+    "gone",
     "internal",
 ]
 # The members a problem document writes itself (`api.errors.problem_body`): no `extra` may replace them, of a

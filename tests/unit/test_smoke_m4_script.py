@@ -294,6 +294,7 @@ class M4Stack(Stack):
                         "mass_disappearances",
                         "unscorable_groups",
                         "broken_sources",
+                        "failed_purges",
                     )
                 }
                 listed = not self.replayed or self.listed_after_replay

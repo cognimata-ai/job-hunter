@@ -8,7 +8,7 @@ filters (`filters_hash`), so a cursor is valid only for the list and the filters
 
 The sorts are namespaced by their list (D35): `GOLDEN_CASES_SORT` is `golden_cases.id` and `ALERTS_SORT`
 `alerts.id`, so one list never takes another's cursor even where both sort by an id; the job sorts are
-`"jobs." + JobSort`.
+`"jobs." + JobSort`; the deletion manifests', newest first, `privacy.manifests.id_desc` (M5 Task 18, D18).
 
 - A list cursor (`encode_list_cursor` / `decode_list_cursor`) has the section `all`, a direction and a
   `last_key` list whose shape the route checks. A cursor of M3's form (a bare `sort` such as `version_no`) is
@@ -57,6 +57,7 @@ SCORE_CYCLES_SORT: Final = "score_cycles.id"
 ALERTS_SORT: Final = "alerts.id"
 EVAL_RUNS_SORT: Final = "eval_runs.id"
 JOB_HISTORY_SORT: Final = "jobs.history"
+MANIFESTS_SORT: Final = "privacy.manifests.id_desc"
 
 ListDir = Literal["asc", "desc"]
 JobSort = Literal["score_mid", "score_low", "posted", "first_seen"]

@@ -683,12 +683,11 @@ def test_the_system_section_s_reused_namespaces_cover_their_literals(
     assert not missing, f"codes.json[{namespace}] lacks {missing}"
 
 
-def test_the_attention_sections_have_no_failed_purges_section() -> None:
-    """Needs attention shows one block per section of `AttentionOut` (their order is
-    `order.attention_section`, held by `test_each_order_is_its_backend_order_of_its_namespace`), and none for
-    failed purges (U1)."""
-    sections = list(attention.AttentionOut.model_fields)
-    assert not [name for name in sections if "purge" in name], sections
+def test_the_attention_sections_include_failed_purges() -> None:
+    """Needs attention has one section per field of `AttentionOut` (their order is `order.attention_section`,
+    held by `test_each_order_is_its_backend_order_of_its_namespace`); M5 Task 18 adds the failed purges, which
+    U1 had deferred to M5 (preflight F41)."""
+    assert "failed_purges" in attention.AttentionOut.model_fields
 
 
 def test_a_role_s_seniority_is_the_profile_s_and_unspecified(catalogue: dict[str, Any]) -> None:

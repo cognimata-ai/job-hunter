@@ -11,8 +11,9 @@ type AttentionOut = components["schemas"]["AttentionOut"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 // The blocks in `AttentionOut`'s order (observability/attention.py; `codes.json`'s `order.attention_section`,
-// which test_i18n_codes.py holds to the model): no failed-purges block (U1).
-const ORDER = codes.order.attention_section as (keyof AttentionOut)[];
+// which test_i18n_codes.py holds to the model). The failed purges are a section since M5 Task 18, but Task 20
+// renders their block: none is shown yet.
+const ORDER = (codes.order.attention_section as (keyof AttentionOut)[]).filter((name) => name !== "failed_purges");
 
 // Needs attention's job links are the router's: these tests render the app at Profile & Settings.
 afterEach(() => {

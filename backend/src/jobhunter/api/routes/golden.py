@@ -20,8 +20,12 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   FOR SHARE` first): a third canary is 422 `validation_failed` (L4632), an unknown case 404, activating a
   case whose job is under a purge fence (M5 Task 8), or whose profile version is purged or fenced (M5 Task
   14), 409 `conflict_state` with `detail = "purge_in_progress"`.
-- `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
-  deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
+- `DELETE /api/golden-cases/{id}` → 202 `{manifest_id}` (M5 Task 18, U8, Deviation 20): A0 of the case's
+  `golden_case_delete` purge (`privacy.kinds.golden_case.request_golden_case_delete`, `active_config FOR
+  UPDATE` first): the api has no manifests volume, so the worker writes the manifest's file and deletes the
+  case, its eval rows by cascade. 404 for no such case (`golden.CaseMissing`), 409 `conflict_state` with
+  `detail = "eval_run_running"` while a running eval run includes it, and 409 `delete_everything_in_progress`
+  under delete-everything's fence.
 - `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
   row alone; the golden case it upserted stays (Deviation 24). 404 `not_found` for no such feedback
   (`golden.FeedbackMissing` through `api.errors.domain_problem`).
@@ -38,15 +42,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem, domain_problem
+from jobhunter.api.errors import domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import GOLDEN_CASES_SORT, cursor_key, decode_id_cursor, list_page
+from jobhunter.api.routes.privacy import ManifestQueuedOut
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.scoring import golden
 from jobhunter.scoring.golden import COMMENT_MAX_CHARS, CaseRow, CaseSource, FeedbackKind, Label
 from jobhunter.types import JSONValue
+from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
@@ -229,23 +236,31 @@ async def set_golden_case_flags(
 
 @router.delete(
     "/api/golden-cases/{case_id}",
-    status_code=204,
-    response_class=Response,
+    status_code=202,
+    response_model=ManifestQueuedOut,
     responses={
         **_NOT_FOUND,
-        409: {"description": "A running eval run includes the case (`conflict_state`)"},
+        409: {
+            "description": "A running eval run includes the case (`conflict_state`, detail "
+            "`eval_run_running`)"
+        },
         422: {"description": "Invalid path (`validation_failed`)"},
         **CSRF_RESPONSES,
     },
 )
 async def delete_golden_case(
     case_id: CaseId, engine: Annotated[AsyncEngine, Depends(get_engine)]
-) -> Response:
-    """Delete a golden case and its eval rows (204); its job's inputs lose their retention exemption."""
-    async with engine.begin() as conn:
-        if not await golden.delete_case_unless_running(conn, case_id):
-            raise Problem(404, "not_found", "Golden case not found")
-    return Response(status_code=204)
+) -> ManifestQueuedOut:
+    """Delete a golden case and its eval rows (202): the deletion runs in the background, recorded in a
+    deletion manifest; its job's inputs lose their retention exemption."""
+    try:
+        async with engine.begin() as conn:
+            opened = await request_golden_case_delete(conn, case_id, now=utcnow(), defer=defer_in_tx)
+    except LookupError as exc:
+        if (problem := domain_problem(exc)) is None:
+            raise
+        raise problem from None
+    return ManifestQueuedOut(manifest_id=opened.manifest_id)
 
 
 @router.delete(

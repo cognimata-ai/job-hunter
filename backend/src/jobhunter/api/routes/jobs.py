@@ -481,6 +481,10 @@ async def get_job_history(
     response_model=ActionsOut,
     responses={
         **_GONE_RESPONSES,
+        409: {
+            "description": "With `apply_to_group`, a member of the job's group is being purged "
+            "(`conflict_state`, detail `purge_in_progress`)"
+        },
         422: {
             "description": "A `job_id` that is no integer from 1 to 2^63 - 1, or an invalid body: an unknown "
             "field, none of `seen`, `saved`, `applied`, `hidden`, `note` and `seen_on_open`, `seen_on_open` "

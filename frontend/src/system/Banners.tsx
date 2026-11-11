@@ -42,6 +42,7 @@ function bannerText(banner: BannerOut, t: T, serverText: ServerText, fmt: Format
     case "cap_reached":
     case "reservation_bound_violated":
     case "scope_not_applied":
+    case "deletion_unshipped":
       return t(`banner.${banner.code}`);
     case "scoring_paused":
       return t("banner.scoring_paused", { reason: serverText("pause", text(p.reason)) });
