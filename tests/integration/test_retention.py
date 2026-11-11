@@ -143,6 +143,8 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "checkpoints": timedelta(days=14),
         "profile_checkpoints": timedelta(days=14),
         "runs": timedelta(days=397),  # 13 months, never fewer days than any 13 calendar months
+        # M5 Task 24: finished backup runs and sets (their own test is in test_backup_set.py)
+        "backup_records": timedelta(days=397),
         "procrastinate_jobs": timedelta(days=7),
     }
     names = [rule.name for rule in RULES]

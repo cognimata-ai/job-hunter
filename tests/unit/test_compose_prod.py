@@ -120,6 +120,7 @@ BACKUP_OPTIONAL: Final = frozenset(
     {
         "JOBHUNTER_BACKUP_CRON",
         "JOBHUNTER_MANIFEST_SHIP_CRON",
+        "JOBHUNTER_BACKUP_PRUNE_CRON",  # M5 Task 24: the weekly prune's schedule
         "JOBHUNTER_RESTORE_TEST_CRON",
         "JOBHUNTER_BACKUP_KEEP_DAILY",
         "JOBHUNTER_BACKUP_KEEP_WEEKLY",

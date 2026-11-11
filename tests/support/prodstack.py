@@ -62,8 +62,9 @@ PB: Final[list[str]] = _compose(PB_PROJECT, _TEST_ENV, _TEST_FILES)
 S3: Final[list[str]] = _compose(S3_PROJECT, ("images.lock",), ("compose.s3stub.yaml",))
 
 # What a stack module brings up by default; `migrate`, `postgres` and `embedder` start with them, as their
-# dependencies. `backup` joins with Task 24, whose scheduler its command runs.
-STACK_SERVICES: Final[tuple[str, ...]] = ("caddy", "api", "worker", "docparse", "stubsvc")
+# dependencies. `backup` runs its scheduler since Task 24 (`jobhunter backup scheduler`, which waits for the
+# database at its start: it does not depend on `migrate`).
+STACK_SERVICES: Final[tuple[str, ...]] = ("caddy", "api", "worker", "docparse", "stubsvc", "backup")
 # The services of the test stack that are built (compose.test.yaml); and those JOBHUNTER_STACK_PREBUILT names.
 BUILT_SERVICES: Final = ("migrate", "api", "worker", "backup", "restore", "docparse", "embedder")
 PREBUILT: Final = tuple(name for name in os.environ.get("JOBHUNTER_STACK_PREBUILT", "").split(",") if name)

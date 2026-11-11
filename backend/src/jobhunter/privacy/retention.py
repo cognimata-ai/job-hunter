@@ -153,6 +153,12 @@ the inputs of every golden case stay.
   version's live proposal operations and commits its manifest, its `profile` fence and its `purge` operation
   (`privacy.kinds.profile_purge`). It counts the versions it fenced.
 
+**The backup records** (M5 Task 24, §19.5), after `runs`: `backup_records` deletes the finished
+(`succeeded` or `failed`) `backup_runs`, then `backup_sets`, 13 months after `finished_at`, in one fenced
+transaction. A running row stays however old (the backup container's next start ends it), and so do the newest
+succeeded set (the backups' age reference, even when every set is older: backups that stopped working) and a
+set that a kept run still names. It deletes rows only; restic's own retention is the backup container's prune.
+
 **Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
 bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
 `cycle_threads` 500 threads, `procrastinate_jobs` 1,000 jobs, `draft_content` 100 drafts, `cv_files` and
@@ -274,6 +280,9 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("profile_checkpoints", timedelta(days=14)),  # threads of operations ended that long ago
     # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
     RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
+    # M5 Task 24: finished backup runs, then backup sets, 13 months after they finished; never the newest
+    # succeeded set.
+    RetentionRule("backup_records", THIRTEEN_MONTHS),
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
@@ -364,6 +373,19 @@ _DELETES: Final[dict[str, TextClause]] = {
         "AND NOT EXISTS (SELECT 1 FROM batch_submissions s WHERE s.bulk_operation_id = b.id)"
     ),
 }
+
+# `backup_records` (M5 Task 24): the finished runs first, then the finished sets that no run left names (a
+# restore test's `backup_set_id`), except the newest succeeded set, the age reference of the backups' health
+# (`observability.backup_health`), whatever its age.
+_BACKUP_RUNS: Final = q(
+    "DELETE FROM backup_runs WHERE status IN ('succeeded', 'failed') AND finished_at < :cutoff"
+)
+_BACKUP_SETS: Final = q(
+    "DELETE FROM backup_sets s WHERE s.status IN ('succeeded', 'failed') AND s.finished_at < :cutoff "
+    "AND s.id IS DISTINCT FROM (SELECT n.id FROM backup_sets n WHERE n.status = 'succeeded' "
+    "ORDER BY n.finished_at DESC, n.id DESC LIMIT 1) "
+    "AND NOT EXISTS (SELECT 1 FROM backup_runs r WHERE r.backup_set_id = s.id)"
+)
 
 # The batch sizes ("Batches" in the module docstring).
 THREAD_BATCH: Final = 500
@@ -516,6 +538,16 @@ async def _delete_rows(
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         return (await conn.execute(statement, dict(params))).rowcount
+
+
+async def _delete_backup_records(engine: AsyncEngine, cutoff: datetime, epoch: int) -> int:
+    """`backup_records` (module docstring), in one fenced transaction: the runs, then the sets; the rows
+    deleted."""
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        runs = (await conn.execute(_BACKUP_RUNS, {"cutoff": cutoff})).rowcount
+        sets = (await conn.execute(_BACKUP_SETS, {"cutoff": cutoff})).rowcount
+    return runs + sets
 
 
 async def _delete_threads(saver: AsyncPostgresSaver, threads: Sequence[str]) -> None:
@@ -798,6 +830,8 @@ async def _apply(
         return await profile_purge.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
     if rule.name == "cycle_threads":
         return await _purge_cycle_threads(engine, saver, cutoff, epoch)
+    if rule.name == "backup_records":
+        return await _delete_backup_records(engine, cutoff, epoch)
     params: dict[str, object] = {"cutoff": cutoff}
     if rule.name == "batch_submissions":
         params["listed_since"] = now - batches.RELEASED_LISTED_FOR
@@ -848,11 +882,11 @@ async def run_retention_daily(
 
     `checkpoints`, `profile_checkpoints` and `cycle_threads` count threads, `cv_files` and `cv_store_orphans`
     files, `score_history` targets, `job_tombstones` the root jobs whose tombstoning it opened,
-    `profile_purges` the versions whose purge it opened. `queue` must be open (`job_tombstones` and
-    `profile_purges` defer their purges' jobs with `defer_in_tx`); `cv_store` is the CV store whose
-    files the two file rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer
-    the current worker epoch: the pass stops before that write and writes nothing more (see "The epoch
-    fence").
+    `profile_purges` the versions whose purge it opened, `backup_records` the runs and sets it deleted.
+    `queue` must be open (`job_tombstones` and `profile_purges` defer their purges' jobs with
+    `defer_in_tx`); `cv_store` is the CV store whose files the two file rules delete. Raises `FencedOut`,
+    logged `retention_fenced`, once `epoch` is no longer the current worker epoch: the pass stops before that
+    write and writes nothing more (see "The epoch fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass

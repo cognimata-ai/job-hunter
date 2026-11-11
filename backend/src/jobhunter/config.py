@@ -28,6 +28,7 @@ from typing import Final, Literal, cast, get_args
 from urllib.parse import quote, urlsplit
 
 import httpx
+from croniter import croniter
 
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
@@ -63,6 +64,17 @@ DEFAULT_EXPORTS_DIR: Final = Path("/data/exports")
 # stage what they back up or restore (Tasks 24 and 26), and the default home of restic's cache.
 DEFAULT_STAGING_DIR: Final = Path("/data/staging")
 RESTIC_CACHE_DIR_NAME: Final = ".restic-cache"
+# M5 Task 24 (spec §19.2, §19.5; R15): the backup container's schedule, five-field cron expressions in UTC
+# (`backup.scheduler`), and how many daily, weekly and monthly backup sets the prune keeps. The restore test's
+# cron fires on the first Sunday only: its job runs only on a day of the month of at most 7.
+DEFAULT_BACKUP_CRON: Final = "15 1 * * *"
+DEFAULT_MANIFEST_SHIP_CRON: Final = "*/5 * * * *"
+DEFAULT_BACKUP_PRUNE_CRON: Final = "30 2 * * 0"
+DEFAULT_RESTORE_TEST_CRON: Final = "30 3 * * 0"
+DEFAULT_BACKUP_KEEP_DAILY: Final = 7
+DEFAULT_BACKUP_KEEP_WEEKLY: Final = 4
+DEFAULT_BACKUP_KEEP_MONTHLY: Final = 3
+_CRON_FIELDS: Final = 5
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 # M5 Task 10: `RESTIC_` for the backup and restore roles' repository and cache (`ResticSettings`).
@@ -218,6 +230,22 @@ class ResticSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class BackupSettings:
+    """M5 Task 24: the backup container's jobs' cron expressions (`JOBHUNTER_BACKUP_CRON`,
+    `JOBHUNTER_MANIFEST_SHIP_CRON`, `JOBHUNTER_BACKUP_PRUNE_CRON`, `JOBHUNTER_RESTORE_TEST_CRON`) and the
+    prune's counts (`JOBHUNTER_BACKUP_KEEP_DAILY` / `_WEEKLY` / `_MONTHLY`). Every one is optional, and an
+    empty value is unset (compose passes `${NAME:-}`): its default applies."""
+
+    set_cron: str
+    ship_cron: str
+    prune_cron: str
+    restore_test_cron: str
+    keep_daily: int
+    keep_weekly: int
+    keep_monthly: int
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     role: Role
     env: EnvName
@@ -254,6 +282,8 @@ class AppConfig:
     # of Tasks 24 and 26 is under it), and the restic repository (`None` without `RESTIC_REPOSITORY`).
     staging_dir: Path
     restic: ResticSettings | None
+    # M5 Task 24: the backup container's schedule and the prune's counts (`BackupSettings`).
+    backup: BackupSettings
     # M5 Task 4: `NTFY_TOPIC_URL`, the topic the worker's alert dispatcher pushes to (`None` when unset or
     # empty: no push; a prod worker needs an https one, `ntfy_in_prod`), registered for log masking by
     # `startup_or_exit`; and `HEALTHCHECKS_API_URL`, the Management API base of §17.7.
@@ -353,6 +383,35 @@ def _restic_settings(environ: Mapping[str, str], staging_dir: Path) -> ResticSet
     )
 
 
+def _cron(environ: Mapping[str, str], name: str, default: str) -> str:
+    """`name`'s cron expression, five fields that croniter reads, or `default` when unset or empty."""
+    value = environ.get(name) or default
+    if len(value.split()) != _CRON_FIELDS or not croniter.is_valid(value):
+        raise StartupCheckFailed("env_valid", f"{name} must be a cron expression of five fields")
+    return value
+
+
+def _keep(environ: Mapping[str, str], name: str, default: int) -> int:
+    """`name`'s count of backup sets kept, a whole number of at least 1, or `default` when unset or empty: a
+    prune never forgets every set of a period."""
+    text = environ.get(name) or str(default)
+    if not (text.isascii() and text.isdigit() and int(text) >= 1):
+        raise StartupCheckFailed("env_valid", f"{name} must be a whole number of at least 1")
+    return int(text)
+
+
+def _backup_settings(environ: Mapping[str, str]) -> BackupSettings:
+    return BackupSettings(
+        set_cron=_cron(environ, "JOBHUNTER_BACKUP_CRON", DEFAULT_BACKUP_CRON),
+        ship_cron=_cron(environ, "JOBHUNTER_MANIFEST_SHIP_CRON", DEFAULT_MANIFEST_SHIP_CRON),
+        prune_cron=_cron(environ, "JOBHUNTER_BACKUP_PRUNE_CRON", DEFAULT_BACKUP_PRUNE_CRON),
+        restore_test_cron=_cron(environ, "JOBHUNTER_RESTORE_TEST_CRON", DEFAULT_RESTORE_TEST_CRON),
+        keep_daily=_keep(environ, "JOBHUNTER_BACKUP_KEEP_DAILY", DEFAULT_BACKUP_KEEP_DAILY),
+        keep_weekly=_keep(environ, "JOBHUNTER_BACKUP_KEEP_WEEKLY", DEFAULT_BACKUP_KEEP_WEEKLY),
+        keep_monthly=_keep(environ, "JOBHUNTER_BACKUP_KEEP_MONTHLY", DEFAULT_BACKUP_KEEP_MONTHLY),
+    )
+
+
 def load_config(
     role: Role,
     environ: Mapping[str, str] | None = None,
@@ -402,6 +461,7 @@ def load_config(
         exports_dir=Path(env.get("JOBHUNTER_EXPORTS_DIR") or DEFAULT_EXPORTS_DIR),
         staging_dir=staging_dir,
         restic=_restic_settings(env, staging_dir),
+        backup=_backup_settings(env),
         ntfy_topic_url=env.get("NTFY_TOPIC_URL") or None,
         healthchecks_api_url=env.get("HEALTHCHECKS_API_URL") or DEFAULT_HEALTHCHECKS_API_URL,
         secrets=MappingProxyType(contents),

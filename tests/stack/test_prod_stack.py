@@ -139,6 +139,7 @@ def test_the_stack_comes_up_healthy(stack: None) -> None:
         "worker": ("running", "healthy", 0),
         "docparse": ("running", "", 0),
         "stubsvc": ("running", "healthy", 0),
+        "backup": ("running", "", 0),  # its scheduler (Task 24); no healthcheck
         "postgres": ("running", "healthy", 0),
         "embedder": ("running", "healthy", 0),
         "migrate": ("exited", "", 0),

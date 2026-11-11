@@ -263,6 +263,16 @@ def _add_backup_commands(commands: "argparse._SubParsersAction[argparse.Argument
     backup_commands.add_parser(
         "ship", help="ship the deletion manifests to the restic repository unless they are unchanged"
     )
+    backup_commands.add_parser(
+        "set", help='take one backup set from one exported snapshot (§19.5); print {"set_id": N}'
+    )
+    backup_commands.add_parser(
+        "prune", help="forget the backup sets beyond the daily, weekly and monthly counts kept, and prune"
+    )
+    backup_commands.add_parser(
+        "scheduler",
+        help="the backup service's command: run the set, ship and prune jobs on their crons until SIGTERM",
+    )
 
 
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
