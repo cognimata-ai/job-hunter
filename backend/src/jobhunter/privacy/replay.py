@@ -47,7 +47,9 @@ reads it (`parse_manifest` of its canonical bytes, then that hash).
   re-created, goes as its live counterpart went), and for a kind that deletes exports its export ops right
   after it (`deletion_graph.purge_exports`), as the live handler's step 3 runs them. A source purge leaves
   its rebuild to phase B (its replay mode deletes its tainted revisions instead): no rebuild runs between
-  manifests. Then the fault point `privacy.replay.after_a` (`AFTER_A`);
+  manifests; after each manifest's execution the fault point `privacy.replay.after_execute`
+  (`AFTER_EXECUTE`), between two manifests of the stream. Then the fault point `privacy.replay.after_a`
+  (`AFTER_A`);
 - **phase B.** The stored affected jobs of every replayed source purge that phase A left, each followed up
   `merged_into_job_id` to its root, are rebuilt once per root by `source_purge.rebuild_jobs`, with the run
   of the latest replayed source purge whose stored set holds a job of that root (T15-4 (1)); each rebuild
@@ -132,7 +134,9 @@ from jobhunter.types import JSONValue
 if TYPE_CHECKING:
     from jobhunter.config import AppConfig
 
-# The fault points (module docstring): after phase A, after phase B.
+# The fault points (module docstring): after each manifest's execution in phase A, after phase A, after
+# phase B.
+AFTER_EXECUTE: Final = "privacy.replay.after_execute"
 AFTER_A: Final = "privacy.replay.after_a"
 AFTER_B: Final = "privacy.replay.after_b"
 LOGGED_IDS: Final = 20
@@ -612,6 +616,7 @@ async def _phase_a(
             pending += 1
         own = _own_rows(restore, turn)
         await _execute(engine, cfg, manifest, files=files, now=now, own_rows=own)
+        await afault_point(AFTER_EXECUTE)
     log.info("replay_phase_a_done", manifest_ids=[m.row.id for m in manifests][:LOGGED_IDS])
     return restore, manifests, pending
 

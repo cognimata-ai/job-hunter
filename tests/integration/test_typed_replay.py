@@ -34,12 +34,13 @@ from jobhunter.clock import utcnow
 from jobhunter.db.migrate import MIGRATE_ORDER, StepGroup, run_migrate_async
 from jobhunter.db.seed import content_hash
 from jobhunter.db.session import make_null_engine
+from jobhunter.errors import InvariantViolation
 from jobhunter.jobs.listing import select_page
 from jobhunter.jobs.query import JobsQuery
 from jobhunter.llm.batches import BatchesClient
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.observability.deadman import DeadmanPinger
-from jobhunter.privacy import purge, replay
+from jobhunter.privacy import deletion_graph, purge, replay
 from jobhunter.privacy.kinds import delete_everything, job_tombstone, profile_purge, source_purge
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.privacy.manifests import (
@@ -1277,6 +1278,135 @@ async def test_a_replayed_kind_never_waits_on_an_eval_run_the_dump_holds_running
     run = await one(restored.engine, _EVAL_RUN, r=seed.running_eval_run_id)
     assert (run.status, run.metrics["failed"]) == ("failed", EVAL_RUN_INTERRUPTED)
     assert not await exists(restored.engine, "golden_cases", case)
+
+
+async def activate(engine: AsyncEngine, case_id: int, active: bool) -> None:
+    """The user's own flag edit of the case (`golden.set_flags`)."""
+    async with engine.begin() as conn:
+        await golden_rules.set_flags(conn, case_id, active=active, is_canary=None, now=utcnow())
+
+
+@pytest.mark.parametrize("kind", ["profile_purge", "job_tombstone"])
+async def test_an_active_case_the_dump_holds_is_deactivated_and_deleted_in_a_replay(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    purger: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
+    kind: str,
+) -> None:
+    """Ruling T25-4 (3): the backup set holds a golden case active that the user deactivated before a purge
+    deleted it: the profile purge of the version it was labelled for, or the tombstone of the job whose
+    revision it names. Live, the purge met it inactive; in the replay the dump's case is active, which both
+    guards refuse live (`profile_purge._refuse_active`, `deletion_graph._refuse_active`). The replay makes it
+    inactive by the user's own flag edit (`golden.set_flags`), logs `golden_case_deactivated_replay` with its
+    id, and deletes it as an inactive case: `migrate` completes and every postcondition holds."""
+    seed = await seeded(engine)
+    case = seed.purgeable_case_id if kind == "profile_purge" else seed.closed_case_id
+    await activate(engine, case, True)
+    await backup_set(migrated, restored)
+    await activate(engine, case, False)
+    if kind == "profile_purge":
+        manifest = await finished(purger, await request_profile_purge(engine, seed.purgeable_version_id))
+    else:
+        batch = await request_tombstones(engine, now=utcnow())
+        assert seed.closed_job_id in batch.roots
+        manifest = await finished(purger, batch.purge)
+    async with restored.engine.connect() as conn:
+        flags = await golden_rules.lock_case(conn, case)
+    assert flags is not None and flags.active  # the dump's case
+    # Live, each guard still refuses this case (in a transaction rolled back).
+    with pytest.raises(InvariantViolation, match="active golden cases"):
+        async with restored.engine.begin() as conn:
+            if kind == "profile_purge":
+                await deletion_graph.settle_and_delete_cases(
+                    conn, [case], now=utcnow(), check=profile_purge._refuse_active
+                )
+            else:
+                await deletion_graph._delete_cases(conn, [seed.closed_job_id], now=utcnow(), replay=False)
+
+    with capture_logs() as logs:
+        await migrate_restored(make_config, restored, purger.cfg.manifests_dir)
+    await assert_replayed(restored.engine, restored.files, manifest)
+    (deactivated,) = events(logs, "golden_case_deactivated_replay")
+    assert deactivated["case_ids"] == [case]
+    assert not await exists(restored.engine, "golden_cases", case)
+
+
+async def test_a_crash_between_two_manifests_of_phase_a_resumes_the_replay(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    live: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Two backup sets from before a delete-everything and a later source purge. One replay is stopped by a
+    crash after delete-everything's execution, before the source purge's admission
+    (`privacy.replay.after_execute`), then `migrate` runs again: it resumes the stored replay (its restore id
+    and high water), applies no admission twice (one `admitted` entry per manifest, delete-everything's turn
+    unchanged, the source purge's admission re-applied once), and reaches the outcome of the other set's
+    uninterrupted replay, which is the live database's."""
+    await seeded(engine)
+    await backup_set(migrated, restored)
+    other_name = restored.name.replace("jh_replay_", "jh_other_")  # the uninterrupted replay's set
+    other = Restored(
+        other_name,
+        make_null_engine(migrated.dsn("migrator", other_name, driver="sqlalchemy")),
+        FileRoots(cv_store=tmp_path / "other-cv", exports=tmp_path / "other-exports"),
+    )
+    for directory in (other.files.cv_store, other.files.exports):
+        directory.mkdir(mode=0o700)
+    try:
+        await dump_and_restore(migrated, source_db=LIVE_DB, target_db=other.name)
+        everything = await finished(live, await request_delete_everything(engine))
+        source = await finished(live, await request_source_purge(engine))
+        expected = await settings_outcome(engine)
+        assert not expected.adzuna_enabled
+
+        monkeypatch.setattr(replay, "afault_point", raising_at(replay.AFTER_EXECUTE))
+        with capture_logs() as first, pytest.raises(SimulatedCrash):
+            await migrate_restored(make_config, restored, live.cfg.manifests_dir)
+        monkeypatch.setattr(replay, "afault_point", no_fault)
+        crashed = {
+            m.manifest_uuid: (await one(restored.engine, _MANIFEST, u=m.manifest_uuid)).replay_log
+            for m in (everything, source)
+        }
+        assert [e.get("phase") for e in crashed[everything.manifest_uuid]] == [
+            replay.STARTED,
+            replay.ADMITTED,
+        ]
+        assert [e.get("phase") for e in crashed[source.manifest_uuid]] == [replay.STARTED]  # not yet admitted
+        (began,) = {
+            (e["restore_id"], tuple(sorted(e["high_water"].items())))
+            for log_ in crashed.values()
+            for e in log_
+            if e.get("phase") == replay.STARTED
+        }
+
+        with capture_logs() as second:
+            await migrate_restored(make_config, restored, live.cfg.manifests_dir)
+        (resumed,) = events(second, "replay_started")
+        assert resumed["resumed"] is True and resumed["restore_id"] == began[0]
+        for manifest in (everything, source):
+            log_ = (await one(restored.engine, _MANIFEST, u=manifest.manifest_uuid)).replay_log
+            assert [e.get("phase") for e in log_] == [replay.STARTED, replay.ADMITTED, None]
+            assert {e["restore_id"] for e in log_} == {began[0]}
+            assert tuple(sorted(log_[0]["high_water"].items())) == began[1]
+            if manifest is everything:
+                assert log_[1] == crashed[everything.manifest_uuid][1]  # its admission, recorded once
+        reapplied = events([*first, *second], "source_purge_admission_reapplied")
+        assert len(reapplied) == 1
+        await assert_replayed(restored.engine, restored.files, everything, source)
+
+        await migrate_restored(make_config, other, live.cfg.manifests_dir)
+        uninterrupted = await settings_outcome(other.engine)
+        assert uninterrupted == expected
+        assert await settings_outcome(restored.engine) == uninterrupted
+    finally:
+        await other.engine.dispose()
+        drop_database(migrated, other.name)
 
 
 async def test_restore_list_leaves_out_what_the_superuser_owns(

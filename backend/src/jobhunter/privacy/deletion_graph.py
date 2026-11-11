@@ -98,7 +98,12 @@ cases locked (the golden-case deletion's running-eval-run wait, the graph deleti
 case), the entries read again under the cases' locks and the accounts of any new one taken (after the rows
 of step 10: the one place it leaves the schedule), each settled (`settle_for_purge`: a `reserved` one
 released, a `dispatched` one `ambiguous`), then the cases deleted (`golden.delete_case`). A case gone
-already is skipped. It returns the ids it deleted.
+already is skipped. It returns the ids it deleted. **In a replay** (`migrate` step 7, M5 Task 25, Ruling
+T25-4 (3)) a purge's refusal of an active case (the graph deletion's here, the profile purge's) gives way to
+`replay_case_check(now)`: a case the restored dump holds active, which the user deactivated before the purge
+met it live, is made inactive by the user's own flag edit (`golden.set_flags(active=False)`, its canary flag
+kept), logged `golden_case_deactivated_replay` with the case ids, and deleted as an inactive one: the stream
+is the binding later fact, and a restore that refused would never finish.
 
 **Eval calls** (M5 Task 15: the Adzuna purge's eval calls whose `input_refs` name a tainted revision and that
 no golden case's deletion takes). `settle_and_delete_calls(conn, call_ids, *, now)` follows the same sequence
@@ -576,6 +581,20 @@ _LOCK_CASES: Final = q(
 CaseCheck = Callable[[AsyncConnection, Mapping[int, golden.CaseFlags]], Awaitable[None]]
 
 
+def replay_case_check(now: datetime) -> CaseCheck:
+    """A replay's check of the cases a purge deletes, in place of its refusal of an active one (module
+    docstring, "Golden cases"): each active case made inactive (`golden.set_flags`) at `now`, logged with
+    the case ids."""
+
+    async def deactivate(conn: AsyncConnection, cases: Mapping[int, golden.CaseFlags]) -> None:
+        if active := sorted(case for case, flags in cases.items() if flags.active):
+            for case_id in active:
+                await golden.set_flags(conn, case_id, active=False, is_canary=None, now=now)
+            log.warning("golden_case_deactivated_replay", case_ids=active[:LOGGED_IDS])
+
+    return deactivate
+
+
 async def settle_and_delete_cases(
     conn: AsyncConnection, case_ids: Sequence[int], *, now: datetime, check: CaseCheck | None = None
 ) -> tuple[int, ...]:
@@ -743,13 +762,15 @@ async def _refuse_active(conn: AsyncConnection, cases: Mapping[int, golden.CaseF
         raise InvariantViolation(f"active golden cases {active} draw on the revisions of the graph")
 
 
-async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime) -> int:
+async def _delete_cases(conn: AsyncConnection, jobs: list[int], *, now: datetime, replay: bool) -> int:
     """Step 4 (module docstring): the inactive golden cases on G's revisions, their in-flight eval entries
-    settled first; an active one is an `InvariantViolation`. How many were deleted."""
+    settled first; an active one is an `InvariantViolation`, in a replay made inactive first
+    (`replay_case_check`). How many were deleted."""
     cases = await select_ids(conn, _CASES_OF_GRAPH, {"jobs": jobs})
     if not cases:
         return 0
-    return len(await settle_and_delete_cases(conn, cases, now=now, check=_refuse_active))
+    check = replay_case_check(now) if replay else _refuse_active
+    return len(await settle_and_delete_cases(conn, cases, now=now, check=check))
 
 
 async def _forget_merges_and_conflicts(conn: AsyncConnection, jobs: list[int]) -> tuple[int, int]:
@@ -794,12 +815,19 @@ async def _tombstone(conn: AsyncConnection, job_id: int, keys: Sequence[AdKey], 
 
 
 async def delete_job_graph(
-    conn: AsyncConnection, job_id: int, *, write_tombstone: bool, held: Collection[int], now: datetime
+    conn: AsyncConnection,
+    job_id: int,
+    *,
+    write_tombstone: bool,
+    held: Collection[int],
+    now: datetime,
+    replay: bool = False,
 ) -> JobGraphDeleted:
     """Delete job `job_id` and every job merged into it, with the graph their targets do not cover, §20.2's
     tombstoning steps 4-7 (module docstring), in the caller's transaction, which holds the jobs' rows and
     their groups' co-members' (`held`) and deleted their targets; J's tombstone with `write_tombstone`.
-    `InvariantViolation` for a job of the graph not held, a target left or an active golden case.
+    `InvariantViolation` for a job of the graph not held, a target left or an active golden case (in a
+    `replay`, made inactive and deleted: module docstring, "Golden cases").
 
     Its statements select by the graph's job ids, which the caller's content names and its fence keeps
     closed (no row naming a fenced job is written after the fence), so they need no `max_ids` bound of their
@@ -811,7 +839,7 @@ async def delete_job_graph(
         raise InvariantViolation(f"job {job_id}: the rows of jobs {unheld} of its graph are not locked")
     if left := int((await conn.execute(_TARGETS_LEFT, {"jobs": jobs})).scalar_one()):
         raise InvariantViolation(f"job {job_id}: {left} targets of its graph are left")
-    cases = await _delete_cases(conn, jobs, now=now)  # 4.
+    cases = await _delete_cases(conn, jobs, now=now, replay=replay)  # 4.
     events, conflicts = await _forget_merges_and_conflicts(conn, jobs)  # 5.
     for job in jobs:
         await groups.leave_group(conn, job, reason=groups.MEMBER_LEFT, held=held)
@@ -895,7 +923,12 @@ async def purge_job_graph(
             break
     async with run.chunk(job_ids=jobs, with_groups_of=jobs) as chunk:
         deleted = await delete_job_graph(
-            chunk.conn, root, write_tombstone=write_tombstone, held=chunk.held, now=run.now
+            chunk.conn,
+            root,
+            write_tombstone=write_tombstone,
+            held=chunk.held,
+            now=run.now,
+            replay=run.mode == "replay",
         )
         if deleted.job_ids:
             await ranking.bump(chunk.conn)

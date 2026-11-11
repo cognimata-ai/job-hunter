@@ -63,7 +63,8 @@ is read; (3) one chunk: the calls (ledger rows, step 9, in id order) `output_jso
 `content_purged_at`, each proposal `running | ready | failed → purged` with `items := NULL`
 (`transition_where`), the vectors deleted, then the fault point `privacy.profile_purge.after_redaction` before
 its commit; (4) one chunk over the cases' jobs: `deletion_graph.settle_and_delete_cases` (their in-flight eval
-entries settled before their calls cascade, G04), an active case an `InvariantViolation`; (5, 6) one chunk:
+entries settled before their calls cascade, G04), an active case an `InvariantViolation` (in a replay made
+inactive first: `deletion_graph.replay_case_check`, Ruling T25-4 (3)); (5, 6) one chunk:
 the version's `profile_json := NULL` with `purged_at`, its drafts' content NULL with `content_purged_at`, the
 CV row's file and texts NULL with `purged_at`; after its commit, the CV file deleted (`CvStore.delete`; one
 gone already is fine). A redaction keeps a time an earlier one set. The ids and states of the proposals,
@@ -455,14 +456,17 @@ async def _refuse_active(conn: AsyncConnection, cases: Mapping[int, golden.CaseF
 
 
 async def _delete_cases(run: PurgeRun, case_ids: Sequence[int]) -> int:
-    """Step 4 (module docstring): the inactive cases, one chunk over their jobs; how many were deleted."""
+    """Step 4 (module docstring): the inactive cases, one chunk over their jobs; how many were deleted. In a
+    replay an active one, which the dump holds, is made inactive first
+    (`deletion_graph.replay_case_check`)."""
     async with run.engine.connect() as conn:
         rows = (await conn.execute(_CASE_JOBS, {"ids": list(case_ids)})).all()
     if not rows:
         return 0  # deleted already
+    check = deletion_graph.replay_case_check(run.now) if run.mode == "replay" else _refuse_active
     async with run.chunk(job_ids=sorted({int(r.job_id) for r in rows})) as chunk:
         deleted = await deletion_graph.settle_and_delete_cases(
-            chunk.conn, [int(r.id) for r in rows], now=run.now, check=_refuse_active
+            chunk.conn, [int(r.id) for r in rows], now=run.now, check=check
         )
     return len(deleted)
 
