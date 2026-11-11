@@ -86,6 +86,15 @@ before `fenced_at` (deleted by the completing transaction). The export ops come 
 Every chunk is idempotent: a re-execution after any commit, or a phase re-run after a lost deadlock (Ruling
 T12-1), finds what is left.
 
+**In a replay** (`migrate` step 7, M5 Task 25, Ruling T25-3 (ii)) a bounded `all` selector by id (a table's
+own, a parent's, a lockout's `generation`) also covers the rows the replay itself created before this
+manifest's turn (`PurgeRun.replayed_rows`: per table the range `(above, upto]`, the replay's start and this
+manifest's turn), which stand where their live counterparts stood, within the bound: a settings version a
+replayed source purge re-created, a tombstone a replayed tombstoning re-created. Rows above the bound that the
+dump holds stay, and so do the rows this manifest or a later one creates. Step 8's reset likewise runs when a
+pointer names such a row. A thread's or a session's bound (`created_at`) is not widened: no replay creates
+one. A live run's ranges are empty.
+
 **The completing transaction** (`complete`, `purge.CompletingKind`, then Task 12's phase C): every session
 created at or before `fenced_at` deleted (the requester's too: the user is logged out), then the global fence
 released, the postconditions checked and the manifest `completed`. There is no rebuild.
@@ -228,6 +237,13 @@ _POINTERS: Final = (
 
 _IDS: Final = "CAST(:ids AS bigint[])"
 
+
+def _in_bound(column: str) -> str:
+    """The predicate "`column` (an id of the module's own SQL) lies within the bound `:bound`, or among the
+    replay's own rows `(:own_above, :own_upto]`" (module docstring); live, the range is empty."""
+    return f"({column} <= :bound OR ({column} > :own_above AND {column} <= :own_upto))"
+
+
 # ---- A0 ----------------------------------------------------------------------------------------------------
 
 _LOCK_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
@@ -277,19 +293,22 @@ _RECORDED_CANCELS: Final = q(
 
 # ---- phase B: the deletes ----------------------------------------------------------------------------------
 
-_TARGET_PAGE: Final = q("SELECT id, job_id FROM score_targets WHERE id <= :bound ORDER BY id LIMIT :limit")
+_TARGET_PAGE: Final = q(
+    f"SELECT id, job_id FROM score_targets WHERE {_in_bound('id')} ORDER BY id LIMIT :limit"  # noqa: S608
+)
 _TARGETS_AGAIN: Final = q(f"SELECT id, job_id FROM score_targets WHERE id = ANY({_IDS}) ORDER BY id")  # noqa: S608
 _EVAL_CALL_PAGE: Final = q(
-    "SELECT id FROM llm_calls WHERE eval_run_id IS NOT NULL AND id <= :bound ORDER BY id LIMIT :limit"
+    "SELECT id FROM llm_calls WHERE eval_run_id IS NOT NULL "  # noqa: S608
+    f"AND {_in_bound('id')} ORDER BY id LIMIT :limit"
 )
-_CALL_PAGE: Final = q("SELECT id FROM llm_calls WHERE id <= :bound ORDER BY id LIMIT :limit")
+_CALL_PAGE: Final = q(f"SELECT id FROM llm_calls WHERE {_in_bound('id')} ORDER BY id LIMIT :limit")  # noqa: S608
 _CASE_PAGE: Final = q(
-    "SELECT g.id, r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "
-    "WHERE g.id <= :bound ORDER BY g.id LIMIT :limit"
+    "SELECT g.id, r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "  # noqa: S608
+    f"WHERE {_in_bound('g.id')} ORDER BY g.id LIMIT :limit"
 )
 # The root jobs within the bound after `:after`, a page in id order, and a root's graph.
 _ROOT_PAGE: Final = q(
-    "SELECT id FROM jobs WHERE merged_into_job_id IS NULL AND id <= :bound AND id > :after "
+    f"SELECT id FROM jobs WHERE merged_into_job_id IS NULL AND {_in_bound('id')} AND id > :after "  # noqa: S608
     "ORDER BY id LIMIT :limit"
 )
 # A root's graph follows `merged_into_job_id` without the jobs' bound: no job is created or merged under the
@@ -299,21 +318,25 @@ _GRAPH: Final = q(
     "WITH RECURSIVE g(id) AS (SELECT id FROM jobs WHERE id = :root "
     "UNION SELECT j.id FROM jobs j JOIN g ON j.merged_into_job_id = g.id) SELECT id FROM g ORDER BY id"
 )
-_JOBS_LEFT: Final = q("SELECT count(*) FROM jobs WHERE id <= :bound")
+_JOBS_LEFT: Final = q(f"SELECT count(*) FROM jobs WHERE {_in_bound('id')}")  # noqa: S608
 _POINTER_VALUES: Final = q(
     "SELECT a.settings_version_id, a.scope_version_id, a.pending_scope_version_id, a.model_policy_id, "
     "a.execution_config_id, a.evaluation_policy_id, a.rubric_version_id, a.prompt_schema_version_id, "
     "a.profile_version_id, a.llm_tuple_id, s.settings_version_id AS schedule_settings_version_id "
     "FROM active_config a CROSS JOIN schedule_state s WHERE a.id = 1 AND s.id = 1"
 )
-_DELETE_VECTORS: Final = q("DELETE FROM profile_vectors WHERE profile_version_id <= :bound")
-_DELETE_DRAFTS: Final = q("DELETE FROM profile_drafts WHERE id <= :bound")
-_DELETE_VERSIONS: Final = q("DELETE FROM profile_versions WHERE id <= :bound")
-_DELETE_CASE_RESULTS: Final = q("DELETE FROM eval_case_results WHERE eval_run_id <= :bound")
-_DELETE_LANE_CREDITS: Final = q("DELETE FROM admission_lane_credits WHERE llm_tuple_id <= :bound")
+_DELETE_VECTORS: Final = q(
+    f"DELETE FROM profile_vectors WHERE {_in_bound('profile_version_id')}"  # noqa: S608
+)
+_DELETE_DRAFTS: Final = q(f"DELETE FROM profile_drafts WHERE {_in_bound('id')}")  # noqa: S608
+_DELETE_VERSIONS: Final = q(f"DELETE FROM profile_versions WHERE {_in_bound('id')}")  # noqa: S608
+_DELETE_CASE_RESULTS: Final = q(f"DELETE FROM eval_case_results WHERE {_in_bound('eval_run_id')}")  # noqa: S608
+_DELETE_LANE_CREDITS: Final = q(
+    f"DELETE FROM admission_lane_credits WHERE {_in_bound('llm_tuple_id')}"  # noqa: S608
+)
 _LOCKOUTS_PAGE: Final = (
-    "DELETE FROM login_lockouts WHERE generation IN (SELECT generation FROM login_lockouts "
-    "WHERE generation <= :bound ORDER BY generation LIMIT :limit)"
+    "DELETE FROM login_lockouts WHERE generation IN (SELECT generation FROM login_lockouts "  # noqa: S608
+    f"WHERE {_in_bound('generation')} ORDER BY generation LIMIT :limit)"
 )
 _DELETE_SESSIONS: Final = q("DELETE FROM sessions WHERE created_at <= :fenced_at")
 
@@ -589,11 +612,18 @@ async def _delete_paged(
 
 
 def _within(table: str, *, order: Literal["ASC", "DESC"] = "ASC", extra: str = "") -> str:
-    """The paged delete of `table`'s rows within its bound `:bound` (`extra` more of its predicate)."""
+    """The paged delete of `table`'s rows within its bound (`_bound`; `extra` more of its predicate)."""
     return (
-        f"DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE id <= :bound{extra} "  # noqa: S608
+        f"DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE {_in_bound('id')}{extra} "  # noqa: S608
         f"ORDER BY id {order} LIMIT :limit)"
     )
+
+
+def _bound(run: PurgeRun, table: str, bound: int) -> dict[str, object]:
+    """The binds of `_in_bound` for the ids of `table`: its bound, and the replay's own rows of it before
+    this manifest's turn (an empty range live; module docstring)."""
+    above, upto = run.replayed_rows.get(table, (0, 0))
+    return {"bound": bound, "own_above": above, "own_upto": upto}
 
 
 async def _delete_targets(run: PurgeRun, bound: int) -> int:
@@ -601,7 +631,8 @@ async def _delete_targets(run: PurgeRun, bound: int) -> int:
     deleted = 0
     while True:
         async with run.engine.connect() as conn:
-            page = (await conn.execute(_TARGET_PAGE, {"bound": bound, "limit": TARGET_SET_CHUNK})).all()
+            params = {**_bound(run, "score_targets", bound), "limit": TARGET_SET_CHUNK}
+            page = (await conn.execute(_TARGET_PAGE, params)).all()
         if not page:
             return deleted
         async with run.chunk(job_ids=sorted({int(r.job_id) for r in page})) as chunk:
@@ -627,7 +658,7 @@ async def _settle_and_delete_calls(run: PurgeRun, page_of: TextClause, bound: in
     deleted = 0
     while True:
         async with run.engine.connect() as conn:
-            page = await select_ids(conn, page_of, {"bound": bound, "limit": ROW_CHUNK})
+            page = await select_ids(conn, page_of, {**_bound(run, "llm_calls", bound), "limit": ROW_CHUNK})
         if not page:
             return deleted
         async with run.chunk() as chunk:
@@ -641,7 +672,8 @@ async def _delete_cases(run: PurgeRun, bound: int) -> int:
     deleted = 0
     while True:
         async with run.engine.connect() as conn:
-            page = (await conn.execute(_CASE_PAGE, {"bound": bound, "limit": ROW_CHUNK})).all()
+            params = {**_bound(run, "golden_cases", bound), "limit": ROW_CHUNK}
+            page = (await conn.execute(_CASE_PAGE, params)).all()
         if not page:
             return deleted
         async with run.chunk(job_ids=sorted({int(r.job_id) for r in page})) as chunk:
@@ -658,7 +690,7 @@ async def _delete_jobs(run: PurgeRun, bounds: Mapping[str, int]) -> int:
     deleted, after = 0, 0
     while True:
         async with run.engine.connect() as conn:
-            params = {"bound": bounds["jobs"], "after": after, "limit": ROW_CHUNK}
+            params = {**_bound(run, "jobs", bounds["jobs"]), "after": after, "limit": ROW_CHUNK}
             roots = await select_ids(conn, _ROOT_PAGE, params)
         for root in roots:
             async with run.engine.connect() as conn:
@@ -672,7 +704,7 @@ async def _delete_jobs(run: PurgeRun, bounds: Mapping[str, int]) -> int:
             break
         after = roots[-1]
     async with run.engine.connect() as conn:
-        if left := int((await conn.execute(_JOBS_LEFT, {"bound": bounds["jobs"]})).scalar_one()):
+        if left := int((await conn.execute(_JOBS_LEFT, _bound(run, "jobs", bounds["jobs"]))).scalar_one()):
             raise InvariantViolation(
                 f"deletion manifest {run.manifest.id}: {left} jobs within its bound left"
             )
@@ -681,7 +713,9 @@ async def _delete_jobs(run: PurgeRun, bounds: Mapping[str, int]) -> int:
 
 async def _delete_rows(run: PurgeRun, bounds: Mapping[str, int], *tables: str) -> dict[str, int]:
     """Each of `tables`' rows within its bound, `ROW_CHUNK` a chunk; how many of each."""
-    return {table: await _delete_paged(run, _within(table), {"bound": bounds[table]}) for table in tables}
+    return {
+        table: await _delete_paged(run, _within(table), _bound(run, table, bounds[table])) for table in tables
+    }
 
 
 async def _step_8(run: PurgeRun, content: ManifestContent) -> int | None:
@@ -689,7 +723,7 @@ async def _step_8(run: PurgeRun, content: ManifestContent) -> int | None:
     pointer holds already; the new version's id, `None` when it was skipped."""
     async with run.chunk(config="update") as chunk:
         conn = chunk.conn
-        if not await _pointer_violations(conn, content):
+        if not await _pointer_violations(conn, content, replayed_rows=run.replayed_rows):
             log.info("delete_everything_reset_skipped", manifest_id=run.manifest.id)
             return None
         version_id = await reset_to_defaults(conn, now=run.now)
@@ -703,12 +737,17 @@ async def _step_9(run: PurgeRun, content: ManifestContent) -> dict[str, int]:
     pair) in one chunk, then the CV rows; their files after that commit; then the embeddings."""
     bounds = content["max_ids"]
     async with run.chunk() as chunk:
-        vectors = await chunk.conn.execute(_DELETE_VECTORS, {"bound": bounds["profile_versions"]})
+        params = _bound(run, "profile_versions", bounds["profile_versions"])
+        vectors = await chunk.conn.execute(_DELETE_VECTORS, params)
     counts = {"profile_vectors": vectors.rowcount}
     counts.update(await _delete_rows(run, bounds, "query_proposals", "llm_tuples"))
     async with run.chunk() as chunk:  # the deferred pair, in one transaction
-        drafts = await chunk.conn.execute(_DELETE_DRAFTS, {"bound": bounds["profile_drafts"]})
-        versions = await chunk.conn.execute(_DELETE_VERSIONS, {"bound": bounds["profile_versions"]})
+        drafts = await chunk.conn.execute(
+            _DELETE_DRAFTS, _bound(run, "profile_drafts", bounds["profile_drafts"])
+        )
+        versions = await chunk.conn.execute(
+            _DELETE_VERSIONS, _bound(run, "profile_versions", bounds["profile_versions"])
+        )
     counts.update({"profile_drafts": drafts.rowcount, "profile_versions": versions.rowcount})
     counts.update(await _delete_rows(run, bounds, "cv_files"))
     files = [
@@ -782,15 +821,25 @@ async def _delete_listed(run: PurgeRun, table: str, ids: Sequence[int]) -> int:
     return deleted
 
 
-async def _pointer_violations(conn: AsyncConnection, content: ManifestContent) -> list[str]:
-    """The pointers of step 8's postcondition that name a row within their table's bound outside `retained`:
-    `<table>.<column>` each."""
+async def _pointer_violations(
+    conn: AsyncConnection,
+    content: ManifestContent,
+    *,
+    replayed_rows: Mapping[str, tuple[int, int]] | None = None,
+) -> list[str]:
+    """The pointers of step 8's postcondition that name a row within their table's bound outside `retained`,
+    or in a replay one of the replay's own rows before this manifest's turn (`replayed_rows`, module
+    docstring): `<table>.<column>` each."""
     row: Any = (await conn.execute(_POINTER_VALUES)).one()
     max_ids, retained = content["max_ids"], content.get("retained", {})
     found: list[str] = []
     for table, column, names in _POINTERS:
         value = row.schedule_settings_version_id if table == "schedule_state" else getattr(row, column)
-        if value is None or int(value) > max_ids[names] or int(value) in retained.get(names, []):
+        above, upto = (replayed_rows or {}).get(names, (0, 0))
+        replays_own = value is not None and above < int(value) <= upto
+        if value is None or int(value) in retained.get(names, []):
+            continue
+        if int(value) > max_ids[names] and not replays_own:
             continue
         found.append(f"{table}.{column}")
     return found
@@ -825,7 +874,8 @@ class DeleteEverything:
             run, _EVAL_CALL_PAGE, bounds["llm_calls"]
         )  # 3.2
         async with run.chunk() as chunk:
-            results = await chunk.conn.execute(_DELETE_CASE_RESULTS, {"bound": bounds["eval_runs"]})
+            params = _bound(run, "eval_runs", bounds["eval_runs"])
+            results = await chunk.conn.execute(_DELETE_CASE_RESULTS, params)
         counts["eval_case_results"] = results.rowcount
         counts.update(await _delete_rows(run, bounds, "eval_runs"))
         counts["golden_cases"] = await _delete_cases(run, bounds["golden_cases"])
@@ -833,13 +883,15 @@ class DeleteEverything:
         counts["llm_calls"] = await _settle_and_delete_calls(run, _CALL_PAGE, bounds["llm_calls"])  # 3.3
         counts.update(await _delete_rows(run, bounds, "batch_items", "batch_submissions"))  # 3.4
         async with run.chunk() as chunk:
-            credits = await chunk.conn.execute(_DELETE_LANE_CREDITS, {"bound": bounds["llm_tuples"]})
+            params = _bound(run, "llm_tuples", bounds["llm_tuples"])
+            credits = await chunk.conn.execute(_DELETE_LANE_CREDITS, params)
         counts["admission_lane_credits"] = credits.rowcount
         counts.update(await _delete_rows(run, bounds, "bulk_operations"))
         counts["jobs"] = await _delete_jobs(run, bounds)  # 3.5
         counts.update(await _delete_rows(run, bounds, "duplicate_groups", "job_tombstones"))
         for table in ("fetch_requests", "raw_responses", "raw_items"):  # 3.6, newest first (module docstring)
-            counts[table] = await _delete_paged(run, _within(table, order="DESC"), {"bound": bounds[table]})
+            params = _bound(run, table, bounds[table])
+            counts[table] = await _delete_paged(run, _within(table, order="DESC"), params)
         counts.update(
             await _delete_rows(
                 run, bounds, "ats_snapshots", "coverage_intervals", "coverage_cells", "queries"
@@ -849,7 +901,7 @@ class DeleteEverything:
         counts["source_instances"] = await _delete_paged(
             run,
             _within("source_instances", extra=f" AND NOT (id = ANY({_IDS}))"),
-            {"bound": bounds["source_instances"], "ids": defaults},
+            {**_bound(run, "source_instances", bounds["source_instances"]), "ids": defaults},
         )
         counts.update(await _delete_rows(run, bounds, "watchlist_companies"))
         if run.effects is not None and run.effects.deadman is not None:  # before 3.7, no transaction open
@@ -868,11 +920,11 @@ class DeleteEverything:
             counts[table] = await _delete_paged(
                 run,
                 _within(table, extra=f" AND NOT (id = ANY({_IDS}))"),
-                {"bound": bounds[table], "ids": _kept(content, table)},
+                {**_bound(run, table, bounds[table]), "ids": _kept(content, table)},
             )
         counts.update(await _delete_rows(run, bounds, "login_attempts"))
         counts["login_lockouts"] = await _delete_paged(
-            run, _LOCKOUTS_PAGE, {"bound": bounds["login_lockouts"]}
+            run, _LOCKOUTS_PAGE, _bound(run, "login_lockouts", bounds["login_lockouts"])
         )
         counts["procrastinate_jobs"] = await _delete_listed(
             run, "procrastinate_jobs", _named(content, "procrastinate_jobs")
@@ -896,7 +948,9 @@ class DeleteEverything:
             for pointer in await _pointer_violations(conn, content)
         ]
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime, high_water: Mapping[str, int]
+    ) -> None:
         return None
 
 

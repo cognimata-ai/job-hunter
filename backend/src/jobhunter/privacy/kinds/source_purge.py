@@ -15,13 +15,15 @@ observe after its commit. The source switch's save defers no job (its one class 
 caller without a deferrer (`defer=None`, the tests' and replay's) gives it one that refuses any job
 (`InvariantViolation`).
 
-**The re-application** (`reapply_admission`, Task 25's replay, phase A, under `active_config FOR UPDATE`): a
-dump from before the purge holds none of A0's durable effects beyond the manifest, its fence and its
-operation, so each is applied again, idempotent and keeping a later explicit choice: `purge_fence_at :=
-admitted_at` when it is NULL or earlier (never lowered); a new internal version disabling the source when the
-active one enables it and was created at or before `admitted_at` (an active version created after it is the
-user's later choice and stays); the collections queued at or before `admitted_at` and still `queued` or
-`running` cancelled.
+**The re-application** (`reapply_admission`, Task 25's replay, phase A, at the manifest's place in the stream,
+under `active_config FOR UPDATE`): a dump from before the purge holds none of A0's durable effects beyond the
+manifest, its fence and its operation, so each is applied again, idempotent and keeping a later explicit
+choice: `purge_fence_at := admitted_at` when it is NULL or earlier (never lowered); a new internal version
+disabling the source when the active one enables it and either was created at or before `admitted_at` or is
+the replay's own (its id above the replay's `high_water`: an earlier manifest of the stream re-created it,
+standing where a version made before this admission stood, such as delete-everything's reset; Ruling T25-3);
+an active version of the dump created after `admitted_at` is the user's later choice and stays; the
+collections queued at or before `admitted_at` and still `queued` or `running` cancelled.
 
 **The content** (A2, `compute`, under the fence after the quiesce; never re-derived, §19.5 step 3), every id
 within `max_ids`:
@@ -395,15 +397,23 @@ def _disabled(payload: JSONValue, source: str) -> dict[str, JSONValue]:
 
 
 async def _disable_source(
-    conn: AsyncConnection, source: str, *, now: datetime, defer: Deferrer | None, created_by: datetime | None
+    conn: AsyncConnection,
+    source: str,
+    *,
+    now: datetime,
+    defer: Deferrer | None,
+    created_by: datetime | None,
+    replay_own_above: int | None = None,
 ) -> int | None:
     """A new internal settings version disabling the source, when the active one enables it (and, with
-    `created_by`, was created at or before it); the new version's id, `None` when none was needed. The caller
-    holds `active_config FOR UPDATE` (`lock_active` is then a no-op lock and a fresh read)."""
+    `created_by`, was created at or before it, or has an id above `replay_own_above`: the replay's own); the
+    new version's id, `None` when none was needed. The caller holds `active_config FOR UPDATE` (`lock_active`
+    is then a no-op lock and a fresh read)."""
     active = await lock_active(conn)
     if not _enables(active.payload, source):
         return None
-    if created_by is not None:
+    replays_own = replay_own_above is not None and active.settings_version_id > replay_own_above
+    if created_by is not None and not replays_own:
         created = (await conn.execute(_VERSION_CREATED, {"v": active.settings_version_id})).scalar_one()
         if created > created_by:
             return None  # the user's later choice
@@ -811,7 +821,12 @@ async def _delete_tainted_revisions(run: PurgeRun, tainted: Sequence[int]) -> in
         async with run.chunk(job_ids=jobs) as chunk:
             if cases := await _ids(chunk.conn, _CASES_ON, {"tainted": ids}):
                 await deletion_graph.settle_and_delete_cases(chunk.conn, cases, now=run.now, check=None)
-                log.info("source_purge_replay_cases_deleted", manifest_id=run.manifest.id, case_ids=cases)
+                log.info(
+                    "source_purge_replay_cases_deleted",
+                    manifest_id=run.manifest.id,
+                    cases=len(cases),
+                    case_ids=cases[:LOGGED_IDS],
+                )
             await chunk.conn.execute(_UNPOINT, {"jobs": sorted(chunk.held), "tainted": ids})
             deleted += (await chunk.conn.execute(_DELETE_REVISIONS, {"tainted": ids})).rowcount
             await ranking.bump(chunk.conn)
@@ -904,12 +919,21 @@ class SourcePurge:
             found.append(Violation(index, "fence", "settings_versions", detail))
         return found
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime, high_water: Mapping[str, int]
+    ) -> None:
         source = _source_of(manifest)
         admitted_at = manifest.created_at
         await conn.execute(_LOCK_CONFIG)  # held by the caller (Task 25's phase A): a no-op lock
         raised = (await conn.execute(_RAISE_FENCE_AT, {"at": admitted_at, "source": source})).first()
-        version = await _disable_source(conn, source, now=now, defer=None, created_by=admitted_at)
+        version = await _disable_source(
+            conn,
+            source,
+            now=now,
+            defer=None,
+            created_by=admitted_at,
+            replay_own_above=high_water.get("settings_versions"),
+        )
         cancelled = await cancel_active_runs(
             conn, reason=SOURCE_PURGE_CANCEL, queued_at_or_before=admitted_at
         )

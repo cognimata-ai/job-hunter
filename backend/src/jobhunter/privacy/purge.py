@@ -15,8 +15,10 @@ a time, so execution follows the UUIDv7 stream order (D5).
 registers one): `compute` (A2, after the quiesce, under the fence: the content of the manifest's request,
 `new_content` building its common fields), `execute` (phase B, in idempotent chunks over the stored scope),
 `postconditions` (the kind's own, checked in phase C after the typed ones), `reapply_admission` (replay's
-re-application of A0's effects beyond the manifest, its fences and its operation: a no-op for every kind but
-the source purge) and `deletes_exports` (true for every kind but `job_tombstone`: M5-R3, Deviation 18).
+re-application of A0's effects beyond the manifest, its fences and its operation, at the manifest's place in
+the stream; `high_water` is each table's greatest id when the replay began, so a row above it is the replay's
+own: a no-op for every kind but the source purge) and `deletes_exports` (true for every kind but
+`job_tombstone`: M5-R3, Deviation 18).
 `compute_content` runs `compute` and completes what the kind cannot know: `fenced_at` (and a watermark's)
 becomes the fence's commit cutoff the quiesce waited from (`fences.fence_committed_at`), and a kind that
 deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["exports"]`.
@@ -72,8 +74,11 @@ committed.
 
 **A live purge's external effects** (`LiveEffects`, Deviation 56): the process's Message Batches client and
 its dead-man pinger, from the worker's `OperationDeps`; a replay has none (`PurgeRun.effects` is `None`).
-A replay's run (`PurgeRun.replay`, `migrate` step 7, M5 Task 25) has neither effects nor an owner, and works
-on the volumes `migrate` was given (its `--cv-dir` and `--exports-dir`).
+A replay's run (`PurgeRun.replay`, `migrate` step 7, M5 Task 25) has neither effects nor an owner, works on
+the volumes `migrate` was given (its `--cv-dir` and `--exports-dir`), and carries `replayed_rows`: per table,
+the id range `(above, upto]` of the rows the replay itself created before the manifest's turn (rows its
+earlier manifests re-created, which stand where their live counterparts stood: inside this manifest's bound;
+Ruling T25-3 (ii)). Only delete-everything reads it; a live run's is empty.
 
 Fault points (test env only): `privacy.purge.before_file`, `after_file`, `after_record`, `mid_delete` (after
 the kind's chunks, before the export ops) and `before_complete`. Ids, counts, kinds and codes only reach a log
@@ -85,8 +90,9 @@ import dataclasses
 import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -278,6 +284,8 @@ class PurgeRun:
     mode: Literal["live", "replay"]
     effects: LiveEffects | None
     owner: PurgeOwner | None
+    # A replay's own rows before the manifest's turn, per table: `(above, upto]` (module docstring).
+    replayed_rows: Mapping[str, tuple[int, int]] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         live = self.mode == "live"
@@ -286,12 +294,20 @@ class PurgeRun:
 
     @classmethod
     def replay(
-        cls, engine: AsyncEngine, cfg: "AppConfig", *, manifest: ManifestRow, now: datetime, files: FileRoots
+        cls,
+        engine: AsyncEngine,
+        cfg: "AppConfig",
+        *,
+        manifest: ManifestRow,
+        now: datetime,
+        files: FileRoots,
+        replayed_rows: Mapping[str, tuple[int, int]] | None = None,
     ) -> "PurgeRun":
-        """A replay's run of `manifest` (`migrate` step 7, M5 Task 25): no effects and no owner, and its file
+        """A replay's run of `manifest` (`migrate` step 7, M5 Task 25): no effects and no owner, its file
         operations on the volumes `migrate` was given (`files`: `--cv-dir`, `--exports-dir`), which become the
         run's configuration's, so `files`, `cv_store` and the export ops (`deletion_graph.purge_exports`) all
-        name them and never an unmounted image directory."""
+        name them and never an unmounted image directory, and the replay's own rows before its turn
+        (`replayed_rows`, module docstring)."""
         volumes = dataclasses.replace(cfg, cv_store_dir=files.cv_store, exports_dir=files.exports)
         return cls(
             engine=engine,
@@ -302,6 +318,7 @@ class PurgeRun:
             mode="replay",
             effects=None,
             owner=None,
+            replayed_rows=MappingProxyType(dict(replayed_rows or {})),
         )
 
     @property
@@ -375,8 +392,12 @@ class KindProcedure(Protocol):
         """The kind's own postconditions, beyond the typed operations'."""
         ...
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
-        """Replay's re-application of A0's effects beyond the manifest, its fences and its operation."""
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime, high_water: Mapping[str, int]
+    ) -> None:
+        """Replay's re-application of A0's effects beyond the manifest, its fences and its operation, at the
+        manifest's place in the stream; a row above `high_water` (each table's greatest id when the replay
+        began) is the replay's own."""
         ...
 
 
@@ -583,7 +604,7 @@ def _adoptable(data: bytes, manifest: ManifestRow) -> ManifestContent | None:
     return None
 
 
-def _unparsable(content: ManifestContent, manifest: ManifestRow) -> str | None:
+def unparsable(content: ManifestContent, manifest: ManifestRow) -> str | None:
     """Why a replay would refuse the file of a computed content (`parse_manifest` of its canonical bytes,
     under its own name), or `None` when it would read the content back unchanged."""
     data = canonical_bytes(content)
@@ -621,7 +642,7 @@ async def _admit(run: PurgeRun, proc: KindProcedure, ending: _Ending) -> Manifes
         async with run.engine.begin() as conn:
             content = await compute_content(conn, proc, manifest, fenced_at=since, now=run.now)
         # the check a replay applies to the file, before anything is written
-        if (reason := _unparsable(content, manifest)) is not None:
+        if (reason := unparsable(content, manifest)) is not None:
             log.error("purge_manifest_invalid", manifest_id=manifest.id, reason=reason, computed=True)
             await ending.fail(MANIFEST_INVALID)
             return None

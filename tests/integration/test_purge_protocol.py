@@ -161,7 +161,9 @@ class FencedKind:
     async def postconditions(self, conn: AsyncConnection, content: ManifestContent) -> list[Violation]:
         return []
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: Any) -> None:
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: Any, high_water: Any
+    ) -> None:
         return None
 
 

@@ -1295,7 +1295,7 @@ async def reapply(engine: AsyncEngine, opened: OpenedPurge, now: datetime) -> No
     manifest = await manifest_of(engine, opened.manifest_id)
     async with engine.begin() as conn:
         await conn.execute(_LOCK_CONFIG)  # phase A's lock (Task 25)
-        await source_purge.SourcePurge().reapply_admission(conn, manifest, now=now)
+        await source_purge.SourcePurge().reapply_admission(conn, manifest, now=now, high_water={})
 
 
 async def test_reapply_admission_restores_the_a0_effects_once(engine: AsyncEngine) -> None:

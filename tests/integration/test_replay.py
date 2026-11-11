@@ -22,7 +22,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import pytest
 import sqlalchemy as sa
@@ -30,7 +30,6 @@ from jobhunter.clock import utcnow
 from jobhunter.db.migrate import StepGroup, run_migrate_async
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.transitions import transition
-from jobhunter.dedup import revisions
 from jobhunter.ids import uuid7
 from jobhunter.privacy import purge, replay
 from jobhunter.privacy.fences import FenceSpec, insert_fence
@@ -39,6 +38,7 @@ from jobhunter.privacy.kinds import source_purge
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.privacy.manifests import (
     FileRoots,
+    ManifestConflict,
     ManifestContent,
     ManifestInvalid,
     ManifestKind,
@@ -53,9 +53,10 @@ from jobhunter.privacy.manifests import (
     record_manifest,
     write_manifest_file,
 )
-from jobhunter.privacy.purge import OpenedPurge
 from jobhunter.privacy.replay import Classified, ReplayFailed, classify_stream
-from jobhunter.scoring import filters
+from jobhunter.settings.active import lock_active
+from jobhunter.settings.save import SaveRequest, save_settings
+from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -64,8 +65,23 @@ from tests.support.faults import PausePoints, SimulatedCrash, no_fault, raising_
 from tests.support.fixtures import ConfigFactory
 from tests.support.observations import stated
 from tests.support.pg import PgServer, table_counts
-from tests.support.privacy_seed import SeedIds, seed_two_year_old_graph
-from tests.support.purges import Purger, completed
+from tests.support.purges import (
+    ALERT,
+    EXPORT,
+    IS_FENCED,
+    JOB,
+    JOB_EXISTS,
+    PROVENANCE_SOURCES,
+    Purger,
+    completed,
+    completions,
+    one,
+    recomputed,
+    request_source_purge,
+    scalar,
+    seeded,
+    stopped_at,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
 
@@ -78,28 +94,21 @@ _FENCES: Final = sa.text(
 _MANIFEST: Final = sa.text(
     "SELECT status, completed_at, replay_log, file_sha256, scope FROM deletion_manifests WHERE id = :m"
 )
-_IS_FENCED: Final = sa.text("SELECT is_fenced(:j)")
-_JOB: Final = sa.text("SELECT current_revision_id, salary FROM jobs WHERE id = :j")
-_JOB_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :j)")
 _LINKS: Final = sa.text(
     "SELECT (SELECT count(*) FROM postings p JOIN source_instances si ON si.id = p.source_instance_id "
     "WHERE p.job_id = :j AND si.source_id = 'adzuna') AS postings, (SELECT count(*) FROM job_revisions r "
     "JOIN job_revision_sources s ON s.job_revision_id = r.id WHERE r.job_id = :j AND s.source_id = 'adzuna') "
     "AS lineage"
 )
-_PROVENANCE_SOURCES: Final = sa.text(
-    "SELECT coalesce(array_agg(DISTINCT si.source_id ORDER BY si.source_id), '{}') FROM jobs j "
-    "CROSS JOIN LATERAL jsonb_each(j.field_provenance) e JOIN source_instances si "
-    "ON si.id = CAST(e.value ->> 'source_instance_id' AS bigint) WHERE j.id = :j"
+POSTING_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM postings WHERE id = :p)")
+OBSERVATION_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM posting_observations WHERE id = :o)")
+ACTIVE_PAYLOAD: Final = sa.text(
+    "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1"
 )
-_POSTING_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM postings WHERE id = :p)")
-_ALERT: Final = sa.text(
-    "INSERT INTO alerts (code, severity, dedup_key, message) "
-    "VALUES ('test.replay', 'info', :key, 'an invented alert') RETURNING id"
-)
-_EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e")
 _SHIPMENT: Final = sa.text("INSERT INTO manifest_shipments (restic_snapshot_id) VALUES ('snap') RETURNING id")
 _MANIFEST_ROWS: Final = sa.text("SELECT count(*) FROM deletion_manifests")
+_HASH_ONLY: Final = sa.text("UPDATE deletion_manifests SET file_sha256 = :sha WHERE id = :m")
 
 
 # ---- helpers -----------------------------------------------------------------------------------------------
@@ -160,7 +169,7 @@ async def recorded_row(
 
 async def alert(engine: AsyncEngine) -> int:
     async with engine.begin() as conn:
-        return int((await conn.execute(_ALERT, {"key": f"replay:{uuid7()}"})).scalar_one())
+        return int((await conn.execute(ALERT, {"key": f"replay:{uuid7()}"})).scalar_one())
 
 
 async def gone_alert(engine: AsyncEngine) -> int:
@@ -169,49 +178,6 @@ async def gone_alert(engine: AsyncEngine) -> int:
     async with engine.begin() as conn:
         await conn.execute(sa.text("DELETE FROM alerts WHERE id = :a"), {"a": alert_id})
     return alert_id
-
-
-async def seeded(engine: AsyncEngine) -> SeedIds:
-    async with engine.begin() as conn:
-        return await seed_two_year_old_graph(conn, now=utcnow())
-
-
-async def request_source_purge(engine: AsyncEngine) -> OpenedPurge:
-    """A0 of the Adzuna purge in a transaction of its own (no deferrer: the purger runs the operation)."""
-    async with engine.begin() as conn:
-        return await source_purge.request_source_purge(conn, source_id=ADZUNA, now=utcnow(), defer=None)
-
-
-async def stopped_at(
-    purger: Purger, opened: OpenedPurge, point: str, monkeypatch: pytest.MonkeyPatch
-) -> ManifestRow:
-    """The purge run by the worker's handler until a crash at `point`; its manifest, still `executing`."""
-    monkeypatch.setattr(purge, "afault_point", raising_at(point))
-    await purger.run(opened.operation_id)
-    monkeypatch.setattr(purge, "afault_point", no_fault)
-    async with purger.engine.connect() as conn:
-        manifest = await read_manifest(conn, opened.manifest_id)
-    assert manifest is not None and manifest.status == "executing"
-    return manifest
-
-
-async def recomputed(engine: AsyncEngine, job_id: int) -> int:
-    """The job's canonical selection and its det-facts hook, as identity resolution runs them."""
-    async with engine.begin() as conn:
-        active = await filters.lock_active_scopes(conn)
-        result = await revisions.recompute_job(conn, job_id)
-        await filters.refilter_job_live(conn, job_id, active=active)
-    return result.revision_id
-
-
-async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
-    async with engine.connect() as conn:
-        return (await conn.execute(statement, params)).one()
-
-
-async def scalar(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
-    async with engine.connect() as conn:
-        return (await conn.execute(statement, params)).scalar_one()
 
 
 async def fences(engine: AsyncEngine, manifest_id: int) -> list[Any]:
@@ -238,7 +204,7 @@ async def assert_replayed(engine: AsyncEngine, purger: Purger, manifest_id: int,
     """The manifest `completed`, every fence of it released in the completing transaction, every
     postcondition holding, and `entries` replays logged."""
     row = await one(engine, _MANIFEST, m=manifest_id)
-    assert row.status == "completed" and len(row.replay_log) == entries
+    assert row.status == "completed" and len(completions(row.replay_log)) == entries
     released = {fence.released_at for fence in await fences(engine, manifest_id)}
     assert released == {row.completed_at}  # one transaction: one now()
     async with engine.connect() as conn:
@@ -246,7 +212,7 @@ async def assert_replayed(engine: AsyncEngine, purger: Purger, manifest_id: int,
         assert manifest is not None and manifest.scope is not None
         assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
         assert await source_purge.SourcePurge().postconditions(conn, manifest.scope) == []
-    entry = row.replay_log[-1]
+    entry = completions(row.replay_log)[-1]
     assert set(entry) == {"restore_id", "at", "counts"} and uuid.UUID(entry["restore_id"])
 
 
@@ -368,6 +334,46 @@ async def test_a_bad_file_stops_migrate(
     assert sorted(os.listdir(stream)) == files
 
 
+@pytest.mark.parametrize("defect", ["another_kind", "another_hash", "completed_without_content"])
+async def test_a_file_or_row_that_is_not_its_manifest_stops_migrate(
+    engine: AsyncEngine,
+    migrator: AsyncEngine,
+    make_config: ConfigFactory,
+    purger: Purger,
+    defect: str,
+) -> None:
+    """The classification refuses a stream file of another kind than its row, one whose bytes do not hash to
+    the row's `file_sha256`, and a `completed` row without its content (no file, an empty `scope`): each is
+    `ManifestConflict`, which stops step 7 before anything is replayed."""
+    stream = purger.cfg.manifests_dir
+    gone = await gone_alert(engine)
+    if defect == "completed_without_content":
+        async with engine.begin() as conn:
+            row = await insert_manifest(conn, kind="golden_case_delete", request={}, now=utcnow())
+            await conn.execute(_HASH_ONLY, {"m": row.id, "sha": hashlib.sha256(b"a shipped file").digest()})
+            await complete_manifest(conn, row.id)
+    else:
+        row = await recorded_row(engine, alerts_named(gone), status="completed")
+        other = content(
+            str(row.manifest_uuid),
+            kind="job_tombstone" if defect == "another_kind" else "golden_case_delete",
+            operations=alerts_named(gone, gone + 1),
+        )
+        write_manifest_file(stream, other)
+    newer = content(operations=alerts_named(gone))  # a manifest the replay would otherwise insert
+    write_manifest_file(stream, newer)
+
+    async with migrator.connect() as conn:
+        with pytest.raises(ManifestConflict):
+            await classify_stream(conn, stream, files=purger.file_roots)
+    with capture_logs() as logs, pytest.raises(ManifestConflict):
+        await migrate(make_config, purger, steps=frozenset({"replay"}))
+    (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
+    assert (failed["step"], failed["error_type"]) == ("replay", "ManifestConflict")
+    assert await scalar(engine, _MANIFEST_ROWS) == 1  # the newer manifest got no row: nothing replayed
+    assert await scalar(engine, sa.text("SELECT count(*) FROM purge_fences")) == 0
+
+
 async def test_nothing_to_replay_ends_step_7(
     migrated: PgServer, engine: AsyncEngine, make_config: ConfigFactory, purger: Purger
 ) -> None:
@@ -415,20 +421,20 @@ async def test_fences_are_released_only_in_phase_c(
     await asyncio.wait_for(pauses[replay.AFTER_A].reached.wait(), 60)
     (fence,) = await fences(engine, opened.manifest_id)
     assert fence.kind == "source" and closed in fence.job_ids and fence.released_at is None
-    assert await scalar(engine, _IS_FENCED, j=closed) is True
-    assert (await one(engine, _JOB, j=closed)).current_revision_id is None  # tainted: nulled in phase A
+    assert await scalar(engine, IS_FENCED, j=closed) is True
+    assert (await one(engine, JOB, j=closed)).current_revision_id is None  # tainted: nulled in phase A
     pauses[replay.AFTER_A].resume()
 
     await asyncio.wait_for(pauses[replay.AFTER_B].reached.wait(), 60)
-    assert (await one(engine, _JOB, j=closed)).current_revision_id is not None  # rebuilt in phase B
+    assert (await one(engine, JOB, j=closed)).current_revision_id is not None  # rebuilt in phase B
     assert [f.released_at for f in await fences(engine, opened.manifest_id)] == [None]
-    assert await scalar(engine, _IS_FENCED, j=closed) is True
+    assert await scalar(engine, IS_FENCED, j=closed) is True
     assert (await one(engine, _MANIFEST, m=opened.manifest_id)).status == "executing"
     pauses[replay.AFTER_B].resume()
 
     assert await asyncio.wait_for(task, 120) == ["reconstruct_and_advance", "advance_again", "replay"]
     await assert_replayed(engine, purger, opened.manifest_id)
-    assert await scalar(engine, _IS_FENCED, j=closed) is False
+    assert await scalar(engine, IS_FENCED, j=closed) is False
 
 
 async def test_a_failed_postcondition_rolls_back_and_keeps_the_fences(
@@ -450,7 +456,7 @@ async def test_a_failed_postcondition_rolls_back_and_keeps_the_fences(
 
     task = asyncio.create_task(migrate(make_config, purger))
     await asyncio.wait_for(pauses[replay.AFTER_B].reached.wait(), 60)
-    assert (await one(engine, _EXPORT, e=seed.ready_export_id)).status == "purged"
+    assert (await one(engine, EXPORT, e=seed.ready_export_id)).status == "purged"
     late.write_bytes(b"an archive written again")
     with capture_logs() as logs:
         pauses[replay.AFTER_B].resume()
@@ -463,14 +469,19 @@ async def test_a_failed_postcondition_rolls_back_and_keeps_the_fences(
     (stopped,) = [e for e in logs if e["event"] == "migrate_failed"]
     assert (stopped["step"], stopped["error_type"]) == ("replay", "ReplayFailed")
     row = await one(engine, _MANIFEST, m=opened.manifest_id)
-    assert row.status == "executing" and row.replay_log == []
+    assert row.status == "executing" and completions(row.replay_log) == []
+    (started,) = [e for e in row.replay_log if e.get("phase") == replay.STARTED]
     assert [f.released_at for f in await fences(engine, opened.manifest_id)] == [None]
-    assert await scalar(engine, _IS_FENCED, j=seed.closed_job_id) is True
+    assert await scalar(engine, IS_FENCED, j=seed.closed_job_id) is True
 
     late.unlink()
     monkeypatch.setattr(replay, "afault_point", no_fault)
     await migrate(make_config, purger)
     await assert_replayed(engine, purger, opened.manifest_id)
+    # The second `migrate` resumed the replay the first one started: its restore id and its high water.
+    log_ = (await one(engine, _MANIFEST, m=opened.manifest_id)).replay_log
+    assert [e.get("phase") for e in log_] == [replay.STARTED, replay.ADMITTED, None]
+    assert completions(log_)[0]["restore_id"] == started["restore_id"]
 
 
 async def test_a_checked_manifest_is_replayed_again(
@@ -498,10 +509,63 @@ async def test_a_checked_manifest_is_replayed_again(
     assert not again.exists()
     row = await one(engine, _MANIFEST, m=done.id)
     assert row.status == "completed" and row.completed_at == done.completed_at
-    assert [entry["counts"]["file_remove"] for entry in row.replay_log] == [1]
+    assert [entry["counts"]["file_remove"] for entry in completions(row.replay_log)] == [1]
     assert done.scope is not None
     async with engine.connect() as conn:
         assert await check_postconditions(conn, done.scope, files=purger.file_roots) == []
+
+
+async def test_a_merged_members_adzuna_data_above_the_bound_survives_a_replay(
+    engine: AsyncEngine,
+    make_config: ConfigFactory,
+    purger: Purger,
+) -> None:
+    """The T15 carry in the replay's phase B: the Adzuna purge completed, Adzuna re-enabled by a new settings
+    version and collected again on a job merged into the mixed job (a posting and an observation above the
+    bound, which the root's provenance names). The manifest is then `checked` (an export archive back on the
+    volume) and replayed: phase B rebuilds the root within the manifest's bound, the member's posting and
+    observation survive, the root's provenance still names Adzuna (above the bound), and Adzuna stays
+    enabled (the user's later version)."""
+    seed = await seeded(engine)
+    closed, member = seed.closed_job_id, seed.merged_job_ids[-1]
+    opened = await request_source_purge(engine)
+    await purger.run(opened.operation_id)
+    manifest = await completed(purger, opened.manifest_id, opened.operation_id)
+    async with engine.begin() as conn:
+        active = await lock_active(conn)
+        payload = cast(dict[str, Any], active.payload)
+        sources = payload["sources"]
+        enabled = {**payload, "sources": {**sources, "enabled": {**sources["enabled"], ADZUNA: True}}}
+        request = SaveRequest(
+            payload=enabled, base_version_id=active.settings_version_id, acknowledged_warnings=frozenset()
+        )
+        await save_settings(conn, request, now=utcnow(), defer=defer_in_tx, internal=True)
+        posting, observation = await add_posting(
+            conn, member, ADZUNA, observed_at=utcnow(), salary=stated(1, 2)
+        )
+    await recomputed(engine, closed)
+    assert ADZUNA in await scalar(engine, PROVENANCE_SOURCES, j=closed)  # collected above the bound
+    assert manifest.scope is not None and posting > manifest.scope["max_ids"]["postings"]
+    archive = purger.cfg.exports_dir / f"{seed.ready_export_id}-restored.jhx"
+    archive.write_bytes(b"an archive a restore brought back")
+
+    with capture_logs() as logs:
+        await migrate(make_config, purger)
+    (classified,) = [e for e in logs if e["event"] == "replay_classified"]
+    assert classified["outcomes"] == {"checked": 1, "satisfied": 1}  # and the seed's shipped manifest
+    assert [e["job_id"] for e in logs if e["event"] == "source_purge_job_rebuilt"] == [closed]
+    assert await scalar(engine, POSTING_EXISTS, p=posting) is True
+    assert await scalar(engine, OBSERVATION_EXISTS, o=observation) is True
+    assert ADZUNA in await scalar(engine, PROVENANCE_SOURCES, j=closed)
+    assert (await one(engine, ACTIVE_PAYLOAD)).payload["sources"]["enabled"][ADZUNA] is True
+    assert not archive.exists()
+    row = await one(engine, _MANIFEST, m=opened.manifest_id)  # still the live completion, now replayed once
+    assert row.completed_at == manifest.completed_at and len(completions(row.replay_log)) == 1
+    assert [f.released_at is not None for f in await fences(engine, opened.manifest_id)] == [True, True]
+    assert manifest.scope is not None
+    async with engine.connect() as conn:
+        assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
+        assert await source_purge.SourcePurge().postconditions(conn, manifest.scope) == []
 
 
 @pytest.mark.parametrize("point", [replay.AFTER_A, replay.AFTER_B])
@@ -531,7 +595,7 @@ async def test_a_crash_in_each_phase_restarts_cleanly(
     revision = await recomputed(engine, mixed.job_id)
     only = await job_with_postings({ADZUNA: {}})
     await recomputed(engine, only.job_id)
-    assert (await one(engine, _JOB, j=mixed.job_id)).salary is not None
+    assert (await one(engine, JOB, j=mixed.job_id)).salary is not None
     opened = await request_source_purge(engine)
     manifest = await stopped_at(purger, opened, purge.AFTER_RECORD, monkeypatch)
     assert manifest.scope is not None and mixed.job_id in manifest.scope["affected"]["job_ids"]
@@ -543,24 +607,24 @@ async def test_a_crash_in_each_phase_restarts_cleanly(
     assert (await one(engine, _MANIFEST, m=opened.manifest_id)).status == "executing"
     (fence,) = await fences(engine, opened.manifest_id)
     assert mixed.job_id in fence.job_ids and fence.released_at is None
-    assert await scalar(engine, _IS_FENCED, j=mixed.job_id) is True  # through the stored job_ids
+    assert await scalar(engine, IS_FENCED, j=mixed.job_id) is True  # through the stored job_ids
     links = await one(engine, _LINKS, j=mixed.job_id)
     assert (links.postings, links.lineage) == (0, 0)  # phase A ran: nothing names Adzuna but its values
     if point == replay.AFTER_A:
-        assert ADZUNA in await scalar(engine, _PROVENANCE_SOURCES, j=mixed.job_id)  # not rebuilt yet
+        assert ADZUNA in await scalar(engine, PROVENANCE_SOURCES, j=mixed.job_id)  # not rebuilt yet
         async with engine.connect() as conn:
             derived = await source_purge.SourcePurge().compute(conn, manifest, now=utcnow())
         assert mixed.job_id not in derived["affected"]["job_ids"]  # a re-derivation would miss it
     else:
-        assert (await one(engine, _JOB, j=mixed.job_id)).salary is None  # rebuilt, the fence still standing
+        assert (await one(engine, JOB, j=mixed.job_id)).salary is None  # rebuilt, the fence still standing
 
     monkeypatch.setattr(replay, "afault_point", no_fault)
     await migrate(make_config, purger)
     await assert_replayed(engine, purger, opened.manifest_id)
-    row = await one(engine, _JOB, j=mixed.job_id)
+    row = await one(engine, JOB, j=mixed.job_id)
     assert row.current_revision_id == revision and row.salary is None  # rebuilt, its revision reused
-    assert await scalar(engine, _PROVENANCE_SOURCES, j=mixed.job_id) == ["greenhouse"]
-    assert await scalar(engine, _JOB_EXISTS, j=only.job_id) is False
+    assert await scalar(engine, PROVENANCE_SOURCES, j=mixed.job_id) == ["greenhouse"]
+    assert await scalar(engine, JOB_EXISTS, j=only.job_id) is False
 
 
 # ---- files and repeats -------------------------------------------------------------------------------------
@@ -600,7 +664,7 @@ async def test_replay_never_overwrites_a_valid_file(
     assert bytes(row.file_sha256) == hashlib.sha256(written).digest()
     assert canonical_bytes(row.scope) == written
     await assert_replayed(engine, purger, opened.manifest_id)
-    assert await scalar(engine, _JOB_EXISTS, j=other.job_id) is True  # above the bound: never touched
+    assert await scalar(engine, JOB_EXISTS, j=other.job_id) is True  # above the bound: never touched
 
 
 async def test_a_second_replay_deletes_nothing(
@@ -628,5 +692,5 @@ async def test_a_second_replay_deletes_nothing(
     (classified,) = [e for e in logs if e["event"] == "replay_classified"]
     assert set(classified["outcomes"]) == {"satisfied"}
     assert table_counts(migrated) == counts
-    assert await scalar(engine, _POSTING_EXISTS, p=posting) is True
+    assert await scalar(engine, POSTING_EXISTS, p=posting) is True
     await assert_replayed(engine, purger, opened.manifest_id)  # still one replay_log entry

@@ -440,11 +440,15 @@ _CASE_VERSION: Final = q(
 )
 # A running eval run includes the case (`in_running_run`): it has a call naming the case, or its
 # kind selects it (a golden run every active case, a canary run every active canary; `eval_runner`'s list).
-_IN_RUNNING_RUN: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM eval_runs r WHERE r.status = 'running' AND ("
+_INCLUDES_CASE: Final = (
+    "r.status = 'running' AND ("
     "EXISTS (SELECT 1 FROM llm_calls c WHERE c.eval_run_id = r.id AND c.golden_case_id = :i) "
     "OR (CAST(:active AS boolean) AND (r.kind = 'golden' "
-    "OR (r.kind = 'canary' AND CAST(:canary AS boolean))))))"
+    "OR (r.kind = 'canary' AND CAST(:canary AS boolean)))))"
+)
+_IN_RUNNING_RUN: Final = q(f"SELECT EXISTS (SELECT 1 FROM eval_runs r WHERE {_INCLUDES_CASE})")  # noqa: S608
+_RUNNING_RUNS_INCLUDING: Final = q(
+    f"SELECT r.id FROM eval_runs r WHERE {_INCLUDES_CASE} ORDER BY r.id"  # noqa: S608 (the module's constant)
 )
 _DELETE: Final = q("DELETE FROM golden_cases WHERE id = :i RETURNING id")
 _CANARY_LOCK: Final = q("SELECT pg_advisory_xact_lock(CAST(:namespace AS integer), 0)")
@@ -494,6 +498,12 @@ async def in_running_run(conn: AsyncConnection, case_id: int, flags: CaseFlags) 
     golden run every active case, a canary run every active canary; `eval_runner`'s list)."""
     params = {"i": case_id, "active": flags.active, "canary": flags.is_canary}
     return bool((await conn.execute(_IN_RUNNING_RUN, params)).scalar_one())
+
+
+async def running_runs_including(conn: AsyncConnection, case_id: int, flags: CaseFlags) -> list[int]:
+    """The `running` eval runs that include the case (`in_running_run`'s predicate), by id."""
+    params = {"i": case_id, "active": flags.active, "canary": flags.is_canary}
+    return [int(i) for i in (await conn.execute(_RUNNING_RUNS_INCLUDING, params)).scalars()]
 
 
 async def case_job(conn: AsyncConnection, case_id: int) -> int | None:

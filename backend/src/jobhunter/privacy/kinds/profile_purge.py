@@ -526,7 +526,9 @@ class ProfilePurge:
     async def postconditions(self, conn: AsyncConnection, content: ManifestContent) -> list[Violation]:
         return []
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime, high_water: Mapping[str, int]
+    ) -> None:
         return None
 
 

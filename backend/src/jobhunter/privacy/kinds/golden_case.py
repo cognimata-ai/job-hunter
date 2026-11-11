@@ -19,13 +19,20 @@ accounts of the case's calls' entries still `reserved` or `dispatched` (`spend_l
 month rows, step 6, and the funded bulk rows, step 7), then the case `FOR UPDATE` (step 10). While a running
 eval run includes it (the helper's check) the chunk rolls back and the operation waits `EVAL_WAIT` (5 min)
 without spending an attempt (`purge.PurgeWait`, error code `eval_run_running`: an eval run may take hours, and
-it has an end of its own). Otherwise those entries are read again under the case's lock, an entry reserved
-since by a run that has ended meanwhile has its accounts taken now (after the case row: the one place this
-chunk leaves the schedule, as `deletion_graph`'s step 7), and they are settled
+it has an end of its own; a replay never waits, below). Otherwise those entries are read again under the
+case's lock, an entry reserved since by a run that has ended meanwhile has its accounts taken now (after the
+case row: the one place this chunk leaves the schedule, as `deletion_graph`'s step 7), and they are settled
 (`spend_ledger.settle_for_purge`: a `reserved` one released, a `dispatched` one `ambiguous`), since every
 later reader of an entry joins its call. Then the case is deleted, its `eval_case_results` and its eval calls
 by cascade (`golden.delete_case`); the ledger rows stay. A case gone already is skipped: the chunk is
 idempotent. The kind has no postcondition of its own and nothing to re-apply in a replay.
+
+**In a replay** (`migrate` step 7, M5 Task 25, Ruling T25-2 (8)) a running eval run that includes the case is
+one the restored dump holds `running`, and nothing can end it: `api` and `worker` are stopped. The chunk ends
+each such run as the `eval_run` operation's failure hook ends an interrupted one
+(`worker.operations.fail_eval_run`: `running → failed`, `metrics.failed = "interrupted"`, found by
+`golden.running_runs_including`), logged `golden_case_replay_eval_runs_ended` with their ids, then deletes the
+case as the live purge does once the run has ended.
 
 Ids only reach a log line.
 """
@@ -58,12 +65,14 @@ from jobhunter.privacy.purge import (
 )
 from jobhunter.scoring import golden
 from jobhunter.types import get_int
+from jobhunter.worker.operations import EVAL_RUN_INTERRUPTED, fail_eval_run
 from jobhunter.worker.tasks import Deferrer
 
 KIND: Final = "golden_case_delete"
 REQUEST_KEY: Final = "golden_case_id"
 # How long a purge waits for a running eval run that includes its case (module docstring).
 EVAL_WAIT: Final = timedelta(minutes=5)
+LOGGED_IDS: Final = 20
 
 _LOCK_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
 
@@ -98,9 +107,23 @@ async def _delete(run: PurgeRun, case_id: int) -> None:
 
     async def unless_running(conn: AsyncConnection, cases: Mapping[int, golden.CaseFlags]) -> None:
         flags = cases.get(case_id)
-        if flags is not None and await golden.in_running_run(conn, case_id, flags):
-            log.info("golden_case_purge_waits", golden_case_id=case_id, manifest_id=run.manifest.id)
-            raise PurgeWait(golden.EVAL_RUN_RUNNING, EVAL_WAIT)
+        if flags is None or not await golden.in_running_run(conn, case_id, flags):
+            return
+        if run.mode == "replay":  # a run the dump holds: ended as an interrupted one (module docstring)
+            ended = [
+                eval_run_id
+                for eval_run_id in await golden.running_runs_including(conn, case_id, flags)
+                if await fail_eval_run(conn, eval_run_id, EVAL_RUN_INTERRUPTED)
+            ]
+            log.warning(
+                "golden_case_replay_eval_runs_ended",
+                golden_case_id=case_id,
+                manifest_id=run.manifest.id,
+                eval_run_ids=ended[:LOGGED_IDS],
+            )
+            return
+        log.info("golden_case_purge_waits", golden_case_id=case_id, manifest_id=run.manifest.id)
+        raise PurgeWait(golden.EVAL_RUN_RUNNING, EVAL_WAIT)
 
     async with run.chunk(job_ids=[job_id]) as chunk:
         await settle_and_delete_cases(chunk.conn, [case_id], now=run.now, check=unless_running)
@@ -130,7 +153,9 @@ class GoldenCaseDelete:
     async def postconditions(self, conn: AsyncConnection, content: ManifestContent) -> list[Violation]:
         return []
 
-    async def reapply_admission(self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime) -> None:
+    async def reapply_admission(
+        self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime, high_water: Mapping[str, int]
+    ) -> None:
         return None
 
 

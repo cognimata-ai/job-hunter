@@ -248,7 +248,7 @@ COUNTS = (
     ],
 )
 async def test_stored_settings_v1_is_frozen_when_a_packaged_default_changes(
-    migrated, make_config, monkeypatch, section, key, value
+    migrated, make_config, monkeypatch, section, key, value, tmp_path
 ) -> None:
     """A release that edits `settings_v1.json` must not break or grow an installed database."""
     import jobhunter.db.seed as seed_module
@@ -258,7 +258,7 @@ async def test_stored_settings_v1_is_frozen_when_a_packaged_default_changes(
     changed = load_settings_v1()
     get_object(changed, section)[key] = value
     monkeypatch.setattr(seed_module, "load_settings_v1", lambda: changed)
-    await run_migrate_async(make_config("migrate"), now=NOW)  # exits normally
+    await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)  # exits normally
     assert one(migrated, COUNTS) == before  # no new rows, in particular no orphaned derived row
 
 
@@ -361,7 +361,7 @@ def test_a_failing_migrate_logs_migrate_failed_and_chains_no_loop_error(make_con
 
 
 async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
-    migrated, make_config, monkeypatch
+    migrated, make_config, monkeypatch, tmp_path
 ) -> None:
     import jobhunter.db.migrate as migrate_module
     from structlog.testing import capture_logs
@@ -372,7 +372,7 @@ async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
     monkeypatch.setattr(migrate_module, "upgrade_head", broken)
     cfg = make_config("migrate")
     with capture_logs() as logs, pytest.raises(ValueError, match="private detail"):
-        await run_migrate_async(cfg, now=NOW)
+        await run_migrate_async(cfg, now=NOW, manifest_dir=tmp_path)
     (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
     assert (failed["step"], failed["error_type"]) == ("alembic", "ValueError")
     assert "private detail" not in repr(logs) and cfg.secret("db_migrator").decode() not in repr(logs)
@@ -381,7 +381,9 @@ async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
     assert one(migrated, ADVISORY_LOCKS) == (0,)  # and the lock was released
 
 
-async def test_a_mis_declared_floor_fails_before_the_schema_moves(migrated, make_config, monkeypatch) -> None:
+async def test_a_mis_declared_floor_fails_before_the_schema_moves(
+    migrated, make_config, monkeypatch, tmp_path
+) -> None:
     import jobhunter.db.compat as compat_module
     import jobhunter.db.migrate as migrate_module
     from structlog.testing import capture_logs
@@ -394,19 +396,19 @@ async def test_a_mis_declared_floor_fails_before_the_schema_moves(migrated, make
     monkeypatch.setattr(migrate_module, "upgrade_head", lambda dsn: upgrades.append("upgrade_head"))
     recorded = pg_rows(migrated, "migrator", COMPAT)
     with capture_logs() as logs, pytest.raises(ValueError, match="b: compat_floor 'a'"):
-        await run_migrate_async(make_config("migrate"), now=NOW)
+        await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)
     assert upgrades == []  # Alembic never ran
     (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
     assert (failed["step"], failed["error_type"]) == ("alembic", "ValueError")
     assert pg_rows(migrated, "migrator", COMPAT) == recorded
 
 
-async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_config) -> None:
+async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_config, tmp_path) -> None:
     from structlog.testing import capture_logs
 
     cfg = make_config("migrate")
-    with capture_logs() as logs:
-        assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
+    with capture_logs() as logs:  # a stream of its own: the shared server's holds whatever others left there
+        assert await run_migrate_async(cfg, now=NOW, manifest_dir=tmp_path) == list(MIGRATE_ORDER)
     steps = [entry["step"] for entry in logs if entry["event"] == "migrate_step"]
     assert steps == list(MIGRATE_ORDER)
     # Steps 1, 3 and 5 end with the identity advancement (M5 Task 23); step 7 replays the manifest stream
@@ -498,7 +500,7 @@ COMPAT = (
 )
 
 
-async def test_migrate_records_schema_compat_for_the_whole_chain(migrated, make_config) -> None:
+async def test_migrate_records_schema_compat_for_the_whole_chain(migrated, make_config, tmp_path) -> None:
     recorded = pg_rows(migrated, "migrator", COMPAT)
     assert [row[:3] for row in recorded] == [
         (i.revision, i.compat_floor, i.destructive) for i in chain_compat()
@@ -506,7 +508,7 @@ async def test_migrate_records_schema_compat_for_the_whole_chain(migrated, make_
     assert [row[0] for row in recorded[: len(CHAIN_TO_M5)]] == CHAIN_TO_M5
     assert [row[:3] for row in recorded[:9]] == [(r, r, False) for r in CHAIN_TO_M5[:9]]
     assert recorded[9][:3] == ("0010_m5_operations", "0009_m4_ui", False)
-    await run_migrate_async(make_config("migrate"), now=NOW)  # a second migrate changes nothing
+    await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)  # changes nothing
     assert pg_rows(migrated, "migrator", COMPAT) == recorded
 
 

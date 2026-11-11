@@ -252,10 +252,11 @@ async def run_migrate_async(
     configuration role's) on `database` (default: `JOBHUNTER_DB_NAME`); returns the steps run, in order.
 
     `manifest_dir`, `cv_dir` and `exports_dir` default to the configuration's volumes (module docstring).
-    Concurrent runs on a database are serialised on `MIGRATE_LOCK_KEY`. `now` (default: the current time) only
-    matters to the first seeding. A step that fails raises (after one `migrate_failed` event with the step and
-    the exception class, never its message) and the steps after it do not run; every step is idempotent, so
-    the next `migrate` starts over.
+    Concurrent runs on a database are serialised on `MIGRATE_LOCK_KEY`. `now` (default: the current time) is
+    the clock of the first seeding and of the replay (step 7): the times its re-applied admissions, its
+    settlements and deletions and its `replay_log` entries record. A step that fails raises (after one
+    `migrate_failed` event with the step and the exception class, never its message) and the steps after it do
+    not run; every step is idempotent, so the next `migrate` starts over (a replay resumes its started one).
     """
     moment = utcnow() if now is None else now
     order = selected_steps(steps)

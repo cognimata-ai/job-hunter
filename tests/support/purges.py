@@ -13,12 +13,27 @@
 - `completed(purger, manifest_id, operation_id)`: the manifest, asserted `completed` with its content, its
   operation `succeeded`, every fence of it released and every postcondition holding.
 
+M5 Task 25 adds what the replay tests (`test_replay.py`, `test_typed_replay.py`) share:
+- `seeded(engine, **kwargs)`: the two-year-old seed (`tests.support.privacy_seed`) at `utcnow()`, committed;
+- `request_source_purge(engine, *, now=None)`: the Adzuna purge's A0 in a transaction of its own (no
+  deferrer: the purger runs the operation);
+- `stopped_at(purger, opened, point, monkeypatch, module=purge)`: the purge run by the handler until a crash
+  at `module`'s fault point `point` (`tests.support.faults.raising_at`); its manifest, still `executing`;
+- `recomputed(engine, job_id)`: the job's canonical selection and det-facts hook, as identity resolution runs
+  them; its current revision;
+- `one`, `scalar` and `rows`: a statement's one row, one value or rows, on a connection of its own;
+- `completions(replay_log)`: a manifest's completed replays (`replay_log`'s entries with their counts);
+- the statements `JOB`, `JOB_EXISTS`, `IS_FENCED`, `PROVENANCE_SOURCES` (the sources a job's
+  `field_provenance` names), `ALERT` (an invented alert, `:key` its dedup key) and `EXPORT`.
+
 It is a plugin module of the root conftest (`pytest_plugins`), so its fixtures reach every test and its
 assertions are rewritten.
 """
 
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -26,6 +41,9 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.dedup import revisions
+from jobhunter.privacy import purge
+from jobhunter.privacy.kinds import source_purge
 from jobhunter.privacy.manifests import (
     FileRoots,
     ManifestRow,
@@ -33,12 +51,16 @@ from jobhunter.privacy.manifests import (
     manifest_file_name,
     read_manifest,
 )
+from jobhunter.privacy.purge import OpenedPurge
 from jobhunter.profile.storage import CvStore
+from jobhunter.scoring import filters
 from jobhunter.worker import operations as ops
 from jobhunter.worker.operations import OperationDeps
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.faults import no_fault, raising_at
 from tests.support.pg import PgServer
+from tests.support.privacy_seed import SeedIds, seed_two_year_old_graph
 
 _DUE: Final = sa.text("UPDATE operations SET not_before = NULL WHERE id = :i")
 _STATUS: Final = sa.text("SELECT status FROM operations WHERE id = :i")
@@ -125,3 +147,74 @@ async def completed(purger: Purger, manifest_id: int, operation_id: int) -> Mani
         assert (await conn.execute(_FENCES_RELEASED, {"m": manifest_id})).scalar_one() is not False
         assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
     return manifest
+
+
+# ---- M5 Task 25: the replay tests' shared helpers ----------------------------------------------------------
+
+JOB: Final = sa.text("SELECT current_revision_id, salary FROM jobs WHERE id = :j")
+JOB_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :j)")
+IS_FENCED: Final = sa.text("SELECT is_fenced(:j)")
+PROVENANCE_SOURCES: Final = sa.text(
+    "SELECT coalesce(array_agg(DISTINCT si.source_id ORDER BY si.source_id), '{}') FROM jobs j "
+    "CROSS JOIN LATERAL jsonb_each(j.field_provenance) e JOIN source_instances si "
+    "ON si.id = CAST(e.value ->> 'source_instance_id' AS bigint) WHERE j.id = :j"
+)
+ALERT: Final = sa.text(
+    "INSERT INTO alerts (code, severity, dedup_key, message) "
+    "VALUES ('test.replay', 'info', :key, 'an invented alert') RETURNING id"
+)
+EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e")
+
+
+async def seeded(engine: AsyncEngine, **kwargs: Any) -> SeedIds:
+    async with engine.begin() as conn:
+        return await seed_two_year_old_graph(conn, now=utcnow(), **kwargs)
+
+
+async def request_source_purge(engine: AsyncEngine, *, now: datetime | None = None) -> OpenedPurge:
+    async with engine.begin() as conn:
+        return await source_purge.request_source_purge(
+            conn, source_id="adzuna", now=utcnow() if now is None else now, defer=None
+        )
+
+
+async def stopped_at(
+    purger: Purger,
+    opened: OpenedPurge,
+    point: str,
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any = purge,
+) -> ManifestRow:
+    monkeypatch.setattr(module, "afault_point", raising_at(point))
+    await purger.run(opened.operation_id)
+    monkeypatch.setattr(module, "afault_point", no_fault)
+    manifest = await manifest_of(purger.engine, opened.manifest_id)
+    assert manifest.status == "executing"
+    return manifest
+
+
+async def recomputed(engine: AsyncEngine, job_id: int) -> int:
+    async with engine.begin() as conn:
+        active = await filters.lock_active_scopes(conn)
+        result = await revisions.recompute_job(conn, job_id)
+        await filters.refilter_job_live(conn, job_id, active=active)
+    return result.revision_id
+
+
+async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
+    async with engine.connect() as conn:
+        return (await conn.execute(statement, params)).one()
+
+
+async def scalar(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
+    async with engine.connect() as conn:
+        return (await conn.execute(statement, params)).scalar_one()
+
+
+async def rows(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> list[Any]:
+    async with engine.connect() as conn:
+        return list((await conn.execute(statement, params)).all())
+
+
+def completions(replay_log: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [entry for entry in replay_log if "counts" in entry]

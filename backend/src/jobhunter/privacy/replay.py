@@ -23,21 +23,31 @@ reads it (`parse_manifest` of its canonical bytes, then that hash).
   one is `checked`.
 
 **The replay** (`replay_stream`) ends at once when every manifest is `satisfied`. Otherwise:
-- **phase A.** One transaction under `active_config FOR UPDATE` (§3.3.3 step 2): the rows the database lacks
-  inserted; every replayed manifest's fences made active (an active fence of the manifest kept, its job ids
-  widened to the stored ones; one reconstructed from the content's `fence` operations, delete-everything's
-  `global`, or a pending retry's request, where none stands); an adopted file recorded (`record_manifest`,
-  which adds the stored affected jobs to the source fence); then each kind's `reapply_admission` (the source
-  purge's disabling settings version, `purge_fence_at` and run cancels; a no-op for the other kinds). Then
-  each pending retry is completed from its row: without a hash its content is computed
-  (`purge.compute_content`, the fence's cutoff read after that commit; `api` and `worker` are stopped, so
-  there is no quiesce), checked as the file will be read, written (`write_manifest_file`: tmp, fsync,
-  rename) and recorded; with one, its file is written from `scope`. Then every replayed manifest's procedure
-  runs in stream order (`PurgeRun.replay`: no effects, no owner, the volumes `migrate` was given), and for a
-  kind that deletes exports its export ops right after it (`deletion_graph.purge_exports`), as the live
-  handler's step 3 runs them. A source purge leaves its rebuild to phase B (its replay mode deletes its
-  tainted revisions instead): no rebuild runs between manifests. Then the fault point
-  `privacy.replay.after_a` (`AFTER_A`);
+- **phase A** (Ruling T25-3: each manifest's effects at its place in the stream). One transaction under
+  `active_config FOR UPDATE` (§3.3.3 step 2): the rows the database lacks inserted; every replayed manifest's
+  fences made active (an active fence of the manifest kept, its job ids widened to the stored ones; one
+  reconstructed from the content's `fence` operations, delete-everything's `global`, or a pending retry's
+  request, where none stands); an adopted file recorded (`record_manifest`, which adds the stored affected
+  jobs to the source fence); and the replay recorded in each replayed manifest's `replay_log` as `{restore_id,
+  at, phase: "started", high_water}`, `high_water` each table's greatest id when the replay began
+  (`max_identity_ids`, before any row of the replay: every row above it is the replay's own). A `migrate`
+  after a crash resumes the replay a `started` entry names that no completion entry closes: its restore id
+  and its high water, never new ones. Then, for each manifest in stream order: its admission, in a
+  transaction of its own under `active_config FOR UPDATE`: each table's greatest id (its turn), its kind's
+  `reapply_admission` (the source purge's disabling settings version, `purge_fence_at` and run cancels; a
+  no-op for the other kinds) and `{restore_id, at, phase: "admitted", turn}` in its `replay_log`, which a
+  resumed replay reads instead of re-applying the admission over the effects of the manifests after it; for a
+  pending retry, its completion from its row: without a hash its content computed (`purge.compute_content`,
+  the cutoff of the fences read once after the first transaction; `api` and `worker` are stopped, so there
+  is no quiesce), checked as the file will be read (`purge.unparsable`), written (`write_manifest_file`: tmp,
+  fsync, rename) and recorded; with one, its file written from `scope`; then its procedure (`PurgeRun.replay`:
+  no effects, no owner, the volumes `migrate` was given, and the replay's own rows before its turn,
+  `replayed_rows`: per table `(high_water, turn]`, which delete-everything's bounded selectors also cover,
+  so a settings version an earlier replayed source purge re-created, or a tombstone an earlier tombstoning
+  re-created, goes as its live counterpart went), and for a kind that deletes exports its export ops right
+  after it (`deletion_graph.purge_exports`), as the live handler's step 3 runs them. A source purge leaves
+  its rebuild to phase B (its replay mode deletes its tainted revisions instead): no rebuild runs between
+  manifests. Then the fault point `privacy.replay.after_a` (`AFTER_A`);
 - **phase B.** The stored affected jobs of every replayed source purge that phase A left, each followed up
   `merged_into_job_id` to its root, are rebuilt once per root by `source_purge.rebuild_jobs`, with the run
   of the latest replayed source purge whose stored set holds a job of that root (T15-4 (1)); each rebuild
@@ -48,18 +58,28 @@ reads it (`parse_manifest` of its canonical bytes, then that hash).
   of every replayed manifest checked (the `fence` operations' "no active fence" holds now; Task 12's order).
   A violation rolls it back, so every fence stays active; it is logged (`replay_postcondition_failed`: ids,
   ops, tables and counts) and raises `ReplayFailed`, which stops `migrate`. Otherwise every `executing`
-  manifest becomes `completed`, and every replayed one's `replay_log` gains `{restore_id, at, counts}` (one
-  uuid per replay, its `now`, and the counts of the manifest's replayed operations by op, of the exports it
-  purged and of the jobs its run rebuilt).
+  manifest becomes `completed`, and every replayed one's `replay_log` gains its completion entry
+  `{restore_id, at, counts}` (the replay's id, its `now`, and the counts of the manifest's replayed
+  operations by op, of the exports it purged and of the jobs its run rebuilt).
 
 A crash anywhere restarts step 7 from the stored sets: the writes of phase A are idempotent (an inserted or
-recorded manifest is then an `executing` row with its file, a reconstructed fence an active one), the
-procedures re-run on what is left, and phase C is all or nothing. The replay writes a manifest file only for a
-pending retry, and never over a valid one (`write_manifest_file` adopts equal bytes and refuses others). It
-changes the database and the volumes only (Deviation 56): it needs no Anthropic or healthchecks secret, and
-delete-everything's recorded batch cancels are dropped (`batch_cancel_skipped_replay`). A kind's `PurgeWait`
-(a condition with an end of its own, such as an eval run the dump holds `running`) or co-members that keep
-changing stop `migrate` like any other error, the fences active. Ids, counts and codes only reach a log line.
+recorded manifest is then an `executing` row with its file, a reconstructed fence an active one, an admission
+recorded once), the procedures re-run on what is left within the same replay's marks, and phase C is all or
+nothing. The replay writes a manifest file only for a pending retry, and never over a valid one
+(`write_manifest_file` adopts equal bytes and refuses others). It changes the database and the volumes only
+(Deviation 56): it needs no Anthropic or healthchecks secret, and delete-everything's recorded batch cancels
+are dropped (`batch_cancel_skipped_replay`).
+
+**Work in flight in the dump** (Ruling T25-2 (8)) never makes a replayed kind wait: nothing can end it in a
+restore. The kinds' waits and give-ups, by site:
+- `golden_case` (a running eval run includes the case, `PurgeWait('eval_run_running')`): the dump's run is
+  ended as the `eval_run` failure hook ends an interrupted run (`fail_eval_run`), logged with its id, and the
+  case deleted;
+- `source_purge`'s frozen embeddings (`PurgeWait('embedding_reused')`, a revision taking a frozen embedding
+  between rounds) and `PurgeRun.chunk` (`CoMemberChanged`, co-members joining a group under its lock, three
+  rounds running): each needs a writer running beside the purge, which no consistent dump holds and no
+  replay has; they keep stopping `migrate`, the fences active.
+Ids, counts and codes only reach a log line.
 """
 
 import dataclasses
@@ -69,6 +89,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, cast
 from uuid import UUID
 
@@ -92,12 +113,20 @@ from jobhunter.privacy.manifests import (
     check_postconditions,
     complete_manifest,
     manifest_file_name,
+    max_identity_ids,
     parse_manifest,
     read_manifest,
     record_manifest,
     write_manifest_file,
 )
-from jobhunter.privacy.purge import KINDS, CompletingKind, KindProcedure, PurgeRun, compute_content
+from jobhunter.privacy.purge import (
+    KINDS,
+    CompletingKind,
+    KindProcedure,
+    PurgeRun,
+    compute_content,
+    unparsable,
+)
 from jobhunter.types import JSONValue
 
 if TYPE_CHECKING:
@@ -107,6 +136,9 @@ if TYPE_CHECKING:
 AFTER_A: Final = "privacy.replay.after_a"
 AFTER_B: Final = "privacy.replay.after_b"
 LOGGED_IDS: Final = 20
+# The phases of a replay's `replay_log` entries before its completion entry (module docstring).
+STARTED: Final = "started"
+ADMITTED: Final = "admitted"
 
 Outcome = Literal["replayed", "pending_retry", "checked", "satisfied"]
 
@@ -134,6 +166,9 @@ _ROOTS: Final = q(
     "WHERE j.id = ANY(CAST(:jobs AS bigint[])) "
     "UNION SELECT up.start, p.id, p.merged_into_job_id FROM jobs p JOIN up ON p.id = up.parent) "
     "SELECT start AS job_id, id AS root_id FROM up WHERE parent IS NULL ORDER BY start"
+)
+_REPLAY_LOGS: Final = q(
+    "SELECT id, replay_log FROM deletion_manifests WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
 )
 _LOG_REPLAY: Final = q(
     "UPDATE deletion_manifests SET replay_log = replay_log || jsonb_build_array(:entry) WHERE id = :id",
@@ -180,15 +215,26 @@ class _Entry:
     row: ManifestRow | None
 
 
+@dataclass(frozen=True)
+class _Restore:
+    """One replay of the stream, new or resumed after a crash: its id and each table's greatest id when it
+    began (`high_water`: a row above it is the replay's own)."""
+
+    restore_id: str
+    high_water: Mapping[str, int]
+
+
 @dataclass
 class _Replayed:
     """A manifest in the replay: its row (read again as each phase writes it), its content (set once a pending
-    retry's is), its procedure and the counts its `replay_log` entry carries."""
+    retry's is), its procedure, its turn (each table's greatest id when its admission began, once recorded)
+    and the counts its completion entry carries."""
 
     row: ManifestRow
     content: ManifestContent | None
     proc: KindProcedure
     pending: bool
+    turn: dict[str, int] | None = None
     counts: dict[str, int] = field(default_factory=dict)
 
     @property
@@ -391,11 +437,53 @@ async def _insert(conn: AsyncConnection, content: ManifestContent) -> ManifestRo
     return await _reread(conn, int((await conn.execute(_INSERT, params)).scalar_one()))
 
 
-async def _admit(engine: AsyncEngine, entries: Sequence[_Entry], *, now: datetime) -> list[_Replayed]:
-    """Phase A's first transaction (module docstring); the manifests to replay, in stream order."""
+def _has_entry(entries: Sequence[Mapping[str, JSONValue]], restore_id: str, phase: str) -> bool:
+    return any(e.get("restore_id") == restore_id and e.get("phase") == phase for e in entries)
+
+
+def _turn_of(entries: Sequence[Mapping[str, JSONValue]], restore_id: str) -> dict[str, int] | None:
+    """The `turn` this replay's `admitted` entry recorded for the manifest, `None` before its admission."""
+    for entry in entries:
+        if entry.get("restore_id") == restore_id and entry.get("phase") == ADMITTED:
+            return {str(t): int(cast(int, v)) for t, v in cast(dict[str, JSONValue], entry["turn"]).items()}
+    return None
+
+
+def _unfinished(logs: Sequence[Sequence[Mapping[str, JSONValue]]]) -> _Restore | None:
+    """The replay an earlier `migrate` started and never completed (a `started` entry whose restore id no
+    completion entry names), the latest one; `None` when there is none."""
+    entries = [entry for log_ in logs for entry in log_]
+    completed = {entry.get("restore_id") for entry in entries if "counts" in entry}
+    started = [e for e in entries if e.get("phase") == STARTED and e.get("restore_id") not in completed]
+    if not started:
+        return None
+    latest = max(started, key=lambda e: str(e["at"]))
+    high_water = {
+        str(t): int(cast(int, v)) for t, v in cast(dict[str, JSONValue], latest["high_water"]).items()
+    }
+    return _Restore(str(latest["restore_id"]), MappingProxyType(high_water))
+
+
+def _entry(restore: _Restore, now: datetime, phase: str, marks: Mapping[str, int]) -> dict[str, JSONValue]:
+    key = "high_water" if phase == STARTED else "turn"
+    found: dict[str, JSONValue] = {**marks}
+    return {"restore_id": restore.restore_id, "at": now.isoformat(), "phase": phase, key: found}
+
+
+async def _admit(
+    engine: AsyncEngine, entries: Sequence[_Entry], *, now: datetime
+) -> tuple[_Restore, list[_Replayed]]:
+    """Phase A's first transaction (module docstring): the replay (resumed or new) and the manifests to
+    replay, in stream order, every fence of them active."""
     replayed: list[_Replayed] = []
     async with engine.begin() as conn:
         await conn.execute(_CONFIG_FOR_UPDATE)
+        recorded = [entry.row.id for entry in entries if entry.row is not None]
+        logs = {int(r.id): list(r.replay_log) for r in await conn.execute(_REPLAY_LOGS, {"ids": recorded})}
+        restore = _unfinished(list(logs.values()))
+        resumed = restore is not None
+        if restore is None:  # before any row of this replay: every row above it is the replay's own
+            restore = _Restore(str(uuid7()), MappingProxyType(await max_identity_ids(conn)))
         for entry in entries:
             row = entry.row
             if row is None:
@@ -406,9 +494,15 @@ async def _admit(engine: AsyncEngine, entries: Sequence[_Entry], *, now: datetim
             if entry.content is not None and row.file_sha256 is None:  # its file adopted (A3)
                 await record_manifest(conn, row, entry.content, _sha256(entry.content))
             row = await _reread(conn, row.id)
-            proc = KINDS[row.kind]
-            await proc.reapply_admission(conn, row, now=now)
-            replayed.append(_Replayed(row, entry.content, proc, pending=entry.outcome == "pending_retry"))
+            known = logs.get(row.id, [])
+            if not _has_entry(known, restore.restore_id, STARTED):
+                started = _entry(restore, now, STARTED, restore.high_water)
+                await conn.execute(_LOG_REPLAY, {"id": row.id, "entry": started})
+            manifest = _Replayed(
+                row, entry.content, KINDS[row.kind], pending=entry.outcome == "pending_retry"
+            )
+            manifest.turn = _turn_of(known, restore.restore_id)
+            replayed.append(manifest)
             log.info(
                 "replay_admitted",
                 manifest_id=row.id,
@@ -416,58 +510,110 @@ async def _admit(engine: AsyncEngine, entries: Sequence[_Entry], *, now: datetim
                 outcome=entry.outcome,
                 fences_reconstructed=reconstructed,
             )
-    return replayed
+    log.info(
+        "replay_started",
+        restore_id=restore.restore_id,
+        resumed=resumed,
+        manifest_ids=[m.row.id for m in replayed][:LOGGED_IDS],
+    )
+    return restore, replayed
 
 
-def _unreadable(content: ManifestContent, row: ManifestRow) -> bool:
-    """Whether a replay could not read a computed content's file back unchanged (`purge`'s check)."""
-    data = canonical_bytes(content)
-    parsed = parse_manifest(data, file_name=manifest_file_name(row.manifest_uuid))
-    return canonical_bytes(parsed) != data
+async def _admission(
+    engine: AsyncEngine, manifest: _Replayed, restore: _Restore, *, now: datetime
+) -> Mapping[str, int]:
+    """The manifest's admission at its place in the stream (module docstring): in a transaction of its own
+    under `active_config FOR UPDATE`, each table's greatest id (its turn), its kind's `reapply_admission` and
+    its `admitted` entry; the turn. A restart reuses a turn its replay recorded and re-applies nothing."""
+    if manifest.turn is not None:
+        return manifest.turn
+    async with engine.begin() as conn:
+        await conn.execute(_CONFIG_FOR_UPDATE)
+        turn = await max_identity_ids(conn)
+        await manifest.proc.reapply_admission(conn, manifest.row, now=now, high_water=restore.high_water)
+        await conn.execute(
+            _LOG_REPLAY, {"id": manifest.row.id, "entry": _entry(restore, now, ADMITTED, turn)}
+        )
+    manifest.turn = turn
+    return turn
+
+
+def _own_rows(restore: _Restore, turn: Mapping[str, int]) -> dict[str, tuple[int, int]]:
+    """Per table, the ids `(above, upto]` of the rows the replay created before a manifest's turn."""
+    return {
+        table: (restore.high_water[table], upto)
+        for table, upto in turn.items()
+        if table in restore.high_water and upto > restore.high_water[table]
+    }
 
 
 async def _complete_pending(
-    engine: AsyncEngine, manifests: Sequence[_Replayed], *, manifest_dir: Path, now: datetime
-) -> int:
-    """Each pending retry completed from its row (module docstring); how many."""
-    pending = [m for m in manifests if m.pending]
-    if not pending:
-        return 0
-    since = await fence_committed_at(engine)  # the restored fences' cutoff, after their commit
-    for manifest in pending:
-        proc = manifest.proc
-        computed = manifest.content is None
-        if manifest.content is None:
-            async with engine.begin() as conn:
-                content = await compute_content(conn, proc, manifest.row, fenced_at=since, now=now)
-            if _unreadable(content, manifest.row):
-                raise ReplayFailed(
-                    f"deletion manifest {manifest.row.id}: its computed content is no manifest"
-                )
-            sha = write_manifest_file(manifest_dir, content)
-            async with engine.begin() as conn:
-                await record_manifest(conn, manifest.row, content, sha)
-                manifest.row = await _reread(conn, manifest.row.id)
-            manifest.content = content
-        else:
-            write_manifest_file(manifest_dir, manifest.content)  # from `scope`; an equal file is adopted
-        log.info("replay_pending_completed", manifest_id=manifest.row.id, computed=computed)
-    return len(pending)
+    engine: AsyncEngine, manifest: _Replayed, *, manifest_dir: Path, since: datetime, now: datetime
+) -> None:
+    """A pending retry completed from its row at its turn (module docstring): without a hash its content
+    computed under the restored fence (`since`, the fences' cutoff), checked, written and recorded; with one,
+    its file written from `scope`."""
+    computed = manifest.content is None
+    if manifest.content is None:
+        async with engine.begin() as conn:
+            content = await compute_content(conn, manifest.proc, manifest.row, fenced_at=since, now=now)
+        if (reason := unparsable(content, manifest.row)) is not None:
+            raise ReplayFailed(
+                f"deletion manifest {manifest.row.id}: its computed content is no manifest: {reason}"
+            )
+        sha = write_manifest_file(manifest_dir, content)
+        async with engine.begin() as conn:
+            await record_manifest(conn, manifest.row, content, sha)
+            manifest.row = await _reread(conn, manifest.row.id)
+        manifest.content = content
+    else:
+        write_manifest_file(manifest_dir, manifest.content)  # from `scope`; an equal file is adopted
+    log.info("replay_pending_completed", manifest_id=manifest.row.id, computed=computed)
 
 
 async def _execute(
-    engine: AsyncEngine, cfg: "AppConfig", manifests: Sequence[_Replayed], *, files: FileRoots, now: datetime
+    engine: AsyncEngine,
+    cfg: "AppConfig",
+    manifest: _Replayed,
+    *,
+    files: FileRoots,
+    now: datetime,
+    own_rows: Mapping[str, tuple[int, int]],
 ) -> None:
-    """Every replayed manifest's destructive operations, in stream order (module docstring)."""
+    """The manifest's destructive operations at its turn, its export ops after them (module docstring)."""
+    content = manifest.stored
+    manifest.counts.update(Counter(op["op"] for op in content["operations"]))
+    run = PurgeRun.replay(engine, cfg, manifest=manifest.row, now=now, files=files, replayed_rows=own_rows)
+    await manifest.proc.execute(run, content)
+    exports: list[Operation] = [op for op in content["operations"] if is_export_op(op)]
+    if manifest.proc.deletes_exports and exports:
+        manifest.counts["exports_purged"] = await purge_exports(run, exports)
+
+
+async def _phase_a(
+    engine: AsyncEngine,
+    cfg: "AppConfig",
+    entries: Sequence[_Entry],
+    *,
+    manifest_dir: Path,
+    files: FileRoots,
+    now: datetime,
+) -> tuple[_Restore, list[_Replayed], int]:
+    """Phase A (module docstring): the replay, its manifests and the pending retries completed."""
+    restore, manifests = await _admit(engine, entries, now=now)
+    since: datetime | None = None
+    pending = 0
     for manifest in manifests:
-        content = manifest.stored
-        manifest.counts.update(Counter(op["op"] for op in content["operations"]))
-        run = PurgeRun.replay(engine, cfg, manifest=manifest.row, now=now, files=files)
-        await manifest.proc.execute(run, content)
-        exports: list[Operation] = [op for op in content["operations"] if is_export_op(op)]
-        if manifest.proc.deletes_exports and exports:
-            manifest.counts["exports_purged"] = await purge_exports(run, exports)
+        turn = await _admission(engine, manifest, restore, now=now)
+        if manifest.pending:
+            if since is None:
+                since = await fence_committed_at(engine)  # the restored fences' cutoff, after their commit
+            await _complete_pending(engine, manifest, manifest_dir=manifest_dir, since=since, now=now)
+            pending += 1
+        own = _own_rows(restore, turn)
+        await _execute(engine, cfg, manifest, files=files, now=now, own_rows=own)
     log.info("replay_phase_a_done", manifest_ids=[m.row.id for m in manifests][:LOGGED_IDS])
+    return restore, manifests, pending
 
 
 # ---- phase B -----------------------------------------------------------------------------------------------
@@ -514,10 +660,10 @@ class _Violated(Exception):
 
 
 async def _verify_and_release(
-    engine: AsyncEngine, manifests: Sequence[_Replayed], *, files: FileRoots, now: datetime
-) -> str:
-    """Phase C (module docstring); the replay's restore id."""
-    restore_id = str(uuid7())
+    engine: AsyncEngine, manifests: Sequence[_Replayed], *, restore: _Restore, files: FileRoots, now: datetime
+) -> None:
+    """Phase C (module docstring)."""
+    restore_id = restore.restore_id
     violations: list[dict[str, object]] = []
     try:
         async with engine.begin() as conn:
@@ -547,7 +693,6 @@ async def _verify_and_release(
         raise ReplayFailed(
             f"the replay's postconditions failed for deletion manifests {manifest_ids}"
         ) from None
-    return restore_id
 
 
 # ---- the replay --------------------------------------------------------------------------------------------
@@ -571,16 +716,16 @@ async def replay_stream(
         return ReplayReport(replayed=0, pending_completed=0, rebuilt_jobs=0)
     if unknown := [str(e.manifest_uuid) for e in to_replay if _kind_of(e) not in KINDS]:
         raise ReplayFailed(f"no procedure replays the kind of manifests {unknown[:LOGGED_IDS]}")
-    manifests = await _admit(engine, to_replay, now=now)
-    pending = await _complete_pending(engine, manifests, manifest_dir=manifest_dir, now=now)
-    await _execute(engine, cfg, manifests, files=files, now=now)
+    restore, manifests, pending = await _phase_a(
+        engine, cfg, to_replay, manifest_dir=manifest_dir, files=files, now=now
+    )
     await afault_point(AFTER_A)
     rebuilt = await _rebuild(engine, cfg, manifests, files=files, now=now)
     await afault_point(AFTER_B)
-    restore_id = await _verify_and_release(engine, manifests, files=files, now=now)
+    await _verify_and_release(engine, manifests, restore=restore, files=files, now=now)
     log.info(
         "replay_completed",
-        restore_id=restore_id,
+        restore_id=restore.restore_id,
         manifest_ids=[m.row.id for m in manifests][:LOGGED_IDS],
         pending_completed=pending,
         rebuilt_jobs=rebuilt,

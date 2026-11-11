@@ -10,7 +10,9 @@ it) owned by the migrator; the migrator dumps (`pg_dump -Fc`) and restores with 
 dump and its list are files of the container's own `/tmp`, removed whatever the outcome. The migrator's
 password is read from its secret file inside the container (`/run/secrets`), never put on a command line.
 
-`drop_database(server, name)` drops a database of the test server, its sessions with it (a test's teardown).
+`dump_listing(server, *, source_db=...)` is the `pg_restore --list` output of a dump of `source_db`, the
+listing `restore_list` filters. `drop_database(server, name)` drops a database of the test server, its
+sessions with it (a test's teardown).
 """
 
 import asyncio
@@ -81,6 +83,20 @@ def _dump_and_restore(server: PgServer, source_db: str, target_db: str) -> None:
         )
     finally:
         _in_container(server, "rm", "-f", dump, listing)
+
+
+def _dump_listing(server: PgServer, source_db: str) -> str:
+    dump = f"/tmp/jh-listing-{secrets.token_hex(6)}.dump"  # noqa: S108 (the container's own /tmp)
+    try:
+        _in_container(server, "pg_dump", "-Fc", *_MIGRATOR, "-d", source_db, "-f", dump)
+        return _in_container(server, "pg_restore", "--list", dump)
+    finally:
+        _in_container(server, "rm", "-f", dump)
+
+
+async def dump_listing(server: PgServer, *, source_db: str) -> str:
+    """The `pg_restore --list` output of a dump of `source_db` (module docstring)."""
+    return await asyncio.to_thread(_dump_listing, server, _checked(source_db))
 
 
 async def dump_and_restore(server: PgServer, *, source_db: str, target_db: str) -> None:

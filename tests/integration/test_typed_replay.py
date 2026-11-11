@@ -34,7 +34,6 @@ from jobhunter.clock import utcnow
 from jobhunter.db.migrate import MIGRATE_ORDER, StepGroup, run_migrate_async
 from jobhunter.db.seed import content_hash
 from jobhunter.db.session import make_null_engine
-from jobhunter.dedup import revisions
 from jobhunter.jobs.listing import select_page
 from jobhunter.jobs.query import JobsQuery
 from jobhunter.llm.batches import BatchesClient
@@ -54,12 +53,14 @@ from jobhunter.privacy.manifests import (
 from jobhunter.privacy.purge import KINDS, OpenedPurge
 from jobhunter.privacy.replay import Classified, classify_stream
 from jobhunter.profile import activation
-from jobhunter.scoring import batch_results, filters
+from jobhunter.scoring import batch_results
+from jobhunter.scoring import golden as golden_rules
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.dryrun import dry_run
 from jobhunter.settings.model import Settings
 from jobhunter.settings.save import SaveRequest, save_settings
 from jobhunter.worker import operations as ops
+from jobhunter.worker.operations import EVAL_RUN_INTERRUPTED, fail_eval_run
 from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from structlog.testing import capture_logs
@@ -70,10 +71,26 @@ from tests.support.fixtures import ConfigFactory
 from tests.support.llm import FakeLLM
 from tests.support.observations import stated
 from tests.support.pg import PgServer
-from tests.support.privacy_seed import SeedIds, seed_two_year_old_graph
+from tests.support.privacy_seed import SeedIds
 from tests.support.profile import SYNTHETIC_PROFILE
-from tests.support.purges import Purger, completed
-from tests.support.restore import drop_database, dump_and_restore
+from tests.support.purges import (
+    ALERT,
+    EXPORT,
+    IS_FENCED,
+    JOB,
+    PROVENANCE_SOURCES,
+    Purger,
+    completed,
+    completions,
+    one,
+    recomputed,
+    request_source_purge,
+    rows,
+    scalar,
+    seeded,
+    stopped_at,
+)
+from tests.support.restore import drop_database, dump_and_restore, dump_listing
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
 
@@ -107,14 +124,6 @@ _PROFILE_PURGE_OF: Final = sa.text(
     "JOIN operations o ON o.kind = 'purge' AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
     "WHERE m.kind = 'profile_purge' AND m.request -> 'profile_version_id' = to_jsonb(CAST(:v AS bigint))"
 )
-_JOB: Final = sa.text("SELECT current_revision_id, salary FROM jobs WHERE id = :j")
-_JOB_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :j)")
-_IS_FENCED: Final = sa.text("SELECT is_fenced(:j)")
-_PROVENANCE_SOURCES: Final = sa.text(
-    "SELECT coalesce(array_agg(DISTINCT si.source_id ORDER BY si.source_id), '{}') FROM jobs j "
-    "CROSS JOIN LATERAL jsonb_each(j.field_provenance) e JOIN source_instances si "
-    "ON si.id = CAST(e.value ->> 'source_instance_id' AS bigint) WHERE j.id = :j"
-)
 _LINEAGE: Final = sa.text(
     "SELECT coalesce(array_agg(DISTINCT s.source_id ORDER BY s.source_id), '{}') FROM jobs j "
     "JOIN job_revision_sources s ON s.job_revision_id = j.current_revision_id WHERE j.id = :j"
@@ -134,10 +143,11 @@ _FENCE_AT: Final = sa.text("SELECT purge_fence_at FROM sources WHERE id = 'adzun
 _RUN: Final = sa.text("SELECT status, status_reason FROM runs WHERE id = :r")
 _TOMBSTONES_OF: Final = sa.text("SELECT count(*) FROM job_tombstones WHERE former_job_id = :j")
 _SUBMISSION_EXISTS: Final = sa.text("SELECT EXISTS (SELECT 1 FROM batch_submissions WHERE id = :s)")
-_EXPORT: Final = sa.text("SELECT status, storage_path FROM exports WHERE id = :e")
 _POSTINGS_MAX: Final = sa.text("SELECT coalesce(max(id), 0) FROM postings")
 _JOBS: Final = sa.text("SELECT count(*) FROM jobs")
 _SESSION_COUNT: Final = sa.text("SELECT count(*) FROM sessions")
+_ACTIVE_CASE: Final = sa.text("SELECT id FROM golden_cases WHERE active ORDER BY id LIMIT 1")
+_EVAL_RUN: Final = sa.text("SELECT status, metrics FROM eval_runs WHERE id = :r")
 _ROW_EXISTS: Final = "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = :i)"
 _CONFIGURATION: Final = sa.text(
     "SELECT 'version' AS kind, id, version_no, NULL::timestamptz AS at FROM settings_versions "
@@ -157,10 +167,6 @@ _JOB_ROW: Final = sa.text(
 )
 _FINISH_JOB: Final = sa.text("UPDATE procrastinate_jobs SET status = 'succeeded' WHERE id = :j")
 _RESOLVE: Final = sa.text("UPDATE alerts SET resolved_at = now() WHERE id = :a AND resolved_at IS NULL")
-_ALERT: Final = sa.text(
-    "INSERT INTO alerts (code, severity, dedup_key, message) "
-    "VALUES ('test.replay', 'info', :key, 'an invented alert') RETURNING id"
-)
 _LOCKOUT_SCOPES: Final = sa.text("SELECT scope FROM login_lockouts ORDER BY scope")
 _RENEW_LOCKOUT: Final = sa.text(
     "INSERT INTO login_lockouts (scope, locked_until, reason) VALUES (:scope, now() + interval '15 minutes', "
@@ -262,21 +268,6 @@ async def migrate_live(make_config: ConfigFactory, purger: Purger) -> list[str]:
 # ---- reading -----------------------------------------------------------------------------------------------
 
 
-async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
-    async with engine.connect() as conn:
-        return (await conn.execute(statement, params)).one()
-
-
-async def scalar(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
-    async with engine.connect() as conn:
-        return (await conn.execute(statement, params)).scalar_one()
-
-
-async def rows(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> list[Any]:
-    async with engine.connect() as conn:
-        return list((await conn.execute(statement, params)).all())
-
-
 async def exists(engine: AsyncEngine, table: str, row_id: int) -> bool:
     return bool(await scalar(engine, sa.text(_ROW_EXISTS.format(table=table)), i=row_id))
 
@@ -295,7 +286,7 @@ async def assert_replayed(engine: AsyncEngine, files: FileRoots, *manifests: Man
     released in the completing transaction, and every postcondition (the typed and the kind's) holding."""
     for manifest in manifests:
         row = await one(engine, _MANIFEST, u=manifest.manifest_uuid)
-        assert row.status == "completed" and len(row.replay_log) == 1, manifest.kind
+        assert row.status == "completed" and len(completions(row.replay_log)) == 1, manifest.kind
         fences = await rows(engine, _FENCES, u=manifest.manifest_uuid)
         assert {fence.released_at for fence in fences} <= {row.completed_at}  # one transaction: one now()
         assert manifest.scope is not None
@@ -320,22 +311,10 @@ def events(logs: Sequence[Mapping[str, Any]], name: str) -> list[Mapping[str, An
 # ---- the purges after the set ------------------------------------------------------------------------------
 
 
-async def seeded(engine: AsyncEngine, **kwargs: Any) -> SeedIds:
-    async with engine.begin() as conn:
-        return await seed_two_year_old_graph(conn, now=utcnow(), **kwargs)
-
-
 async def opened_of(engine: AsyncEngine, kind: ManifestKind) -> OpenedPurge:
     """The newest purge of `kind` opened so far."""
     row = await one(engine, _OPENED, kind=kind)
     return OpenedPurge(int(row.manifest_id), row.manifest_uuid, int(row.operation_id))
-
-
-async def request_source(engine: AsyncEngine, *, now: datetime | None = None) -> OpenedPurge:
-    async with engine.begin() as conn:
-        return await source_purge.request_source_purge(
-            conn, source_id=ADZUNA, now=utcnow() if now is None else now, defer=None
-        )
 
 
 async def request_golden(engine: AsyncEngine, case_id: int) -> OpenedPurge:
@@ -377,33 +356,6 @@ async def finished(purger: Purger, opened: OpenedPurge) -> ManifestRow:
     manifest."""
     await purger.run(opened.operation_id)
     return await completed(purger, opened.manifest_id, opened.operation_id)
-
-
-async def stopped_at(
-    purger: Purger,
-    opened: OpenedPurge,
-    point: str,
-    monkeypatch: pytest.MonkeyPatch,
-    module: Any = purge,
-) -> ManifestRow:
-    """The purge run by the worker's handler until a crash at `point` (of `module`); its manifest,
-    `executing`."""
-    monkeypatch.setattr(module, "afault_point", raising_at(point))
-    await purger.run(opened.operation_id)
-    monkeypatch.setattr(module, "afault_point", no_fault)
-    async with purger.engine.connect() as conn:
-        manifest = await read_manifest(conn, opened.manifest_id)
-    assert manifest is not None and manifest.status == "executing"
-    return manifest
-
-
-async def recomputed(engine: AsyncEngine, job_id: int) -> int:
-    """The job's canonical selection and its det-facts hook, as identity resolution runs them."""
-    async with engine.begin() as conn:
-        active = await filters.lock_active_scopes(conn)
-        result = await revisions.recompute_job(conn, job_id)
-        await filters.refilter_job_live(conn, job_id, active=active)
-    return result.revision_id
 
 
 async def _refuse_defer(conn: AsyncConnection, task: str, **kwargs: Any) -> int | None:
@@ -497,17 +449,17 @@ async def test_profile_source_and_golden_purges_replay_after_a_restore(
     await backup_set(migrated, restored)
     golden = await finished(purger, await request_golden(engine, seed.closed_case_id))
     profile = await finished(purger, await request_profile_purge(engine, version))
-    source = await finished(purger, await request_source(engine))
+    source = await finished(purger, await request_source_purge(engine))
 
     pauses = PausePoints(replay.AFTER_A, replay.AFTER_B)
     monkeypatch.setattr(replay, "afault_point", pauses)
     task = asyncio.create_task(migrate_restored(make_config, restored, purger.cfg.manifests_dir))
     await asyncio.wait_for(pauses[replay.AFTER_A].reached.wait(), 120)
-    assert (await one(restored.engine, _JOB, j=closed)).current_revision_id is None
-    assert await scalar(restored.engine, _IS_FENCED, j=closed) is True
+    assert (await one(restored.engine, JOB, j=closed)).current_revision_id is None
+    assert await scalar(restored.engine, IS_FENCED, j=closed) is True
     pauses[replay.AFTER_A].resume()
     await asyncio.wait_for(pauses[replay.AFTER_B].reached.wait(), 120)
-    assert (await one(restored.engine, _JOB, j=closed)).current_revision_id is not None
+    assert (await one(restored.engine, JOB, j=closed)).current_revision_id is not None
     assert [f.released_at for f in await rows(restored.engine, _FENCES, u=source.manifest_uuid)] == [None]
     assert (await one(restored.engine, _MANIFEST, u=source.manifest_uuid)).status == "executing"
     pauses[replay.AFTER_B].resume()
@@ -517,7 +469,7 @@ async def test_profile_source_and_golden_purges_replay_after_a_restore(
     purged_version = await one(restored.engine, _VERSION, v=version)
     assert purged_version.redacted and purged_version.purged_at is not None
     assert await rows(restored.engine, _TUPLES, v=version) == tuples
-    assert ADZUNA not in await scalar(restored.engine, _PROVENANCE_SOURCES, j=closed)
+    assert ADZUNA not in await scalar(restored.engine, PROVENANCE_SOURCES, j=closed)
     assert ADZUNA not in await scalar(restored.engine, _LINEAGE, j=closed)
     assert not await exists(restored.engine, "golden_cases", seed.closed_case_id)
     for job in seed.adzuna_only_job_ids:
@@ -542,7 +494,7 @@ async def test_an_injected_rebuild_failure_keeps_the_fence_and_fails_migrate(
     fence active over the mixed job; the next `migrate` replays the stream again and completes."""
     seed = await seeded(engine)
     await backup_set(migrated, restored)
-    source = await finished(purger, await request_source(engine))
+    source = await finished(purger, await request_source_purge(engine))
 
     monkeypatch.setattr(source_purge, "afault_point", raising_at(source_purge.MID_REBUILD))
     with capture_logs() as logs, pytest.raises(SimulatedCrash):
@@ -551,12 +503,12 @@ async def test_an_injected_rebuild_failure_keeps_the_fence_and_fails_migrate(
     assert (failed["step"], failed["error_type"]) == ("replay", "SimulatedCrash")
     assert (await one(restored.engine, _MANIFEST, u=source.manifest_uuid)).status == "executing"
     assert [f.released_at for f in await rows(restored.engine, _FENCES, u=source.manifest_uuid)] == [None]
-    assert await scalar(restored.engine, _IS_FENCED, j=seed.closed_job_id) is True
+    assert await scalar(restored.engine, IS_FENCED, j=seed.closed_job_id) is True
 
     monkeypatch.setattr(source_purge, "afault_point", no_fault)
     await migrate_restored(make_config, restored, purger.cfg.manifests_dir)
     await assert_replayed(restored.engine, restored.files, source)
-    assert await scalar(restored.engine, _IS_FENCED, j=seed.closed_job_id) is False
+    assert await scalar(restored.engine, IS_FENCED, j=seed.closed_job_id) is False
 
 
 async def test_data_collected_after_a_reenablement_survives(
@@ -574,7 +526,7 @@ async def test_data_collected_after_a_reenablement_survives(
     the next `migrate` there replays nothing."""
     seed = await seeded(engine)
     await backup_set(migrated, restored)
-    source = await finished(purger, await request_source(engine))
+    source = await finished(purger, await request_source_purge(engine))
     await save(engine, adzuna_on, internal=True)
     fresh = await job_with_postings({ADZUNA: {}})
     await recomputed(engine, fresh.job_id)
@@ -585,7 +537,7 @@ async def test_data_collected_after_a_reenablement_survives(
         )
         on_member = await add_posting(conn, member, ADZUNA, observed_at=utcnow())
     await recomputed(engine, seed.closed_job_id)
-    assert ADZUNA in await scalar(engine, _PROVENANCE_SOURCES, j=seed.closed_job_id)  # above the watermark
+    assert ADZUNA in await scalar(engine, PROVENANCE_SOURCES, j=seed.closed_job_id)  # above the watermark
 
     with capture_logs() as logs:
         await migrate_live(make_config, purger)
@@ -594,7 +546,7 @@ async def test_data_collected_after_a_reenablement_survives(
         assert await exists(engine, "postings", posting)
         assert await exists(engine, "posting_observations", observation)
     assert await exists(engine, "jobs", fresh.job_id) and await adzuna_enabled(engine)
-    assert ADZUNA in await scalar(engine, _PROVENANCE_SOURCES, j=seed.closed_job_id)
+    assert ADZUNA in await scalar(engine, PROVENANCE_SOURCES, j=seed.closed_job_id)
     assert source.scope is not None
     async with engine.connect() as conn:
         assert await check_postconditions(conn, source.scope, files=purger.file_roots) == []
@@ -621,12 +573,12 @@ async def test_a_job_two_source_purges_hold_is_rebuilt_once_by_the_latest(
     seed = await seeded(engine)
     closed = seed.closed_job_id
     await backup_set(migrated, restored)
-    m1 = await finished(purger, await request_source(engine))
+    m1 = await finished(purger, await request_source_purge(engine))
     await save(engine, adzuna_on, internal=True)
     async with engine.begin() as conn:
         await add_posting(conn, closed, ADZUNA, observed_at=utcnow(), salary=stated(1, 2))
     await recomputed(engine, closed)
-    m2 = await finished(purger, await request_source(engine))
+    m2 = await finished(purger, await request_source_purge(engine))
     assert m1.scope is not None and m2.scope is not None
     assert closed in m1.scope["affected"]["job_ids"] and closed in m2.scope["affected"]["job_ids"]
 
@@ -636,7 +588,7 @@ async def test_a_job_two_source_purges_hold_is_rebuilt_once_by_the_latest(
     latest = await row_of(restored.engine, m2.manifest_uuid)
     rebuilt = [e["manifest_id"] for e in events(logs, "source_purge_job_rebuilt") if e["job_id"] == closed]
     assert rebuilt == [latest.id]
-    assert ADZUNA not in await scalar(restored.engine, _PROVENANCE_SOURCES, j=closed)
+    assert ADZUNA not in await scalar(restored.engine, PROVENANCE_SOURCES, j=closed)
 
 
 async def test_purge_then_tombstone_then_restore(
@@ -653,7 +605,7 @@ async def test_purge_then_tombstone_then_restore(
     seed = await seeded(engine)
     closed = seed.closed_job_id
     await backup_set(migrated, restored)
-    m1 = await finished(purger, await request_source(engine))
+    m1 = await finished(purger, await request_source_purge(engine))
     batch = await request_tombstones(engine, now=utcnow())
     assert closed in batch.roots
     m2 = await finished(purger, batch.purge)
@@ -684,7 +636,7 @@ async def test_stream_order_replay_tolerates_completions_out_of_order(
     complete with every postcondition holding."""
     seed = await seeded(engine)
     await backup_set(migrated, restored)
-    first = await request_source(engine)
+    first = await request_source_purge(engine)
     m2 = await finished(purger, await request_golden(engine, seed.closed_case_id))
     m1 = await finished(purger, first)
     assert m1.manifest_uuid < m2.manifest_uuid and m1.completed_at is not None
@@ -715,7 +667,7 @@ async def test_executing_without_file_is_completed_before_verify(
     under the restored fence, writes its file, records it and replays it; only then does the manifest
     stand `completed` with every postcondition holding."""
     seed = await seeded(engine)
-    opened = await request_source(engine)
+    opened = await request_source_purge(engine)
     await backup_set(migrated, restored)
     stream = tmp_path / "shipped"
     stream.mkdir(mode=0o700)
@@ -756,7 +708,7 @@ async def test_hash_present_file_never_shipped(
     await seeded(engine)
     newest = await job_with_postings({ADZUNA: {}})  # the highest posting id, deleted by the purge
     await recomputed(engine, newest.job_id)
-    opened = await request_source(engine)
+    opened = await request_source_purge(engine)
     manifest = await stopped_at(purger, opened, source_purge.BEFORE_REBUILD, monkeypatch, source_purge)
     assert manifest.scope is not None and manifest.file_sha256 is not None
     bounds = manifest.scope["max_ids"]
@@ -854,18 +806,18 @@ async def test_a_tainted_current_revision_is_nulled_in_phase_a(
     await backup_set(migrated, restored)
     assert closed in await listed(restored.engine)
     assert ADZUNA in await scalar(restored.engine, _LINEAGE, j=closed)
-    source = await finished(purger, await request_source(engine))
+    source = await finished(purger, await request_source_purge(engine))
 
     pauses = PausePoints(replay.AFTER_A, replay.AFTER_B)
     monkeypatch.setattr(replay, "afault_point", pauses)
     task = asyncio.create_task(migrate_restored(make_config, restored, purger.cfg.manifests_dir))
     await asyncio.wait_for(pauses[replay.AFTER_A].reached.wait(), 120)
-    assert (await one(restored.engine, _JOB, j=closed)).current_revision_id is None
+    assert (await one(restored.engine, JOB, j=closed)).current_revision_id is None
     assert await scalar(restored.engine, _CURRENT_SCORES, j=closed) == 0
     assert closed not in await listed(restored.engine)
     pauses[replay.AFTER_A].resume()
     await asyncio.wait_for(pauses[replay.AFTER_B].reached.wait(), 120)
-    assert (await one(restored.engine, _JOB, j=closed)).current_revision_id is not None
+    assert (await one(restored.engine, JOB, j=closed)).current_revision_id is not None
     assert await scalar(restored.engine, _CURRENT_SCORES, j=closed) == 1
     assert closed not in await listed(restored.engine)  # still fenced
     pauses[replay.AFTER_B].resume()
@@ -933,9 +885,9 @@ async def test_a_source_purge_replay_reapplies_its_admission_effects(
     if dump == "before_the_purge":
         run_id = (await queued_run(engine)).run_id
         await backup_set(migrated, restored)
-        manifest = await finished(purger, await request_source(engine))
+        manifest = await finished(purger, await request_source_purge(engine))
     else:
-        opened = await request_source(engine)
+        opened = await request_source_purge(engine)
         manifest = await stopped_at(purger, opened, purge.MID_DELETE, monkeypatch)
         reenabling = await save(engine, adzuna_on, internal=True)
         await backup_set(migrated, restored)
@@ -963,7 +915,7 @@ async def test_delete_everything_replays_and_the_rebuild_skips_its_deleted_jobs(
     nothing, and phase C verifies and completes both."""
     seed = await seeded(engine)
     await backup_set(migrated, restored)
-    source = await finished(live, await request_source(engine))
+    source = await finished(live, await request_source_purge(engine))
     everything = await finished(live, await request_delete_everything(engine))
 
     with capture_logs() as logs:
@@ -977,6 +929,74 @@ async def test_delete_everything_replays_and_the_rebuild_skips_its_deleted_jobs(
     # Its completing transaction's own writes ran in phase C (`CompletingKind.complete`): the dump's session
     # (created before the fence) is gone.
     assert await scalar(restored.engine, _SESSION_COUNT) == 0
+
+
+_SETTINGS_VERSIONS: Final = sa.text("SELECT version_no, payload FROM settings_versions ORDER BY version_no")
+
+
+@dataclasses.dataclass(frozen=True)
+class SettingsOutcome:
+    """What a source purge's admission and delete-everything's reset leave: the active settings document,
+    every settings version (its number and document), `sources.purge_fence_at` and Adzuna's switch."""
+
+    active: Any
+    versions: list[tuple[int, Any]]
+    purge_fence_at: datetime | None
+    adzuna_enabled: bool
+
+
+async def settings_outcome(engine: AsyncEngine) -> SettingsOutcome:
+    active = (await one(engine, _ACTIVE_SETTINGS)).payload
+    return SettingsOutcome(
+        active=active,
+        versions=[(int(r.version_no), r.payload) for r in await rows(engine, _SETTINGS_VERSIONS)],
+        purge_fence_at=await scalar(engine, _FENCE_AT),
+        adzuna_enabled=bool(active["sources"]["enabled"][ADZUNA]),
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["source_purge_then_delete_everything", "delete_everything_then_source_purge", "crash_after_phase_a"],
+)
+async def test_admissions_replay_at_their_place_in_the_stream(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    live: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+) -> None:
+    """Ruling T25-3: a backup set from before a source purge and a delete-everything, in either order (and
+    the first order with a crash after phase A, then a restart), replays to the outcome the live database
+    reached: the same active settings document, the same settings versions, the same `purge_fence_at` and
+    Adzuna's switch. Each manifest's admission runs at its place in the stream, and the rows the replay
+    created before delete-everything's turn (the source purge's re-applied settings version) fall within its
+    bound, as their live counterparts did."""
+    await seeded(engine)
+    await backup_set(migrated, restored)
+    if order == "delete_everything_then_source_purge":
+        everything = await finished(live, await request_delete_everything(engine))
+        source = await finished(live, await request_source_purge(engine))
+        assert everything.manifest_uuid < source.manifest_uuid
+    else:
+        source = await finished(live, await request_source_purge(engine))
+        everything = await finished(live, await request_delete_everything(engine))
+    expected = await settings_outcome(engine)
+    assert expected.adzuna_enabled == (order != "delete_everything_then_source_purge")
+
+    if order == "crash_after_phase_a":
+        monkeypatch.setattr(replay, "afault_point", raising_at(replay.AFTER_A))
+        with pytest.raises(SimulatedCrash):
+            await migrate_restored(make_config, restored, live.cfg.manifests_dir)
+        monkeypatch.setattr(replay, "afault_point", no_fault)
+    with capture_logs() as logs:
+        await migrate_restored(make_config, restored, live.cfg.manifests_dir)
+    assert await settings_outcome(restored.engine) == expected
+    await assert_replayed(restored.engine, restored.files, source, everything)
+    (started,) = events(logs, "replay_started")
+    assert started["resumed"] is (order == "crash_after_phase_a")
 
 
 async def test_a_retained_default_scope_pending_again_keeps_the_manifest_satisfied(
@@ -1048,7 +1068,7 @@ async def later_activity(
     job that was `doing` finished, a lockout renewed, a session and a login attempt, a settings save, and a
     new profile confirmed with its tuple."""
     async with engine.begin() as conn:
-        await conn.execute(_ALERT, {"key": f"replay:{secrets.token_hex(6)}"})
+        await conn.execute(ALERT, {"key": f"replay:{secrets.token_hex(6)}"})
         await conn.execute(_RESOLVE, {"a": seed.open_alert_id})
         await conn.execute(_FINISH_JOB, {"j": doing_job})
         for scope in (await conn.execute(_LOCKOUT_SCOPES)).scalars():
@@ -1078,7 +1098,7 @@ async def run_kind(engine: AsyncEngine, live: Purger, seed: SeedIds, kind: Manif
     elif kind == "profile_purge":
         opened = await request_profile_purge(engine, seed.purgeable_version_id)
     elif kind == "source_purge":
-        opened = await request_source(engine)
+        opened = await request_source_purge(engine)
     else:
         opened = await request_delete_everything(engine)
     return await finished(live, opened)
@@ -1196,7 +1216,7 @@ async def test_replay_removes_the_export_archive_from_the_exports_volume(
     `file_remove` postcondition is no evidence when read in another, empty directory: there it holds before
     anything was removed."""
     seed = await seeded(engine)
-    export = await one(engine, _EXPORT, e=seed.ready_export_id)
+    export = await one(engine, EXPORT, e=seed.ready_export_id)
     archive = restored.files.exports / export.storage_path
     archive.write_bytes(b"an encrypted archive")
     opened = await request_golden(engine, seed.closed_case_id)
@@ -1220,32 +1240,62 @@ async def test_replay_removes_the_export_archive_from_the_exports_volume(
     task = asyncio.create_task(migrate_restored(make_config, restored, purger.cfg.manifests_dir))
     await asyncio.wait_for(pauses[replay.AFTER_B].reached.wait(), 120)
     assert not archive.exists()
-    assert tuple(await one(restored.engine, _EXPORT, e=seed.ready_export_id)) == ("purged", None)
+    assert tuple(await one(restored.engine, EXPORT, e=seed.ready_export_id)) == ("purged", None)
     assert (await one(restored.engine, _MANIFEST, u=manifest.manifest_uuid)).status == "executing"
     pauses[replay.AFTER_B].resume()
     await asyncio.wait_for(task, 300)
     await assert_replayed(restored.engine, restored.files, manifest)
 
 
-async def test_restore_list_leaves_out_what_the_superuser_owns(
-    migrated: PgServer, restored: Restored
+async def test_a_replayed_kind_never_waits_on_an_eval_run_the_dump_holds_running(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    purger: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
 ) -> None:
-    """The filtered list of a real dump (`backup.restore.restore_list`): no extension, no comment on one and
-    no `public` schema entry, every table's data kept, and the restore it drives succeeds with
-    `--exit-on-error`."""
+    """Ruling T25-2 (8): the backup set holds a `running` golden eval run, which includes every active case;
+    after it ended live, an active case was deleted. In the restore nothing could ever end that run (`api`
+    and `worker` are stopped), so the replay ends it as the `eval_run` failure hook ends an interrupted run
+    (`failed`, `metrics.failed = "interrupted"`), logs its id, and deletes the case: `migrate` completes and
+    every postcondition holds, where the live purge would have waited."""
+    seed = await seeded(engine)
+    case = int(await scalar(engine, _ACTIVE_CASE))
     await backup_set(migrated, restored)
-    assert await scalar(restored.engine, sa.text("SELECT count(*) FROM settings_versions")) >= 1
-    sample = (
-        ";\n; Archive created at 2026-11-11\n;\n"
-        "3; 3079 16717 EXTENSION - pg_trgm \n"
-        "5420; 0 0 COMMENT - EXTENSION pg_trgm \n"
-        "7; 2615 2200 SCHEMA - public pg_database_owner\n"
-        "301; 1259 17001 TABLE public jobs jobhunter_migrator\n"
-        "5001; 0 17001 TABLE DATA public jobs jobhunter_migrator\n"
-    )
-    assert restore_list(sample) == [
-        "301; 1259 17001 TABLE public jobs jobhunter_migrator",
-        "5001; 0 17001 TABLE DATA public jobs jobhunter_migrator",
-    ]
-    with pytest.raises(ValueError):
-        restore_list("not an entry\n")
+    async with engine.begin() as conn:  # the run ends live (as its operation's hook ends it)
+        assert await fail_eval_run(conn, seed.running_eval_run_id, EVAL_RUN_INTERRUPTED)
+    golden = await finished(purger, await request_golden(engine, case))
+    async with restored.engine.connect() as conn:
+        flags = await golden_rules.lock_case(conn, case)
+        assert flags is not None and await golden_rules.in_running_run(conn, case, flags)
+
+    with capture_logs() as logs:
+        await migrate_restored(make_config, restored, purger.cfg.manifests_dir)
+    await assert_replayed(restored.engine, restored.files, golden)
+    (ended,) = events(logs, "golden_case_replay_eval_runs_ended")
+    assert (ended["golden_case_id"], ended["eval_run_ids"]) == (case, [seed.running_eval_run_id])
+    run = await one(restored.engine, _EVAL_RUN, r=seed.running_eval_run_id)
+    assert (run.status, run.metrics["failed"]) == ("failed", EVAL_RUN_INTERRUPTED)
+    assert not await exists(restored.engine, "golden_cases", case)
+
+
+async def test_restore_list_leaves_out_what_the_superuser_owns(
+    migrated: PgServer, engine: AsyncEngine, restored: Restored
+) -> None:
+    """The filtered list of a real dump of the seeded database (`backup.restore.restore_list`): it loses
+    exactly the `EXTENSION`, `COMMENT - EXTENSION` and `SCHEMA - public` entries (the three extensions and
+    their comments among them) and keeps every other entry in its order, and the restore it drives succeeds
+    with `--exit-on-error`, every table's rows there."""
+    await seeded(engine)
+    listing = await dump_listing(migrated, source_db=LIVE_DB)
+    entries = [line for line in listing.splitlines() if line.strip() and not line.startswith(";")]
+    markers = (" EXTENSION - ", " COMMENT - EXTENSION ", " SCHEMA - public ")
+    owned = [line for line in entries if any(marker in f"{line} " for marker in markers)]
+    names = {line.split()[5] for line in owned if " EXTENSION - " in f"{line} "}
+    assert names == {"pg_trgm", "unaccent", "vector"} and len(owned) >= 6
+    assert restore_list(listing) == [line for line in entries if line not in owned]
+
+    await backup_set(migrated, restored)
+    for table in ("settings_versions", "jobs", "postings", "deletion_manifests", "golden_cases"):
+        live = await scalar(engine, sa.text(f"SELECT count(*) FROM {table}"))  # noqa: S608 (constant names)
+        assert await scalar(restored.engine, sa.text(f"SELECT count(*) FROM {table}")) == live > 0  # noqa: S608
