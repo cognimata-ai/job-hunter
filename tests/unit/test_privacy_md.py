@@ -6,13 +6,14 @@ RUNBOOK's deploy checklist fills its operator fields (Task 31). So:
 
 - its `##` sections are §20.6's ten items and `## Operator`, in that order, with no level-1 heading (the page
   has its own title, Ruling T19-3 I3);
-- §5's table is §20.1's, row for row and cell for cell, but the exports' retention (Deviation 18), and the
+- §5's table is §20.1's, row for row and cell for cell, but the exports' retention, in the statement's words
+  with the code's 30 days for the record (Deviations 18 and 48), and the
   sentences under it name what HEAD's profile purge does beyond the table (Rulings T19-2 (3), T19-3 I1);
 - §4's table is §20.6's, word for word;
 - §8 carries the gazetteer's GeoNames attribution, §7 the Adzuna badge's;
 - the operator fields are exactly the five markers, under `## Operator`, and nothing in it is e-mail-shaped;
 - it uses only headings, paragraphs, bullet lists, tables, `**bold**` and `` `code` ``;
-- the typed phrases, the export's period and the login throttle it states are the code's;
+- the typed phrases, the export's period and its record's, and the login throttle it states are the code's;
 - §2 states the client addresses HEAD logs and stores, and how long it keeps them (Rulings T19-2 (1),
   T19-3 I2).
 """
@@ -25,7 +26,7 @@ from typing import Final
 from jobhunter.api.routes.privacy import DELETE_EVERYTHING_PHRASE, PURGE_ADZUNA_PHRASE
 from jobhunter.auth import throttle
 from jobhunter.privacy import retention
-from jobhunter.privacy.export import EXPORT_TTL
+from jobhunter.privacy.export import EXPORT_ROWS_KEPT, EXPORT_TTL
 from jobhunter.privacy.kinds.job_tombstone import JobTombstone
 from jobhunter.privacy.kinds.profile_purge import ProfilePurge
 
@@ -51,10 +52,13 @@ SECTIONS: Final = (
 )
 SPEC_RETENTION: Final = "### 20.1 Retention table"
 SPEC_PRIVACY_MD: Final = "### 20.6 PRIVACY.md (contents)"
-# Deviation 18: the exports row's retention, in place of §20.1's "deleted immediately by any purge".
+# The exports row's retention: §20.1's rule (Deviations 18 and 48) in the statement's words, which say what
+# the exception to "every purge" means for the user; the record without its archive goes `EXPORT_ROWS_KEPT`
+# later.
 EXPORTS_RETENTION: Final = (
     "7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job "
-    "tombstoning, so an export can hold content tombstoned after it was made until it expires"
+    "tombstoning, so an export can hold content tombstoned after it was made until it expires; its record, "
+    f"without the archive, {EXPORT_ROWS_KEPT.days} days after it expires"
 )
 # Under §5's table: the profile purge deletes the exports (T19-2 (3)) and spares four kinds of version
 # (T19-3 I1).
@@ -221,6 +225,8 @@ def test_the_phrases_the_export_period_and_the_throttle_are_the_codes() -> None:
     assert f"`{PURGE_ADZUNA_PHRASE}`" in " ".join(section(lines, "## 7. Adzuna"))
     assert EXPORT_TTL.total_seconds() == EXPORT_TTL.days * 86400
     assert f"for {EXPORT_TTL.days} days" in deletion
+    assert EXPORT_ROWS_KEPT.total_seconds() == EXPORT_ROWS_KEPT.days * 86400
+    assert f"is deleted {EXPORT_ROWS_KEPT.days} days after it expires" in deletion
     security = " ".join(section(lines, "## 9. Security measures"))
     window = int(throttle.IP_WINDOW.total_seconds() // 60)
     lock = int(throttle.IP_LOCK.total_seconds() // 60)

@@ -3,7 +3,7 @@
 starts with the worker's epoch fence (`epoch.fence_epoch`, Ruling FR-h), and returns the rows it changed: the
 manifests it shipped, the operations it created and the alerts it opened, raised or resolved.
 
-**`manifest_shipping`** (every minute, Deviation 43; §17.4 says 5 min). A `completed` manifest that a
+**`manifest_shipping`** (every minute, on the tick: §17.4, Deviation 43). A `completed` manifest that a
 `manifest_shipment_items` row names with its uuid and an equal `file_sha256` becomes `shipped` with the
 earliest such shipment (the backup container's shipper records one item per file its snapshot held, so the
 coverage is exact, never inferred from a later or higher id: §18.2 "manifest shipment coverage"); `shipped_at`

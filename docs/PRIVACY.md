@@ -79,7 +79,7 @@ Retention is dependency-aware: a record is removed only after everything that re
 | Login attempts | DB | 30 days | daily |
 | Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
 | Alerts | DB | Resolved + 90 days | daily |
-| Exports | `exports` volume | 7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job tombstoning, so an export can hold content tombstoned after it was made until it expires | daily |
+| Exports | `exports` volume and table | 7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job tombstoning, so an export can hold content tombstoned after it was made until it expires; its record, without the archive, 30 days after it expires | daily |
 | Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: indefinitely | `restic forget/prune` |
 | Backup sets, backup runs | DB | 13 months after they finished, except the newest succeeded set and restore test, and a set a kept run names | daily |
 | Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
@@ -108,7 +108,7 @@ The names in code font are names inside the app: its database tables, columns, s
 | `README.txt` | What each file holds |
 
 - **Encrypted at rest.** On the server the archive exists only encrypted with the data key (AES-256-GCM, in segments of 1 MiB). Its plaintext is written only to the worker's memory-backed `/tmp` while the archive is being built. A download decrypts it segment by segment in the api's memory as it streams.
-- **Download.** You can download it for 7 days, over TLS and while logged in, and each download is logged with the export's id. The downloaded zip itself is not encrypted or protected by a passphrase, so keep it safe. After the 7 days it expires and is deleted at the next daily clean-up, so it can stay available for up to about a day longer.
+- **Download.** You can download it for 7 days, over TLS and while logged in, and each download is logged with the export's id. The downloaded zip itself is not encrypted or protected by a passphrase, so keep it safe. After the 7 days it expires and is deleted at the next daily clean-up, so it can stay available for up to about a day longer. Its record, which holds the export's times, size and checksum but none of your data, is deleted 30 days after it expires.
 - **Purges delete it.** Every privacy purge (delete everything, the Adzuna purge, deleting a golden case, and the automatic purge of an old profile version) deletes every existing export at once, because an export may hold the deleted data. The nightly tombstoning of old job ads does not, so an export can hold an ad tombstoned after the export was made, until the export expires. An export is not built while a purge is running: it waits, and fails if the purge has not finished within a day, so it never holds data a purge is deleting.
 - **Never in a backup.** An export archive is never copied into a backup, so a restore does not bring it back.
 
@@ -127,7 +127,7 @@ The names in code font are names inside the app: its database tables, columns, s
 
 - **Manifests.** Every purge first records a deletion manifest, which holds ids, table and column names and key hashes, never content. The manifests are shipped to the offsite backup storage every 5 minutes.
 - **Confirmed offsite.** A deletion counts as done only when the app shows it "confirmed offsite": its manifest is shipped, so no restore can bring the deleted data back.
-- **Backups.** Older backup sets still hold the deleted data until they age out, within about 3 months (backup sets are kept as 7 daily, 4 weekly and 3 monthly ones).
+- **Backups.** Older backup sets still hold the deleted data until they age out, within about 3 months (backup sets are kept as 7 daily, 4 weekly and 3 monthly ones). The backup storage then keeps the deleted files of an aged-out set for up to 30 days more, as a safeguard against the backups being destroyed, so deleted data can remain in the offsite backups for about 4 months in all.
 - **Restore.** A restore replays the shipped manifests before the app starts again, so the manifest replay keeps deleted data from returning on a restore.
 
 ## 7. Adzuna

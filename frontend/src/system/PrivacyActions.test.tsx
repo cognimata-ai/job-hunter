@@ -69,7 +69,7 @@ describe("PrivacyActions", () => {
     api.routes.set(DELETE, () => new Promise<Response>((resolve) => { answer = resolve; }));
     renderInProviders(<><PrivacyActions /><DeletionStatus /></>);
     const dialog = await openDialog("delete");
-    // §20.4: backups age out within about 3 months, the replay keeps the data from returning, done at "confirmed offsite"
+    // §20.4: deleted data leaves the backups within about 4 months, the replay keeps it from returning, done at "confirmed offsite"
     expect(dialog.textContent).toContain(en["settings_privacy.later"]);
     expect(dialog.textContent).toContain(en["settings_privacy.delete.what"]);
     expect(within(dialog).getByText("DELETE EVERYTHING").tagName).toBe("CODE");

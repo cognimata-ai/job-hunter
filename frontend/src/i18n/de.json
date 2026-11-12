@@ -1650,7 +1650,7 @@
   "settings_privacy.score_history_months": "Bewertungsverlauf in Monaten",
   "settings_privacy.months": "Monate",
   "settings_privacy.statement": "Datenschutzerklärung: was die App verarbeitet und warum, wer es erhält, wie lange es aufbewahrt wird und wie Sie es exportieren oder löschen",
-  "settings_privacy.later": "Ältere Sicherungssätze enthalten gelöschte Daten noch, bis sie auslaufen, innerhalb von etwa 3 Monaten. Eine Wiederherstellung spielt zuerst die extern aufbewahrten Löschprotokolle ab, sodass die gelöschten Daten nicht zurückkehren. Eine Löschung ist abgeschlossen, sobald sie „Extern bestätigt“ zeigt.",
+  "settings_privacy.later": "Ältere Sicherungssätze enthalten gelöschte Daten noch, bis sie auslaufen, und der Sicherungsspeicher bewahrt die gelöschten Dateien eines ausgelaufenen Satzes noch bis zu 30 Tage auf. So verschwinden gelöschte Daten innerhalb von etwa 4 Monaten aus den externen Sicherungen. Eine Wiederherstellung spielt zuerst die extern aufbewahrten Löschprotokolle ab, sodass die gelöschten Daten nicht zurückkehren. Eine Löschung ist abgeschlossen, sobald sie „Extern bestätigt“ zeigt.",
   "settings_privacy.enable_another_source": "Aktivieren Sie zuerst eine andere Quelle",
   "settings_privacy.actions": "Export und Löschung",
   "settings_privacy.export.title": "Export",

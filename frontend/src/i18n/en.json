@@ -1650,7 +1650,7 @@
   "settings_privacy.score_history_months": "Score history, in months",
   "settings_privacy.months": "months",
   "settings_privacy.statement": "Privacy statement: what the app processes and why, who receives it, how long it is kept, and how you export or delete it",
-  "settings_privacy.later": "Older backup sets still hold deleted data until they age out, within about 3 months. A restore first replays the deletion records kept offsite, so the deleted data does not return. A deletion is done once it shows “Confirmed offsite”.",
+  "settings_privacy.later": "Older backup sets still hold deleted data until they age out, and the backup storage keeps the deleted files of an aged-out set for up to 30 days more, so deleted data leaves the offsite backups within about 4 months. A restore first replays the deletion records kept offsite, so the deleted data does not return. A deletion is done once it shows “Confirmed offsite”.",
   "settings_privacy.enable_another_source": "Enable another source first",
   "settings_privacy.actions": "Export and deletion",
   "settings_privacy.export.title": "Export",

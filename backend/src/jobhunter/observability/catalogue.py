@@ -1,4 +1,4 @@
-"""The alert catalogue as data (spec §17.6 L5631-5698; plan M5 Task 2, O-ops §2.2, Deviations 7 and 8).
+"""The alert catalogue as data (spec §17.6; plan M5 Task 2, O-ops §2.2, Deviations 7 and 8).
 
 `CATALOGUE` holds an entry for every alert code the code base raises, each a `CatalogueEntry`:
 
@@ -10,17 +10,18 @@
   how; "manual" and "manual acknowledgement" mean it does not. A manual alert is resolved by the user
   (`POST /api/alerts/{id}/resolve`, `lists.resolve_manual`); one in `RESOLVE_ON_ACK` also by its
   acknowledgement (`llm.reservation_bound_violated`: §17.6 "manual acknowledgement", so its next occurrence
-  opens a new row that pauses the score lane and is pushed again). `embedder.checksum_mismatch`, manual in
-  §17.6, resolves itself on a later `checksum_ok: true` (Deviation 8).
-- `pushed`: the alert dispatcher sends it to ntfy, at `push_priority(severity)` (L5631: `warn` 3, `critical`
+  opens a new row that pauses the score lane and is pushed again). `embedder.checksum_mismatch` resolves
+  itself on a later `checksum_ok: true` (Deviation 8; manual in §17.6 until spec revision 3.7).
+- `pushed`: the alert dispatcher sends it to ntfy, at `push_priority(severity)` (§17.6: `warn` 3, `critical`
   5, `info` in-app only), unless its code is in `NEVER_PUSHED`: `notify.delivery_failed` ("warn (in-app
-  only)", L5695) reports that the push channel failed, so it is never sent through it.
+  only)") reports that the push channel failed, so it is never sent through it.
 
-Beyond §17.6's 63 rows the catalogue holds the eight codes the code raised before M5 without a row (O-ops
-§2.2): `llm.unexpected_stop_reason` (M2 Deviation 6), `profile.extract_generation_mismatch` (M2 Carry-forward
-3), `dedup.ambiguous_grouping` (§8), `quota.serpapi_renewal_stale` (ruling T7-b), `reconciler.failed`,
-`retention.failed`, `api.unhandled_exception` (§17.1) and `auth.totp_key_mismatch` (ruling T16-c); and the
-new `docparse.leftover` (Deviation 7). `is_manual` treats a code the catalogue lacks as manual, so such an
+§17.6 holds 72 rows: revision 3.6's 63, and the nine that revision 3.7 added, the eight codes the code
+raised before M5 without a row (O-ops §2.2): `llm.unexpected_stop_reason` (M2 Deviation 6),
+`profile.extract_generation_mismatch` (M2 Carry-forward 3), `dedup.ambiguous_grouping` (§8),
+`quota.serpapi_renewal_stale` (ruling T7-b), `reconciler.failed`, `retention.failed`,
+`api.unhandled_exception` (§17.1) and `auth.totp_key_mismatch` (ruling T16-c); and the new
+`docparse.leftover` (Deviation 7). `is_manual` treats a code the catalogue lacks as manual, so such an
 alert can always be resolved; `tests/unit/test_alert_catalogue.py` keeps every raised code catalogued.
 """
 
@@ -94,7 +95,7 @@ _SPEC: Final = (
     _entry("schedule.stale_data", "critical", AUTO),
     _entry("worker.heartbeat_stale", "critical", AUTO),
     _entry("embedder.unavailable", "warn", AUTO),
-    _entry("embedder.checksum_mismatch", "critical", AUTO),  # §17.6 says manual (Deviation 8)
+    _entry("embedder.checksum_mismatch", "critical", AUTO),  # a later `checksum_ok: true` (Deviation 8)
     _entry("source.breaker_open", "warn", AUTO),
     _entry("source.auth_failed", "critical", AUTO),
     _entry("source.contract_broken", "critical", AUTO),

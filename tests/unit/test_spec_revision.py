@@ -35,6 +35,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import get_args
 
+import pytest
 from jobhunter.api.app import create_app
 from jobhunter.api.routes.privacy import DELETE_EVERYTHING_PHRASE
 from jobhunter.db.seed import DEFAULT_PROJECTED_CRITIC_RATE, load_settings_v1
@@ -250,21 +251,36 @@ def _paths(path: str) -> set[str]:
     )
 
 
-def test_14_2_lists_the_routes_m4_added() -> None:
+# The routes M5 added that §14.2 lists (revision 3.7).
+M5_ROUTES = frozenset(
+    {
+        ("POST", "/api/alerts/{}/resolve"),
+        ("GET", "/api/privacy/manifests"),
+        ("GET", "/api/privacy/manifests/{}"),
+        ("GET", "/api/privacy/exports/{}"),
+        ("POST", "/api/system/purges/{}/retry"),
+        ("DELETE", "/api/golden-cases/{}"),
+    }
+)
+
+
+@pytest.mark.parametrize("routes", [M4_ROUTES, M5_ROUTES], ids=["m4", "m5"])
+def test_14_2_lists_the_routes_a_milestone_added(routes: frozenset[tuple[str, str]]) -> None:
+    """Each route §14.2 lists for the milestone is a row of its table and a route of the api's OpenAPI."""
     listed = {
         (match.group(1), path)
         for line in _section("### 14.2 ")
         if (match := ROUTE_ROW.match(line)) is not None
         for path in _paths(match.group(2))
     }
-    assert sorted(M4_ROUTES - listed) == []
+    assert sorted(routes - listed) == []
     document = create_app().api.openapi()
     served = {
         (method.upper(), PARAMETER.sub("{}", path))
         for path, ops in document["paths"].items()
         for method in ops
     }
-    assert sorted(M4_ROUTES - served) == []
+    assert sorted(routes - served) == []
 
 
 # The problem codes M5 added (the global fence's admission stop, the re-authentication, an export's end).
@@ -397,36 +413,6 @@ def test_17_6_states_the_dispatchers_ascii_title_and_click_path() -> None:
     assert f"`Click: $JOBHUNTER_PUBLIC_ORIGIN{CLICK_PATH}`" in body
     assert "Job Hunter —" not in body
     assert "/settings#system" not in body
-
-
-# The routes M5 added that §14.2 lists (a path parameter of any name is `{}`).
-M5_ROUTES = frozenset(
-    {
-        ("POST", "/api/alerts/{}/resolve"),
-        ("GET", "/api/privacy/manifests"),
-        ("GET", "/api/privacy/manifests/{}"),
-        ("GET", "/api/privacy/exports/{}"),
-        ("POST", "/api/system/purges/{}/retry"),
-        ("DELETE", "/api/golden-cases/{}"),
-    }
-)
-
-
-def test_14_2_lists_the_routes_m5_added() -> None:
-    listed = {
-        (match.group(1), path)
-        for line in _section("### 14.2 ")
-        if (match := ROUTE_ROW.match(line)) is not None
-        for path in _paths(match.group(2))
-    }
-    assert sorted(M5_ROUTES - listed) == []
-    document = create_app().api.openapi()
-    served = {
-        (method.upper(), PARAMETER.sub("{}", path))
-        for path, ops in document["paths"].items()
-        for method in ops
-    }
-    assert sorted(M5_ROUTES - served) == []
 
 
 def test_19_8_restarts_the_worker_after_a_source_key_changes() -> None:

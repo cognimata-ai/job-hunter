@@ -6,7 +6,7 @@
 //   expiry; a failed, expired or purged one says so. Following the link reads the export again, so a purge that
 //   deleted it meanwhile shows.
 // - **Purge Adzuna data** and **Delete everything** each open a dialog: what it deletes, §20.4's statement (backup
-//   sets age out within about 3 months; the replay of the deletion records keeps the data from returning on a
+//   data is gone within about 4 months; the replay of the deletion records keeps the data from returning on a
 //   restore; done once it shows "Confirmed offsite"), the phrase to type (`PURGE ADZUNA`, `DELETE EVERYTHING`),
 //   the password and, when the session's `totp_enabled`, the TOTP code. Submit is enabled only on the exact
 //   phrase, a password and (with TOTP) six digits, and is busy while its request runs: a double submit sends
