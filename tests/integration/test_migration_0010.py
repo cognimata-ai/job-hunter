@@ -830,7 +830,11 @@ async def test_the_downgrade_is_refused_while_any_record_table_holds_a_row(
             )
     finally:
         await engine.dispose()
+    # `migrate` went to the head; 0011 (Task 27) only adds an index, and its downgrade has no guard. Alembic
+    # commits each migration's downgrade on its own, so the refusals below are 0010's, at 0010.
+    await downgrade(server, M5_SCHEMA)
     at_0010 = catalogue(server)
+    assert at_0010[0] == (M5_SCHEMA,)
 
     for table in RECORD_TABLES:
         with pytest.raises(sa.exc.DBAPIError) as bad:

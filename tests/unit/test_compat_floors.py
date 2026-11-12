@@ -9,6 +9,7 @@ from jobhunter.db.compat import CompatInfo, chain_compat, classify_schema, compa
 
 M4_SCHEMA = "0009_m4_ui"
 M5_SCHEMA = "0010_m5_operations"
+M5_INDEX = "0011_m5_purge_operation_index"
 # The revisions before M5, base first: none declares a floor, so each is its own.
 BEFORE_M5 = (
     "0001_m0_baseline",
@@ -50,6 +51,18 @@ def test_0010_floor_is_0009() -> None:
     assert (module.compat_floor, module.destructive) == (M4_SCHEMA, False)
     assert {info.revision: info for info in chain_compat()}[M5_SCHEMA] == CompatInfo(
         M5_SCHEMA, M4_SCHEMA, False
+    )
+
+
+def test_0011_floor_is_0010() -> None:
+    """0011, the rollback drill's expand migration (Task 27), is the head; M5's first schema's code runs on
+    it."""
+    module = migration(M5_INDEX)
+    assert (module.revision, module.down_revision) == (M5_INDEX, M5_SCHEMA)
+    assert (module.compat_floor, module.destructive) == (M5_SCHEMA, False)
+    assert code_head() == M5_INDEX
+    assert {info.revision: info for info in chain_compat()}[M5_INDEX] == CompatInfo(
+        M5_INDEX, M5_SCHEMA, False
     )
 
 
