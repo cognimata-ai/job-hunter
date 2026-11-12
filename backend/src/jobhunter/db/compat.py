@@ -35,7 +35,12 @@ head's `schema_compat` row, which the newer release's `migrate` recorded:
 
 `classify_schema` is that rule without the database. The floors only move forward along a validated chain,
 so a floor the older code knows also means that no destructive revision lies between its head and the
-database's.
+database's. `schema_compat` versions the schema only, not the transition matrix (an older release on a newer
+schema keeps the newer one, `seed_defaults(sync_matrix=False)`) nor the manifest stream (step 1 and step 7 of
+`migrate` parse it): a release whose revision narrows a transition edge of an existing table, or changes the
+manifest format in a way an older parser refuses, declares that revision `destructive`; with a compatible
+floor the older release would pass `/readyz` and fail later, at a refused `transition()` or a
+`ManifestInvalid`.
 """
 
 import functools
@@ -212,11 +217,10 @@ async def database_heads(conn: AsyncConnection) -> tuple[str, ...]:
     return tuple(str(head) for head in (await conn.execute(_HEADS)).scalars())
 
 
-async def schema_state(conn: AsyncConnection, *, code_head: str) -> SchemaState:
-    """Where the database of `conn` stands to the code whose head is `code_head` (module docstring). Reads
-    only; the `schema_compat` rows are read only for heads the code does not know."""
-    heads = await database_heads(conn)
-    if heads == (code_head,):
+async def heads_state(conn: AsyncConnection, heads: Sequence[str], *, code_head: str) -> SchemaState:
+    """Where a database whose heads are `heads` (`database_heads` of `conn`) stands to the code whose head is
+    `code_head`. Reads only the `schema_compat` rows of the heads the code does not know."""
+    if tuple(heads) == (code_head,):
         return "current"
     known = _code_known(code_head)
     unknown = [head for head in heads if head not in known]
@@ -225,3 +229,9 @@ async def schema_state(conn: AsyncConnection, *, code_head: str) -> SchemaState:
         rows = await conn.execute(_RECORDS, {"heads": unknown})
         records = {row.revision: CompatInfo(row.revision, row.compat_floor, row.destructive) for row in rows}
     return classify_schema(heads, records, code_head=code_head, known=known)
+
+
+async def schema_state(conn: AsyncConnection, *, code_head: str) -> SchemaState:
+    """Where the database of `conn` stands to the code whose head is `code_head` (module docstring). Reads
+    only."""
+    return await heads_state(conn, await database_heads(conn), code_head=code_head)

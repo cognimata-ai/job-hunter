@@ -178,3 +178,15 @@ def test_a_destructive_migration_is_its_own_floor() -> None:
     assert classify_schema(("b",), flagged, code_head="a", known=known_revisions("a", modules)) == (
         "ahead_incompatible"
     )
+
+
+def test_several_database_heads_are_refused() -> None:
+    """A database with several heads is `ahead_incompatible` as soon as one is unknown to the code, even when
+    that head's record alone would be compatible, and even when the other head is the code's own."""
+    modules = [fake("a", None), fake("b", "a", compat_floor="a")]
+    records = {info.revision: info for info in compat_of(modules)}
+    records["x"] = CompatInfo("x", "a", False)  # a newer head whose floor this code knows
+    known = known_revisions("b", modules)
+    assert classify_schema(("x",), records, code_head="b", known=known) == "ahead_compatible"
+    assert classify_schema(("a", "x"), records, code_head="b", known=known) == "ahead_incompatible"
+    assert classify_schema(("b", "x"), records, code_head="b", known=known) == "ahead_incompatible"

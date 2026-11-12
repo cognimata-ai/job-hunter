@@ -14,7 +14,6 @@ import sys
 from typing import Final
 
 import pytest
-import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.compat import schema_state
@@ -24,6 +23,7 @@ from jobhunter.observability.health import ReadinessReport, check_readiness
 from structlog.testing import capture_logs
 
 from tests.support.fake_revision import FAKE_HEAD, FAKE_TABLE, migrate_newer_release
+from tests.support.fixtures import fresh_heartbeat
 from tests.support.pg import PgServer, pg_one, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -36,10 +36,6 @@ _TABLES: Final = (
 _SEQUENCES: Final = (
     "SELECT schemaname, sequencename, last_value FROM pg_sequences "
     "WHERE schemaname IN ('public', 'procrastinate') ORDER BY 1, 2"
-)
-_FRESH_HEARTBEAT: Final = (
-    "INSERT INTO worker_heartbeat VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now()) "
-    "ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()"
 )
 
 
@@ -143,8 +139,7 @@ async def test_readiness_accepts_a_compatible_head_and_refuses_an_incompatible_o
     await migrate_newer_release(server)
     engine = make_engine(make_config("api", server))
     try:
-        async with engine.begin() as conn:
-            await conn.execute(sa.text(_FRESH_HEARTBEAT))
+        await fresh_heartbeat(engine)
         ready = await check_readiness(engine, code_head=code_head(), now=utcnow(), embedder=None)
         assert ready == ReadinessReport(ok=True, failing=[])
         mark(server, "UPDATE schema_compat SET destructive = true WHERE revision = %s")

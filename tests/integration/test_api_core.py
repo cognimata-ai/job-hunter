@@ -11,6 +11,8 @@ import structlog
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from tests.support.fixtures import fresh_heartbeat
+
 pytestmark = pytest.mark.integration
 HEADERS = {
     "strict-transport-security": "max-age=63072000; includeSubDomains",
@@ -32,16 +34,6 @@ def assert_edge(r: httpx.Response) -> None:
     )
     if r.headers.get("content-type") == "application/problem+json":
         assert r.json()["request_id"] == r.headers["x-request-id"]
-
-
-async def fresh_heartbeat(engine) -> None:
-    async with engine.begin() as c:
-        await c.execute(
-            sa.text(
-                "INSERT INTO worker_heartbeat VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now()) "
-                "ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()"
-            )
-        )
 
 
 async def test_healthz(api_client) -> None:
@@ -370,8 +362,9 @@ async def test_readiness_flags_a_stale_heartbeat_and_a_foreign_revision(engine, 
     async with engine.begin() as c:
         await c.execute(
             sa.text(
-                "INSERT INTO worker_heartbeat VALUES "
-                "(1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now() - interval '90 seconds')"
+                "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, "
+                "lock_backend_pid, app_version, started_at, heartbeat_at) "
+                "VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now() - interval '90 seconds')"
             )
         )
     stale = await check_readiness(engine, code_head="0000_not_the_head", now=utcnow(), embedder=None)

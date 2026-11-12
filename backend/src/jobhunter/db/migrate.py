@@ -23,12 +23,12 @@ of the configuration (`manifests_dir`, `cv_store_dir`, `exports_dir`), so a scra
 ones.
 
 **A newer schema** (M5 Task 27, Deviation 32). Under the lock and before any step, `migrate` reads where the
-database stands to this code (`db.compat.schema_state`). `current` and `behind` run the steps as above.
-`ahead_compatible` (a rollback to this release from a newer one whose floor this code knows) logs
-`migrate_schema_ahead_compatible` with both heads and runs every selected step but the alembic one, which
-would refuse a head it does not know; the seed then leaves the transition matrix as the newer release wrote
-it (its schema's triggers check that one, `seed_defaults(sync_matrix=False)`), so it writes nothing.
-`ahead_incompatible` logs `migrate_schema_ahead_incompatible` with both heads and raises
+database stands to this code (`db.compat`: its heads read once, then `heads_state`). `current` and `behind`
+run the steps as above. `ahead_compatible` (a rollback to this release from a newer one whose floor this
+code knows) logs `migrate_schema_ahead_compatible` with both heads and runs every selected step but the
+alembic one, which would refuse a head it does not know; the seed then leaves the transition matrix as the
+newer release wrote it (its schema's triggers check that one, `seed_defaults(sync_matrix=False)`), so it
+writes nothing. `ahead_incompatible` logs `migrate_schema_ahead_incompatible` with both heads and raises
 `SchemaAheadIncompatible` before any step (the CLI exits 1); the RUNBOOK rolls back by restore.
 """
 
@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, DbRole
 from jobhunter.db.alembic_runner import code_head, upgrade_head
-from jobhunter.db.compat import SchemaState, chain_compat, database_heads, record_compat, schema_state
+from jobhunter.db.compat import SchemaState, chain_compat, database_heads, heads_state, record_compat
 from jobhunter.db.seed import seed_defaults
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
@@ -169,12 +169,12 @@ async def _advance(conn: AsyncConnection, step: MigrateStep, manifest_dir: Path)
 
 
 async def _schema_state(engine: AsyncEngine) -> SchemaState:
-    """Where the database stands to this code (`db.compat.schema_state`); a newer schema is logged with both
-    heads, and an incompatible one refused (`SchemaAheadIncompatible`)."""
+    """Where the database stands to this code (`db.compat.heads_state` over its heads, read once); a newer
+    schema is logged with both heads, and an incompatible one refused (`SchemaAheadIncompatible`)."""
     head = code_head()
     async with engine.connect() as conn:
-        state = await schema_state(conn, code_head=head)
         heads = list(await database_heads(conn))
+        state = await heads_state(conn, heads, code_head=head)
     if state == "ahead_compatible":
         log.info("migrate_schema_ahead_compatible", database_heads=heads, code_head=head)
     elif state == "ahead_incompatible":

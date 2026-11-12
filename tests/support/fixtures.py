@@ -513,6 +513,19 @@ _EPOCH_1_IS_CURRENT: Final = (
     "app_version, started_at, heartbeat_at) "
     "VALUES (1, gen_random_uuid(), 1, 'test', 1, 1, 'test', now(), now())"
 )
+_FRESH_HEARTBEAT: Final = (
+    "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, lock_backend_pid, "
+    "app_version, started_at, heartbeat_at) "
+    "VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now()) "
+    "ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()"
+)
+
+
+async def fresh_heartbeat(engine: AsyncEngine) -> None:
+    """The worker's heartbeat written now, as `engine`'s role: the row inserted (epoch 1), or its
+    `heartbeat_at` moved to now; readiness's `worker_heartbeat` probe then passes."""
+    async with engine.begin() as conn:
+        await conn.execute(sa.text(_FRESH_HEARTBEAT))
 
 
 @pytest.fixture
