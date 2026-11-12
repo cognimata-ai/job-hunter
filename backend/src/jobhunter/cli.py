@@ -79,6 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ops_commands(commands)
     _add_backup_commands(commands)
     _add_restore_commands(commands)
+    _add_crypto_commands(commands)
     return parser
 
 
@@ -326,6 +327,17 @@ def _add_restore_commands(commands: "argparse._SubParsersAction[argparse.Argumen
     verify.add_argument("--database", metavar="DB", help="the database to check (default JOBHUNTER_DB_NAME)")
 
 
+def _add_crypto_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    crypto = commands.add_parser("crypto", help="the data key (§16.8), as the worker; never print a key")
+    crypto_commands = crypto.add_subparsers(dest="crypto_command", required=True)
+    crypto_commands.add_parser(
+        "rotate",
+        help="re-encrypt every ciphertext under data_key_previous with data_key, resumably, then count what "
+        "remains by key id; exit 0 when only data_key remains, 3 when other old keys remain, 2 without a "
+        "previous key",
+    )
+
+
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     fixtures = commands.add_parser("fixtures", help="source fixture tooling (§18.4)")
     fixtures_commands = fixtures.add_subparsers(dest="fixtures_command", required=True)
@@ -480,6 +492,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.restore_command == "verify":
             return run_restore_verify_command(args)
         return run_restore_command(args)
+    if args.command == "crypto":
+        # Imported here: the rotation needs the database layer, the CV store and the export format.
+        from jobhunter.crypto_rotate import run_rotate_command
+
+        return run_rotate_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command
