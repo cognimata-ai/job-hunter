@@ -1,0 +1,63 @@
+# The real embedder image (spec §2.1 U3, §16.8 check 7, §18.8's "embedder model checksum check"; plan M5 Task
+# 29): on a pull request that changes embedder/, and by hand. The build downloads the model files of
+# embedder/model.lock from Hugging Face at the locked revision and checks each against the lock
+# (download_model.sh); the image is then started once, as compose.yaml runs it (read-only, uid 10004, no
+# capability) and with no network at all, since the model is in the image. app.py checks /opt/model against
+# model.lock again at its start and exits 78 on a mismatch; the job passes only once `embedder-health` passes,
+# a 200 from /health with `"checksum_ok": true`, and fails when the embedder exits first or is not healthy
+# within 300 s, printing its log. The `fake` target, which downloads no model, is ci.yml's `images` job's.
+#
+# Supply chain as ci.yml: the checkout pinned to a full commit SHA (the release tag is the trailing comment),
+# the base images to the digests of deploy/images.lock. No secret is referenced: the token is read-only and the
+# checkout does not keep it.
+name: Embedder image
+
+on:
+  pull_request:
+    paths: ["embedder/**"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: embedder-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  embedder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: The real embedder image, its model checked against embedder/model.lock
+        run: >-
+          docker build -f embedder/Dockerfile --target runtime
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          --secret id=build_ca,src="${SSL_CERT_FILE:-/dev/null}"
+          -t jobhunter-embedder:ci .
+      - name: Start it once
+        run: >-
+          docker run -d --name jobhunter-embedder-ci --read-only --user 10004:10004 --cap-drop ALL
+          --security-opt no-new-privileges:true --network none jobhunter-embedder:ci
+      - name: Healthy only when its model matches embedder/model.lock
+        run: |
+          for _ in $(seq 1 150); do
+            if [ "$(docker inspect --format '{{.State.Running}}' jobhunter-embedder-ci)" != true ]; then
+              docker logs jobhunter-embedder-ci
+              code=$(docker inspect --format '{{.State.ExitCode}}' jobhunter-embedder-ci)
+              echo "the embedder exited with status $code before it was healthy" >&2
+              exit 1
+            fi
+            if docker exec jobhunter-embedder-ci embedder-health; then
+              echo "the embedder is healthy: its model matches embedder/model.lock"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs jobhunter-embedder-ci
+          echo "the embedder was not healthy within 300 s" >&2
+          exit 1

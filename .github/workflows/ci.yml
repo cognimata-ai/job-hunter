@@ -1,11 +1,12 @@
-# CI for Job Hunter (spec §18.8, the M0 to M2 subset): lint, unit, integration, contract, payload, docparse,
-# frontend and audit.
+# CI for Job Hunter (spec §18.8, the M0 to M2 subset, and M5's image scan): lint, unit, integration, contract,
+# payload, docparse, images, frontend and audit.
 # The live smoke of the free sources is the separate, manual and weekly smoke-free-sources.yml; no job here calls
 # a provider.
 #
 # Supply chain: every action is pinned to a full commit SHA (the release tag is the trailing comment), uv and Node
-# to exact versions, the container images (PostgreSQL, gitleaks) to digests in deploy/images.lock. No job uses a
-# secret or a provider key: the token is read-only and the checkout does not keep it.
+# to exact versions, the container images (PostgreSQL, gitleaks, Trivy) and the base images of every build to
+# digests in deploy/images.lock. No job uses a secret or a provider key: the token is read-only and the
+# checkout does not keep it.
 name: CI
 
 on:
@@ -146,6 +147,68 @@ jobs:
           --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
           --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
           -t jobhunter-docparse:ci .
+
+  # The release images (spec §19.1, §18.8; plan M5 Task 29, R11, Deviation 40), built as release.yml builds
+  # them but pushed nowhere (no registry login, no push): the app (`runtime`), backup (`backup`; the root
+  # Dockerfile's last stage, so every build of it names its target) and docparse images, and the embedder's
+  # `fake` target (the real one downloads the model: embedder-image.yml). Every base image comes from the
+  # digests of deploy/images.lock, and each build gets the optional `build_ca` secret as compose's
+  # x-app-build passes it (SSL_CERT_FILE, /dev/null when unset). Then Trivy, by its digest in the lock, scans
+  # the app, backup and docparse images through the Docker socket, and the job fails on a CRITICAL
+  # vulnerability that has a fix (`--ignore-unfixed`).
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: app image
+        run: >-
+          docker build -f Dockerfile --target runtime
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          --build-arg NODE_IMAGE="$(grep ^node= deploy/images.lock | cut -d= -f2)"
+          --build-arg RESTIC_IMAGE="$(grep ^restic= deploy/images.lock | cut -d= -f2)"
+          --build-arg PGVECTOR_IMAGE="$(grep ^pgvector= deploy/images.lock | cut -d= -f2)"
+          --secret id=build_ca,src="${SSL_CERT_FILE:-/dev/null}"
+          -t jobhunter-app:ci .
+      - name: backup image
+        run: >-
+          docker build -f Dockerfile --target backup
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          --build-arg NODE_IMAGE="$(grep ^node= deploy/images.lock | cut -d= -f2)"
+          --build-arg RESTIC_IMAGE="$(grep ^restic= deploy/images.lock | cut -d= -f2)"
+          --build-arg PGVECTOR_IMAGE="$(grep ^pgvector= deploy/images.lock | cut -d= -f2)"
+          --secret id=build_ca,src="${SSL_CERT_FILE:-/dev/null}"
+          -t jobhunter-backup:ci .
+      - name: docparse image
+        run: >-
+          docker build -f docparse/Dockerfile
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          --secret id=build_ca,src="${SSL_CERT_FILE:-/dev/null}"
+          -t jobhunter-docparse:ci .
+      - name: embedder image, the fake target
+        run: >-
+          docker build -f embedder/Dockerfile --target fake
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          --secret id=build_ca,src="${SSL_CERT_FILE:-/dev/null}"
+          -t jobhunter-embedder:ci-fake .
+      - name: scan the app image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          image --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-app:ci
+      - name: scan the backup image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          image --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-backup:ci
+      - name: scan the docparse image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          image --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-docparse:ci
 
   frontend:
     runs-on: ubuntu-24.04
