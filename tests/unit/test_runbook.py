@@ -22,7 +22,7 @@ checks it against what it documents:
 - no data volume is removed before section 8's procedure ships the manifests and checks that none is left, and
   section 10 states the manifest format's expand/contract rule (Rulings T31-2, T31-3 I1 and I3); section 8's
   procedure stops api and worker before it ships and checks, and each block that removes a volume does too,
-  in that order, before the removal (Ruling T31-5);
+  in that order, before the removal (Rulings T31-5, T31-6);
 - V21 is the N1 stack test on the VPS, a skip counting as not passed, and its hand probes of api and docparse
   connect to a literal address (Rulings T31-3 I2, T31-5);
 - every `scripts/…` path exists and takes the flags given to it, every `jobhunter …` command is a command of
@@ -582,7 +582,8 @@ def _wipe_events(lines: list[tuple[bool, str]]) -> list[str]:
 
 def test_each_volume_removal_stops_ships_and_checks_first() -> None:
     """Section 8's procedure stops api and worker, then ships, then checks; each block that removes a volume
-    does the same before the removal, so no path relies on an earlier stop (Ruling T31-5)."""
+    does the same before the removal, a ship before its check included, so no path relies on an earlier stop
+    or ship (Rulings T31-5, T31-6)."""
     kit = _section(KIT)
     assert BEFORE_A_WIPE in kit, "section 8 has no procedure before a wipe"
     procedure = _wipe_events(_lines(kit[kit.index(BEFORE_A_WIPE) + len(BEFORE_A_WIPE) :]))
@@ -594,6 +595,7 @@ def test_each_volume_removal_stops_ships_and_checks_first() -> None:
         events = _wipe_events(block)
         before = events[: events.index("removal")]
         assert "check" in before, f"{events}: no check before the removal"
+        assert "ship" in before[: before.index("check")], f"{events}: no ship before the check (Ruling T31-6)"
         first = min(before.index(step) for step in ("ship", "check") if step in before)
         assert "stop" in before[:first], f"{events}: api and worker are not stopped before the ship and check"
 

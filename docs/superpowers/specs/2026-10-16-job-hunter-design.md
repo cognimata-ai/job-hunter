@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Approved** — revision 3.6. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Revision 3.5 (2026-10-29, the user's decisions U1–U4 and the M3 plan's deviations): the generator output schema of §11.5 is candidate C of spike V4b (generic fact items plus generic criterion items; the §11.5 schema of revision 3.4 is rejected by the API as too large), with §11.4, §11.6, §10.6, §10.11 and §11.9 adjusted to it; §11.3's language anchor follows §11.4 (B2 or higher is `met`); §6.8's Arbeitnow page yield is V8's 17.5 h, so the coverage-risk warning fires for intervals above 35 h (a 7-day interval raises it); `display.timezone` is a `schedule` field (§13.1); and the M3 plan's recorded deviations (its Deviations 1–41) on §3.3.3, §6.9.3, §7.11–7.13, §7.16, §7.18, §9.2, §9.3, §9.6, §9.7, §10.6, §10.10, §10.11, §11.6, §11.8, §11.13, §13.1, §14.2, §17.2, §17.6, §18.6, §20.1, §21.4 and §22, with the M3 execution rulings T3-b (§11.4, §11.6), T4-a (§7.3), T5-e (§11.6), T9-f (§11.7.2), T11-f and T11-g (§10.4), T12-b (§9.6.2), T15-a and T15-d (§8.7), T16-a, T16-d, T16-f, T16-g and T17-a (§10.10, §17.4, §17.6), T18-a (§17.5), T19-c (§7.4), T20-a (§13.2), T20-d (§10.3, §11.13), T22-c and T22-d′ (§8.6.1, §8.6.2), T22-e (§9.7) and M2-C1 (§12.3), and the overhead of V19's M3 re-count, 1,878 tokens (§6.9.1). Revision 3.6 (2026-11-04, the user's decisions U1–U3 of 2026-11-02 and the M4 plan's deviations): a submitted batch whose retrieve keeps failing can be released (§7.16.6, §10.10, §14.2, §17.6); the ranking generation bumps on scoring-state bucket changes only (§7.1); the Jobs list's sections, filters, group cards, counts and cursor are settled (§14.3, §15.3, §15.5); the header status, query, watchlist, activation-preview, eval-run and facet routes and the route extensions (§14.2); `totp_required` (§14.4, §15.2, §16.3); background polls keep no session alive (§16.4); presets A/B/C (§10.3, §13.1); needs attention and the replay operation (§7.3, §14.2, §15.7); the SPA's serving, stack and E2E tooling (§4.1, §4.2, §15, §18.4, §18.7, §18.8); and the M4 plan's recorded deviations that change spec text, and the M4 tasks' recorded rulings (T-numbers in `.superpowers` ledgers are not cited). Audit trail: `docs/council/` |
-| Known open points (revision 3.6) | Recorded, not decided: (1) §10.10 has a purge cancel the affected `in_batch` targets individually, while §20.2 step 1 requests the submission's cancel first; M5 decides (`targets.delete_target_set` records it). (2) §12.3's header-name rule takes a name only from a line that is nothing but a name, so mixed header lines (`Max Mustermann \| Senior Backend Engineer`, `Max Mustermann, M.Sc.`, `Lebenslauf Max Mustermann`, `Max Mustermann · max@… · +49 …`) and glued URLs (`LinkedInhttps://…`, an e-mail glued to a URL) leave contact data in the text; the user's review of the stripped text is the guarantee (a decision for the user). (3) §13.4: the scope apply's final staleness check recomputes in Python under `active_config FOR UPDATE` (about 0.7–1 s per 10,000 published results). (4) §18.3 C28: the old attempt's gateway path releases the entry `not_billed(never_dispatched)`, not the new owner; the end state is the same. (6) §6.9.4/§21.4 size the first reservation with the v1 schema's 8.0 KB bound (36,800 tokens at the overhead floor; 37,678 at the measured overhead); candidate C's 1,713 B schema would give about 31,400 tokens; the constant moves only on Task 26's measurement. (7) §12.3: marking an extra span for removal in the text review uses the native text selection, which keyboard users reach with caret browsing; a keyboard-only marking path is open. |
+| Status | **Approved** — revision 3.7. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Revision 3.5 (2026-10-29, the user's decisions U1–U4 and the M3 plan's deviations): the generator output schema of §11.5 is candidate C of spike V4b (generic fact items plus generic criterion items; the §11.5 schema of revision 3.4 is rejected by the API as too large), with §11.4, §11.6, §10.6, §10.11 and §11.9 adjusted to it; §11.3's language anchor follows §11.4 (B2 or higher is `met`); §6.8's Arbeitnow page yield is V8's 17.5 h, so the coverage-risk warning fires for intervals above 35 h (a 7-day interval raises it); `display.timezone` is a `schedule` field (§13.1); and the M3 plan's recorded deviations (its Deviations 1–41) on §3.3.3, §6.9.3, §7.11–7.13, §7.16, §7.18, §9.2, §9.3, §9.6, §9.7, §10.6, §10.10, §10.11, §11.6, §11.8, §11.13, §13.1, §14.2, §17.2, §17.6, §18.6, §20.1, §21.4 and §22, with the M3 execution rulings T3-b (§11.4, §11.6), T4-a (§7.3), T5-e (§11.6), T9-f (§11.7.2), T11-f and T11-g (§10.4), T12-b (§9.6.2), T15-a and T15-d (§8.7), T16-a, T16-d, T16-f, T16-g and T17-a (§10.10, §17.4, §17.6), T18-a (§17.5), T19-c (§7.4), T20-a (§13.2), T20-d (§10.3, §11.13), T22-c and T22-d′ (§8.6.1, §8.6.2), T22-e (§9.7) and M2-C1 (§12.3), and the overhead of V19's M3 re-count, 1,878 tokens (§6.9.1). Revision 3.6 (2026-11-04, the user's decisions U1–U3 of 2026-11-02 and the M4 plan's deviations): a submitted batch whose retrieve keeps failing can be released (§7.16.6, §10.10, §14.2, §17.6); the ranking generation bumps on scoring-state bucket changes only (§7.1); the Jobs list's sections, filters, group cards, counts and cursor are settled (§14.3, §15.3, §15.5); the header status, query, watchlist, activation-preview, eval-run and facet routes and the route extensions (§14.2); `totp_required` (§14.4, §15.2, §16.3); background polls keep no session alive (§16.4); presets A/B/C (§10.3, §13.1); needs attention and the replay operation (§7.3, §14.2, §15.7); the SPA's serving, stack and E2E tooling (§4.1, §4.2, §15, §18.4, §18.7, §18.8); and the M4 plan's recorded deviations that change spec text, and the M4 tasks' recorded rulings (T-numbers in `.superpowers` ledgers are not cited). Revision 3.7 (2026-11-12, the user's decisions M5-U1–U4 of 2026-11-09 and the M5 plan's deviations): the alert catalogue's delivery, escalation and manual resolution (§17.6), the dead-man mechanisms (§17.7), LangSmith's client (§17.8); the purge protocol's lifecycle, fence coverage and the global admission stop (§20.2), a purge's in-batch targets (§10.10, §20.2), export (§20.3), delete-everything's re-authentication and table list (§20.4), the Adzuna purge's mechanics (§20.5); the production compose, Caddy, the egress rule, roles and secrets (§16.8, §16.9, §19.1, §19.2), migrate's flags, the compatibility floor and the identity advancement (§19.3, §19.4, §19.6), the backup image, restic conventions and the restore orchestration (§4.1, §19.5), rotation (§19.8), the test placement and CI (§18.7, §18.8); and the M5 plan's recorded deviations that change spec text. Audit trail: `docs/council/` |
+| Known open points (revision 3.7) | Recorded, not decided: (2) §12.3's header-name rule takes a name only from a line that is nothing but a name, so mixed header lines (`Max Mustermann \| Senior Backend Engineer`, `Max Mustermann, M.Sc.`, `Lebenslauf Max Mustermann`, `Max Mustermann · max@… · +49 …`) and glued URLs (`LinkedInhttps://…`, an e-mail glued to a URL) leave contact data in the text; the user's review of the stripped text is the guarantee (a decision for the user). (3) §13.4: the scope apply's final staleness check recomputes in Python under `active_config FOR UPDATE` (about 0.7–1 s per 10,000 published results). (4) §18.3 C28: the old attempt's gateway path releases the entry `not_billed(never_dispatched)`, not the new owner; the end state is the same. (6) §6.9.4/§21.4 size the first reservation with the v1 schema's 8.0 KB bound (36,800 tokens at the overhead floor; 37,678 at the measured overhead); candidate C's 1,713 B schema would give about 31,400 tokens; the constant moves only on Task 26's measurement. (7) §12.3: marking an extra span for removal in the text review uses the native text selection, which keyboard users reach with caret browsing; a keyboard-only marking path is open. (8) §3.3.1, a known limit: a takeover outlasts a frozen old worker's idle transactions, which `idle_in_transaction_session_timeout` (60 s, §19.1) ends, but a session of it frozen while active (the server blocked sending to the stopped process) has no bound, since no pool sets a `statement_timeout`; the takeover then stalls until that session is terminated by hand. Terminating the old instance's other backends at takeover, or a role-level timeout, is the open hardening. |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
@@ -243,10 +243,10 @@ Three review findings cannot be fixed literally. The chair decided:
 | `embedder` | Stateless HTTP embedding service. The model is baked into the image at a pinned revision, and its sha256 is verified at start. | 1 | `internal` | none |
 | `postgres` | `pgvector/pgvector:0.8.7-pg17-bookworm` (pinned by digest). | 1 | `internal` | bootstrap superuser |
 | `migrate` | One-shot service: `alembic upgrade head`, default privileges, procrastinate schema migration, `PostgresSaver.setup()` on its own autocommit connection, then deletion-manifest replay (§19.5). `api` and `worker` depend on it with `service_completed_successfully`. | one-shot | `internal` | DB migrator role |
-| `backup` | busybox `crond` schedules: nightly backup sets, the deletion-manifest shipper, weekly prune, monthly restore test (§19.5). Built from the app image, so the restore test runs the app's replay and verification code. A one-off `restore` service with the same image runs a disaster restore. | 1 | `internal`, `egress` | DB backup and restore-test roles, restic, S3 |
+| `backup` | `jobhunter backup scheduler` (croniter) runs the nightly sets, the shipper, the weekly prune and the monthly restore test, as uid 10001 in group 10010 (§19.5). Built from the app image, so the restore test runs the app's replay and verification code. A one-off `restore` service with the same image runs a disaster restore. | 1 | `internal`, `egress` | DB backup and restore-test roles, restic, S3 |
 
 - **No Redis.** Postgres holds the queue, intents, sessions, throttling counters, ledgers, checkpoints and domain data.
-- **Network boundary.** `proxy` and `internal` are Compose networks with `internal: true`, so they have no route to the internet. Only `edge` and `egress` are routable. A host firewall rule in the `DOCKER-USER` chain additionally drops new outbound connections from every container address except those on `egress` and Caddy's `edge` address, which ACME needs (§16.9). Integration test N1 (§18.2) proves that `api` and `docparse` cannot open an outbound connection.
+- **Network boundary.** `proxy` and `internal` are Compose networks with `internal: true`, so they have no route to the internet. Only `edge` and `egress` are routable. In addition, a host nft table on the forward hook (`deploy/firewall/docker-user.nft`, loaded before Docker) drops new outbound connections from the `proxy`, `internal` and `edge` subnets to non-container addresses, except Caddy's `edge` address, which ACME needs (§16.9). Integration test N1 (§18.2) proves that `api` and `docparse` cannot open an outbound connection.
 - **Secrets** are delivered per service as Compose `secrets` files (§19.2). No service receives a secret it does not need.
 
 ### 3.3 Process model
@@ -392,6 +392,7 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 - Versions without a mark come from the council's research snapshot (`research/tech`).
 - Versions marked † are not in the research. They were read from PyPI, npm or Docker Hub on 2026-10-16, and the first `uv lock` / `npm install` MUST re-confirm them; a different resolution is recorded in the lock PR.
 - The frontend versions that revision 3.6 adds (marked †) are the M4 plan's pins, as `frontend/package.json` holds them.
+- The versions that revision 3.7 adds (marked †) are the M5 plan's pins, as `pyproject.toml` and `deploy/images.lock` hold them.
 - `anthropic` 1.x depends on the separate distribution `httpx2` (import name `httpx2`; per the bundled Claude API SDK notes). The source adapters use `httpx` 0.28.1. These are two different packages and coexist in one lockfile; objects from one are never passed to the other (the gateway uses `anthropic.Timeout`, §10.1 G3).
 
 | Area | Component | Version |
@@ -412,12 +413,12 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 | | langchain-core | 1.6.11 |
 | | langchain-anthropic | 1.7.6 |
 | | anthropic | 1.15.0 (depends on `httpx2`) |
-| | langsmith | 0.14.11 |
+| | langsmith | 0.14.11 (a direct dependency) |
 | HTTP (sources) | httpx | † 0.28.1 |
 | Embeddings | onnxruntime | 1.31.0 |
 | | tokenizers | † 0.23.3 |
 | | numpy | † 2.5.4 |
-| | Model | `Snowflake/snowflake-arctic-embed-l-v2.0`, ONNX int8 export, pinned HF revision and sha256 in `embedder/model.lock` |
+| | Model | `Snowflake/snowflake-arctic-embed-l-v2.0`, ONNX fp32 export (fp32 or int8 decided after V7 on the VPS), pinned HF revision and sha256 in `embedder/model.lock` |
 | Parsing | pypdf | 6.20.1 |
 | | pdfplumber | 0.11.10 |
 | | python-docx | 1.2.0 |
@@ -433,7 +434,8 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 | | Extensions | `vector`, `pg_trgm`, `unaccent` |
 | Proxy | Caddy | † 2.11.7 (`caddy:2.11.7-alpine`) |
 | Backup | restic | † 0.19.1 |
-| | Backup base image | `postgres:17.11-alpine3.24` (pg_dump 17 + busybox `crond`); restic binary copied from `restic/restic:0.19.1` (both †) |
+| | Backup image | the app image's `backup` stage: the PostgreSQL 17 client and its libraries from the pinned `pgvector` image, restic 0.19.1 from `restic/restic:0.19.1` |
+| | croniter | † 6.2.4 (a direct dependency: `jobhunter backup scheduler`) |
 | Frontend build | Node | † 22.22.3 (`node:22.22.3-bookworm`, build stage only) |
 | | Vite | 8.3.4 |
 | | React | 19.3.1 |
@@ -464,6 +466,8 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 | | @testing-library/react | † 16.3.3 |
 | | @testing-library/user-event | † 14.6.8 |
 | | jsdom | † 29.1.1 |
+| | versitygw | † v1.9.0 (`versity/versitygw:v1.9.0`, test only: the S3 stand-in of the compose test stack) |
+| | trivy | † 0.76.1 (`aquasec/trivy:0.76.1`, CI only: the `images` job's scan) |
 
 ### 4.2 Repository layout
 
@@ -473,9 +477,13 @@ job-hunter/
 ├── backend/src/jobhunter/
 │   ├── config.py                 # env loading + startup assertions (§16.8)
 │   ├── cli.py                    # `jobhunter` CLI: user, totp, migrate, worker, manifests, restore, startup-check, fixtures, schema-dry-run
+│   ├── cli_ops.py, cli_backup.py # `jobhunter ops …` (the V15 checks), `jobhunter backup …` and `restore …` (§19.4)
+│   ├── crypto_rotate.py          # `jobhunter crypto rotate` (§19.8)
+│   ├── backup/ runner.py restic.py shipper.py backup_set.py prune.py scheduler.py cron.py restore.py
+│   │           restore_test.py   # the backup image's jobs (§19.5)
 │   ├── api/                      # FastAPI app
 │   │   ├── app.py, deps.py, errors.py (RFC 9457), pagination.py (signed keyset cursors), retry.py (40P01)
-│   │   ├── security.py (sessions, CSRF, headers, throttling), static.py (SPA)
+│   │   ├── security.py (sessions, CSRF, headers, throttling), static.py (SPA), reauth.py (§20.4, §20.5)
 │   │   └── routes/ auth.py jobs.py groups.py targets.py labelling.py profile.py settings.py
 │   │               watchlist.py runs.py cycles.py eval_runs.py system.py alerts.py privacy.py health.py docs.py
 │   ├── worker/ main.py lock.py epoch.py watchdog.py heartbeat.py tasks.py operations.py tick.py
@@ -511,12 +519,14 @@ job-hunter/
 │   ├── profile/ upload.py parse_client.py contacts.py schema.py validate.py activation.py
 │   ├── geo/ gazetteer.py data/{de_places.tsv, non_de_places.tsv}   # GeoNames CC-BY 4.0, attributed
 │   ├── db/ base.py session.py locks.py transitions.py snapshot.py models/*.py views.sql
-│   │       migrations/ (alembic env + versions)
+│   │       compat.py (§19.6) fence_guard.py (§20.2) migrations/ (alembic env + versions)
 │   ├── observability/ logging.py redact.py metrics.py alerts.py ntfy.py deadman.py langsmith.py health.py
 │   │                  status.py attention.py lists.py   # the header status, needs attention, the lists
+│   │                  catalogue.py heartbeat_watch.py backup_health.py   # §17.6, §17.5
 │   ├── api_idempotency.py        # Idempotency-Key store (§14.1)
 │   └── privacy/ retention.py deletion_graph.py purge.py fences.py export.py manifests.py replay.py
 │                restore_verify.py identities.py   # §19.5 replay, verification, identity advancement
+│                reconcilers.py kinds/{golden_case,job_tombstone,profile_purge,source_purge,delete_everything}.py
 ├── embedder/ Dockerfile app.py model.lock
 ├── docparse/ Dockerfile worker.py        # network_mode: none; reads/writes the parse_jobs volume
 ├── frontend/ package.json vite.config.ts tsconfig.json scripts/check-dist-csp.mjs
@@ -528,8 +538,8 @@ job-hunter/
 │   │         NeedsAttention, ...) profile/
 │   └── e2e/ playwright.config.ts specs/ support/ fixtures/ visual/   # §18.7
 ├── deploy/ compose.yaml Caddyfile secrets.example (names only) postgres/{postgresql.conf, init/}
-│           firewall/docker-user.nft backup/{Dockerfile (FROM the app image),crontab,backup_set.sh,
-│           manifest_shipper.sh,restore.sh,restore-test.sh}
+│           firewall/{docker-user.nft, jobhunter-egress.service} caddy/site.caddy Caddyfile.test
+│           compose.test.yaml compose.s3stub.yaml release.lock (written by the release workflow)
 ├── tests/ unit/ property/ integration/ crash/ contract/{fixtures (scrubbed)}/ payload/ eval/
 ├── docs/ PRIVACY.md RUNBOOK.md superpowers/specs/
 └── .github/workflows/ ci.yml eval-manual.yml schema-dry-run-manual.yml
@@ -2775,6 +2785,7 @@ CREATE TABLE deletion_manifests (                  -- ids and key hashes only, n
   shipped_at       timestamptz,
   shipment_id      bigint,                         -- FK below
   replay_log       jsonb NOT NULL DEFAULT '[]',
+  request          jsonb NOT NULL DEFAULT '{}',    -- the purge's request, ids only, written at A0 (§20.2)
   CHECK (status = 'executing' OR (completed_at IS NOT NULL AND file_sha256 IS NOT NULL)),
   CHECK ((status = 'shipped') = (shipped_at IS NOT NULL AND shipment_id IS NOT NULL))
 );
@@ -2861,8 +2872,45 @@ CREATE TABLE exports (
   storage_path text,
   sha256       bytea,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  expires_at   timestamptz NOT NULL                -- created + 7 d
+  expires_at   timestamptz NOT NULL,               -- created + 7 d
+  size_bytes   bigint CHECK (size_bytes >= 0),
+  purge_generation bigint                          -- max(deletion_manifests.id) its snapshot saw (§20.3)
 );
+CREATE UNIQUE INDEX exports_one_running ON exports ((true)) WHERE status = 'running';   -- one live export
+
+CREATE TABLE purged_batch_items (                  -- a purge deleted this item of a live submission (§10.10)
+  submission_id bigint NOT NULL REFERENCES batch_submissions(id) ON DELETE CASCADE,
+  custom_id     text NOT NULL,
+  manifest_id   bigint NOT NULL REFERENCES deletion_manifests(id),
+  purged_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (submission_id, custom_id)
+);
+
+CREATE TABLE deadman_state (                       -- the dead-man check as last applied (§17.7); seeded all NULL
+  id                 smallint PRIMARY KEY CHECK (id = 1),
+  applied_interval_s integer,
+  applied_timeout_s  integer,
+  applied_grace_s    integer,
+  applied_paused     boolean,
+  last_pinged_run_id bigint,
+  synced_at          timestamptz,
+  last_error_code    text,
+  next_try_at        timestamptz
+);
+
+CREATE TABLE schema_compat (                       -- per revision, the oldest code that runs on it (§19.6)
+  revision     text PRIMARY KEY,
+  compat_floor text NOT NULL,
+  destructive  boolean NOT NULL,
+  recorded_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- The columns M5 adds to earlier tables:
+ALTER TABLE api_idempotency ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY;   -- a surrogate identity;
+ALTER TABLE api_idempotency ADD UNIQUE (id);                                     -- the key stays (route, idem_key)
+ALTER TABLE login_lockouts ADD COLUMN generation bigint GENERATED BY DEFAULT AS IDENTITY;   -- renewed by every lock
+ALTER TABLE llm_calls ADD COLUMN content_purged_at timestamptz;   -- the marker of a field_redact of output_json
+ALTER TABLE worker_heartbeat ADD COLUMN tracing jsonb;            -- the worker's published tracing state (§17.5)
 ```
 
 ### 7.15 Library-managed tables
@@ -2920,7 +2968,7 @@ deferred ──a later run re-resolves it (§8.6)──► linked | out_of_scope
 rejected ──explicit replay (payload ≤ 30 d)────► pending          (re-parsed from the stored body)
 ```
 
-At finalize, `count(pending) = 0` and the dispositions sum to `raw_responses.item_count` for every response of the run. `deferred('job_fenced')` is a **recorded disposition**, not a pending item: it counts in the sum, satisfies I1 and S1, and is listed in the run report. Node 6 of every later run re-resolves the deferred items of earlier runs whose jobs are no longer fenced (oldest first, at most 1,000 per run), each in one §8.6 transaction under that run's ownership predicate; an item still fenced stays `deferred`. A deferred item that reaches the 90-day raw-item retention is dropped with its raw item and counted in the retention report. A resumed attempt continues every `pending` item from its stored `normalized` intermediate and skips only terminal dispositions.
+At finalize, `count(pending) = 0` and the dispositions sum to `raw_responses.item_count` for every response of the run. `deferred('job_fenced')` is a **recorded disposition**, not a pending item: it counts in the sum, satisfies I1 and S1, and is listed in the run report. Node 6 of every later run re-resolves the deferred items of earlier runs whose jobs are no longer fenced (oldest first, at most 1,000 per run), each in one §8.6 transaction under that run's ownership predicate; an item still fenced stays `deferred`. A deferred item is kept past the 90-day raw-item retention until it is resolved. A resumed attempt continues every `pending` item from its stored `normalized` intermediate and skips only terminal dispositions.
 
 #### 7.16.2 Availability (postings; jobs derive)
 
@@ -3090,7 +3138,9 @@ ambiguous ──(LLM batch item of a batch that was found) errored | canceled | 
 - **Score attempt**: `running → published_accepted | published_contested | refused | failed_max_tokens | failed_invalid_output | failed_request | transient_error | budget_exhausted | claim_lost | cancelled | batch_draft_ready | submit_rejected | released`; an abandoned submission ends its attempts `cancelled('batch_abandoned')`, a `retry_online` item decision ends the batch attempt with the outcome its cause maps to.
 - **Bulk operation**: `active → completed | cancelled`; the operation becomes `completed` when its `create_targets_for_tuple` operation has ended, none of its targets is `pending`, `in_progress` or `in_batch`, and no unreleased submission of it is in flight.
 - **Deletion manifest**: `executing → completed → shipped`.
-- **Backup set**: `running → succeeded | failed`.
+- **Backup set**: `running → succeeded | failed`. A backup run (prune, restore test) follows the same machine.
+- **Export**: `running → ready | failed | purged`; `ready → expired | purged`.
+- **Query proposal**: `running → ready | failed`; `running | ready | failed → purged` (items NULL).
 - **Duplicate group**: `active → dissolved` when fewer than 2 members remain. Representative changes and `unscorable_reason` changes are recorded in `election_reason` (§8.7).
 - **Identity conflict**: `open → resolved_separate | resolved_merged` (user action).
 - **Coverage gap**: `open → closed` (a contiguous traversal covers it) or `→ abandoned` (older than `max_ad_age_days`, or beyond the provider window).
@@ -4083,7 +4133,7 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 | *(no result after a complete stream)* | — | stays `ambiguous`; critical alert `batch.items_missing` | `retry_online` → `pending('batch_missing')` |
 
 - **Batched targets are `in_batch(submission_id)`.** That state is exempt from claim-reclaim, from online admission and from the stuck-target invariant until the batch ends or expires, the submission is rejected or abandoned, or the user releases it.
-- **Cancellation of batched targets.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. The cancel request is recorded on every non-terminal submission of the tuple, whatever its phase, and is sent to the provider as soon as a provider id is known, only while the batch is `in_progress`, after a retrieve. A revision supersession, job merge or purge cancels the affected `in_batch` targets individually (`cancelled(reason)`, §7.16.3) without cancelling the batch. Either way, an item that later arrives for a cancelled target is fenced: it settles spend from usage (`billed`) or from the provider's per-item evidence (`not_billed(batch_item_*)`) and publishes nothing (`decision='ignored_fenced'`).
+- **Cancellation of batched targets.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. The cancel request is recorded on every non-terminal submission of the tuple, whatever its phase, and is sent to the provider as soon as a provider id is known, only while the batch is `in_progress`, after a retrieve. A revision supersession or job merge cancels the affected `in_batch` targets individually (`cancelled(reason)`, §7.16.3) without cancelling the batch. A purge abandons a `preparing` submission; for any later submission it requests the submission's cancel, cancels the purged targets individually, settles their items' entries `dispatched → ambiguous`, and records in `purged_batch_items` each deleted item whose submission can still return results, a released one included; the result reader skips a line as `purged` only on such a record, and the ambiguous reconciliation matches the submission's items plus its purged items. Either way, an item that later arrives for a cancelled target is fenced: it settles spend from usage (`billed`) or from the provider's per-item evidence (`not_billed(batch_item_*)`) and publishes nothing (`decision='ignored_fenced'`).
 - Every item decision but `followup` releases its share of `followup_held_usd` at processing (`batch_items.hold_released_at`, once), a `followup` when its target ends terminally.
 - Every cleanup of this section ends an attempt only while it is `running`; an attempt supersession ended keeps its outcome, and the accounting of an item never depends on its target's state.
 
@@ -5005,7 +5055,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | CSRF | Every state-changing method (POST, PUT, PATCH, DELETE) requires `Origin` equal to `JOBHUNTER_PUBLIC_ORIGIN` **and** the header `X-JH-Request: 1`. Otherwise → 403 `csrf_failed`. |
 | Request id | Each response carries `X-Request-Id` (a UUIDv7), which also appears in logs and in problem details. |
 | Rate limiting | Login: §16.3. Other routes: 600 requests/min per session (a 429 problem). |
-| Idempotency | Every POST that can start paid work, activate a version or delete data requires an `Idempotency-Key` header (16–128 characters of `[A-Za-z0-9_-]`, generated by the client per user action): `POST /api/runs`, `/score-now`, `/targets/{id}/retry`, `/profile/drafts/{id}/text-review`, `/profile/drafts/{id}/retry`, `/profile/drafts/{id}/confirm`, `/profile/query-proposals`, `/settings` (save), `/settings/*-versions/{id}/activate`, `/batches/{id}/release`, `/system/score-cycle`, `/privacy/export`, `/privacy/delete-everything`, `/privacy/purge-source`. The server stores `(route, key, request hash, response)` in `api_idempotency` for 7 days: the same key with the same request returns the **stored response**, even after the work finished; the same key with a different request → 422 `idempotency_key_reused`; a key whose first request is still running → 409 `idempotency_in_progress`. A confirm of an already confirmed draft returns its original outcome even with a new key (§12.6). |
+| Idempotency | Every POST that can start paid work, activate a version or delete data requires an `Idempotency-Key` header (16–128 characters of `[A-Za-z0-9_-]`, generated by the client per user action): `POST /api/runs`, `/score-now`, `/targets/{id}/retry`, `/profile/drafts/{id}/text-review`, `/profile/drafts/{id}/retry`, `/profile/drafts/{id}/confirm`, `/profile/query-proposals`, `/settings` (save), `/settings/*-versions/{id}/activate`, `/batches/{id}/release`, `/system/score-cycle`, `/privacy/export`, `/privacy/delete-everything`, `/privacy/purge-source`. The server stores `(route, key, request hash, response)` in `api_idempotency` for 7 days: the same key with the same request returns the **stored response**, even after the work finished; the same key with a different request → 422 `idempotency_key_reused`; a key whose first request is still running → 409 `idempotency_in_progress`. A confirm of an already confirmed draft returns its original outcome even with a new key (§12.6). For delete-everything and the source purge, the idempotency fingerprint leaves out `password` and `totp`, and a key whose request completed returns its stored response before any re-authentication. |
 
 ### 14.2 Endpoints
 
@@ -5023,7 +5073,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/jobs/{job_id}/feedback` | Label or "wrong score" | `{kind: label \| wrong_score, label: good \| ok \| poor, comment?}` → 201. Creates `score_feedback` (with the score snapshot) and, when a profile is active, upserts the `golden_cases` row for (revision, profile) with the active scope. |
 | GET | `/api/golden-cases` | Golden set | keyset paged → `[{id, job_id, title, company, label, comment, profile_version, scope_version, source, active}]` |
 | PATCH | `/api/golden-cases/{id}` | Activate, deactivate or mark a canary | `{active?, is_canary?}` → 200 |
-| DELETE | `/api/golden-cases/{id}` | Delete a golden case | → 204. Writes a `golden_case_delete` manifest (the manifest from M5); the job's inputs lose their retention exemption (§20.1). |
+| DELETE | `/api/golden-cases/{id}` | Delete a golden case | → 202 `{manifest_id}`. Opens a `golden_case_delete` purge; the worker writes its manifest's file and deletes the case (the api has no `manifests` volume); the job's inputs lose their retention exemption (§20.1). |
 | DELETE | `/api/feedback/{id}` | Delete a label or feedback | → 204; the golden case it created stays |
 | POST | `/api/jobs/{job_id}/unmerge` | Reverse a merge | `{merge_event_id}` → 202 `{unmerge_event_id}`; 404 unless the event merged into `{job_id}` |
 | POST | `/api/duplicate-groups/{group_id}/split` | Split a member out | `{job_id}` → 200 `Group`: `{id, status, representative_job_id, unscorable_reason, election_reason, members}`, the drawer's group view, each member with its title, company, sources, locations, completeness, availability, target state, `score_individually` and `is_representative` |
@@ -5073,7 +5123,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | GET | `/api/system/quota` | Quota windows and ledger summary | → per provider `{window, used, reserved, ambiguous, adjustments, tokens, state}` |
 | GET | `/api/system/spend` | LLM spend | → `{month, counted, billed, ambiguous, reserved, cap, headroom, bucket: {usd, capacity, rate_per_h}, c_hat, critic_rate_7d, projected_critic_rate, bulk_operation, quarantined_batch_usd, by_model_effort_role}` |
 | GET | `/api/system/needs-attention` | Items needing the user | → each section's full count and its first 50 items: rejected raw items (per response, with `replayable`), identity conflicts, failed/refused targets, quarantined batches, lost batches (`batch.retrieve_failing`, with `releasable`), mass disappearances, unscorable groups, broken sources; the acknowledgeable pause of the score lane and a failed scope apply. Failed purges join with M5's purges |
-| POST | `/api/system/purges/{operation_id}/retry` | Retry a failed purge | → 202. A new attempt of the same `purge` operation and manifest; its purge fence stays active throughout (§20.2) |
+| POST | `/api/system/purges/{operation_id}/retry` | Retry a failed purge | → 202 `{operation_id, manifest_id}`. A new `purge` operation for the same manifest; its purge fence stays active throughout (§20.2) |
 | POST | `/api/system/raw-items/replay` | Replay rejected items | `{raw_response_id \| raw_item_ids[]}` → 202 `{operation_id, items}`, a `replay_raw_items` operation (§7.3) |
 | POST | `/api/identity-conflicts/{id}/resolve` | Resolve a conflict | `{decision: separate \| merge}` → 202 `{conflict_id, status}` |
 | POST | `/api/ats-snapshots/{id}/acknowledge` | Confirm a mass disappearance | → 200; the absent postings close (§8.11) |
@@ -5081,11 +5131,13 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/system/score-cycle` | Start a cycle manually | → 202 `{queued, reason}`: the API requests a cycle; the worker creates it |
 | GET | `/api/alerts` | Alerts | `?status=open\|acknowledged\|resolved` keyset paged: `resolved` once resolved, else `acknowledged` once acknowledged, else `open` |
 | POST | `/api/alerts/{id}/ack` | Acknowledge | → 200 |
+| POST | `/api/alerts/{id}/resolve` | Resolve a manual alert | → 200 the alert. Only for a code the catalogue marks manual (§17.6); 409 for an auto-resolving code |
 | POST | `/api/privacy/export` | Start an export | → 202 `{export_id}` |
-| GET | `/api/privacy/exports/{id}` | Export status / download | → status, or a `application/zip` stream when ready |
-| POST | `/api/privacy/delete-everything` | Delete all data | `{confirm: "DELETE EVERYTHING", password}` → 202 `{manifest_id}` |
-| GET | `/api/privacy/manifests/{id}` | Deletion status | → `{status: executing \| completed \| shipped, completed_at, shipped_at}`. The UI reports a deletion as done only at `shipped` (§19.5). |
-| POST | `/api/privacy/purge-source` | Purge a source's data | `{source: "adzuna", confirm: "PURGE ADZUNA", password}` → 202 `{manifest_id}` |
+| GET | `/api/privacy/exports/{id}` | Export status / download | → status JSON; `?download=1` streams the zip when ready; 410 `gone` once expired or purged |
+| POST | `/api/privacy/delete-everything` | Delete all data | `{confirm: "DELETE EVERYTHING", password, totp?}` → 202 `{manifest_id}` |
+| GET | `/api/privacy/manifests` | Deletion statuses | keyset paged, newest first → `{items, next_cursor}`, each item as below |
+| GET | `/api/privacy/manifests/{id}` | Deletion status | → `{id, kind, status: executing \| completed \| shipped, created_at, completed_at, shipped_at, deleted_golden_case_ids}`. The UI reports a deletion as done only at `shipped` (§19.5). |
+| POST | `/api/privacy/purge-source` | Purge a source's data | `{source: "adzuna", confirm: "PURGE ADZUNA", password, totp?}` → 202 `{manifest_id}` |
 | GET | `/api/openapi.json` | OpenAPI 3.1 | authenticated; not listed in its own document (§14.5) |
 | GET | `/healthz` | Liveness | unauthenticated → 200 `{status: "ok"}` |
 | GET | `/readyz` | Readiness | unauthenticated → 200 or 503 `{failing: [component codes]}`, with no details beyond codes |
@@ -5133,7 +5185,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 
 - The content type is `application/problem+json`.
 - Stack traces, SQL and secrets are never included. Validation errors use 422 with `errors[]`.
-- Stable `code` values include: `unauthenticated`, `totp_required`, `csrf_failed`, `throttled`, `invalid_cursor`, `stale_base_version`, `validation_failed`, `budget_exhausted`, `filtered_requires_force`, `run_active`, `not_found`, `conflict_state`, `upload_rejected`, `idempotency_key_required`, `idempotency_key_reused`, `idempotency_in_progress`, `eval_gate_failed`, `internal`.
+- Stable `code` values include: `unauthenticated`, `totp_required`, `csrf_failed`, `throttled`, `invalid_cursor`, `stale_base_version`, `validation_failed`, `budget_exhausted`, `filtered_requires_force`, `run_active`, `not_found`, `conflict_state`, `upload_rejected`, `idempotency_key_required`, `idempotency_key_reused`, `idempotency_in_progress`, `eval_gate_failed`, `delete_everything_in_progress`, `confirmation_mismatch`, `reauth_failed`, `gone`, `internal`.
 
 ### 14.5 OpenAPI generation
 
@@ -5360,8 +5412,8 @@ The cost labels (the extraction's ~$0.14 here, **Propose queries** ~$0.10 below)
 | Schedule | Enabled, interval, anchor time (local), "include paid sources in scheduled runs", next slots preview. |
 | Scoring & models | Preset selector (A/B/C/custom) with a per-node model/effort grid (the critic with its light effort) and a separate execution grid (max_tokens, deadlines); **critic routing** (the evaluation policy: relevance threshold, T2 band and straddle coverage, T3 threshold, sample %, light-effort triggers) with the projected and the measured 7-day critic rate; monthly cost projection; eval status ("last eval: passed, ρ = 0.71"); available rubric/prompt versions with **Activate** (gated). |
 | Budget & quota | LLM cap, nonscoring reserve, bucket floor, max and minimum targets per cycle, batch options; live state: counted spend and headroom, the USD bucket (balance, capacity, rate), `ĉ`, the active bulk operation's budget and spend, any amount held by a quarantined batch; plus live windows (JSearch/SerpApi/Adzuna usage, reset dates, ambiguous counts, adjustments). |
-| System | Display (time zone, UI language) and notifications, runs (list plus report viewer), score cycles, **Needs attention** (rejected raw items [Replay], identity conflicts [Resolve], failed/refused targets [Retry], quarantined batches and batches that cannot be retrieved [Release & re-score], mass disappearances [Confirm closure], unscorable groups, broken sources, paused scoring [Acknowledge], a failed scope apply [Retry apply]), alerts [Ack], the golden set (list, delete), and a health panel (§17.5). |
-| Privacy & data | Export, Adzuna purge, delete everything (typed confirmation plus password), each deletion's status (executing → completed → **confirmed offsite**), the retention table (with `retention.score_history_months`, edited in its row), the backup lag note, and a link to PRIVACY.md. |
+| System | Display (time zone, UI language) and notifications, runs (list plus report viewer), score cycles, **Needs attention** (rejected raw items [Replay], identity conflicts [Resolve], failed/refused targets [Retry], quarantined batches and batches that cannot be retrieved [Release & re-score], mass disappearances [Confirm closure], unscorable groups, broken sources, paused scoring [Acknowledge], a failed scope apply [Retry apply], failed purges [Retry]), alerts [Ack] [Resolve], the golden set (list, delete), and a health panel (§17.5). |
+| Privacy & data | Export, Adzuna purge, delete everything (typed confirmation, the password and, with TOTP on, the code), each deletion's status (executing → completed → **confirmed offsite**), the retention table (with `retention.score_history_months`, edited in its row), the backup lag note, and the privacy statement, rendered in the app (`docs/PRIVACY.md`, in English in both UI languages, with a German note). |
 
 **The dry-run panel** lists errors (red, block Save) and warnings (amber, each with an "I understand" checkbox). The projections are shown as compact rows. The effect classes appear as chips, e.g. "Recompute scores (no LLM)" or "LLM re-score ≈ $41".
 
@@ -5423,6 +5475,8 @@ The cost labels (the extraction's ~$0.14 here, **Propose queries** ~$0.10 below)
 - **Per IP**: after 5 failures in 15 min, `login_lockouts('ip:<ip>')` blocks the IP for 15 min.
 - **Global**: after 20 failures in 1 h, `login_lockouts('global')` blocks everyone for 1 h and raises the critical alert `auth.lockout`.
 - **The CLI is the escape hatch**: `jobhunter sessions unlock`.
+- A re-authentication (delete everything, the source purge) counts each failure as a failed login attempt; the api's edge refuses a client past 10 login requests a minute (100 in all) with 429 before any database work.
+- **No access log.** Neither uvicorn (`access_log` off, WebSockets off) nor Caddy (no `log` directive; a global log filter deletes the client's address, port and request headers from the lines it still writes, its errors among them) logs a request with its client address; the sign-in and re-authentication events record the address with their outcome, and `login_attempts` and `login_lockouts` hold it (§20.1).
 - Every attempt is recorded with an HMAC of the username, never the raw value.
 - Responses take constant time: a dummy Argon2 verify runs on unknown usernames. Error messages are generic.
 - When TOTP is enabled and the request has no code, the server answers 401 `totp_required` before any password check, records no attempt and reveals nothing else.
@@ -5471,17 +5525,18 @@ Cross-Origin-Resource-Policy: same-origin
 
 ### 16.8 Secrets and startup assertions
 
-Every process runs these checks at start. A failure exits with code 78 and logs the failing check by name, never by value.
+Every process runs these checks at start, for its role: `api`, `worker`, `migrate`, `backup` or `restore` (`jobhunter startup-check --role <service>` runs them alone). A failure exits with code 78 and logs the failing check by name, never by value.
 
 1. Every secret file the role needs is present and readable, none is world-readable (the files are `root:10010`, mode 0440, §19.2), no secret of another role is mounted, and `JOBHUNTER_ENV ∈ {prod, dev, test}`.
 2. `LANGSMITH_GATEWAY` is unset, and the `anthropic_key` secret does not start with `lsv2_`.
 3. In `prod`, `JOBHUNTER_FAKE_SOURCES` and `JOBHUNTER_FAKE_LLM` are unset.
-4. If `LANGSMITH_TRACING=true`: `LANGSMITH_HIDE_INPUTS=true`, `LANGSMITH_HIDE_OUTPUTS=true` and `LANGSMITH_ENDPOINT == "https://eu.api.smith.langchain.com"`.
+4. If tracing is on (any of the SDK's tracing variables): `LANGSMITH_HIDE_INPUTS=true`, `LANGSMITH_HIDE_OUTPUTS=true` and `LANGSMITH_ENDPOINT == "https://eu.api.smith.langchain.com"` (a legacy endpoint variable too, when set); the `langsmith_key` secret is present; no write replica, API key variable or sampling rate is set; and for a prod worker `LANGSMITH_USE_DAEMON` and `LANGSMITH_DISABLE_RUN_COMPRESSION` are `true` (`langsmith_config`).
 5. The session secret decodes to at least 32 bytes; the data key decodes to **exactly** 32 bytes (AES-256); the two differ. A previous data key, when mounted during a rotation, also decodes to exactly 32 bytes.
 6. For the worker, the advisory lock is acquired (§3.3.1).
 7. For the embedder, the model sha256 matches `model.lock`.
-8. In `prod`, the worker has the healthchecks ping URL **and** Management API key (§17.7).
+8. In `prod`, the worker has the healthchecks ping URL **and** Management API key (§17.7); the ping URL is an https URL that ends in the check's UUID (`healthchecks_ping_url_form`); and `NTFY_TOPIC_URL` is an https URL (`ntfy_in_prod`).
 9. For `api`, no provider, Anthropic, LangSmith, ntfy, healthchecks or S3 secret is mounted.
+10. For `backup` and `restore`, an `s3:` repository has both S3 keys (`restic_s3_credentials`).
 
 Secrets are never written to the DB, logs, traces, fixtures or images. The structlog redaction processor drops or masks these keys: `authorization`, `cookie`, `set-cookie`, `x-rapidapi-key`, `api_key`, `app_key`, `app_id`, `password`, `token`, `secret`, `redirect_url`, `outbound_url_private`, `description*`, `profile*`, `cv*`, `stripped_text`, `reviewed_text`, `raw_text*`. It also masks emails, phone numbers and key-shaped strings inside values. CI runs `gitleaks` on every push.
 
@@ -5492,13 +5547,13 @@ Secrets are never written to the DB, logs, traces, fixtures or images. The struc
 ### 16.9 Data at rest and network exposure
 
 - The VPS disk is encrypted with LUKS (provider permitting). CV files and raw CV texts are additionally AES-256-GCM encrypted by the app, and backups are encrypted by restic.
-- The `data_key` secret is never stored in the DB or in backups. It is kept in the deployment's secret store and in an offline copy held by the user; the runbook covers this.
+- The `data_key` secret is never stored in the DB or in backups. It is kept in the deployment's secret store and in the offline recovery kit held by the user; the runbook covers this. The offline recovery kit holds the current `data_key` and every earlier data key a retained backup set names, `restic_password`, the S3 keys, `RESTIC_REPOSITORY` and the env file.
 - **Network boundary** (§3.2, §19.1):
   - only Caddy publishes ports (80, 443), on the `edge` network;
   - `proxy` (Caddy ↔ API) and `internal` (API, worker, Postgres, embedder) are Compose networks with `internal: true`, so they have **no route to the internet**; `api` is attached only to these two;
   - only `worker` and `backup` are attached to `egress` (and the one-off `restore` container while a restore runs, §19.5);
   - `docparse` runs with `network_mode: none`;
-  - a host `DOCKER-USER` firewall rule (`deploy/firewall/docker-user.nft`) drops new outbound connections from any container address that is not on `egress` or Caddy's `edge` address, as defence in depth;
+  - a host nft table on the forward hook (`deploy/firewall/docker-user.nft`, loaded before Docker) drops new outbound connections from the `proxy`, `internal` and `edge` subnets to non-container addresses, except Caddy's `edge` address, as defence in depth;
   - integration test N1 (§18.2) asserts that `api` and `docparse` cannot resolve or connect to an outside address, and that `worker` can.
 - **Secrets per service**: `api` receives only the session secret, the data key and its DB credentials; provider, Anthropic, LangSmith, ntfy, healthchecks and S3 credentials exist only in `worker` and `backup` (§19.2). A compromise of the internet-facing API therefore exposes no provider key and cannot send data out directly.
 
@@ -5586,12 +5641,14 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `expiry_sweep` | every 10 min + every cycle | §9.6.3 | Expire or revive |
 | `awaiting_embedding` | every 10 min, when the embedder is healthy | Revisions `awaiting_embedding` for more than 10 min | Embed; set similarity on their targets |
 | `stale_sweep` | tick (≤ 1,000 rows) + daily | Aggregator TTL | `active → stale` ("not re-confirmed"; targets are not expired by it) |
-| `manifest_shipping` | every 5 min | `completed` manifests named by a `manifest_shipment_items` row with an equal file hash; manifests `completed` for more than 1 h without one | Mark exactly those `shipped`; raise `privacy.manifest_unshipped` (critical) for the others |
+| `manifest_shipping` | tick (every minute) | `completed` manifests named by a `manifest_shipment_items` row with an equal file hash; manifests `completed` for more than 1 h without one | Mark exactly those `shipped`; raise `privacy.manifest_unshipped` (critical) for the others |
 | `ats_mass_events` | after every ATS snapshot | An unconfirmed mass disappearance with two later **structurally complete** snapshots (`complete` or `mass_disappearance`) ≥ 24 h apart | Confirm and close (§8.11) |
 | `batch_poll` | every 5 min (a periodic task on `aux`) | `submitted` or `ended` submissions | Poll and process (§10.10) |
 | `ambiguous_batches` | every 15 min (a periodic task on `aux`) | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation (a released submission is reconciled outside the `batch_one_in_flight` singleton); alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
-| `purge_fences` | every 10 min | An active purge fence whose purge operation is `failed` or has not progressed for 1 h; an `executing` manifest without a live `purge` operation | Keep the fence (fenced work stays blocked); raise `privacy.purge_failed` (critical); re-queue the missing operation, which resumes from the stored affected set (§19.5) |
-| `deadman_sync` | daily + on schedule changes | The healthchecks check's timeout/grace ≠ expected | Update via the Management API |
+| `purge_fences` | every 10 min | An active purge fence whose purge operation is `failed` or has not progressed for 1 h; an `executing` manifest without a live or failed `purge` operation | A failed purge keeps its fence and alerts: raise `privacy.purge_failed` (critical), fenced work stays blocked; only an `executing` manifest without a live or failed purge is re-queued, and its new operation computes from the manifest's request and resumes from the stored affected set (§19.5) |
+| `deadman_ping` | tick | Collection runs to ping above `deadman_state.last_pinged_run_id` (§17.7) | Ping them in id order (the durable path); no alert on a failed ping |
+| `deadman_sync` | daily + when the tick finds `schedule_state` differing from `deadman_state`'s applied period, or its sync older than 24 h | The healthchecks check's timeout/grace or pause ≠ expected | Update via the Management API and read it back, under the dead-man lock; a failure raises `deadman.update_failed` and retries after 5 min, doubling to 60 min |
+| `backup_health` | every 10 min | The backup tables (§19.5) and the backup age | Raise or resolve `backup.failed`, `backup.stale` (warn, escalated to critical) and `backup.restore_test_failed` (§17.6) |
 | `retention_daily` | daily 03:17 UTC | §20.1 | Purges and tombstones |
 
 ### 17.5 Logging, metrics, health
@@ -5622,7 +5679,7 @@ The UI renders the report under System → Runs. It contains no ad text.
 |---|---|---|---|
 | `/healthz` | none | The process is up and the event loop responds | Compose healthcheck for `api` |
 | `/readyz` | none | DB `SELECT 1` within 2 s; Alembic revision = code head; embedder `/health` OK with checksum OK; `worker_heartbeat` age ≤ 60 s | 503 with failing component codes only. **Serving prerequisites only.** Last-run age and backup age are not here. |
-| `/api/system/health` | session | Everything in `/readyz`, plus:<br>• last run status and age;<br>• last *successful* run age, counting `succeeded` and `partial` (warn > 1.5× interval, critical > 2× interval; grace: no alert until 2× interval after the first settings version), and separately the last *fully* successful run;<br>• the latest backup set, the latest offsite manifest shipment and any unshipped manifest;<br>• last backup age (warn > 36 h, critical > 72 h; grace 48 h after install);<br>• last restore-test age (warn > 35 d);<br>• queue depths; oldest pending target age;<br>• quota windows; LLM spend;<br>• open alerts by severity;<br>• disk usage; table sizes;<br>• embedder model id;<br>• app and library versions;<br>• LangSmith tracing state (on/off, region) | Run and backup ages raise alerts, but they are **not** readiness gates |
+| `/api/system/health` | session | Everything in `/readyz`, plus:<br>• last run status and age;<br>• last *successful* run age, counting `succeeded` and `partial` (warn > 1.5× interval, critical > 2× interval; grace: no alert until 2× interval after the first settings version), and separately the last *fully* successful run;<br>• the latest backup set (any status), the latest offsite manifest shipment with its manifest count, and the manifests completed but not shipped yet;<br>• the backup age as a state from the newest succeeded set: `ok`, `warn` > 36 h, `critical` > 72 h; `grace` for 48 h after install (the first settings version);<br>• the latest restore test with its age state (`warn` > 35 d since the newest succeeded one; a health state only, no alert);<br>• queue depths; oldest pending target age;<br>• quota windows; LLM spend;<br>• open alerts by severity;<br>• disk usage; table sizes;<br>• embedder model id;<br>• app and library versions;<br>• LangSmith tracing state (on/off, region), as the worker published it in `worker_heartbeat.tracing` | Run and backup ages raise alerts, but they are **not** readiness gates |
 
 `worker` and `embedder` have their own Compose healthchecks: `jobhunter worker-health` checks the worker's heartbeat row, and the embedder exposes `GET /health`.
 
@@ -5641,7 +5698,7 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `schedule.stale_data` | critical | Last successful run older than 2× interval (after grace) | success |
 | `worker.heartbeat_stale` | critical | `worker_heartbeat` older than 60 s (raised in-app by `api`; the external path is the dead-man switch) | heartbeat fresh |
 | `embedder.unavailable` | warn | Embedding failed in a run | embedder healthy and backlog cleared |
-| `embedder.checksum_mismatch` | critical | Model checksum mismatch at start | manual |
+| `embedder.checksum_mismatch` | critical | Model checksum mismatch at start (best effort: the real embedder exits 78, so a mismatch shows mostly as readiness and the dead-man alarm) | resolved by a later `checksum_ok: true` |
 | `source.breaker_open` | warn | An instance breaker opened | half-open success |
 | `source.auth_failed` | critical | 401/403 from a source | success |
 | `source.contract_broken` | critical | Envelope contract violation | success |
@@ -5696,31 +5753,44 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `eval.gate_failed` | warn | A candidate tuple failed the golden-set gate | manual |
 | `privacy.purge_failed` | critical | A purge or delete task failed | success |
 | `privacy.manifest_unshipped` | critical | A completed deletion manifest has not been shipped offsite within 1 h (§19.5) | shipped |
+| `llm.unexpected_stop_reason` | warn | A call ended with a stop reason the gateway does not expect, and failed | manual |
+| `profile.extract_generation_mismatch` | warn | A profile extraction met its draft in another generation; the draft stays `extracting_profile` | manual |
+| `dedup.ambiguous_grouping` | info | A job could join more than one duplicate group and joined the best (§8.7) | the ambiguity ends (the job leaves the group, or no other group qualifies) |
+| `quota.serpapi_renewal_stale` | warn | SerpApi's monthly window is still unvalidated 48 h after its start | a read that validates the window |
+| `reconciler.failed` | warn | A reconciler raised (the subject names it) | its next success |
+| `retention.failed` | warn | A retention rule failed (the subject names it) | its next success |
+| `api.unhandled_exception` | warn | A request ended in a 500 | manual |
+| `auth.totp_key_mismatch` | critical | No mounted data key opens the TOTP secret | manual |
+| `docparse.leftover` | warn | docparse left its marker on the parse tmpfs (a leftover it could not remove, before exit 70) | the marker is gone |
 
-**ntfy delivery.** The worker's `alert_dispatcher` loop runs every 30 s. It sends `POST $NTFY_TOPIC_URL` with:
-- headers `Title: Job Hunter — <code>`, `Priority: 5|3`, `Tags: <severity>`, `Click: $JOBHUNTER_PUBLIC_ORIGIN/settings#system`, and `Authorization: Bearer <ntfy_token>` when that secret is set;
+`backup.*` are raised by the worker from the backup tables (the `backup_health` reconciler, §17.4): the backup role cannot write `alerts`.
+
+**Escalation and manual resolution.** One dedup key rises from `warn` to `critical` when its condition worsens (and is pushed again at once), never back. An alert whose "Auto-resolves" cell says manual is resolved by the user (`POST /api/alerts/{id}/resolve`, §14.2); an acknowledgement resolves none, except that acknowledging `llm.reservation_bound_violated` resolves it, so its next occurrence pauses the score lane and is pushed again.
+
+**ntfy delivery.** The `alerts` row is the outbox. The worker's `alert_dispatcher` loop runs every 30 s and pushes an open, unacknowledged alert whose severity is at or above `notifications.push_min_severity`, never `info`, never `notify.delivery_failed` and never a resolution; at most ten per pass, criticals first. It sends `POST $NTFY_TOPIC_URL` with:
+- headers `Title: Job Hunter - <code>` (ASCII: httpx sends header values as ASCII), `Priority: 5|3`, `Tags: <severity>`, `Click: $JOBHUNTER_PUBLIC_ORIGIN/settings#alerts`, where the list is, and `Authorization: Bearer <ntfy_token>` when that secret is set;
 - a body holding the alert message, which contains no PII, ad text or profile data.
 
-It retries 3 times with backoff 5 s, 30 s and 120 s. A final failure records `notify_failures` and raises `notify.delivery_failed` in-app. `api` never sends notifications, because it has no egress.
+The first failing alert of a pass gets four tries (5 s, 30 s and 120 s apart); when all fail, `notify_failures` is counted and `notify.delivery_failed` raised in-app, and the dispatcher pauses for 5 min, doubling to 60 min, so an outage costs one alert four tries a pass. `api` never sends notifications, because it has no egress.
 
 ### 17.7 Dead-man switch (healthchecks.io)
 
-- **Pings** on `finalize`, for scheduled and catch-up runs only (never manual ones):
-  - status `succeeded`: `GET <ping URL>` (the `healthchecks_ping_url` secret);
+- **Pings** for scheduled and catch-up runs, and for a manual run whose window covered a skipped scheduled slot (it pings with its own status); never for another manual run:
+  - status `succeeded`: `GET <ping URL>` (the `healthchecks_ping_url` secret, which must be the UUID form: a URL ending in the check's UUID, §16.8);
   - status `partial`: `GET <ping URL>` as well, because collection is alive; the in-app `run.partial` alert and the health page's "last fully successful run" age report the incomplete sources separately;
   - status `failed` or `failed_invariant`: `GET <ping URL>/fail`.
 
-  A missing run therefore alarms off-box even when the VPS is dead. The dead-man switch measures **collection liveness**; source completeness is reported by the run report, `run.partial` and the coverage gaps.
+  A **fast path** pings after the run-ending commit; a **durable path**, the `deadman_ping` reconciler at every tick, pings every such run above `deadman_state.last_pinged_run_id`, which also covers the ends no finalize writes (`resume_exhausted`, `orphaned_queue`) and a ping lost to a crash. A failed ping (three tries) is logged and raises no alert: the off-box switch is the signal. Pings and the period sync serialise on one lock, and no ping is sent while the schedule is disabled or the check paused. A missing run therefore alarms off-box even when the VPS is dead. The dead-man switch measures **collection liveness**; source completeness is reported by the run report, `run.partial` and the coverage gaps.
 - **Period derived from the interval**:
   - check `timeout = interval_s`;
   - `grace = clamp(0.25 × interval_s, 3,600 s, 43,200 s)`. That gives 1 h at a 1–4 h interval, 1.5 h at 6 h, 6 h at 24 h and 12 h at 7 d.
-- **Keeping the check in sync** (required): the period is applied through the Management API, `POST $HEALTHCHECKS_API_URL/checks/<uuid>` with `X-Api-Key: <healthchecks_api_key>` and body `{"timeout": …, "grace": …}`. The uuid is parsed from the ping URL. The worker applies it whenever a settings version with effect class `schedule` activates, and the `deadman_sync` reconciler verifies it daily.
+- **Keeping the check in sync** (required): the period is applied through the Management API, `POST $HEALTHCHECKS_API_URL/checks/<uuid>` with `X-Api-Key: <healthchecks_api_key>` and body `{"timeout": …, "grace": …}`. The uuid is parsed from the ping URL. The applied period and pause are recorded in `deadman_state`: the tick defers `deadman_sync` when they differ from `schedule_state` or were synced more than 24 h ago, and the task also runs daily; it updates the check, reads it back, and on a failure backs off from 5 to 60 min.
 - `schedule.enabled = false` pauses the check (`POST …/pause`), and re-enabling resumes it with a ping.
 - **The Management API key is required in production** (startup assertion, §16.8), because the promised automatic period synchronisation depends on it. An API failure raises `deadman.update_failed` (warn) while pings continue.
 
 ### 17.8 LangSmith configuration
 
-The user's decision is **ON**, with hidden inputs and outputs, on the EU endpoint. The worker env sets:
+The user's decision is **ON**, with hidden inputs and outputs, on the EU endpoint; tracing is on in the prod compose only, unsampled. The worker env sets:
 
 ```
 LANGSMITH_TRACING=true
@@ -5729,11 +5799,15 @@ LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
 LANGSMITH_PROJECT=jobhunter-prod
 LANGSMITH_HIDE_INPUTS=true
 LANGSMITH_HIDE_OUTPUTS=true
+LANGSMITH_USE_DAEMON=true
+LANGSMITH_DISABLE_RUN_COMPRESSION=true
 ```
 
-- **Startup assertion** (§16.8): when tracing is on, the hide flags must be true and the endpoint must be the EU host; otherwise the worker refuses to start.
+The last two keep an unreachable LangSmith from holding the worker's exit (the SDK's threads are daemons, and no compression pool is joined at exit); the worker also flushes the client for at most 5 s after its graceful stop.
+
+- **Startup assertion** (§16.8): when tracing is on, the hide flags must be true and the endpoint must be the EU host, and the further conditions of §16.8 check 4 hold; otherwise the worker refuses to start.
 - **Defence in depth**:
-  - the worker constructs the LangSmith client with `hide_inputs=lambda _: {}` and `hide_outputs=lambda _: {}`;
+  - the worker constructs the LangSmith client with `hide_inputs=True`, `hide_outputs=True` and one anonymizer that keeps the metadata allowlist plus the token counts of `usage_metadata` and rewrites errors to `<ErrorClass>:<code>`;
   - LLM nodes carry `TracePolicy(process_inputs=omit, process_outputs=omit)`;
   - run metadata is limited to an allowlist: `run_id`, `cycle_id`, `target_id`, `attempt_no`, `node`, `model`, `effort`, `prompt_schema_hash`, `profile_version_id`.
 - **Exception messages** in traces are replaced by `"<ErrorClass>:<code>"`.
@@ -5789,7 +5863,7 @@ LANGSMITH_HIDE_OUTPUTS=true
 - **Score-instance replacement (Codex N2)**: recomputing an existing `(result, scope)` pair clears the old current row before inserting the new one and never violates `det_results_current`; a failure in between rolls back to the old instance.
 - **Dry-run projection (Codex N4)**: `project_allowance` on a provider with no window, and on an expired window, returns a projection inside a read-only transaction and writes no row.
 - **Purged profile re-upload (Codex N12)**: confirming content whose hash equals a purged version creates a new version with content; replaying the old profile-purge manifest leaves it intact.
-- **Purge fences (Codex N14)**: during a source purge, the `missing_targets` reconciler, `enqueue_targets`, the claim, the publish transaction, an eval run and an export each refuse work on a fenced job; after the purge commits, no target or result exists for a deleted revision.
+- **Purge fences (Codex N14)**: during a source purge, the `missing_targets` reconciler, `enqueue_targets`, the claim, the publish transaction, an eval run and an export each refuse work on a fenced job; after the purge commits, no target or result exists for a deleted revision. Every other consumer of §20.2's table has a test of its own that it honours the fence.
 - **Collection vs scope flip (Codex #7)**: a job inserted concurrently with an `apply_scope` final transaction either commits before the check (and carries its pending-scope projections) or after the flip (and computes them for the new active scope); the flip never commits with a job lacking them.
 - **Publication**: the publish transaction (§9.4.1) commits with the deferred `score_targets ↔ llm_results` keys; a concurrent scope save waits for it (`active_config` `FOR SHARE` vs `FOR UPDATE`), and the final flip never sees a published result without a current pending-scope `det_result`.
 - **Deletion graph**: on a database seeded with two-year-old rows of every table, the profile purge, the job tombstone (including a job with an inactive golden case), the Adzuna purge and delete-everything run to completion against the real DDL with no FK or CHECK violation, and leave the ledgers intact. Delete-everything with a `preparing`, a `submitted` and a `submit_ambiguous` submission applies exactly the mapping of §20.4: no ledger entry stays `reserved`, and batch entries end `ambiguous`.
@@ -5813,7 +5887,7 @@ LANGSMITH_HIDE_OUTPUTS=true
   - the watchdog exits within 10 s of the lock session being terminated.
 - Two ticks for the same slot produce exactly one run; overlap → `skipped_overlap`; downtime → `missed` + `catch_up`.
 - Scope precompute-then-flip never exposes a missing det_result to the view.
-- The network tests N1 (no egress from `api` and `docparse`) and N2 (real client IP through Caddy) need the Compose networks and run on the test stack in the `e2e` job (§18.8).
+- The network tests N1 (no egress from `api` and `docparse`) and N2 (real client IP through Caddy) need the Compose networks and run on the compose test stack in the `prodstack` job (§18.8).
 - The current-score view never returns a non-active tuple's result.
 
 ### 18.3 Crash-injection matrix
@@ -5908,7 +5982,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 
 ### 18.7 E2E (Playwright)
 
-E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) against the E2E stack, the dev stack with its overlays (`deploy/compose.dev.yaml`, `compose.fixtures.yaml`, `compose.fakellm.yaml`, `compose.e2e.yaml`), with `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger). E2E uses a deterministic test embedder (`EMBEDDER_FAKE=1`, refused outside dev and test). `@playwright/cli` takes the visual checks of the UI. The network tests N1/N2 and the crash cases C32, C37 and C39 run on the compose test stack (`deploy/compose.yaml` + `deploy/compose.test.yaml`, `JOBHUNTER_ENV=test`, M5).
+E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) against the E2E stack, the dev stack with its overlays (`deploy/compose.dev.yaml`, `compose.fixtures.yaml`, `compose.fakellm.yaml`, `compose.e2e.yaml`), with `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger). E2E uses a deterministic test embedder (`EMBEDDER_FAKE=1`, refused outside dev and test). `@playwright/cli` takes the visual checks of the UI. E2E stays on the dev stack; E18 runs there with the deletion-manifest shipper and a local restic repository (the `shipper` profile, on demand). The network tests N1/N2, the crash cases C32, C37 and C39, the spikes V20 and V22 and the upgrade-then-rollback and rotation drills run on the compose test stack (`deploy/compose.yaml` + `deploy/compose.test.yaml`, `JOBHUNTER_ENV=test`, with versitygw as its S3 stand-in) in the `prodstack` job (§18.8).
 
 | # | Scenario | Page |
 |---|---|---|
@@ -5939,14 +6013,16 @@ E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) aga
 |---|---|
 | `lint` | ruff (including the banned-API rules), mypy `--strict`, eslint, `tsc --noEmit`, gitleaks |
 | `unit` | pytest unit + property tests |
-| `integration` | pytest with a `pgvector/pgvector:0.8.7-pg17-bookworm` service: migrations, constraints, concurrency, deletion graph, Postgres-log test L1, crash matrix C1–C39 (C32, C37 and C39 run on the compose test stack in the `e2e` job) |
+| `integration` | pytest with a `pgvector/pgvector:0.8.7-pg17-bookworm` service: migrations, constraints, concurrency, deletion graph, Postgres-log test L1, crash matrix C1–C39 (C32, C37 and C39 run on the compose test stack in the `prodstack` job) |
 | `contract` | adapter contract tests + fixture PII scan |
 | `payload` | LLM payload contract tests (offline) |
 | `frontend` | vitest, build, OpenAPI drift check |
-| `images` | build the api/worker, embedder and backup images (no push on PRs); embedder model checksum check |
-| `e2e` | runs on pull requests to `main` and on demand: the E2E stack (§18.7) + the Playwright suite E1–E20, plus the network tests N1 (no egress from `api` and `docparse`) and N2 (real client IP through Caddy, spoofed `X-Forwarded-For` ignored) |
+| `images` | build the app, backup, docparse and fake embedder images without pushing, then scan the app, backup and docparse images with trivy (`--scanners vuln`): it fails on a fixable CRITICAL vulnerability only; the repository's secrets are gitleaks' gate (`lint`) |
+| `embedder` (`embedder-image.yml`) | on pull requests that change `embedder/` or what the image is built from, and on demand: build the real embedder image (its build downloads the model from `huggingface.co` and checks it against `embedder/model.lock`), start it with no network and require `checksum_ok: true` |
+| `e2e` | runs on pull requests to `main` and on demand: the E2E stack (§18.7) + the Playwright suite E1–E20 |
+| `prodstack` (`prodstack.yml`) | runs on pull requests to `main` and on demand: the compose test stack (§18.7) with N1 (no egress from `api` and `docparse`, the worker's reach included), N2 (real client IP through Caddy, spoofed `X-Forwarded-For` ignored), C32, C37, C39, V20, V22 and the upgrade-then-rollback and rotation drills |
 | `audit` | pip-audit, npm audit |
-| Manual workflows | `eval-manual.yml`, `schema-dry-run-manual.yml`, `smoke-free-sources.yml` (weekly live smoke of free sources only, never paid) |
+| Manual workflows | `eval-manual.yml`, `schema-dry-run-manual.yml`, `smoke-free-sources.yml` (weekly live smoke of free sources only, never paid), `release.yml` (dispatched by hand at a release: builds and pushes the app, backup, docparse and embedder images to GHCR, then opens the digest PR that writes `deploy/release.lock`, §19.6) |
 
 **No CI job makes live paid calls.**
 
@@ -5956,10 +6032,12 @@ E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) aga
 
 ### 19.1 Compose outline
 
+`deploy/compose.yaml` holds the outline below (abridged: each app service's `environment`, `logging` and the healthchecks' start periods are left out). Every image is a variable: `caddy` and `pgvector` from `deploy/images.lock`, the app, backup, docparse and embedder images from `deploy/release.lock`, each a `repo@sha256:<digest>`. Each service names its own environment variables, `${NAME:?}` for a required one and `${NAME:-}` for an optional one, so a service sees only its own (§19.2).
+
 ```yaml
 name: jobhunter
 x-app: &app
-  image: ghcr.io/<owner>/jobhunter-app@sha256:<digest>
+  image: "${app_image:?}"                        # deploy/release.lock: ghcr.io/<owner>/jobhunter-app@sha256:<digest>
   read_only: true
   tmpfs: [/tmp]
   cap_drop: [ALL]
@@ -5968,30 +6046,38 @@ x-app: &app
   group_add: ["10010"]                           # jobhunter-secrets: reads the 0440 secret files (§19.2)
   logging: {driver: local, options: {max-size: 20m, max-file: "10"}}
   restart: unless-stopped
+  init: true                                     # Docker's init as PID 1 forwards the stop signal
 
 services:
   caddy:
-    image: caddy:2.11.7-alpine@sha256:<digest>
-    ports: ["80:80", "443:443"]
-    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy_data:/data, caddy_config:/config]
+    image: "${caddy:?}"                          # deploy/images.lock: caddy:2.11.7-alpine@sha256:<digest>
+    read_only: true                              # the image's user, which owns its ACME state
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]                  # ports 80 and 443 only
+    security_opt: ["no-new-privileges:true"]
+    ports: ["80:80", "443:443"]                  # TCP only: HTTP/3 is not advertised
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, ./caddy/site.caddy:/etc/caddy/site.caddy:ro,
+              caddy_data:/data, caddy_config:/config]
     networks:
-      edge: {}
+      edge: {ipv4_address: 172.30.1.2}
       proxy: {ipv4_address: 172.30.0.2}          # fixed: the only trusted forwarder (§16.3)
     depends_on: {api: {condition: service_healthy}}
+    mem_limit: 256m
     restart: unless-stopped
   migrate:
     <<: *app
     command: ["jobhunter", "migrate"]            # §19.3
     restart: "no"
     secrets: [db_migrator]
-    volumes: [manifests:/data/manifests, cv_store:/data/cv]   # manifest replay; writes a pending-retry manifest's file (§19.5)
+    volumes: [manifests:/data/manifests, cv_store:/data/cv, exports:/data/exports]   # replay: a pending-retry manifest's file, CV files, export archives (§19.5)
     networks: [internal]
     depends_on: {postgres: {condition: service_healthy}}
+    mem_limit: 2g
   api:
     <<: *app
-    command: ["uvicorn", "jobhunter.api.app:app", "--host", "0.0.0.0", "--port", "8000",
-              "--proxy-headers", "--forwarded-allow-ips=172.30.0.2"]
-    secrets: [session_secret, data_key, db_app]
+    command: ["jobhunter", "api", "--host", "0.0.0.0", "--port", "8000",   # the startup assertions, then uvicorn
+              "--proxy-headers", "--forwarded-allow-ips", "172.30.0.2"]
+    secrets: [session_secret, data_key, data_key_previous, db_app]
     volumes: [cv_store:/data/cv, exports:/data/exports:ro]   # encrypted CV uploads; export downloads
     networks: [proxy, internal]                  # both internal: no route to the internet
     healthcheck: {test: ["CMD", "jobhunter", "http-check", "http://127.0.0.1:8000/healthz"], interval: 15s}
@@ -6002,8 +6088,9 @@ services:
     command: ["jobhunter", "worker"]
     deploy: {replicas: 1}                        # MUST stay 1
     stop_grace_period: 120s
-    secrets: [data_key, db_app, anthropic_key, rapidapi_key, serpapi_key, adzuna_app_id, adzuna_app_key,
-              langsmith_key, ntfy_token, healthchecks_ping_url, healthchecks_api_key]
+    tmpfs: ["/tmp:size=1g"]                      # the plaintext export zip before its encryption (§20.3)
+    secrets: [data_key, data_key_previous, db_app, anthropic_key, rapidapi_key, serpapi_key, adzuna_app_id,
+              adzuna_app_key, langsmith_key, ntfy_token, healthchecks_ping_url, healthchecks_api_key]
     volumes: [cv_store:/data/cv, manifests:/data/manifests, exports:/data/exports, parse_jobs:/data/parse]
     group_add: ["10010", "10011"]                # secrets; jobhunter-parse (exchange with docparse)
     networks: [internal, egress]
@@ -6013,7 +6100,7 @@ services:
       embedder: {condition: service_healthy}
     mem_limit: 2g
   docparse:
-    image: ghcr.io/<owner>/jobhunter-docparse@sha256:<digest>   # pypdf, pdfplumber, python-docx only
+    image: "${docparse_image:?}"                 # pypdf, pdfplumber, python-docx only
     network_mode: none                           # no network at all (§12.2)
     read_only: true
     tmpfs: [/tmp]
@@ -6023,48 +6110,61 @@ services:
     volumes: [parse_jobs:/data/parse]            # tmpfs, shared with the worker via group 10011
     group_add: ["10011"]                         # never in the secrets group; mounts no secret
     mem_limit: 1g
+    pids_limit: 16
     restart: unless-stopped
   embedder:
-    image: ghcr.io/<owner>/jobhunter-embedder@sha256:<digest>   # model baked in, sha256 verified at start
-    networks: [internal]
+    image: "${embedder_image:?}"                 # model baked in, sha256 verified at start
     read_only: true
-    healthcheck: {test: ["CMD", "embedder-health"], interval: 30s, start_period: 60s}
+    user: "10004:10004"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+    healthcheck: {test: ["CMD", "embedder-health"], interval: 30s}
     mem_limit: 3500m
     cpus: 3
     restart: unless-stopped
   postgres:
-    image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:<digest>
+    image: "${pgvector:?}"                       # deploy/images.lock: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:<digest>
     user: "999:999"                              # the image's postgres user; no root step, so group_add applies
     group_add: ["10010"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     secrets: [pg_bootstrap, db_app, db_migrator, db_backup, db_restore]   # role passwords: init only (§19.3)
     volumes: [pgdata:/var/lib/postgresql/data, ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro,
               ./postgres/init:/docker-entrypoint-initdb.d:ro]     # roles + default privileges (§19.3)
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     networks: [internal]
     shm_size: 1g
-    healthcheck: {test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"], interval: 10s}
+    healthcheck: {test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'], interval: 10s}   # over TCP: the init phase's server listens on the socket only
     mem_limit: 5g
     restart: unless-stopped
   backup:
-    image: ghcr.io/<owner>/jobhunter-backup@sha256:<digest>     # app image + PostgreSQL 17.11 client + restic 0.19.1 + busybox crond
+    <<: *app
+    image: "${backup_image:?}"                   # the app image's `backup` stage: + PostgreSQL 17 client + restic 0.19.1 (§4.1)
+    hostname: jobhunter-backup                   # one restic host for backup and restore
+    command: ["jobhunter", "backup", "scheduler"]   # §19.5, as 10001 in group 10010
     secrets: [db_backup, db_restore, restic_password, s3_access_key_id, s3_secret_access_key]
     volumes: [cv_store:/data/cv:ro, manifests:/data/manifests:ro, backup_staging:/data/staging]
     networks: [internal, egress]
-    restart: unless-stopped                      # runs as root in its container (crond); reads secrets as their owner
-  restore:                                       # one-off: docker compose --profile restore run --rm restore (§19.5)
-    image: ghcr.io/<owner>/jobhunter-backup@sha256:<digest>
+    mem_limit: 1g
+  restore:                                       # one-off, once the operator started postgres:
+    <<: *app                                     # docker compose --profile restore run --rm restore (§19.5)
+    image: "${backup_image:?}"
+    hostname: jobhunter-backup
     profiles: [restore]
-    command: ["/usr/local/bin/restore.sh"]
-    secrets: [db_migrator, restic_password, s3_access_key_id, s3_secret_access_key]
-    volumes: [cv_store:/data/cv, manifests:/data/manifests, backup_staging:/data/staging]
-    networks: [internal, egress]
+    command: ["jobhunter", "restore", "run"]     # refuses a database that is not empty
     restart: "no"
+    secrets: [db_migrator, restic_password, s3_access_key_id, s3_secret_access_key]
+    volumes: [cv_store:/data/cv, manifests:/data/manifests, backup_staging:/data/staging, exports:/data/exports]
+    networks: [internal, egress]
+    depends_on: {postgres: {condition: service_healthy}}
+    mem_limit: 2g
 
-networks:
-  edge: {}                                       # internet-facing: caddy only
-  proxy: {internal: true, ipam: {config: [{subnet: 172.30.0.0/24}]}}
-  internal: {internal: true}
-  egress: {}                                     # worker and backup only (plus the one-off restore)
+networks:                                        # every subnet pinned; dynamic addresses from the upper half
+  edge: {ipam: {config: [{subnet: 172.30.1.0/24, ip_range: 172.30.1.128/25}]}}    # internet-facing: caddy only
+  proxy: {internal: true, ipam: {config: [{subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25}]}}   # none takes Caddy's .2
+  internal: {internal: true, ipam: {config: [{subnet: 172.30.2.0/24}]}}
+  egress: {ipam: {config: [{subnet: 172.30.3.0/24}]}}   # worker and backup only (plus the one-off restore)
 volumes:
   parse_jobs:                                    # RAM only: a decrypted CV never reaches a disk (§12.2)
     driver: local
@@ -6082,15 +6182,31 @@ secrets:                                         # files under /etc/jobhunter/se
   # … one entry per secret named above (§19.2)
 ```
 
-**Caddyfile** (excerpt):
+- **Volumes.** Every named volume has one owner and mode, carried by the mount point of every image that mounts it (`cv_store`, `manifests`, `exports` and `backup_staging` 10001:10001 0700 in the app image and its `backup` stage; `pgdata` the pgvector image's; `caddy_data` and `caddy_config` the caddy image's), so no start order can leave a volume root-owned under a non-root writer.
+- **The worker's `/tmp`** is a tmpfs of 1 GiB, about three times the zip of a year at §19.7's volume; its pages count against the worker's 2 GB. A full `/tmp` fails the export attempt with ENOSPC before it can exhaust the worker's memory; the operation retries it (10 attempts, a minute apart) and then ends the export `failed`, its files removed.
+
+**Caddyfile** (excerpt; the site block is `deploy/caddy/site.caddy`, which the prod and test Caddyfiles import):
 
 ```
+{
+  email {$JOBHUNTER_ACME_EMAIL}
+  servers { protocols h1 h2 }                    # HTTP/1.1 and HTTP/2 only: no HTTP/3
+  log default {                                  # no access log; the lines Caddy still writes, its errors
+    format filter {                              # among them, lose the client's address, port and headers
+      wrap json
+      request>remote_ip delete
+      request>remote_port delete
+      request>client_ip delete
+      request>headers delete
+    }
+  }
+}
 {$JOBHUNTER_DOMAIN} {
   encode zstd gzip
   reverse_proxy api:8000 {
     header_up X-Forwarded-For {remote_host}      # overwrite: a client-supplied value never passes
   }
-  header { … security headers of §16.6 … }
+  header { … security headers of §16.6 …; -Server }
 }
 ```
 
@@ -6129,14 +6245,14 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 **Secrets** are files under `/etc/jobhunter/secrets/`, delivered by Compose `secrets` to the services listed, and read by the app from `/run/secrets/<name>`. A template listing the names only is `deploy/secrets.example`.
 
 - **Ownership.** Compose bind-mounts a file-backed secret with the host file's owner and mode; it does not remap them. Every secret file is therefore `root:10010` (host group `jobhunter-secrets`) with mode **0440**, and the directory is `root:10010` with mode 0750. No host user is a member of the group.
-- **Readers.** Each service that receives a secret runs with supplementary group 10010: `api`, `worker` and `migrate` (`user: "10001:10001"`, `group_add: ["10010"]`) and `postgres` (`user: "999:999"`, `group_add: ["10010"]`). The `backup` and `restore` containers run as root inside the container (busybox `crond`) and read the files as their owner. `docparse`, `embedder` and `caddy` receive no secret and are not in the group.
+- **Readers.** Each service that receives a secret runs with supplementary group 10010: `api`, `worker`, `migrate`, `backup` and `restore` (`user: "10001:10001"`, `group_add: ["10010"]`) and `postgres` (`user: "999:999"`, `group_add: ["10010"]`). `docparse`, `embedder` and `caddy` receive no secret and are not in the group.
 - **Isolation.** Group membership does not widen access: a container sees only the secrets mounted into it, so the per-service lists below remain the boundary.
 - **Check.** Startup assertion 1 (§16.8) reads every mounted secret and refuses to start when one is unreadable or world-readable, naming the file and never its content. The runbook (§19.8) provisions the files.
 
 | Secret | Services | Purpose |
 |---|---|---|
 | `session_secret` | api | ≥ 32 random bytes (base64). HKDF root for the session pepper and cursor signing |
-| `data_key` (and `data_key_previous` during a rotation) | api, worker | Exactly 32 random bytes (base64). AES-256-GCM for CV files, raw CV texts, the TOTP secret and exports |
+| `data_key`, `data_key_previous` | api, worker | Exactly 32 random bytes (base64). AES-256-GCM for CV files, raw CV texts, the TOTP secret and exports. `data_key_previous` is always declared: an empty file outside a rotation (§19.8) |
 | `db_app` | api, worker; postgres (init) | DML role credentials |
 | `db_migrator` | migrate, restore; postgres (init) | Schema owner credentials |
 | `db_backup` | backup; postgres (init) | `pg_read_all_data` role |
@@ -6151,7 +6267,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `healthchecks_ping_url`, `healthchecks_api_key` | worker | Dead-man ping URL and Management API key (both required in prod, §17.7) |
 | `restic_password`, `s3_access_key_id`, `s3_secret_access_key` | backup, restore | Offsite repository |
 
-**Non-secret environment** (`/etc/jobhunter/jobhunter.env`, passed to each service through its own `environment` section in Compose, so a service sees only its own names):
+**Non-secret environment** (`/etc/jobhunter/jobhunter.env`, which the production command passes with `--env-file` beside `deploy/images.lock` and `deploy/release.lock`; each service names its own variables in its `environment` section, `${NAME:?}` for a required one and `${NAME:-}` for an optional one, where an empty value takes the default, so a service sees only its own names):
 
 | Name | Used by | Required | Purpose / fixed value |
 |---|---|---|---|
@@ -6164,6 +6280,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `LANGSMITH_PROJECT` | worker | when tracing | project name |
 | `LANGSMITH_HIDE_INPUTS` | worker | when tracing | must be `true` |
 | `LANGSMITH_HIDE_OUTPUTS` | worker | when tracing | must be `true` |
+| `LANGSMITH_USE_DAEMON`, `LANGSMITH_DISABLE_RUN_COMPRESSION` | worker | when tracing in prod | must be `true` (§17.8) |
 | `NTFY_TOPIC_URL` | worker | yes | ntfy topic URL |
 | `HEALTHCHECKS_API_URL` | worker | optional | Management API base (defaults to the healthchecks.io v3 API) |
 | `POSTGRES_DB`, `POSTGRES_USER` | postgres | yes | Database name, bootstrap superuser name |
@@ -6174,11 +6291,13 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `JOBHUNTER_FAKE_SOURCES` | worker | test only | Fixture adapters (refused in prod) |
 | `JOBHUNTER_FAKE_LLM` | worker | test only | Stub gateway (refused in prod) |
 | `JOBHUNTER_FAULT` | worker | test only | Crash-injection point (refused in prod) |
-| `RESTIC_REPOSITORY` | backup | yes | `s3:<endpoint>/<bucket>/<path>` (§23) |
-| `AWS_DEFAULT_REGION` | backup | yes | S3 region |
+| `RESTIC_REPOSITORY` | backup, restore | yes | `s3:<endpoint>/<bucket>/<path>` (§23) |
+| `AWS_DEFAULT_REGION` | backup, restore | yes | S3 region |
+| `RESTIC_CACHE_DIR` | backup, restore | optional | restic's cache (default `<staging dir>/.restic-cache`) |
 | `JOBHUNTER_BACKUP_CRON` | backup | optional | Nightly backup set (default 01:15 UTC) |
 | `JOBHUNTER_MANIFEST_SHIP_CRON` | backup | optional | Manifest shipper (default every 5 min) |
-| `JOBHUNTER_RESTORE_TEST_CRON` | backup | optional | Monthly restore test (default first Sunday 03:30 UTC) |
+| `JOBHUNTER_BACKUP_PRUNE_CRON` | backup | optional | Weekly prune (default Sunday 02:30 UTC) |
+| `JOBHUNTER_RESTORE_TEST_CRON` | backup | optional | Monthly restore test (default `30 3 * * 0`, run on the first Sunday of the month only: 03:30 UTC) |
 | `JOBHUNTER_BACKUP_KEEP_DAILY` / `_WEEKLY` / `_MONTHLY` | backup | optional | Retention (defaults 7 / 4 / 3) |
 
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL`, `ANTHROPIC_API_KEY` and `LANGSMITH_GATEWAY` MUST NOT be set in production. The startup assertions enforce this, and they also refuse to start a service that has a secret mounted that its role does not need (§16.8).
@@ -6194,21 +6313,23 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
   - `ALTER DEFAULT PRIVILEGES FOR ROLE jobhunter_migrator GRANT USAGE, SELECT ON SEQUENCES TO jobhunter_app;`
   - `GRANT pg_read_all_data TO jobhunter_backup;` and `ALTER ROLE jobhunter_restore CREATEDB;`
 - **`jobhunter migrate`** runs as the `migrator` role, in this order:
-  1. **reconstruct, then advance.** First, every manifest that the database holds with its content but whose file is missing from the `manifests` volume (an `executing` row with `file_sha256` set, or a `completed` row, whose file was never shipped before the disaster) gets its file rewritten from the row's `scope` (tmp, fsync, rename). Then **identities of the existing tables advance** past every bound of every manifest, in the files and in the database rows alike (§19.5). On a restored database this happens before any write. On an empty schema (a first installation) no application table exists yet, and the step does nothing;
+  1. **reconstruct, then advance.** First, every manifest that the database holds with its content but whose file is missing from the `manifests` volume (an `executing` row with `file_sha256` set, or a `completed` row, whose file was never shipped before the disaster) gets its file rewritten from the row's `scope` (tmp, fsync, rename). Then **identities of the existing tables advance** (identity and `serial` columns) past every bound of every manifest and every id a manifest lists, in the files and in the database rows alike (§19.5). On a restored database this happens before any write. On an empty schema (a first installation) no application table exists yet, and the step does nothing;
   2. `alembic upgrade head`. Migrations change the schema only and never insert rows into identity tables (seeding is step 6), so no id is allocated before the advancement;
-  3. **advance identities again**, now for every table, including those step 2 created, with the same bounds (files and database rows). This is the empty-schema path: a first installation onto a `manifests` volume that already holds manifests gets the same guarantee;
+  3. **advance identities again** (identity and `serial` columns), now for every table, including those step 2 created, with the same bounds and listed ids (files and database rows). This is the empty-schema path: a first installation onto a `manifests` volume that already holds manifests gets the same guarantee;
   4. **explicit grants**, idempotently and only now that every table exists: the backup role's `INSERT, UPDATE` on `backup_sets`, `backup_runs`, `manifest_shipments` and `manifest_shipment_items`. This creates them on a first installation and after an upgrade that adds one of these tables, and re-creates them after a restore, which uses `--no-acl` (§19.5);
-  5. `procrastinate schema --apply` (or its migration scripts, for upgrades), then `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`);
+  5. `procrastinate schema --apply` (or its migration scripts, for upgrades), then `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`), then the identities advance once more, over every table, now that the queue's and the checkpointer's schemas exist: on a first installation their sequences are created here, after steps 1 and 3;
   6. seeding the `sources` rows, rubric v1, the initial prompt-schema version, the default execution config and evaluation policy, and the `ranking_state` row, all idempotent;
   7. replaying deletion manifests from the mounted `manifests` volume (§19.5) in two phases: the destructive operations of every replayed manifest in stream order with all their fences active, then one rebuild over the union of their stored affected jobs that still exist, then one transaction that verifies every postcondition and releases the fences. A manifest restored as `executing` without its file is completed here from its database row first.
 - Steps 1, 3, 4 and 7 are idempotent and cheap, so every `migrate` runs them, not only the one after a restore. The three paths (first installation, upgrade from the preceding release, restore) are integration-tested (§18.2) and exercised by spike V22.
+- **Flags**: `--database <db>`, `--steps sequences,alembic,replay` (steps 1 and 3; step 2; step 7), `--manifest-dir <dir>`, `--cv-dir <dir>`, `--exports-dir <dir>` and `--db-role migrator|restore` (the login; `restore` for the restore test, §19.5). `migrate` and `manifests replay` run only while `api` and `worker` are stopped.
+- **The compatibility floor.** Each revision records in `schema_compat` the oldest revision whose code still runs on it and whether its upgrade is destructive (`db/compat.py`). Before any step, `migrate` reads where the database stands to its code: `current`, `behind` (it upgrades), `ahead_compatible` (one newer head whose floor the code knows and that is not destructive: the alembic step is skipped and `/readyz` passes) or `ahead_incompatible` (a destructive head, an unknown floor: `migrate` refuses with `migrate_schema_ahead_incompatible` and `/readyz` fails). §19.6 rolls back by it.
 - **Expand/contract**: additive migrations ship first. Destructive steps follow at least one release later.
 - Every migration has an integration test, and long index builds use `CONCURRENTLY` in separate non-transactional migrations.
-- `/readyz` fails until the Alembic revision equals the code head.
+- `/readyz` fails until the Alembic revision equals the code head, or is a newer head the code runs on (`ahead_compatible`).
 
 ### 19.4 User bootstrap CLI
 
-`jobhunter` (run as `docker compose run --rm api jobhunter <cmd>`, or with the `migrate` service for the restore commands):
+`jobhunter` (run as `docker compose run --rm --no-deps <service> jobhunter <cmd>` in the service whose role the command takes: `api` for the user and session commands, `worker` for `crypto rotate` and `ops …`, `migrate` for `migrate` and `manifests replay`, `restore` for `restore …`; the `backup …` commands run in the backup container, `docker compose exec backup jobhunter backup <job>`):
 
 | Command | Purpose |
 |---|---|
@@ -6218,31 +6339,39 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `sessions revoke-all` / `sessions unlock` | Session recovery and lockout release |
 | `migrate` | §19.3 |
 | `worker` / `worker-health` | Start the worker / its health probe |
-| `migrate --database <db> --steps sequences,alembic,replay --manifest-dir <dir> --cv-dir <dir>` | The subset of `migrate` the restore test runs against its scratch database (§19.5) |
+| `api` | Run the api's startup assertions, then serve it with uvicorn (the `api` service's command) |
+| `migrate --database <db> --steps sequences,alembic,replay --manifest-dir <dir> --cv-dir <dir> --exports-dir <dir> --db-role restore` | The subset of `migrate` the restore test runs against its scratch database (§19.5) |
 | `manifests replay` | Migrate steps 1, 3 and 7 alone: advance identities, then replay the manifest stream by `manifest_uuid` |
-| `restore verify --set <id> --phase restored\|replayed [--database <db>]` | Checks on a restored database (§19.5) |
-| `crypto rotate` | Resumable data-key rotation (§16.8) |
+| `backup init` / `set` / `ship` / `prune` / `restore-test` / `scheduler` | The backup container's jobs (§19.5): the repository's explicit initialisation, a backup set, the manifest shipper, the prune, the restore test, and the scheduler that runs them on their crons (the `backup` service's command). Each prints one JSON line |
+| `restore run [--set <id>]` | The restore orchestration of §19.5 (the `restore` service's command), in the `restore` container |
+| `restore verify --set <id> --phase restored\|replayed [--database <db>]` | Checks on a restored database (§19.5), in the `restore` container |
+| `crypto rotate` | Resumable data-key rotation (§16.8, §19.8), as the worker |
+| `ops notify-test` / `ops deadman-sync [--show]` | The V15 checks: one test push to ntfy; the dead-man check's period applied and read back (§17.7), as the worker |
 | `schema-dry-run --live` | §10.11 |
 | `fixtures scrub <in> <out>` | §18.4 |
 | `http-check <url>` | Compose healthcheck helper |
-| `startup-check` | Run the startup assertions of §16.8 for this service and exit |
+| `startup-check --role <service>` | Run the startup assertions of §16.8 for that role and exit |
 
 ### 19.5 Backups, deletion manifests and restore
 
-**Backup sets** (nightly, `JOBHUNTER_BACKUP_CRON`). `backup_set.sh` runs with `set -euo pipefail`, so any failing step fails the set:
+**The backup jobs** are typed `jobhunter backup` commands (§19.4) in the backup container: `set`, `ship`, `prune` and `restore-test`, each run by `jobhunter backup scheduler` on its cron (UTC) and on demand, one at a time (a job that finds another running writes nothing and exits 1). The scheduler, at its start, fails every `backup_sets` or `backup_runs` row a dead container left `running` (`interrupted`). Every restic call runs with `--host jobhunter-backup` (one host for the backup and restore containers) and `--retry-lock 30m`, with its cache in `RESTIC_CACHE_DIR`; the repository is created once, by an explicit `jobhunter backup init` (no `--host`: restic refuses it there), never by a job. A job's failure raises no alert itself: the worker's `backup_health` reconciler derives the backup alerts from these tables (§17.4).
+
+**Backup sets** (nightly, `JOBHUNTER_BACKUP_CRON`, `jobhunter backup set`). Any failing step fails the set:
 1. Insert `backup_sets(status='running')`.
-2. **One snapshot for the dump and the inventory.** A `psql` co-process, as the backup role, opens `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY`, sets `idle_in_transaction_session_timeout = 0` for itself and runs `SELECT pg_export_snapshot()`. In that transaction it records `db_snapshot_at` (`now()`, the transaction start), `manifest_count` (`count(*)` of `deletion_manifests`) and `row_counts` (`count(*)` of every application table). It keeps the transaction open until step 3 has finished.
-3. `pg_dump -Fc --snapshot=<id>` as the backup role into `/data/staging/jobhunter.dump` (a file, not a pipe, so its exit status is checked). The dump therefore sees exactly the rows that were counted. The co-process then commits.
+2. **One snapshot for the dump and the inventory.** A connection as the backup role opens `REPEATABLE READ, READ ONLY`, sets `idle_in_transaction_session_timeout = 0` for that transaction and runs `SELECT pg_export_snapshot()`. In that transaction it records `db_snapshot_at` (`now()`, the transaction start), the Alembic revision, `manifest_count` (`count(*)` of `deletion_manifests`), `row_counts` (`count(*)` of every application table) and the data key ids of the sealed CV texts and TOTP secret. It keeps the transaction open until step 3 has finished.
+3. `pg_dump -Fc --snapshot=<id>` as the backup role into `/data/staging/set/jobhunter.dump` (a file, not a pipe, so its exit status is checked). The dump therefore sees exactly the rows that were counted. The transaction then commits.
 4. Verify the dump with `pg_restore --list` and record its sha256 and size.
-5. Write `backup_set.json`: the set id, dump sha256, Alembic revision, `db_snapshot_at`, `manifest_count`, `row_counts`, the CV file count and the app version.
-6. Take **one** restic snapshot of `/data/staging` (dump and `backup_set.json`), `/data/cv` and `/data/manifests`, tagged `set:<id>`. The CV files are already app-encrypted, and they are captured after the dump: every file the dump references existed when the dump began, and later files are orphans that the restore removes.
-7. Set `backup_sets` to `succeeded` with the restic snapshot id and the inventory, and clear the staging directory. Any failure → `failed` with the error and `backup.failed` (critical).
+5. Write `backup_set.json`: the set id, dump sha256, Alembic revision, `db_snapshot_at`, `manifest_count`, `row_counts`, the CV file count, the app version and `data_key_ids`, the key ids of every ciphertext of the snapshot and of the CV files: the keys a restore of this set needs (§19.8).
+6. Take **one** restic snapshot of `/data/staging/set` (dump and `backup_set.json`; not restic's cache), `/data/cv` and `/data/manifests`, tagged `set` and `set:<id>`. The CV files are already app-encrypted, and they are captured after the dump: every file the dump references existed when the dump began, and later files are orphans that the restore removes. A backup set holds no export archive.
+7. Set `backup_sets` to `succeeded` with the restic snapshot id and the inventory, and clear `/data/staging/set`. Any failure → `failed` with the error, and the worker raises `backup.failed` (critical).
 
 **Deletion manifests** (§7.14) make deletions durable across a disaster:
 1. **Identity.** A manifest's stream identity is its `manifest_uuid` (UUIDv7, generated by the app), never its `id`. Its file is `<manifest_uuid>.json`; it holds the uuid, the kind, `max_ids` (the highest id of every identity column of the application schema when the manifest's content was computed), an ordered list of **typed operations**, and, for a source or profile purge, the **affected set** and the **purge watermark**:
    - **affected set**: the explicit `job_ids` (source purge: every job with a posting of the source, a revision whose lineage names it, or a `det_results` instance or golden-case snapshot that draws on it) and the `profile_version_ids` and `tuple_ids` (profile purge), computed once, before any destructive operation;
    - **watermark** (the manifest's provenance generation): `fenced_at` and the `max_ids` taken with the affected set. A posting, observation, lineage row, `det_results` instance or golden case with an id at or below the watermark existed when the purge began; anything above it was created later.
-2. **Typed operations** (Codex R3-5). A manifest never says only "these ids must be gone": each operation states what it does and the postcondition that replay and verification check. Operations hold ids, named selectors, column names and key hashes only, never content.
+
+   Every manifest holds `format: 1`, its `admitted_at` (A0's clock: the value of every audit field A0 writes, against which a check of A0's own writes compares) beside `fenced_at` (the later commit cutoff: the bound of other rows), and is written as canonical JSON. A table without an identity column is bounded by its parent's id, by `created_at ≤ fenced_at`, or by the owner a checkpoint's `thread_id` names; `login_lockouts`, which has none of these, is bounded by its `generation`.
+2. **Typed operations** (Codex R3-5). A manifest never says only "these ids must be gone": each operation states what it does and the postcondition that replay and verification check. Operations hold ids, named selectors, column names and key hashes only, never content. A selector names only properties a row never loses; any other membership is an id list frozen when the manifest is computed, and a state set on a kept row is checked relative to the bounds, so a completed manifest stays satisfied under later activity. A replay makes no external call.
 
    | Operation | Payload | Replay action | Verified postcondition |
    |---|---|---|---|
@@ -6252,9 +6381,9 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
    | `file_remove` | a volume and storage keys | unlink | no named file exists on the volume |
 
    The `max_ids` bound makes selectors safe to replay: rows created after the manifest have larger ids (identity advancement, below), so a replay never touches them.
-3. **Before** any row or file is deleted, the purge commits the `deletion_manifests` row (`executing`, no file yet) together with its purge fence (§20.2). It then waits until no `jobhunter_app` transaction that began before that commit is still open (`pg_stat_activity`), so every consumer that checked the fence earlier has finished, and only then computes `max_ids`, the affected set, the watermark and the operations, and writes the file: to `<manifest_uuid>.json.tmp`, `fsync`, rename, `fsync` of the directory. One transaction then records `file_sha256`, stores the same content in the row's `scope`, and adds the affected `job_ids` to the source fence. Deletes start only after that commit, so the shipped file and the database row both hold the affected set before anything is destroyed. A crash before that commit leaves an `executing` row without a file; the purge operation's retry recomputes the content, which the fence keeps unchanged, and writes the file before it deletes anything. **Every later retry, of the purge or of a replay, uses the stored affected set and never re-derives it from lineage**, which the deletions themselves remove (Codex R3-6).
+3. **Before** any row or file is deleted, the purge commits the `deletion_manifests` row (`executing`, no file yet) together with its purge fence (§20.2). It then waits until no `jobhunter_app` transaction that began before that commit is still open (`pg_stat_activity`), so every consumer that checked the fence earlier has finished, and only then computes `max_ids`, the affected set, the watermark and the operations, and writes the file: to `<manifest_uuid>.json.tmp`, `fsync`, rename, `fsync` of the directory. One transaction then records `file_sha256`, stores the same content in the row's `scope`, and adds the affected `job_ids` to the source fence. Deletes start only after that commit, so the shipped file and the database row both hold the affected set before anything is destroyed. A crash before that commit leaves an `executing` row without a file; the purge operation's retry recomputes the content, which the fence keeps unchanged, and writes the file before it deletes anything (a crash after the file's rename adopts the written file instead). **Every later retry, of the purge or of a replay, uses the stored affected set and never re-derives it from lineage**, which the deletions themselves remove (Codex R3-6).
 4. It performs the operations in order, then sets `completed`.
-5. The **manifest shipper** (backup container, every 5 min) lists the `*.json` files of `/data/manifests` (never `*.tmp`), hashes each, runs `restic backup --files-from <that list> --tag manifests`, and records in one transaction a `manifest_shipments` row with one `manifest_shipment_items` row **per file the snapshot contains** (uuid and sha256). Coverage is therefore exact, never inferred from a highest id: a manifest that was still unwritten during a shipment simply has no item in it. Every run ships every file, so the latest `manifests` snapshot is always the complete stream.
+5. The **manifest shipper** (`jobhunter backup ship`, backup container, every 5 min) lists the `<manifest_uuid>.json` files of `/data/manifests` (never `*.tmp`) and hashes each. It ships only when the stream changed: when the files equal the latest shipment's items, or the stream is empty (no purge yet), it ships nothing. Otherwise it runs `restic backup --files-from-verbatim <that list> --tag manifests` (a listed file that is missing fails it, where `--files-from` would skip it), and records in one transaction a `manifest_shipments` row with one `manifest_shipment_items` row **per file the snapshot contains** (uuid and sha256). Coverage is therefore exact, never inferred from a highest id: a manifest that was still unwritten during a shipment simply has no item in it. Every shipment ships every file, so the latest `manifests` snapshot is always the complete stream.
 6. The `manifest_shipping` reconciler (§17.4) marks a `completed` manifest `shipped` when an item names its uuid with an equal sha256.
 7. The UI and the API report a deletion as done **only at `shipped`**. A manifest not shipped within 1 h raises `privacy.manifest_unshipped` (critical).
 
@@ -6269,48 +6398,53 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | the row, `completed`, but no file in the stream (completed, never shipped before the disaster) | the file was rewritten from `scope` in migrate step 1, before identity advancement, so that it ships; then **checked** as above |
 
 If no manifest is replayed, step 7 ends here. Otherwise it runs three phases (Fable round 4, N5):
-- **Phase A — destructive operations of the whole stream.** The fences of every replayed manifest are made active first (reconstructed where the database has none). Then the `row_delete`, `field_redact` and `file_remove` operations of all replayed manifests run in stream order, each idempotent. A source purge's operations null `jobs.current_revision_id` (`field_redact`, as tombstoning step 6 does) for every affected job whose current revision is tainted, **before** the `row_delete` of that revision, so each phase-A transaction commits with no dangling deferred key (Fable N6). **No rebuild runs between manifests**, so a later manifest never meets a row it could not name: a revision or `det_results` instance that a rebuild would have created does not exist yet.
+- **Phase A — destructive operations of the whole stream.** The fences of every replayed manifest are made active first (reconstructed where the database has none), and each table's greatest id at the replay's start is recorded once as its high water. Then each manifest's effects run at its place in the stream: its admission re-applied (the source purge's disabling settings version, `purge_fence_at` and run cancels, §20.5), a pending retry's content computed and its file written, then its `row_delete`, `field_redact` and `file_remove` operations, each idempotent, and its export removals as the live purge's. The rows a replay itself creates stand where their live counterparts stood, inside every later replayed manifest's bound: delete-everything's bounded selectors also cover the replay's own rows made before its turn. In replay mode a source purge deletes the golden cases still on its own tainted revisions, an active golden case that guards a replayed purge's job or version is made inactive first, and work in flight that the dump holds (an eval run `running`) is ended by the transition the worker's start-up recovery applies to it; each is logged with its ids. A source purge's operations null `jobs.current_revision_id` (`field_redact`, as tombstoning step 6 does) for every affected job whose current revision is tainted, **before** the `row_delete` of that revision, so each phase-A transaction commits with no dangling deferred key (Fable N6). **No rebuild runs between manifests**, so a later manifest never meets a row it could not name: a revision or `det_results` instance that a rebuild would have created does not exist yet.
 - **Phase B — one rebuild.** The union of the stored affected `job_ids` of the replayed source purges, minus the jobs that phase A deleted (for example a job a later tombstone or delete-everything removed), following `merged_into_job_id` to the root, is rebuilt once per job as in §20.5 step 5, from the surviving postings and observations; the rebuild sets `jobs.current_revision_id` again and, in the same transaction, recomputes the current `det_results` instances of every affected job for the active scope (and the pending scope, if any), so phase C never depends on the `det_completeness` reconciler to close the gap left by §20.5 step 3. Data above each manifest's watermark is used and kept.
 - **A NULL current revision is never visible.** Between phases A and B an affected job can be committed with `current_revision_id` NULL. That state exists only while the job is fenced, inside migrate step 7, with `api` and `worker` stopped, or after a failed replay, which keeps them stopped. Every reader tolerates it anyway: consumers skip fenced jobs (§20.2), the current-score view and the jobs list treat a job without a current revision as absent (its detail returns 404), and invariant 1 exempts fenced jobs (§7.17).
 - **Phase C — verify and release.** One transaction checks every postcondition of every replayed manifest (the destructive ones and the bounded `fence` postconditions), then sets `completed` where needed, appends `replay_log` (restore id, time, per-operation counts) and releases every fence of the replayed manifests. If any postcondition fails, the transaction rolls back and `migrate` stops with the fences still active.
 
 Fences are therefore never released before the rebuild and its verification have committed (Codex R3-6), and a crash anywhere in phases A to C restarts step 7 with the stored affected sets. `api` and `worker`, which depend on `migrate` completing, do not start while a fence of the stream is active. A file that does not parse, or whose name differs from the uuid inside it, also stops `migrate` with an error for the operator; nothing is replayed until it is resolved. `migrate` writes manifest files (step 1 and pending retries) but **never deletes or overwrites a valid one**.
 
-**Identity advancement** (migrate steps 1 and 3). Before any write, `migrate` sets every identity column of the application schema to restart above the greatest of: its current maximum, its **current sequence position** (an identity is never lowered), and the `max_ids` (and watermark) value of every manifest, both those in the stream's files and those persisted only in `deletion_manifests.scope` (pending-retry `executing` rows and `completed` rows whose files were never shipped, whose files step 1 has just rewritten) (`ALTER TABLE … ALTER COLUMN id RESTART WITH`, as the owner). A pending-retry manifest without `file_sha256` has no bounds yet; nothing was deleted under it, and its bounds are computed after the advancement (Codex round 5). A row created after a restore therefore never receives an id that a manifest names or that a selector's bound covers, so a later replay can never delete new data, and a profile version or job re-created after a purge never shares an id with the purged one.
+**Identity advancement** (migrate steps 1, 3 and the end of step 5). Before any write, `migrate` moves every identity and `serial` column of the application schema, the queue's and the checkpointer's included, above the greatest of: its current maximum, its **current sequence position** (an identity is never lowered), every id a manifest lists, and the `max_ids` (and watermark) value of every manifest, both those in the stream's files and those persisted only in `deletion_manifests.scope` (pending-retry `executing` rows and `completed` rows whose files were never shipped, whose files step 1 has just rewritten). Identities advance with `setval` whenever the sequence's next allocatable value (`last_value`, plus one once called) is at or below the bound, never lowered, skipping tables above every bound, so a deploy's `migrate` takes no exclusive table lock. A pending-retry manifest without `file_sha256` has no bounds yet; nothing was deleted under it, and its bounds are computed after the advancement (Codex round 5). A row created after a restore therefore never receives an id that a manifest names or that a selector's bound covers, so a later replay can never delete new data, and a profile version or job re-created after a purge never shares an id with the purged one.
 
-**Restore order** (`deploy/backup/restore.sh`, run with `docker compose --profile restore run --rm restore`; documented in the runbook; `api` and `worker` stay stopped):
-1. Restore the **latest manifest stream** (`restic restore latest --tag manifests`) into the `manifests` volume first.
-2. Choose a backup set (`--tag set:<id>`, latest by default), restore it into `/data/staging`, and verify `backup_set.json` against the dump's sha256.
-3. Start `postgres` on an empty data directory: `deploy/postgres/init` creates the roles, the extensions, the template database and the default privileges (§19.3).
+**Restore order** (`jobhunter restore run [--set <id>]`, the `restore` service's command, run with `docker compose --profile restore run --rm restore` once the operator has started `postgres` on an empty data directory; documented in the runbook; `api` and `worker` stay stopped). `restore run` refuses a database or a CV store that is not empty. Every restic restore names its subfolder (`snapshot:subfolder`), so its files land at exact paths:
+1. Restore the **latest manifest stream** (the latest snapshot tagged `manifests`) into the `manifests` volume first. An empty manifest stream (no purge yet) restores as empty; a shipped manifest missing from the stream stops the restore.
+2. Choose a backup set (`set:<id>`, latest by default), restore its `/data/staging/set` into `/data/staging/restore`, and verify `backup_set.json` against the dump's sha256. The set's `data_key_ids` are reported for §19.8's key passes.
+3. The operator has started `postgres` on an empty data directory: `deploy/postgres/init` creates the roles, the extensions, the template database and the default privileges (§19.3).
 4. `pg_restore --no-owner --no-acl --exit-on-error -L <filtered list>` into the application database, as the migrator role. Every restored object is owned by the migrator, so the default privileges grant DML to the app role, and no ownership or ACL statement needs a superuser. The filtered list is `pg_restore --list` without the entries for the extensions, their comments and the `public` schema, which step 3 already created.
 5. `jobhunter restore verify --set <id> --phase restored`: the Alembic revision and the per-table row counts equal `backup_set.json`; `deletion_manifests` holds `manifest_count` rows; the checksum of 100 random raw responses matches. This runs before replay, because replay deletes rows. It then closes the backup rows the dump captured mid-run: the set's own `backup_sets` row, dumped while `running`, becomes `succeeded` from `backup_set.json` and the restic snapshot id, and any other `running` `backup_sets` or `backup_runs` row becomes `failed` with error `restored_mid_backup`.
 6. Restore the CV files of the same set into `cv_store`.
-7. Run `migrate` (§19.3): identity advancement, migrations, grants, seeding and the **two-phase replay** with its single rebuild; it then deletes CV files that no restored row references.
+7. Run `migrate` (§19.3): identity advancement, migrations, grants, seeding and the **two-phase replay** with its single rebuild; it then deletes CV files that no restored row references. A backup set holds no export archive: after replay, the restore expires the exports still `ready`, fails those still `running` and empties the exports volume. A replayed purge removes export archives as the live one does, and an export already `failed`, `expired` or `purged` satisfies it.
 8. `jobhunter restore verify --set <id> --phase replayed`: every manifest of the stream, **and every manifest that was pending retry**, has a `completed` or `shipped` row (a pending-retry manifest is accepted only after migrate completed it and wrote its file); **every operation's postcondition holds** (rows deleted, fields redacted with their rows intact, files removed, and the `fence` postconditions bounded to each stored affected set and watermark); no purge fence is active; every identity column restarts above all `max_ids`.
-9. Start `api` and `worker`.
+9. Start `api` and `worker` (after §19.8's data-key passes for a set from before a rotation).
 
-A deletion acknowledged to the user is shipped offsite before the acknowledgement, so no restore can bring it back (S9, crash case C32).
+Whatever the outcome, the restore removes its staging copy of the dump (`/data/staging/restore`). Steps 3 and 9 are the operator's; `restore run` runs the others in order, logs both verification reports and prints the set and its `data_key_ids`. A deletion acknowledged to the user is shipped offsite before the acknowledgement, so no restore can bring it back (S9, crash case C32).
 
-**Monthly restore test** (`JOBHUNTER_RESTORE_TEST_CRON`). The backup image contains the app package, so the test runs the same code as a real restore:
+**Monthly restore test** (`JOBHUNTER_RESTORE_TEST_CRON`, `jobhunter backup restore-test`). The backup image contains the app package, so the test runs the same code as a real restore:
 1. As `jobhunter_restore`: drop a leftover `jobhunter_restore_test`, then `CREATE DATABASE jobhunter_restore_test TEMPLATE jobhunter_template` (the role owns it; the extensions come from the template).
-2. Restore the latest backup set and the latest manifest stream into `/data/staging/restore_test/`.
+2. Restore the latest backup set and the latest manifest stream into `/data/staging/restore_test/`, with the same subfolder restores and empty-stream rule.
 3. Run restore steps 4 and 5 against the scratch database, as `jobhunter_restore`, with `pg_restore --no-owner --no-acl`.
-4. Run, as `jobhunter_restore`, `jobhunter migrate --database jobhunter_restore_test --steps sequences,alembic,replay` with the scratch manifest and CV directories, then restore step 8 (`--phase replayed`) against the scratch database.
+4. Run, as `jobhunter_restore` (`--db-role restore`), the `migrate` steps `sequences,alembic,replay` against `jobhunter_restore_test` with the scratch manifest, CV and exports directories, the restore's export step, then restore step 8 (`--phase replayed`) against the scratch database.
 5. Drop the scratch database and directory.
 6. Record, as the backup role, `backup_runs(kind='restore_test', backup_set_id)` with the verification report. A failure raises `backup.restore_test_failed`.
 
-**Retention**: `restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 3` for the `set:*` snapshots, with `prune` weekly. The `manifests` snapshots are never forgotten (they hold ids and hashes only).
+**Retention**: `jobhunter backup prune` (weekly, `JOBHUNTER_BACKUP_PRUNE_CRON`) runs `restic forget --tag set --keep-daily 7 --keep-weekly 4 --keep-monthly 3 --prune`. The `manifests` snapshots are never forgotten (they hold ids and hashes only).
 
-**RPO 24 h, RTO 4 h**. Recovery is a fresh VPS, `docker compose`, the restore order above, and `up`.
+**RPO 24 h, RTO 4 h**. Recovery is a fresh VPS, the offline recovery kit, `docker compose`, the restore order above, and `up`; the RTO is measured by the deployment's timed restore.
 
 ### 19.6 Upgrades
 
-- CI builds images on `main`, tags them with the git SHA and pushes them to GHCR. A release PR updates the digests in `deploy/compose.yaml`.
+- **The release workflow** (`release.yml`, dispatched by hand) builds the app, backup, docparse and embedder images, pushes them to GHCR tagged with the commit, and opens the digest PR, which writes their digests into `deploy/release.lock`; the release tag names that PR's head commit. The embedder image's build downloads the model files of `embedder/model.lock`, so it needs the route to `huggingface.co`; the VPS pulls the release's images and never builds one.
 - **Deploy steps**:
+  0. check out the release tag;
   1. `docker compose pull`;
-  2. `docker compose run --rm migrate`;
-  3. `docker compose up -d`. The worker drains gracefully within 120 s, and an in-flight run resumes as a new attempt.
-- **Rollback** means redeploying the previous digests. This is safe because migrations are expand-first.
+  2. a backup set and a manifest shipment, the restore point of a rollback by restore;
+  3. `docker compose stop api worker`: `migrate` runs only while they are stopped. The worker drains gracefully within 120 s;
+  4. `docker compose run --rm migrate`;
+  5. `docker compose up -d`. An in-flight run resumes as a new attempt.
+- **Rollback** by compatibility floor or by restore (§19.3). The previous release's `migrate` reports the newer schema `ahead_compatible` (a floor it knows, not destructive): the previous release is redeployed and runs on it. It reports `migrate_schema_ahead_incompatible`: the last backup set is restored under the previous release, after the manifests were shipped and checked, so no deletion is lost.
+  - A release whose migration narrows a transition edge of an existing table declares its revision destructive; its rollback is a restore.
+  - A manifest-format change ships expand/contract: release N teaches the parser the new format while still writing the old; release N+1 writes the new format. A rollback from N+1 therefore lands on N, whose restore reads both.
 - **LangGraph and checkpointer upgrades**: checkpoints are per-attempt and short-lived. A resumed run always starts a new thread, so old checkpoints are never read across versions.
 - **Embedding model change**: a new embedder image with a new `embedding_model_id`. Revisions are re-embedded in the background, and similarities are recomputed for pending targets. Vectors of different models are never compared.
 
@@ -6321,29 +6455,29 @@ A deletion acknowledged to the user is shipped offsite before the acknowledgemen
 | Service | Memory limit | Notes |
 |---|---|---|
 | postgres | 5 GB | `shared_buffers` 2 GB |
-| embedder | 3.5 GB | 2.6 GB RSS measured with arctic int8 |
+| embedder | 3.5 GB | about 2.6 GB RSS measured with the arctic fp32 export |
 | worker | 2 GB | |
 | api | 1 GB | |
 | docparse | 1 GB | parsing subprocesses with `RLIMIT_AS` 768 MiB |
 | caddy | 256 MB | |
 | backup | 1 GB | |
+| migrate, restore | 2 GB each | one-off; neither runs beside api and worker |
 | OS and page cache | the rest | |
 
-- **Embedder throughput**: about 2 docs/s at 1,024 tokens on 4 vCPU (measured). 1,000 new ads/day take under 10 min of CPU.
+- **Embedder throughput**: about 0.6 docs/s at 1,024 tokens with the fp32 export on the dev CPU (V7), so 1,000 new ads a day take about half an hour of CPU; V7 on the VPS's CPU measures fp32 and int8, and the user decides between them. There is no fp16 fallback: V7 measured fp16 slower and larger than fp32.
 - **Disk**: raw payloads are kept for 30 days, compressed and deduplicated by body hash; that is about 1–3 GB. Domain data is a few GB per year. 100 GB leaves headroom for WAL, backups staging and logs.
-- If spike V7 measures the int8 model below 1.5 docs/s on the chosen CPU, the fp16 export is used instead (RSS about 3.5 GB).
 
 ### 19.8 Runbook basics (`docs/RUNBOOK.md`)
 
-- **Host setup** (once, before the first `up`):
+- **Host setup** (once, before the first `up`), through `scripts/host-setup.sh` (a dry run first; its read-only preflight stops at the first failure), which runs these steps:
   1. `groupadd --gid 10010 jobhunter-secrets` (no user is added to it).
   2. `install -d -o root -g 10010 -m 0750 /etc/jobhunter/secrets`.
   3. For each name of §19.2: `install -o root -g 10010 -m 0440 <file> /etc/jobhunter/secrets/<name>`, then delete the source file. Never `chmod 0400`: the app services run as uid 10001 and could not read it.
-  4. Check with `docker compose run --rm --no-deps api jobhunter startup-check`, and the same for `worker` and `migrate` (the assertions of §16.8 for that service, without starting it).
-  5. Run the host without swap, or with encrypted swap only, so the `parse_jobs` tmpfs never pages a decrypted CV to a plain disk.
-  6. Install `deploy/firewall/docker-user.nft` (§16.9).
+  4. Check with `docker compose run --rm --no-deps <service> jobhunter startup-check --role <service>` for `api`, `worker`, `migrate`, `backup` and `restore` (the assertions of §16.8 for that role, without starting the service).
+  5. Run the host without swap, or with encrypted swap only, so the `parse_jobs` tmpfs never pages a decrypted CV to a plain disk. The script refuses any unencrypted swap device, RAM-only zram included; on a host whose image ships zram swap, it is turned off before host setup (the runbook says how).
+  6. Install `deploy/firewall/docker-user.nft` (§16.9) with its systemd unit, which loads it at boot before Docker.
 - **Start / stop**: `docker compose up -d` / `docker compose stop` (graceful). Never `--scale worker=…`.
-- **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs contain no PII).
+- **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs hold ids, codes and counts, no content; the sign-in and re-authentication events also hold the client address, §20.6).
 - **Alerts**:
 
 | Alert | Action |
@@ -6357,11 +6491,11 @@ A deletion acknowledged to the user is shipped offsite before the acknowledgemen
 | `llm.reservation_bound_violated` | Scoring is paused. Check `llm/pricing.py` and the overhead constant against the call's usage; fix, deploy, then acknowledge. |
 | `privacy.manifest_unshipped` | Check the backup container and S3 credentials; run the shipper manually; the deletion is reported done only when shipped. |
 | `llm.budget_counter_drift` | The reconciler has corrected the counters from the ledger; file a bug with the alert context. |
-| `source.auth_failed` | Rotate or renew the key in its secret file (§19.2), then `docker compose up -d worker`. |
+| `source.auth_failed` | Rotate or renew the key in its secret file (§19.2), then `docker compose restart worker`. |
 
-- **Secret rotation**: replace the secret file with the same `install -o root -g 10010 -m 0440` command, then restart the services that receive it (§19.2). Rotating the session secret logs the user out. Rotating the data key: mount the old key as `data_key_previous` and the new one as `data_key`, run `jobhunter crypto rotate` (resumable), and remove `data_key_previous` only after its verification pass reports no ciphertext with the old key id (§16.8).
-- **Restore**: on a fresh host, do the host setup first, then follow the restore order of §19.5 exactly: manifest stream first, then the backup set, the empty database with its init, `pg_restore --no-owner --no-acl`, `restore verify --phase restored`, the CV files, `migrate` (identity advancement and replay), `restore verify --phase replayed`, and only then start `api` and `worker`.
-- **Disk pressure**: check `jobhunter_table_bytes`. Run `retention_daily` manually; vacuum.
+- **Secret rotation**: replace the secret file with the same `install -o root -g 10010 -m 0440` command, then `docker compose restart` the services that receive it (§19.2): Compose compares a service's configuration, not a secret file's content, so `up -d` alone would keep the old value. A DB role's password also changes in PostgreSQL (`scripts/rotate-db-role.sh`). Rotating the session secret logs the user out. Rotating the data key: mount the old key as `data_key_previous` and the new one as `data_key`, restart `api` and `worker`, run `jobhunter crypto rotate` as the worker (resumable), and empty `data_key_previous` only after its verification pass reports no ciphertext with the old key id (§16.8). The retired key stays in the offline recovery kit while a retained backup set names it in its `data_key_ids`. `crypto rotate` re-encrypts what the mounted previous key opens and reports the other key ids left, so a set restored under several old keys takes one pass per key, before `up -d`.
+- **Restore**: on a fresh host, do the host setup first, with the offline recovery kit's data key, restic password and S3 keys; start `postgres` on an empty data directory; then `docker compose --profile restore run --rm restore` (`restore run`), which follows the restore order of §19.5 exactly: manifest stream first, then the backup set, `pg_restore --no-owner --no-acl`, `restore verify --phase restored`, the CV files, `migrate` (identity advancement and replay), the exports, `restore verify --phase replayed`. Then the data-key passes above for every key id of the set other than the current key, and only then start `api` and `worker`.
+- **Disk pressure**: check `jobhunter_table_bytes`. `retention_daily` runs nightly (03:17 UTC) and has no manual trigger: a full disk waits for its next pass; vacuum the table that grew.
 - **Password lost**: `jobhunter user set-password`.
 
 ---
@@ -6377,7 +6511,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | CV file (original) and raw CV text | `cv_store` (encrypted), `cv_files.raw_text_enc` | Files of the active and the previous profile version. Files of discarded or failed drafts and abandoned uploads: 30 days after the draft ended. | `retention_daily` / on confirm |
 | Contact-stripped text | `cv_files.stripped_text` | Same as the CV file | Same |
 | Draft content (`draft_json`, `reviewed_text`, and the `output_json` of the draft's `extract_profile` calls) | `profile_drafts`, `llm_calls` | 30 days after the draft is `confirmed`, `discarded` or `failed` (`content_purged_at`); the rows' ids, states and usage stay | `retention_daily` |
-| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | Profile purge (§20.2) |
+| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | `retention_daily`: a profile purge (§20.2) of each eligible version, which is not synthetic, not the active, the newest confirmed or the previous version, has its score history expired and has no active golden case or feedback naming it |
 | Query proposals (`items`, and the `output_json` of their `propose_queries` calls) | `query_proposals`, `llm_calls` | With the profile content; the proposal becomes `purged` | Profile purge |
 | Profile vectors | `profile_vectors` + `embeddings` | With the profile content | Profile purge |
 | Score history (targets, attempts, drafts, critic notes, llm_results, evidence, det instances, llm_calls) | DB | `retention.score_history_months` (default 12) after the target ended terminally, **except**: targets of the active tuple and everything they reference are never deleted by age (deleting one would make `missing_targets` re-create and re-score it); results referenced by an active golden case are kept; a target whose batch item belongs to a submission not yet resolved (`preparing`, `submit_started`, `submit_ambiguous`, `submitted`, `ended`, or `released` with `submit_started_at` younger than 29 days, the reconciler's clock) is kept with its items and calls until the submission is resolved; no age releases a submission (C3) | Target-set deletion (§20.2) |
@@ -6386,7 +6520,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Golden cases | `golden_cases`, `eval_case_results`, their eval calls | Until the user deletes them (§14.2). While a case is active, **its job revision, the job and its profile version are exempt** from tombstoning and purges (the Adzuna purge excepted, §20.5). Tombstoning and the profile purge delete **inactive** cases they would otherwise orphan (§20.2) | User action (manifest) |
 | Eval runs, their case results and calls (golden, canary, schema dry-run) | `eval_runs`, `eval_case_results`, `llm_calls` | 13 months after the run, except the latest completed run of each kind | `retention_daily` (calls cascade) |
 | Raw provider payload bodies | `raw_responses.body_zstd` | 30 days, extended while a newer row references the body (§7.7) | `retention_daily` (body nulled) |
-| `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`) | `retention_daily` |
+| `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`); a `deferred` item is kept until it is resolved | `retention_daily` |
 | `raw_responses` rows (metadata, body already nulled) | DB | With their fetch request (13 months) | Cascade |
 | Runs, run attempts, fetch requests, score cycles, coverage intervals, operations, bulk operations | DB (metadata, no content) | 13 months (operations: 30 days after they finish) | `retention_daily` |
 | Batch submissions (metadata, no content) | DB | 13 months after they ended (`reconciled`, `submit_rejected`, `abandoned`, or `released` with `submit_started_at` older than 29 days), once their items went with their targets; their bulk operation after them | `retention_daily` |
@@ -6394,7 +6528,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Quota ledger, LLM spend ledger, `llm_budget`, `quota_windows` | DB (no content) | Indefinitely, so a restart can never exceed a window or the cap | — |
 | `llm_tuples`, `execution_configs`, `evaluation_policies`, `model_policies` | DB (ids and settings, no personal content) | Indefinitely | — |
 | Posting observations, jobs, revisions, lineage | DB | While the job is retained | With the job |
-| Closed or stale jobs (not saved or applied, not referenced by an active golden case) | DB | 90 days after `jobs.availability_changed_at`, then **tombstoned**: hashed keys and user-action timestamps kept, content deleted | `retention_daily` + manifest |
+| Closed or stale jobs (not saved or applied, not referenced by an active golden case) | DB | 90 days after `jobs.availability_changed_at`, then **tombstoned**: hashed keys and user-action timestamps kept, content deleted | `retention_daily`: tombstone batches of up to 200 root jobs with the jobs merged into them (ten a run), the exemptions checked again under the fence; + manifest |
 | Saved or applied jobs | DB | Until the user clears saved/applied, or deletes everything | User action |
 | Embeddings | `embeddings` | While a revision or profile vector references them | `retention_daily` (unreferenced rows) |
 | LangGraph checkpoints | DB | 14 days after the run or cycle ends; a cycle's row goes only after its checkpoint thread | `retention_daily` (deletes threads) |
@@ -6403,10 +6537,11 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Logs | Docker local driver | about 14 days (rotation) | Rotation |
 | Sessions | DB | Expiry + 1 day | daily |
 | Login attempts | DB | 30 days | daily |
+| Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
 | Alerts | DB | Resolved + 90 days | daily |
-| Exports | `exports` volume | 7 days; deleted immediately by any purge (§20.2) | daily |
+| Exports | `exports` volume | 7 days; deleted by every purge but the nightly job tombstoning; rows 30 days after expiry | daily |
 | Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: indefinitely | `restic forget/prune` |
-| Backup sets, backup runs | DB | 13 months | daily |
+| Backup sets, backup runs | DB | 13 months after they finished, except the newest succeeded set and restore test, and a set a kept run names | daily |
 | Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
 | LangSmith traces | LangSmith EU | Per the LangSmith project retention setting (no I/O content) | LangSmith console |
 
@@ -6414,13 +6549,13 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 
 ### 20.2 Deletion graph
 
-Every purge runs as a `purge` operation (§7.3; the payload names its manifest) and follows the same protocol:
-1. **Manifest and fence.** One transaction holding `active_config` `FOR UPDATE` commits the `deletion_manifests` row (`executing`, no file yet) and the purge's `purge_fences` rows (§7.14). Once every application transaction older than that commit has ended, the purge computes the manifest's typed operations and `max_ids` and, for a source or profile purge, its explicit **affected set** (job ids; profile version and tuple ids) and **purge watermark**; it then writes and fsyncs the file and, in one transaction, records its hash, stores the same content in the row and adds the affected job ids to the source fence (§19.5). Nothing is deleted before that, and every retry uses the stored affected set instead of re-deriving it.
-2. **Delete** in the order below, in bounded transactions that are idempotent on retry. A chunk that touches jobs first takes their rows `FOR UPDATE` in id order and only then selects the rows to delete, so it includes anything a consumer created before the fence committed.
-3. **Complete.** The final transaction checks the manifest's postconditions, bounded to its stored affected set and watermark (§19.5), then sets the manifest `completed` and the fences' `released_at`. A failed purge keeps its fences, so fenced work stays blocked until a retry completes it (`purge_fences` reconciler, §17.4).
+Every purge runs as a `purge` operation (§7.3; the payload names its manifest, the dedup key is `purge:<manifest_uuid>`), one purge at a time (the procrastinate lock `purge`), and follows the same protocol:
+1. **Manifest and fence.** One transaction holding `active_config` `FOR UPDATE` commits the `deletion_manifests` row (`executing`, no file yet, with the purge's request, ids only) and the purge's `purge_fences` rows (§7.14). A manifest row keeps its request, from which any later operation of the purge computes its content. Once every application transaction older than that commit has ended (`pg_stat_activity`, waited for at most 10 min, then the operation is requeued), the purge computes the manifest's typed operations and `max_ids` and, for a source or profile purge, its explicit **affected set** (job ids; profile version and tuple ids) and **purge watermark**; it then writes and fsyncs the file and, in one transaction, records its hash, stores the same content in the row and adds the affected job ids to the source fence (§19.5). A crash after the file's rename adopts the written file instead of recomputing it. Nothing is deleted before that, and every retry uses the stored affected set instead of re-deriving it.
+2. **Delete** in the order below, in bounded transactions that are idempotent on retry. A chunk that touches jobs first takes their rows `FOR UPDATE` in id order and only then selects the rows to delete, so it includes anything a consumer created before the fence committed. Each chunk locks in §3.3.3's order: the epoch, the configuration, the job rows (with their groups' co-members when it asks for them), then the operation's owner row.
+3. **Complete.** The completing transaction releases the fences, then checks the manifest's postconditions, bounded to its stored affected set and watermark (§19.5); a violation rolls both back. Otherwise it sets the manifest `completed`. A failed purge keeps its fences, so fenced work stays blocked until a retry completes it: its failure hook raises `privacy.purge_failed` at once, the retry route (§14.2) inserts a new `purge` operation, and the `purge_fences` reconciler (§17.4) alerts on a failed purge and re-queues only an `executing` manifest without a live or failed purge. Retention keeps the purge operations of `executing` manifests.
 4. **Report** the deletion as done only when the manifest is `shipped`.
 
-**Manifest operations.** The manifest records each purge's steps below as typed operations (§19.5): every deletion as `row_delete`; every content nulling (`profile_json`, query-proposal `items`, call `output_json`, CV texts, draft content, raw bodies, export paths) as `field_redact`, whose rows stay valid; CV and export files as `file_remove`; and the purge fence as `fence`. Replay after a restore checks each operation's own postcondition, so a purged profile version that still exists with its content absent satisfies its manifest.
+**Manifest operations.** The manifest records each purge's steps below as typed operations (§19.5): every deletion as `row_delete`; every content nulling (`profile_json`, query-proposal `items`, call `output_json`, CV texts, draft content, raw bodies, export paths) as `field_redact`, whose rows stay valid; CV and export files as `file_remove`; and the purge fence as `fence`. Replay after a restore checks each operation's own postcondition, so a purged profile version that still exists with its content absent satisfies its manifest. A call whose content a purge redacted keeps it redacted (`llm_calls.content_purged_at`): a late settlement records the usage and cost but no output.
 
 Ledgers (`quota_ledger`, `llm_spend_ledger`, `llm_budget`) are never touched; their `run_id` and `fetch_request_id` references become NULL by `ON DELETE SET NULL`.
 
@@ -6438,19 +6573,24 @@ Every consumer checks the fences **inside the transaction that does the work**, 
 | Consumer | Behaviour while fenced |
 |---|---|
 | Target creation: `enqueue_targets` (§9.2 node 9), the `missing_targets` reconciler, `create_targets_for_tuple`, revival of a cancelled target (§7.16.3) | skips the job |
-| Identity resolution (§8.6) | a `source` fence makes the item `out_of_scope('source_purged')`; a fenced job in `P` or `J` leaves the item `pending` until release |
+| Identity resolution (§8.6) | a `source` fence makes the item `out_of_scope('source_purged')`; a fenced job in `P` or `J` defers the item (`deferred('job_fenced')`) until release |
 | Admission: the claim (§9.4.2) and batch preparation (§10.10) | `NOT is_fenced(job_id, llm_tuple_id)` in the selecting statement |
 | Publication (§9.4.1 step 1a) | publishes nothing; the attempt ends `cancelled`, and the purge cancels the target |
 | Evaluation (§11.13) | the case is skipped and reported as `fenced`; no `eval_case_results` row is written |
-| Export (§20.3) | the final transaction takes `active_config` `FOR SHARE` and ends the export `purged` if any fence is active |
+| Export (§20.3) | starts reading only while no manifest is `executing`, and ends `purged` when a manifest opened after its snapshot exists |
 | Profile activation (§12.6) | refuses a version under a `profile` fence with 409 `profile_purge_in_progress` |
-| Runs, cycles, operations, batch submits | a `global` fence is a persisted admission stop: none starts, and every dispatch check (§3.3.3) refuses. The purge operation itself is exempt |
+| The `det_completeness` reconciler (§17.4) and the scope precompute's `det_results` chunks (§13.4) | skip a result whose job is fenced for the tuple; `det_completeness` writes its instance once the fence is released |
+| The embedding writers (§9.2 node 7, the `awaiting_embedding` reconciler) and the similarity writer | leave a fenced job's revisions and targets out; they are written once the fence is released, if the job still exists |
+| The user's writes: feedback (`record_feedback`), a golden case's activation (`set_flags`), the group-wide actions, a split (§14.2) | refused with 409 `conflict_state` (`purge_in_progress`), having written nothing |
+| The target actions: score now, retry (§14.2) | a fenced job's target is 404, as the job's detail answers |
+| The jobs list and the detail (§14.2) | omit a fenced job; its detail is 404 |
+| Runs, cycles, operations, batch submits | a `global` fence is a persisted admission stop: none starts, and every dispatch check (§3.3.3) refuses. The purge operation itself is exempt. A global fence also stops new operations at their claim and the api's writes (409 `delete_everything_in_progress`), except login, logout, the privacy routes and the purge retry; every transaction of a request the edge let through reads the fence first |
 
 Retention deletion of expired score history needs no fence: it touches only terminal targets of inactive tuples, and each chunk re-checks under `active_config` `FOR SHARE` that their tuple is still inactive.
 
 **Target-set deletion** (used by every purge below) for a set T of score targets, in one transaction per chunk of 200 targets:
-1. Cancel the non-terminal targets in T (`cancelled('purged')`, §7.16.3): `in_progress` targets lose their claims and their coroutines stop at the next claim check; for `in_batch` targets the submission's cancel is requested first. Late results are fenced and publish nothing.
-2. `UPDATE score_targets SET resume_draft_id = NULL WHERE id = ANY(:T)`.
+1. Cancel the non-terminal targets in T (`cancelled('purged')`, §7.16.3): `in_progress` targets lose their claims and their coroutines stop at the next claim check. For `in_batch` targets (§10.10), a `preparing` submission is abandoned; for any later submission the purge requests the submission's cancel, cancels the purged targets individually, settles their items' entries `dispatched → ambiguous`, and records in `purged_batch_items` each deleted item whose submission can still return results, a released one included. Late results are fenced and publish nothing.
+2. `UPDATE score_targets SET resume_draft_id = NULL WHERE id = ANY(:T)`. Before step 3, an online entry of a call the deletion removes is settled first: `reserved` → `not_billed(never_dispatched)`, `dispatched` → `ambiguous`; a late response of a purged call settles nothing.
 3. Delete `result_evidence` and `det_results` of the results of T (`score_feedback` and `golden_cases.labelled_from_result_id` references become NULL).
 4. Delete `critic_notes` of the attempts of T.
 5. Delete `llm_results` of T; the deferred keys with `score_targets.published_result_id` are satisfied because step 9 runs in the same transaction.
@@ -6481,12 +6621,14 @@ Only non-content audit metadata remains: ids, timestamps, usage numbers. Identic
 **Job tombstoning** for a batch of jobs (each job J with every job merged into it):
 1. Check the exemptions: not saved or applied, no **active** golden case on any of its revisions.
 2. Manifest and a `jobs` fence naming the batch.
-3. Target-set deletion for every target of J.
+3. Target-set deletion for every target of J, the targets first, at most 200 a transaction; then one transaction deletes the graph (steps 4 to 7), which locks J's jobs and every co-member of their duplicate groups in one ascending-id statement before the operation's owner row, and starts again when a member joined under the lock.
 4. Delete the **inactive** golden cases on J's revisions, with their `eval_case_results` and calls (cascade). `golden_cases.job_revision_id` restricts revision deletion, so this step must precede step 6; a job with an active case was excluded in step 1.
-5. Delete `merge_events` naming J, `identity_conflicts` naming J (or remove J from their candidates), and J's duplicate-group membership (the group re-elects or dissolves).
+5. Delete `merge_events` naming J, `identity_conflicts` naming J (or remove J from their candidates), and J's duplicate-group membership: the job leaves its group with every co-member locked, which dissolves or re-elects and settles the group's deferred targets.
 6. Set `jobs.current_revision_id = NULL` (deferred), then delete the revisions (lineage, occurrences and `hard_filter_results` cascade) and the postings (observations and their `ad_key_sources` cascade). A key of J that other jobs' postings also supply is re-assigned to the job of its earliest remaining provenance row; J's other `ad_keys` are deleted.
-7. Write `job_tombstones` (user-action timestamps only, never notes) and `tombstone_keys` (hashed keys), then delete `user_job_actions` and the job.
+7. Write `job_tombstones` (user-action timestamps only, never notes) and `tombstone_keys` (hashed keys), then delete `user_job_actions` and the jobs, merged jobs deepest first.
 8. Final transaction: release the fence, mark the manifest `completed`.
+
+The job-graph cleanup of steps 3, 5 and 6, and the jobs' deletion deepest first, are shared by the Adzuna purge (§20.5) and delete-everything (§20.4).
 
 `resolve_identity` consults `tombstone_keys` before creating a job (§8.6 step 3), so a re-posted ad keeps its hidden or applied state.
 
@@ -6504,12 +6646,12 @@ Only non-content audit metadata remains: ids, timestamps, usage numbers. Identic
   - `golden_cases.json`;
   - `runs.json` (reports);
   - a `README.txt`.
-- The zip is encrypted at rest with the data key. It is available for 7 days, and its download is logged by id. Any purge deletes every existing export (`status='purged'`), because an export may contain the purged content.
-- The export's final transaction (`running → ready`) takes `active_config` `FOR SHARE` and ends the export `purged` instead if any purge fence is active. A fence commits under `active_config` `FOR UPDATE`, so an export either became `ready` before the fence, and the purge deletes it, or it sees the fence (§20.2).
+- The zip is encrypted at rest with the data key. It is available for 7 days, and its download is logged by id. Every purge but the nightly job tombstoning deletes every existing export (`status='purged'`), because an export may contain the purged content.
+- **Mechanics.** One export runs at a time (`exports_one_running`). The worker writes the plaintext zip to its memory-backed `/tmp` (§19.1), then encrypts it onto the `exports` volume in 1 MiB segments, each sealed with AES-256-GCM under the data key and the AAD `export:<id>:<n>:<last>`, so the api streams it within its memory limit and a truncated or reordered file fails; it records `size_bytes`. An export starts reading only while no manifest is executing, waiting without spending an attempt for at most 24 hours, ends `failed` with its files removed whenever its operation fails, and ends `purged` when a manifest opened after its snapshot exists: it records the purge generation its snapshot saw (`max(deletion_manifests.id)`), so a purge without a fence (the golden-case delete) cannot leak into it either. `GET /api/privacy/exports/{id}` answers its status; `?download=1` streams a `ready` export's zip, its file opened before the 200 starts, so a purge racing it answers 410 `gone`, while a download already under way completes from its open file. The download is not protected by a passphrase. A `ready` export stays downloadable past `expires_at` until the daily retention pass expires it, up to about a day later.
 
 ### 20.4 Delete everything
 
-The user types `DELETE EVERYTHING` and re-enters the password. A `purge` operation then runs:
+The user types `DELETE EVERYTHING`, re-enters the password and, with TOTP on, a code (each failure counts as a failed login attempt, §16.3). A `purge` operation then runs:
 
 1. **Manifest and global fence.** One transaction holding `active_config` `FOR UPDATE` commits the manifest (`kind='delete_everything'`) and a `global` purge fence; the manifest file is fsync'd. The fence is the **persisted admission stop**: it survives a restart, and nothing new starts until the final transaction releases it.
 2. **Cancel live work**, each with an explicit, legal terminal mapping (§7.16):
@@ -6522,11 +6664,11 @@ The user types `DELETE EVERYTHING` and re-enters the password. A `purge` operati
    | `score_targets`, non-terminal | `cancelled('purged')`, by target-set deletion step 1 |
    | `batch_submissions` `preparing` | `abandoned`; its ledger entries `reserved → not_billed(never_dispatched)` |
    | `batch_submissions` `submit_started`, `submit_ambiguous` | `released`; its ledger entries `dispatched → ambiguous` (counted at their reservation) |
-   | `batch_submissions` `submitted`, `ended` | `cancel_requested_at := now()`; `messages.batches.cancel` after commit (3 tries, then logged); its unsettled ledger entries `dispatched → ambiguous` |
+   | `batch_submissions` `submitted`, `ended` | `cancel_requested_at := now()`; a live purge sends the cancel itself (3 tries, each a retrieval and a cancel, then logged) before step 3 deletes the submission; a replay sends none; its unsettled ledger entries `dispatched → ambiguous` |
    | `batch_submissions` `submit_rejected`, `released`, `reconciled`, `abandoned` | already terminal |
    | `bulk_operations` `active` | `cancelled` |
    | other `reserved` ledger entries | `not_billed(never_dispatched)`: their owners were cancelled before dispatch |
-   | other `dispatched` ledger entries (online calls in flight) | settle from their response, or become `ambiguous` after 15 minutes (§7.16.7) |
+   | other `dispatched` ledger entries (online calls in flight) | `ambiguous`, counted at their reservation: every online entry still `reserved` or `dispatched` is settled before its call is deleted, and a late response of a deleted call settles nothing |
 
    Every reservation of a deleted batch therefore stays counted at its maximum until the month closes, so the cap holds even if a cancel fails.
 3. **Delete**, in this order (each step's referencing rows are gone before the referenced rows). The manifest records each step as a `row_delete` with the `all` selector bounded by `max_ids` (§19.5), so a replay never removes rows created after the deletion:
@@ -6534,21 +6676,22 @@ The user types `DELETE EVERYTHING` and re-enters the password. A `purge` operati
    2. `eval_case_results`, `eval_runs` (their `llm_calls` cascade), `golden_cases` (their calls cascade), `score_feedback`;
    3. every remaining `llm_calls` row (extraction and query-proposal calls; `profile_drafts.llm_call_id` and `query_proposals.llm_call_id` become NULL);
    4. remaining `batch_items`, then `batch_submissions`, then `admission_lane_credits`, then `bulk_operations` (the ledger's `bulk_operation_id` becomes NULL);
-   5. jobs and their graph as in tombstoning steps 5–7, but without writing tombstones, and then every existing tombstone;
+   5. jobs and their graph as in tombstoning steps 5–7 (the shared job-graph cleanup, §20.2), but without writing tombstones, then the `duplicate_groups` and every existing tombstone;
    6. fetch requests (their raw responses and raw items cascade), ATS snapshots, coverage intervals and cells, queries, watchlist entries and source instances other than the defaults;
-   7. score cycles, runs and their attempts;
-   8. **re-point `active_config`** in one transaction holding it `FOR UPDATE`: insert and activate a new default settings version and its scope version, set `profile_version_id := NULL`, `llm_tuple_id := NULL`, `pending_scope_version_id := NULL`, and bump `ranking_state`;
+   7. score cycles, runs and their attempts, after one durable dead-man ping pass (§17.7), so no run that ended before the purge loses its ping with its row;
+   8. **re-point `active_config`** in one transaction holding it `FOR UPDATE`: a dedicated reset installs the default settings version (no activation gate, no tuple, no operation) and re-points `active_config` and `schedule_state` (`profile_version_id := NULL`, `llm_tuple_id := NULL`, `pending_scope_version_id := NULL`), and bumps `ranking_state`. Its postcondition is relative to the manifest's bounds: every pointer is NULL, above its table's bound, or one of the manifest's frozen `retained` ids, so a later settings save or profile activation keeps it true;
    9. profile vectors and query proposals; then `llm_tuples`; then `profile_versions` together with `profile_drafts` (a deferred pair); then CV files and texts, and unreferenced embeddings;
    10. the old settings versions and the scope versions only they used;
-   11. alerts, exports, checkpoints, idempotency records, and every operation except this purge;
-   12. every session except the current one, which is logged out at the end.
-4. **Final transaction**: release the global fence and mark the manifest `completed`.
-5. These are **kept**:
-   - the user account;
+   11. the alerts resolved when the manifest is computed, an id list (the others are kept), exports, checkpoints, idempotency records except the request's own row, every operation except this purge, the login attempts and lockouts, and the procrastinate jobs finished when the manifest is computed;
+   12. the sessions created up to the manifest are deleted in the final transaction, the requester's included: the user is logged out.
+4. **Final transaction**: delete those sessions, release the global fence, check the postconditions and mark the manifest `completed`.
+5. These are **kept** (every other table is empty):
+   - the user account and its TOTP enrolment;
    - the quota and LLM spend ledgers, `llm_budget` and `quota_windows`, which hold no content and are needed so a later restart cannot exceed the windows or the cap;
    - the policy and config tables of §20.1 that hold no personal content;
    - `backup_sets`, `backup_runs`;
-   - the deletion manifests, their shipments and the purge fences (ids only).
+   - the deletion manifests, their shipments and the purge fences (ids only);
+   - records without content: the alerts open when the manifest is computed, this purge's operation and the request's own idempotency row (so a retried key returns the stored 202), the procrastinate jobs not finished then, and the export rows, each `purged`, `expired` or `failed` without its archive.
 
 Delete-everything has no rebuild. In a replay after a restore, its `row_delete` operations run in phase A with those of every other replayed manifest, so a job affected by an earlier source purge that it deleted is simply skipped by the single rebuild of phase B (§19.5).
 
@@ -6556,24 +6699,25 @@ The UI states that backup sets age out within about 3 months, that the manifest 
 
 ### 20.5 Adzuna purge
 
-`POST /api/privacy/purge-source {source: 'adzuna'}` handles termination of the Adzuna agreement as a `purge` operation:
-1. **Fence.** One transaction holding `active_config` `FOR UPDATE` disables the Adzuna source, sets `sources.purge_fence_at`, cancels active runs (§7.16.4), and commits the manifest and a `source` fence for `adzuna`. From then on, `resolve_identity` refuses Adzuna items (`out_of_scope('source_purged')`, §8.6), and every job with an Adzuna posting or a tainted revision is fenced: no target is created, claimed or published for it, and no eval or export reads it, until step 6.
+`POST /api/privacy/purge-source {source: 'adzuna'}` handles termination of the Adzuna agreement as a `purge` operation. The user types `PURGE ADZUNA`, re-enters the password and, with TOTP on, a code (each failure counts as a failed login attempt, §16.3). While Adzuna is the only enabled source the request is refused (422 `validation_failed` on `payload.sources.enabled`: "enable another source first") and leaves nothing behind: no settings version, fence, manifest or cancelled run.
+1. **Fence.** One transaction holding `active_config` `FOR UPDATE` disables the Adzuna source through a new internal settings version, sets `sources.purge_fence_at`, cancels active runs (§7.16.4), and commits the manifest and a `source` fence for `adzuna`. From then on, `resolve_identity` refuses Adzuna items (`out_of_scope('source_purged')`, §8.6), and every job with an Adzuna posting or a tainted revision is fenced: no target is created, claimed or published for it, and no eval or export reads it, until step 6.
 2. **Find and record the affected set**, once, before anything is deleted (§20.2 step 1): the tainted revisions through lineage (every revision with a `job_revision_sources` row for `adzuna`, including historical and mixed-source revisions), and the **affected jobs**: every job with an Adzuna posting, a tainted revision, a `det_results` instance whose `det_inputs` name Adzuna, or a golden case drawing on it. The job ids and the purge watermark go into the manifest file and row and onto the fence (§19.5). A retry after a crash, for example between step 4 and step 5, rebuilds exactly this stored set: by then the job's Adzuna posting and lineage are gone, so re-deriving the set would miss it (Codex R3-6).
 3. **Purge derivatives**:
-   - target-set deletion for every target of a tainted revision (results, drafts, critic notes, call outputs, evidence and det instances);
+   - target-set deletion for every target of a tainted revision (results, drafts, critic notes, call outputs, evidence and det instances), its in-flight batch items handled as §20.2's target-set deletion step 1 says;
+   - the embeddings of the deleted tainted revisions;
    - `det_results` of untainted revisions whose `det_inputs` name an Adzuna source (for example an Adzuna salary): deleted, and new current instances are computed from the remaining data;
-   - golden cases on tainted revisions **and golden cases whose frozen det-inputs draw on Adzuna** (`'adzuna' = ANY(det_input_sources)`, for example an Adzuna salary on a revision whose text came from another source), active or not (the agreement overrides the exemption; the UI lists the deleted cases). Their `eval_case_results` **and their eval calls** are deleted with them (`llm_calls.golden_case_id ON DELETE CASCADE`), and the manifest lists them as `row_delete` operations. Any other evaluation call whose `input_refs` names a tainted revision is deleted explicitly. Eval runs keep only aggregate metrics, which hold no ad content;
+   - golden cases on tainted revisions **and golden cases whose frozen det-inputs draw on Adzuna** (`'adzuna' = ANY(det_input_sources)`, for example an Adzuna salary on a revision whose text came from another source), active or not (the agreement overrides the exemption; the manifest lists the deleted cases, which `GET /api/privacy/manifests/{id}` returns as `deleted_golden_case_ids` and the UI shows). Their `eval_case_results` **and their eval calls** are deleted with them (`llm_calls.golden_case_id ON DELETE CASCADE`), and the manifest lists them as `row_delete` operations. Any other evaluation call whose `input_refs` names a tainted revision is deleted explicitly. Eval runs keep only aggregate metrics, which hold no ad content;
    - every export.
 4. **Delete the source data** (manifest operations: `row_delete` with the `source:adzuna` selector bounded by `max_ids`, §19.5): every Adzuna posting (observations and key sources cascade), the `adzuna` keys, and the Adzuna fetch requests with their raw responses and items (the quota ledger keeps its rows, with `fetch_request_id := NULL`).
 5. **Rebuild** each job of the stored affected set that still exists from its remaining postings: recompute the canonical fields; reuse a revision only if its lineage names no Adzuna source; otherwise, in one transaction per job, set `current_revision_id := NULL` (manifest operation `field_redact`, as in tombstoning step 6), delete the job's tainted revisions, insert a new revision and point `current_revision_id` at it, so a rebuilt revision with an identical `material_hash` is never the tainted one. Jobs that had only Adzuna postings are deleted with their dependents (tombstoning steps 4–7, without tombstones). No target is created here.
-6. **Final transaction**: check the postconditions for exactly the stored affected jobs (no canonical-field provenance, current-revision lineage, current det instance or golden snapshot at or below the watermark names Adzuna, §19.5), then release the fence and mark the manifest `completed`; it is reported done when `shipped`. The `missing_targets` reconciler then creates the targets of the rebuilt revisions (§17.4). A replay after a restore reconstructs the fence, runs this rebuild once for the whole stream after every manifest's destructive operations, and releases the fence only after the verification commits (§19.5), so a restored database never exposes an Adzuna-derived canonical field.
+6. **Final transaction**: check the postconditions for exactly the stored affected jobs (no canonical-field provenance, current-revision lineage, current det instance or golden snapshot at or below the watermark names Adzuna, §19.5), then release the fence and mark the manifest `completed`; it is reported done when `shipped`. The `missing_targets` reconciler then creates the targets of the rebuilt revisions (§17.4). A replay after a restore reconstructs the fence, runs this rebuild once for the whole stream after every manifest's destructive operations, and releases the fence only after the verification commits (§19.5), so a restored database never exposes an Adzuna-derived canonical field. A replay re-applies the disabling version, `purge_fence_at` and the run cancels, unless a settings version created after the fence re-enabled Adzuna.
 
 Afterwards, no Adzuna-derived text, salary or score remains in the database, in exports or in any future restore. `sources.purge_fence_at` stays set as the record that the source was purged; the disabled source can only be re-enabled by a new settings version. **Data collected after a re-enablement is out of scope** for this manifest and is preserved by every later replay (Codex R4-1): its rows lie above the watermark, including a fresh Adzuna posting attached to an affected job and its newer observations, and the manifest's postconditions cover only the stored affected jobs and rows at or below the watermark.
 
 ### 20.6 PRIVACY.md (contents)
 
 1. **Purpose and controller**: the user runs the app for their own job search, on a single-user deployment.
-2. **Data categories**: CV and profile (personal data), user actions and labels, job ads (public, and they may contain recruiter names and contacts), technical logs (no PII).
+2. **Data categories**: CV and profile (personal data), user actions and labels, job ads (public, and they may contain recruiter names and contacts), account and sign-in data (sessions, login attempts and lockouts, which hold the client address, §20.1), technical logs (no content; neither the api nor Caddy logs a request with its client address, §16.3; the sign-in and re-authentication events record the client address with their outcome).
 3. **Processing and minimisation**:
    - contact stripping and a user review of the text before any LLM or embedding call;
    - the native-PDF opt-in and its disclosure;
@@ -6592,11 +6736,13 @@ Afterwards, no Adzuna-derived text, salary or score remains in the database, in 
    | The VPS provider, the S3 backup provider | Infrastructure (§23) |
 
 5. **The retention table** (§20.1).
-6. **Deletion and export procedures**, including the backup lag of about 3 months, the offsite manifest shipping that makes every acknowledged deletion survive a restore, and the manifest replay.
+6. **Deletion and export procedures**, including the backup lag of about 3 months, the offsite manifest shipping that makes every acknowledged deletion survive a restore, and the manifest replay. The export note: every purge but the nightly job tombstoning deletes the exports, so an export can hold content tombstoned after it was made until it expires (7 days, §20.3).
 7. **The Adzuna personal-use terms and the attribution requirement**; the Adzuna purge procedure.
 8. **GeoNames attribution** (CC BY 4.0).
 9. **Security measures** (§16) in summary.
 10. **How to report a concern** (the operator contact is set at deployment).
+
+Then an **Operator** section with five marked fields: the operator name, the contact address, the controller name, the VPS provider and the S3 backup provider. The SPA renders `docs/PRIVACY.md` at build time as React elements (no route, no HTML injection; in English in both UI languages, §15.7), so the fields are bundled into the app image when it is built: filling them in the repository commits the operator's contact details to it and trips the marker test of `tests/unit/test_privacy_md.py`. How they are filled is a decision for the user at the deployment step: fill them in the release commit, or serve an override file.
 
 ---
 
@@ -6741,7 +6887,7 @@ Each spike produces a short recorded result in `docs/spikes/` and, where relevan
 | V4b | Which candidate generator wire schema compiles | 3 probe messages on Sonnet, effort `low`, `max_tokens` 1,024 (about $0.02) | A and B rejected, C accepted (`docs/spikes/V4b-generator-v2.md`) |
 | V5 | Stream idle and timeout values; ChatAnthropic accepts `anthropic.Timeout` (httpx2) | A local stalled-SSE test server, plus 20 real streamed generator and critic calls at medium (10 generator + 10 critic calls, in identical-prefix pairs; V14 folded in) | Idle read timeout fires at 120 s ± 5. p99 call duration < 300 s, so the 600 s deadline gives 2× margin. SSE pings arrive at < 30 s intervals during thinking. If ChatAnthropic rejects the object, the subclass fallback (G3) passes the same tests. |
 | V6 | The PostgresSaver contract: dedicated autocommit pool; `setup()` on an autocommit connection; per-attempt threads; thread deletion for retention | Integration tests | Resume within an attempt re-runs only the unfinished node. Deleting old threads leaves others intact. `setup()` is idempotent. |
-| V7 | The arctic-embed-l-v2.0 int8 ONNX export and throughput in the container on the target VPS CPU | Run `embedder` on the provisioned VPS | ≥ 1.5 docs/s at 1,024 tokens, RSS ≤ 3 GB, cosine parity with fp32 ≥ 0.99 on 50 ads, query-prefix handling verified. Otherwise use the fp16 export. |
+| V7 | The arctic-embed-l-v2.0 int8 ONNX export and throughput in the container on the target VPS CPU | Run `embedder` on the provisioned VPS | ≥ 1.5 docs/s at 1,024 tokens, RSS ≤ 3 GB, cosine parity with fp32 ≥ 0.99 on 50 ads, query-prefix handling verified. On the dev CPU no export met all three, and fp16 was slower and larger than fp32, so the fp32 export is locked and there is no fp16 fallback; V7 on the VPS measures fp32 and int8, and the user decides (§19.7). |
 | V8 | The Arbeitnow rate-limit window (`x-ratelimit-limit: 50`) | ≤ 6 requests spread over 2 h, recording `x-ratelimit-remaining` | The window length is determined. The page cap formula keeps a 7-day catch-up within the limit, or the cap is lowered. |
 | V9 | JSearch page and date semantics: 1 credit per page; `date_posted` buckets filter correctly; cursor reusability across hours; per-second limit | ≤ 6 paid calls | Recorded fixtures prove each point. `cursor_reuse_ttl` is set from the observation (0 if not reusable). |
 | V10 | `htidocid` stability across days | The same JSearch query on 2 days (2 units, combinable with V9) | The overlapping ads have identical `job_uid` |
@@ -6749,14 +6895,14 @@ Each spike produces a short recorded result in `docs/spikes/` and, where relevan
 | V12 | Batches: `custom_id` pattern; result `usage` present; errored and expired items unbilled; the list API fields (`created_at`, `request_counts`) that the §10.10 matching rule uses; cache behaviour in batches | A 3-item Haiku batch (< $0.01), then a workspace listing (expired items cannot be produced on demand; the decision path is tested on the fake) | Results are processed by the real code path, and the fields needed by the §10.10 reconciliation exist. The listing is used only to **find** a batch; an empty listing is never treated as proof of absence (chair decision C3), so no visibility-lag constant is measured or used |
 | V13 | `with_structured_output(method="json_schema", include_raw=True)` with `streaming=True` exposes `stop_reason`, `stop_details`, the served `model` and the cache usage fields | 2 calls (Sonnet, Opus) with payload capture | The fields are present in `raw.response_metadata` / `usage_metadata`. The request carries `output_config.format` and `effort`, and no `tool_choice`. |
 | V14 | Prompt cache hits per (model, effort) with the §10.6 layout | 2 identical-prefix calls per model | The second call has `cache_read_input_tokens ≥ 4,000` |
-| V15 | healthchecks Management API timeout/grace update, and ntfy publish with a token | Calls against the user's accounts at deployment | The check shows the updated timeout and grace; an ntfy test notification arrives |
+| V15 | healthchecks Management API timeout/grace update, and ntfy publish with a token | At the deployment step, against the user's accounts, with M5's CLI: `jobhunter ops notify-test` and `jobhunter ops deadman-sync --show` (§19.4) | The check shows the updated timeout and grace; an ntfy test notification arrives |
 | V16 | The TypeScript 7.0.2 toolchain (Vite 8 plugin, eslint, openapi-typescript) | Build the frontend | A clean build and lint. Otherwise stay on TypeScript 5.9.3. |
 | V17 | Gazetteer coverage of real location strings | Run the location parser over the scrubbed fixtures | ≥ 95% of German city strings resolve; no false "outside Germany" |
 | V18 | Adzuna `results_per_page=50` cap, `max_days_old`, `distance` semantics | ≤ 5 calls | Recorded fixtures confirm them |
 | V19 | The text input bound of §10.7 (chair decision C1): the tokenizer emits **at most one token per UTF-8 byte** for every rendered component, and the fixed per-request overhead per model | For 30 recorded generator, critic and profile requests per model, German and English, including umlauts, `ß`, typographic quotes and dashes: `messages.count_tokens` (free) for each component on its own and for the whole request, compared with the `usage` of the matching recorded responses (no new paid calls) | Every component has tokens ≤ bytes, and every recorded `usage` input + cache tokens ≤ the computed bound. `PROMPT_OVERHEAD_TOKENS[model]` = 2 × the largest framing overhead observed (whole-request tokens − Σ component tokens). For native PDF, `count_tokens` accepts the document block and recorded usage ≤ 1.25 × its count; otherwise the native-PDF path stays disabled. A violation of tokens ≤ bytes applies the §10.7 factor rule and restates S3 |
-| V20 | Client IP through Caddy | Compose test stack: requests from two client addresses, with and without a spoofed `X-Forwarded-For` | `login_attempts.ip` and `sessions.ip` record the real addresses; the spoofed header is ignored (test N2) |
-| V21 | The no-egress boundary | Compose test stack on the target VPS image with the `DOCKER-USER` rule installed | From `api` and `docparse`, DNS and TCP connections to an outside address fail; from `worker` they succeed (test N1) |
-| V22 | Secret delivery and the non-superuser restore (§19.2, §19.5) | Compose test stack with every secret file `root:10010`, mode 0440; a backup set, then a manifest created after it | Every app service passes `startup-check`. `pg_restore --no-owner --no-acl --exit-on-error` with the filtered list succeeds as the migrator and, into a database created from `jobhunter_template`, as `jobhunter_restore`. `migrate` also completes on a first installation and on an upgrade from the preceding release. Both `restore verify` phases pass: the post-dump manifest's operation postconditions hold after replay (including a profile purge whose version row stays with its content absent), its rebuild completes before the fence is released, and every identity restarts above its `max_ids`. The same stack also runs Fable's sequence (backup, source purge with rebuild, tombstone of the rebuilt job, restore), a manifest restored as `executing` without its file, and a purge followed by re-enablement and new collection: each `migrate` completes, and no row above a watermark is deleted |
+| V20 | Client IP through Caddy | Compose test stack: requests from two client addresses, with and without a spoofed `X-Forwarded-For` | `login_attempts.ip` and `sessions.ip` record the real addresses; the spoofed header is ignored (test N2). Recorded in `docs/spikes/V20.md` (the compose test stack in M5); the two real client addresses are the deployment step's |
+| V21 | The no-egress boundary | At the deployment step: M5's N1 stack test (`tests/stack/test_prod_network.py`, with the outside reach) on the target VPS image, with the egress rule's nft table loaded | From `api` and `docparse`, DNS and TCP connections to an outside address fail; from `worker` they succeed (test N1) |
+| V22 | Secret delivery and the non-superuser restore (§19.2, §19.5) | Compose test stack with every secret file `root:10010`, mode 0440; a backup set, then a manifest created after it | Every app service passes `startup-check`. `pg_restore --no-owner --no-acl --exit-on-error` with the filtered list succeeds as the migrator and, into a database created from `jobhunter_template`, as `jobhunter_restore`. `migrate` also completes on a first installation and on an upgrade from the preceding release. Both `restore verify` phases pass: the post-dump manifest's operation postconditions hold after replay (including a profile purge whose version row stays with its content absent), its rebuild completes before the fence is released, and every identity restarts above its `max_ids`. The same stack also runs Fable's sequence (backup, source purge with rebuild, tombstone of the rebuilt job, restore), a manifest restored as `executing` without its file, and a purge followed by re-enablement and new collection: each `migrate` completes, and no row above a watermark is deleted. Recorded in `docs/spikes/V22.md` (M5, on the compose test stack); the timed restore from the offline recovery kit is the deployment step's |
 
 ---
 
@@ -6766,11 +6912,11 @@ These are decided by the user at deployment. Each has a defined place in the con
 
 | Item | Where it goes | Constraint |
 |---|---|---|
-| Domain name | `JOBHUNTER_DOMAIN`, `JOBHUNTER_PUBLIC_ORIGIN`, Caddyfile | A DNS A/AAAA record pointing at the VPS before first start (ACME) |
+| Domain name | `JOBHUNTER_DOMAIN`, `JOBHUNTER_PUBLIC_ORIGIN`, Caddyfile | A DNS A record pointing at the VPS before first start (ACME); no AAAA record, since an IPv6 client would reach the api through one bridge address and share the login throttle |
 | ACME contact mailbox | `JOBHUNTER_ACME_EMAIL` | An operator mailbox |
 | VPS provider and region | — | EU region, 4 vCPU (AVX-512 VNNI preferred), 16 GB, ≥ 100 GB NVMe; run spike V7 on it |
-| Offsite backup target (S3-compatible) | `RESTIC_REPOSITORY`, `AWS_DEFAULT_REGION`, secrets `restic_password`, `s3_access_key_id`, `s3_secret_access_key` | A provider other than the VPS's; bucket versioning or object lock recommended |
-| Proxy network subnet | `deploy/compose.yaml` (`172.30.0.0/24`, Caddy at `.2`) | Change only if it collides with a host network; the uvicorn `--forwarded-allow-ips` value changes with it (§16.3) |
+| Offsite backup target (S3-compatible) | `RESTIC_REPOSITORY`, `AWS_DEFAULT_REGION`, secrets `restic_password`, `s3_access_key_id`, `s3_secret_access_key` | A provider other than the VPS's; bucket versioning on, with a noncurrent-version expiry longer than the backup retention (about 3 months); no object lock in compliance mode, which would keep deleted data past every purge |
+| Network subnets (`proxy`, `edge`, `internal`, `egress`) and Caddy's two addresses | `deploy/compose.yaml` (`172.30.0.0/24` to `172.30.3.0/24`; Caddy at `.2` on `proxy` and `edge`), `deploy/firewall/docker-user.nft` | Change only if one collides with a host network; the uvicorn `--forwarded-allow-ips` value (§16.3) and the egress rule (§16.9) change with them |
 | ntfy topic (and optional token) | `NTFY_TOPIC_URL`, secret `ntfy_token` | A private topic name; a token if the server requires auth |
 | healthchecks.io account and check | secrets `healthchecks_ping_url`, `healthchecks_api_key` | One check for the collection schedule; the Management API key is required, because the app manages the period (§17.7) |
 | Initial watchlist companies | Settings → Watchlist | — |

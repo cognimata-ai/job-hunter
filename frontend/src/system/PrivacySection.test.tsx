@@ -49,7 +49,9 @@ describe("PrivacySection", () => {
     expect(kept("Raw provider response bodies")).toBe("30 days, longer while a newer response refers to the same body");
     expect(kept("Raw provider response records (metadata, body already removed)")).toBe("With their fetch request: 13 months");
     expect(kept("Backups")).toBe("Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: indefinitely");
-    expect(kept("Backup set and backup run records")).toBe("13 months");
+    expect(kept("Backup set and backup run records")).toBe(
+      "13 months after they finished, except the newest successful backup set and restore test, and a set a kept run refers to",
+    );
     expect(kept("Closed or stale jobs (not saved, applied or in an active golden case)")).toBe(
       "90 days after they closed, then tombstoned: their hashed keys and user-action timestamps are kept, their content deleted",
     );

@@ -37,10 +37,13 @@ head's `schema_compat` row, which the newer release's `migrate` recorded:
 so a floor the older code knows also means that no destructive revision lies between its head and the
 database's. `schema_compat` versions the schema only, not the transition matrix (an older release on a newer
 schema keeps the newer one, `seed_defaults(sync_matrix=False)`) nor the manifest stream (step 1 and step 7 of
-`migrate` parse it): a release whose revision narrows a transition edge of an existing table, or changes the
-manifest format in a way an older parser refuses, declares that revision `destructive`; with a compatible
-floor the older release would pass `/readyz` and fail later, at a refused `transition()` or a
-`ManifestInvalid`.
+`migrate` parse it). A release whose revision narrows a transition edge of an existing table declares that
+revision `destructive`, so its rollback is a restore: with a compatible floor the older release would pass
+`/readyz` and fail later, at a refused `transition()`. A change of the manifest format ships expand/contract
+instead (spec §19.6): release N teaches the parser the new format while it still writes the old one, and
+release N+1 writes the new format. A rollback from N+1 therefore lands on N, whose restore reads both, so no
+release ever needs a restore its own parser cannot replay (one that skipped release N would stop its restore
+at a `ManifestInvalid`).
 """
 
 import functools

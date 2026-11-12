@@ -67,6 +67,7 @@ COVERED: Final[dict[str, str]] = {
     "Logs": "logs",
     "Sessions": "sessions",
     "Login attempts": "sessions",
+    "Login lockouts": "sessions",
     "Alerts": "alerts",
     "Exports": "exports",
     "Backups": "backups",

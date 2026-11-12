@@ -6,8 +6,10 @@
   code, which `is_manual` treats as manual, is one nobody raises.
 - Every §17.6 row is held as the spec states it: its severity, its escalation (`warn / critical`), whether
   it is pushed (`warn (in-app only)` is not) and whether it is manual (`manual`, `manual acknowledgement`),
-  parsed from the spec's table; `embedder.checksum_mismatch` resolves itself (Deviation 8).
-- The rows beyond the spec: the eight codes the code raised without a row and `docparse.leftover`.
+  parsed from the spec's table; `embedder.checksum_mismatch` resolves itself (Deviation 8, which spec
+  revision 3.7 states).
+- The rows beyond revision 3.6's table: the eight codes the code raised without a row and `docparse.leftover`,
+  which revision 3.7 adds to §17.6 (Deviation 7).
 - Every catalogued code has its `alert.<code>` text in English and in German.
 - `push_priority` maps a severity to its ntfy priority (§17.6 L5631), and an entry is pushed by it unless its
   code is never pushed.
@@ -46,8 +48,6 @@ ALERT_CODE: Final = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 # A §17.6 row: | `code` | severity | condition | auto-resolves |
 SPEC_ROW: Final = re.compile(r"^\| `([a-z0-9_.]+)` \| ([^|]+) \| .* \| ([^|]+) \|$")
 MANUAL_CELLS: Final = frozenset({"manual", "manual acknowledgement"})
-# §17.6 says manual; the catalogue resolves it on a later `checksum_ok: true` (Deviation 8).
-SELF_RESOLVING_DESPITE_SPEC: Final = frozenset({"embedder.checksum_mismatch"})
 
 
 def module_constants() -> set[str]:
@@ -121,7 +121,7 @@ def test_spec_rows_are_held_verbatim() -> None:
 
 def test_every_spec_row_is_held_verbatim() -> None:
     rows = spec_rows()
-    assert len(rows) == 63  # L5636-5698
+    assert len(rows) == 72  # revision 3.6's 63 rows and the nine of revision 3.7 (Deviation 7)
     for code, (severity_cell, resolves_cell) in rows.items():
         entry = CATALOGUE[code]
         severity, _, escalation = severity_cell.partition(" / ")
@@ -129,8 +129,7 @@ def test_every_spec_row_is_held_verbatim() -> None:
         severity = severity.removesuffix(" (in-app only)")
         assert (entry.code, entry.severity, entry.escalates_to) == (code, severity, escalation or None), code
         assert entry.pushed is (severity != "info" and not in_app_only), code
-        if code not in SELF_RESOLVING_DESPITE_SPEC:
-            assert entry.auto_resolves is (resolves_cell not in MANUAL_CELLS), (code, resolves_cell)
+        assert entry.auto_resolves is (resolves_cell not in MANUAL_CELLS), (code, resolves_cell)
 
 
 def test_the_rows_beyond_the_spec() -> None:

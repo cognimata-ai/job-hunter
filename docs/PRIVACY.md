@@ -51,7 +51,7 @@ Retention is dependency-aware: a record is removed only after everything that re
 | CV file (original) and raw CV text | `cv_store` (encrypted), `cv_files.raw_text_enc` | Files of the active and the previous profile version. Files of discarded or failed drafts and abandoned uploads: 30 days after the draft ended. | `retention_daily` / on confirm |
 | Contact-stripped text | `cv_files.stripped_text` | Same as the CV file | Same |
 | Draft content (`draft_json`, `reviewed_text`, and the `output_json` of the draft's `extract_profile` calls) | `profile_drafts`, `llm_calls` | 30 days after the draft is `confirmed`, `discarded` or `failed` (`content_purged_at`); the rows' ids, states and usage stay | `retention_daily` |
-| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | Profile purge (§20.2) |
+| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | `retention_daily`: a profile purge (§20.2) of each eligible version, which is not synthetic, not the active, the newest confirmed or the previous version, has its score history expired and has no active golden case or feedback naming it |
 | Query proposals (`items`, and the `output_json` of their `propose_queries` calls) | `query_proposals`, `llm_calls` | With the profile content; the proposal becomes `purged` | Profile purge |
 | Profile vectors | `profile_vectors` + `embeddings` | With the profile content | Profile purge |
 | Score history (targets, attempts, drafts, critic notes, llm_results, evidence, det instances, llm_calls) | DB | `retention.score_history_months` (default 12) after the target ended terminally, **except**: targets of the active tuple and everything they reference are never deleted by age (deleting one would make `missing_targets` re-create and re-score it); results referenced by an active golden case are kept; a target whose batch item belongs to a submission not yet resolved (`preparing`, `submit_started`, `submit_ambiguous`, `submitted`, `ended`, or `released` with `submit_started_at` younger than 29 days, the reconciler's clock) is kept with its items and calls until the submission is resolved; no age releases a submission (C3) | Target-set deletion (§20.2) |
@@ -60,7 +60,7 @@ Retention is dependency-aware: a record is removed only after everything that re
 | Golden cases | `golden_cases`, `eval_case_results`, their eval calls | Until the user deletes them (§14.2). While a case is active, **its job revision, the job and its profile version are exempt** from tombstoning and purges (the Adzuna purge excepted, §20.5). Tombstoning and the profile purge delete **inactive** cases they would otherwise orphan (§20.2) | User action (manifest) |
 | Eval runs, their case results and calls (golden, canary, schema dry-run) | `eval_runs`, `eval_case_results`, `llm_calls` | 13 months after the run, except the latest completed run of each kind | `retention_daily` (calls cascade) |
 | Raw provider payload bodies | `raw_responses.body_zstd` | 30 days, extended while a newer row references the body (§7.7) | `retention_daily` (body nulled) |
-| `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`) | `retention_daily` |
+| `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`); a `deferred` item is kept until it is resolved | `retention_daily` |
 | `raw_responses` rows (metadata, body already nulled) | DB | With their fetch request (13 months) | Cascade |
 | Runs, run attempts, fetch requests, score cycles, coverage intervals, operations, bulk operations | DB (metadata, no content) | 13 months (operations: 30 days after they finish) | `retention_daily` |
 | Batch submissions (metadata, no content) | DB | 13 months after they ended (`reconciled`, `submit_rejected`, `abandoned`, or `released` with `submit_started_at` older than 29 days), once their items went with their targets; their bulk operation after them | `retention_daily` |
@@ -68,7 +68,7 @@ Retention is dependency-aware: a record is removed only after everything that re
 | Quota ledger, LLM spend ledger, `llm_budget`, `quota_windows` | DB (no content) | Indefinitely, so a restart can never exceed a window or the cap | — |
 | `llm_tuples`, `execution_configs`, `evaluation_policies`, `model_policies` | DB (ids and settings, no personal content) | Indefinitely | — |
 | Posting observations, jobs, revisions, lineage | DB | While the job is retained | With the job |
-| Closed or stale jobs (not saved or applied, not referenced by an active golden case) | DB | 90 days after `jobs.availability_changed_at`, then **tombstoned**: hashed keys and user-action timestamps kept, content deleted | `retention_daily` + manifest |
+| Closed or stale jobs (not saved or applied, not referenced by an active golden case) | DB | 90 days after `jobs.availability_changed_at`, then **tombstoned**: hashed keys and user-action timestamps kept, content deleted | `retention_daily`: tombstone batches of up to 200 root jobs with the jobs merged into them (ten a run), the exemptions checked again under the fence; + manifest |
 | Saved or applied jobs | DB | Until the user clears saved/applied, or deletes everything | User action |
 | Embeddings | `embeddings` | While a revision or profile vector references them | `retention_daily` (unreferenced rows) |
 | LangGraph checkpoints | DB | 14 days after the run or cycle ends; a cycle's row goes only after its checkpoint thread | `retention_daily` (deletes threads) |
@@ -77,10 +77,11 @@ Retention is dependency-aware: a record is removed only after everything that re
 | Logs | Docker local driver | about 14 days (rotation) | Rotation |
 | Sessions | DB | Expiry + 1 day | daily |
 | Login attempts | DB | 30 days | daily |
+| Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
 | Alerts | DB | Resolved + 90 days | daily |
 | Exports | `exports` volume | 7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job tombstoning, so an export can hold content tombstoned after it was made until it expires | daily |
 | Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: indefinitely | `restic forget/prune` |
-| Backup sets, backup runs | DB | 13 months | daily |
+| Backup sets, backup runs | DB | 13 months after they finished, except the newest succeeded set and restore test, and a set a kept run names | daily |
 | Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
 | LangSmith traces | LangSmith EU | Per the LangSmith project retention setting (no I/O content) | LangSmith console |
 
