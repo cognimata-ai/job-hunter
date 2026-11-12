@@ -4,7 +4,9 @@
 #     --env-file /etc/jobhunter/jobhunter.env -f deploy/compose.yaml up -d --wait
 #
 # Every image is a variable: caddy and pgvector from deploy/images.lock, the app, backup, docparse and embedder
-# images from deploy/release.lock (written by the release PR, Task 29), each a `repo:tag@sha256:<digest>`.
+# images from deploy/release.lock (written by .github/workflows/release.yml and merged through its digest PR,
+# Task 29), each a `repo@sha256:<digest>`, e.g. `app_image=ghcr.io/<owner>/jobhunter-app@sha256:<digest>`; a
+# `repo:tag@sha256:<digest>` works too (the digest decides which image runs).
 # `${NAME:?}` fails loudly when a line is missing. The non-secret environment (§19.2) comes from
 # /etc/jobhunter/jobhunter.env, and each service names its own variables only, so a service sees only its own
 # (R26): `${NAME:?}` for a required one, `${NAME:-}` for an optional one (empty means the default). The

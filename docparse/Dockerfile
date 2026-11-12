@@ -30,6 +30,10 @@ RUN --mount=type=secret,id=build_ca,required=false \
 
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
+# The base image's pip goes (M5 Task 29): nothing runs it (uv installs the venv in the build stage), and the
+# image scan flags the certifi it vendors.
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info \
+    /usr/local/bin/pip*
 # The whole package, so no module of it is ever left out; .dockerignore keeps this Dockerfile and caches out.
 COPY docparse/ /app/docparse/
 # PYTHONPATH: the loop runs as `python -m docparse.worker`, and each job's spawn child imports docparse too.

@@ -248,6 +248,8 @@ def test_images_builds_four_images_and_pushes_nothing() -> None:
     }
     builds = docker_builds(job)
     assert [build.tag for build in builds] == list(expected)
+    # and nowhere else in ci.yml: the docparse job no longer builds its image a second time
+    assert [build.tag for each in doc["jobs"].values() for build in docker_builds(each)] == list(expected)
     for build in builds:
         file, target, bases = expected[build.tag]
         assert (build.file, build.target, build.context) == (file, target, "."), build.argv
@@ -281,6 +283,8 @@ def test_the_scan_fails_on_a_fixable_critical() -> None:
             "/var/run/docker.sock:/var/run/docker.sock",
             from_lock("trivy"),
             "image",
+            "--scanners",
+            "vuln",  # the gate is a fixable CRITICAL vulnerability; the repository's secrets are gitleaks'
             "--exit-code",
             "1",
             "--severity",
@@ -299,6 +303,17 @@ def test_the_scan_fails_on_a_fixable_critical() -> None:
         assert not set(found[i]) & {"continue-on-error", "if"}, found[i]
         assert "||" not in str(found[i]["run"]) and ";" not in str(found[i]["run"])
     assert "continue-on-error" not in job
+
+
+def test_no_build_context_holds_a_secret_or_a_raw_recording() -> None:
+    """Every image is built from the repository root (`context: .`), and .dockerignore keeps `.secrets` (the
+    secret files) and `.fixtures-raw` (raw recordings with personal data) out of it, with no later `!` line
+    letting either back in; the scan checks vulnerabilities only, so nothing else would notice."""
+    lines = [line.strip() for line in (REPO / ".dockerignore").read_text("utf-8").splitlines()]
+    patterns = [line for line in lines if line and not line.startswith("#")]
+    for name in (".secrets", ".fixtures-raw"):
+        assert name in patterns, name
+        assert not [p for p in patterns if p.startswith("!") and p.lstrip("!/").startswith(name)], name
 
 
 def test_prodstack_triggers_are_pull_requests_to_main_and_dispatch() -> None:

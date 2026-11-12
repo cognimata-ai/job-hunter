@@ -117,10 +117,13 @@ def images() -> None:
                 "keeping its volumes) to run the backup image test."
             )
     # restic_password and the role passwords: kept when they exist, never printed. Without a key variable the
-    # script writes an empty anthropic_key when it has none, and keeps the one there.
+    # script writes an empty anthropic_key when it has none, and keeps the one there. As root, through
+    # `sudo -n` (which fails rather than ask), as prodstack.ensure_test_secrets runs test-secrets.sh: the
+    # script sets group 10010 on its directory at every run, which a user who is not root (a CI runner)
+    # cannot.
     env = {name: value for name, value in os.environ.items() if name != KEY_VARIABLE}
     subprocess.run(
-        [str(REPO / "scripts/dev-secrets.sh")],
+        ["sudo", "-n", str(REPO / "scripts/dev-secrets.sh")],
         check=True,
         capture_output=True,
         timeout=CALL_TIMEOUT_S,

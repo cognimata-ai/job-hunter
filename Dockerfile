@@ -2,7 +2,7 @@
 
 # The app image (api, worker, migrate): a non-editable install of the locked dependencies and the jobhunter wheel
 # into /opt/venv, and the built SPA in /opt/spa, which the api serves (M4 Task 19). The runtime stage holds no
-# source tree, no Node runtime and no node_modules, and runs as 10001:10001 (spec §19.1, §19.2).
+# source tree, no Node runtime, no node_modules and no pip, and runs as 10001:10001 (spec §19.1, §19.2).
 #
 # The backup image (M5 Task 10, Deviation 29: the backup and restore roles) is the `backup` stage, the last
 # one: the runtime plus restic and the PostgreSQL 17 client. A build without a target would produce it, so
@@ -60,8 +60,11 @@ COPY --from=spa /src/frontend/dist /opt/spa
 # The mount points of the cv_store volume (encrypted CV files, §12.1) and, since M5 (R18), of the manifests
 # volume (the deletion manifests' files, §19.5) and the exports volume (the encrypted export archives, §20.3),
 # each owned by the app user and private to it: Docker gives a fresh named volume the ownership and mode of the
-# image's directory.
-RUN mkdir -p /data/cv /data/manifests /data/exports \
+# image's directory. The base image's pip goes first (M5 Task 29): nothing runs it (uv installs the venv in the
+# build stage), and the image scan flags the certifi it vendors.
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info \
+        /usr/local/bin/pip* \
+    && mkdir -p /data/cv /data/manifests /data/exports \
     && chown 10001:10001 /data/cv /data/manifests /data/exports \
     && chmod 0700 /data/cv /data/manifests /data/exports
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1
