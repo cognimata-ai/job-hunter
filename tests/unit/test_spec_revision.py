@@ -21,7 +21,8 @@ The spec is prose, so only the values that the code also holds are pinned here:
   §14.2 lists the routes M5 added, `/api/privacy/manifests` and `/api/alerts/{id}/resolve` among them, each a
   route of the api's OpenAPI document; §19.8's `source.auth_failed` row restarts the worker (Compose does not
   see a secret file's content); §4.1's backup row names the app image's `backup` stage, which the
-  `Dockerfile` builds; §20.4's re-authentication asks for the TOTP code.
+  `Dockerfile` builds; §20.4's re-authentication asks for the TOTP code; and the offsite lag of deleted data
+  is about 4 months, with the bucket's 30-day noncurrent-version expiry, in §19.5, §20.4, §20.6 and §23.
 """
 
 # ruff: noqa: RUF001  (the spec's text as it is written: its dashes and its prime)
@@ -435,3 +436,25 @@ def test_20_4_re_authentication_asks_for_the_totp_code() -> None:
     body = " ".join(_section("### 20.4 "))
     typed = f"The user types `{DELETE_EVERYTHING_PHRASE}`"
     assert f"{typed}, re-enters the password and, with TOTP on, a code" in body
+
+
+# The offsite lag of deleted data (Ruling T32-2): about 3 months of retained backup sets, plus up to 30 days
+# of the bucket's deleted object versions, so about 4 months, wherever the spec states it.
+OFFSITE_LAG = "about 4 months"
+VERSIONS_EXPIRY = "noncurrent-version expiry of 30 days"
+
+
+def test_the_offsite_lag_of_deleted_data_is_about_4_months() -> None:
+    retention = " ".join(_section("### 19.5 "))
+    assert f"so deleted data can stay offsite for {OFFSITE_LAG}" in retention
+    assert "noncurrent versions for 30 days" in retention
+    delete_everything = " ".join(_section("### 20.4 "))
+    assert f"deleted data can stay in the offsite backups for {OFFSITE_LAG}" in delete_everything
+    statement = " ".join(_section("### 20.6 "))
+    assert f"the offsite lag of {OFFSITE_LAG}" in statement
+    assert "lag of about 3 months" not in statement
+    targets = [line for line in _section("## 23. ") if line.startswith("| Offsite backup target")]
+    assert len(targets) == 1
+    assert VERSIONS_EXPIRY in targets[0]
+    assert f"the offsite lag of deleted data to {OFFSITE_LAG}" in targets[0]
+    assert "the monthly restore test within about a month" in targets[0]

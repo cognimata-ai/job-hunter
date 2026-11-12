@@ -8,8 +8,8 @@ checks it against what it documents:
 - the headings: the production intro, sections 1 to 13, then the existing sections, in that order;
 - every alert code of `CATALOGUE` has one row in section 6, with the catalogue's severity and resolution;
 - the deploy checklist (section 1) names every secret of `deploy/secrets.example`, every environment variable
-  `deploy/compose.yaml` reads, PRIVACY.md's operator fields and the deployment's other inputs, and the file
-  holds nothing e-mail-shaped;
+  `deploy/compose.yaml` reads, PRIVACY.md's operator fields and the deployment's other inputs, the bucket's
+  noncurrent-version expiry is 30 days and no other (Ruling T32-2), and the file holds nothing e-mail-shaped;
 - no rotation is followed by an `up -d`: in section 7 each secret install is followed by a restart, and the
   rows of the two key alerts say `$JH restart worker`;
 - every `startup-check` names its role, the role of the service it runs in, and host setup names all five;
@@ -101,7 +101,7 @@ INPUTS: Final = (
     "ACME e-mail",
     "S3",
     "bucket versioning",
-    "noncurrent-version expiry",
+    "noncurrent-version expiry of 30 days",  # Ruling T32-2: the offsite lag of deleted data is about 4 months
     "Object Lock",
     "compliance mode",
     "SSH",
@@ -409,6 +409,9 @@ def test_the_deploy_checklist_names_every_deployment_input() -> None:
     assert len(fields) == 5, fields
     assert [field for field in fields if field not in checklist] == []
     assert [phrase for phrase in INPUTS if phrase not in checklist] == []
+    bucket = [line for line in checklist.splitlines() if "noncurrent-version expiry" in line]
+    assert len(bucket) == 1, bucket
+    assert re.findall(r"\b(\d+) days\b", bucket[0]) == ["30"], "the deleted versions' expiry is 30 days only"
     assert EMAIL.search(_text()) is None, "no e-mail address: the ACME e-mail is a placeholder"
 
 

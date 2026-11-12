@@ -15,7 +15,10 @@ RUNBOOK's deploy checklist fills its operator fields (Task 31). So:
 - it uses only headings, paragraphs, bullet lists, tables, `**bold**` and `` `code` ``;
 - the typed phrases, the export's period and its record's, and the login throttle it states are the code's;
 - §2 states the client addresses HEAD logs and stores, and how long it keeps them (Rulings T19-2 (1),
-  T19-3 I2).
+  T19-3 I2);
+- §6 and the UI's backup note (`settings_privacy.later`, in English and German) state the offsite lag of
+  deleted data: about 4 months, the bucket's deleted object versions up to 30 days after a set ages out
+  (Ruling T32-2).
 """
 
 import json
@@ -35,6 +38,7 @@ PRIVACY: Final = REPO / "docs/PRIVACY.md"
 SPEC: Final = REPO / "docs/superpowers/specs/2026-10-16-job-hunter-design.md"
 GEONAMES: Final = REPO / "backend/src/jobhunter/geo/data/ATTRIBUTION.md"
 CATALOGUE: Final = REPO / "frontend/src/i18n/en.json"
+CATALOGUES: Final = {lang: REPO / f"frontend/src/i18n/{lang}.json" for lang in ("en", "de")}
 COMPOSE: Final = REPO / "deploy/compose.dev.yaml"
 
 SECTIONS: Final = (
@@ -80,6 +84,16 @@ LOGGED_REQUESTS: Final = (
     "neither the api nor its reverse proxy logs requests with the client address; sign-in and "
     "re-authentication events record the client address with their outcome"
 )
+# The offsite lag of deleted data (Ruling T32-2): about 3 months of retained backup sets, plus up to 30 days
+# of the bucket's deleted object versions. §6 states it, and so does the UI's backup note in both languages.
+OFFSITE_LAG: Final = (
+    "keeps the deleted files of an aged-out set for up to 30 days more",
+    "deleted data can remain in the offsite backups for about 4 months in all",
+)
+UI_OFFSITE_LAG: Final = {
+    "en": ("for up to 30 days more", "leaves the offsite backups within about 4 months"),
+    "de": ("noch bis zu 30 Tage auf", "innerhalb von etwa 4 Monaten aus den externen Sicherungen"),
+}
 LOG_ROTATION: Final = re.compile(r'max-size: (\d+)m, max-file: "(\d+)"')
 OPERATOR_FIELDS: Final = (
     "[set at deployment: operator name]",
@@ -257,3 +271,11 @@ def test_the_logged_client_addresses_and_their_retention_are_stated() -> None:
     rotation = LOG_ROTATION.search(COMPOSE.read_text(encoding="utf-8"))
     assert rotation is not None, "the services' log rotation"
     assert f"rotated at {rotation.group(2)} files of {rotation.group(1)} MB per service" in categories
+
+
+def test_the_offsite_lag_of_deleted_data_is_stated() -> None:
+    deletion = " ".join(section(lines_of(PRIVACY), "## 6. Deletion and export"))
+    assert [phrase for phrase in OFFSITE_LAG if phrase not in deletion] == []
+    for lang, phrases in UI_OFFSITE_LAG.items():
+        note = json.loads(CATALOGUES[lang].read_text(encoding="utf-8"))["settings_privacy.later"]
+        assert [phrase for phrase in phrases if phrase not in note] == [], lang
