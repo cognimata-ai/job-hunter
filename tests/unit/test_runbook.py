@@ -17,6 +17,12 @@ checks it against what it documents:
   data keys included;
 - the restore (section 9) runs one `crypto rotate` pass per extra key between the restore and `up -d`;
 - every compose command of the production sections is `$JH …`, and the existing sections keep theirs;
+- a one-off `$JH run` whose service depends on `migrate` takes `--no-deps`, and api and worker are stopped
+  before any command runs `migrate` (§19.5; Ruling T31-3 M11);
+- no data volume is removed before section 8's procedure ships the manifests and checks that none is left, and
+  section 10 states the manifest format's expand/contract rule (Rulings T31-2, T31-3 I1 and I3);
+- V21 is the N1 stack test on the VPS, and its hand probes of api and docparse connect to a literal address
+  (Ruling T31-3 I2);
 - every `scripts/…` path exists and takes the flags given to it, every `jobhunter …` command is a command of
   the CLI's parser with the options given to it, and every service a `$JH` command names is a service of
   `deploy/compose.yaml`.
@@ -56,7 +62,7 @@ SECTIONS: Final = (
     "## 12. The embedder model",
     "## 13. The deployment step",
 )
-CHECKLIST, HOST_SETUP, _, _, _, ALERTS, ROTATION, KIT, RESTORE, _, _, _, _ = SECTIONS
+CHECKLIST, HOST_SETUP, _, _, _, ALERTS, ROTATION, KIT, RESTORE, UPGRADE, _, _, DEPLOYMENT = SECTIONS
 # The M3 and M4 sections, after the new ones, in their order.
 EXISTING: Final = (
     "## The web UI's operator paths",
@@ -150,6 +156,18 @@ COMPOSE_VALUE_OPTIONS: Final = frozenset(
 )
 # The subcommands whose first operand is the service (the rest is its command).
 ONE_SERVICE: Final = frozenset({"run", "exec"})
+ONE_OFF_RUN: Final = re.compile(r"\$JH (?:--profile \S+ )?run\b")
+MIGRATING: Final = re.compile(r"\bjobhunter (?:migrate|manifests replay)\b")
+# A run of the migrate service with its own command (`… migrate jobhunter startup-check …` runs no migration).
+OWN_MIGRATE: Final = re.compile(r"\$JH (?:--profile \S+ )?run(?: -\S+)* migrate")
+APP: Final = frozenset({"api", "worker"})
+# Section 8's procedure before a wipe, and what removes the manifests volume (Ruling T31-3 I1).
+BEFORE_A_WIPE: Final = "**Before any volume is removed**"
+VOLUME_REMOVAL: Final = re.compile(r"docker volume rm .*jobhunter_manifests|\$JH down -v|\bwiped\b")
+SHIP: Final = "$JH exec backup jobhunter backup ship"
+# V21 on the VPS (Ruling T31-3 I2): the N1 stack test, and hand probes that connect to a literal address.
+N1: Final = "tests/stack/test_prod_network.py"
+ADDRESS_PROBE: Final = re.compile(r"create_connection\(\('\d{1,3}(?:\.\d{1,3}){3}', \d+\)")
 
 
 @cache
@@ -157,26 +175,29 @@ def _text() -> str:
     return RUNBOOK.read_text(encoding="utf-8")
 
 
-def _split(markdown: str) -> tuple[list[str], str]:
-    """The logical lines of `markdown`'s fenced code blocks (a line ending in `\\` joined to the next, every
-    run of whitespace one space), and its text outside them."""
-    code: list[str] = []
-    prose: list[str] = []
+def _lines(markdown: str) -> list[tuple[bool, str]]:
+    """`markdown`'s lines in order, each with whether it is code: a fenced line is one logical line (a line
+    ending in `\\` joined to the next, every run of whitespace one space), the fences themselves left out."""
+    lines: list[tuple[bool, str]] = []
     inside = False
     pending = ""
     for line in markdown.splitlines():
         if line.strip().startswith(FENCE):
             inside = not inside
-            continue
-        if not inside:
-            prose.append(line)
-            continue
-        if line.rstrip().endswith("\\"):
+        elif not inside:
+            lines.append((False, line))
+        elif line.rstrip().endswith("\\"):
             pending += line.rstrip()[:-1] + " "
-            continue
-        code.append(" ".join((pending + line).split()))
-        pending = ""
-    return code, "\n".join(prose)
+        else:
+            lines.append((True, " ".join((pending + line).split())))
+            pending = ""
+    return lines
+
+
+def _split(markdown: str) -> tuple[list[str], str]:
+    """The logical lines of `markdown`'s fenced code blocks, and its text outside them."""
+    lines = _lines(markdown)
+    return [text for code, text in lines if code], "\n".join(text for code, text in lines if not code)
 
 
 def _spans(prose: str) -> list[str]:
@@ -185,9 +206,10 @@ def _spans(prose: str) -> list[str]:
 
 
 def _snippets(markdown: str) -> list[str]:
-    """Every piece of code of `markdown`: the fenced lines, then the inline spans."""
-    code, prose = _split(markdown)
-    return [*code, *_spans(prose)]
+    """Every piece of code of `markdown`, in document order: its fenced lines and its inline spans."""
+    lines = _lines(markdown)
+    assert not [text for code, text in lines if code and "`" in text], "a fenced line with a backtick"
+    return _spans("\n".join(f"`{text}`" if code else text for code, text in lines))
 
 
 def _headings() -> list[str]:
@@ -300,9 +322,10 @@ def _check_command(parser: argparse.ArgumentParser, words: list[str]) -> None:
         assert option in current._option_string_actions, f"`jobhunter {' '.join(path)}` has no {option}"
 
 
-def _jh_services(snippet: str) -> list[str]:
-    """The services each `$JH …` command of `snippet` names (placeholders such as `<services>` left out)."""
-    named: list[str] = []
+def _compose_calls(snippet: str) -> list[tuple[str, list[str]]]:
+    """Each `$JH …` command of `snippet`: its subcommand and the services it names (placeholders such as
+    `<services>` left out)."""
+    calls: list[tuple[str, list[str]]] = []
     for match in re.finditer(r"\$JH\b", snippet):
         tokens = shlex.split(snippet[match.end() :])
         while tokens and tokens[0].startswith("-"):
@@ -310,6 +333,7 @@ def _jh_services(snippet: str) -> list[str]:
         if not tokens:
             continue
         subcommand, rest = tokens[0], tokens[1:]
+        named: list[str] = []
         index = 0
         while index < len(rest) and rest[index] not in SEPARATORS and rest[index] != "$JH":
             token = rest[index]
@@ -321,7 +345,26 @@ def _jh_services(snippet: str) -> list[str]:
             if subcommand in ONE_SERVICE:
                 break
             index += 1
-    return named
+        calls.append((subcommand, named))
+    return calls
+
+
+def _jh_services(snippet: str) -> list[str]:
+    """The services the `$JH …` commands of `snippet` name."""
+    return [service for _, services in _compose_calls(snippet) for service in services]
+
+
+def _depends_on(service: str) -> set[str]:
+    """Every service `service` depends on in `deploy/compose.yaml`, directly or not."""
+    services = _compose()["services"]
+    found: set[str] = set()
+    pending = [service]
+    while pending:
+        for dependency in services[pending.pop()].get("depends_on", {}):
+            if dependency not in found:
+                found.add(dependency)
+                pending.append(dependency)
+    return found
 
 
 def test_the_new_sections_come_first_in_order() -> None:
@@ -457,3 +500,69 @@ def test_every_named_script_and_command_exists() -> None:
             commands += 1
         assert [name for name in _jh_services(snippet) if name not in services] == [], snippet
     assert scripts and commands
+
+
+def test_a_one_off_run_never_starts_migrate_beside_the_stack() -> None:
+    """Without `--no-deps`, Compose starts a run's dependencies again: a one-off run of a service that depends
+    on `migrate` (api, worker) takes `--no-deps`, so `migrate` never runs beside a live api and worker."""
+    runs = 0
+    for heading in SECTIONS:
+        for snippet in _snippets(_section(heading)):
+            services = _jh_services(snippet) if ONE_OFF_RUN.match(snippet) else []
+            if not services:
+                continue
+            (service,) = services
+            runs += 1
+            if "migrate" in _depends_on(service):
+                options = snippet.split(f" {service} ", 1)[0]
+                assert "--no-deps" in options.split(), f"{heading}: `{snippet}`"
+    assert runs
+
+
+def test_api_and_worker_stop_before_migrate() -> None:
+    """Within each section, in document order, a command that runs `migrate` or `manifests replay` follows a
+    stop of api and worker, with no command between that starts either again."""
+    migrations = 0
+    for heading in SECTIONS:
+        stopped = False
+        for snippet in _snippets(_section(heading)):
+            for subcommand, named in _compose_calls(snippet):
+                services = set(named)
+                if subcommand in ("stop", "down") and (not services or APP <= services):
+                    stopped = True
+                elif subcommand in ("up", "start", "restart") and (not services or services & APP):
+                    stopped = False
+                if OWN_MIGRATE.fullmatch(snippet) or MIGRATING.search(snippet):
+                    migrations += 1
+                    assert stopped, f"{heading}: `{snippet}` while api and worker may run"
+    assert migrations
+
+
+def test_no_volume_is_removed_before_the_manifests_are_shipped() -> None:
+    kit = _section(KIT)
+    assert BEFORE_A_WIPE in kit, "section 8 has no procedure before a wipe"
+    procedure = kit[kit.index(BEFORE_A_WIPE) :]
+    snippets = _snippets(procedure)
+    ship = snippets.index(SHIP)
+    check = next(index for index, snippet in enumerate(snippets) if "manifest_shipment_items" in snippet)
+    assert ship < check, "the check of the latest shipment follows the ship"
+    assert [p for p in ("backup_job_busy", "run it again", "remove no volume") if p not in procedure] == []
+    removals = 0
+    for heading in SECTIONS:
+        text = _section(heading)
+        for match in VOLUME_REMOVAL.finditer(text):
+            removals += 1
+            assert BEFORE_A_WIPE in text[: match.start()], f"{heading}: `{match[0]}` before {BEFORE_A_WIPE}"
+    assert removals
+    upgrade = _section(UPGRADE)
+    assert [p for p in ("expand/contract", "remove no volume", "roll forward") if p not in upgrade] == []
+
+
+def test_v21_runs_n1_on_the_vps_and_probes_connecting_out_by_address() -> None:
+    assert (REPO / N1).is_file()
+    snippets = _snippets(_section(DEPLOYMENT))
+    n1 = [s for s in snippets if s.startswith("JOBHUNTER_N1_OUTSIDE=1 ") and "pytest -m stack" in s]
+    assert [s for s in n1 if s.endswith(f" {N1}")], "V21 runs the N1 stack test with the outside reach"
+    probes = [s for s in snippets if re.match(r"\$JH exec -T (?:api|docparse) ", s)]
+    assert {probe.split()[3] for probe in probes} == {"api", "docparse"}
+    assert [probe for probe in probes if not ADDRESS_PROBE.search(probe)] == [], "connect to an address"

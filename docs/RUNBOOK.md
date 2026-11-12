@@ -1,11 +1,12 @@
 # Job Hunter runbook
 
-The operations guide of spec §19.8. This file starts with the score lane's entries (M3, plan Task 27): a
-paused score lane and its acknowledgement, a quarantined batch and its release, a submitted batch that cannot
-be retrieved, the live schema dry-run before a prompt-schema version is activated, and the golden eval run on
-the installation before an activation. M4 adds the web UI's operator paths (below), which each entry names
-before its API route, and, for development, the E2E suite (last). M5 adds the host setup, start and stop, the
-health check, secret rotation, restore and the rest of the alert table (§19.8).
+The operations guide of spec §19.8. This file starts with the production stack (M5, plan Task 31): the deploy
+checklist, host setup, the first start, start and stop, the health check, the alert table, secret rotation,
+the backups and the offline recovery kit, restore, upgrade and rollback, and the deployment step. The score
+lane's entries follow (M3, plan Task 27): a paused score lane and its acknowledgement, a quarantined batch and
+its release, a submitted batch that cannot be retrieved, the live schema dry-run before a prompt-schema version
+is activated, and the golden eval run on the installation before an activation. M4 adds the web UI's operator
+paths (below), which each entry names before its API route, and, for development, the E2E suite (last).
 
 Every command below runs on the host in the compose directory. `docker compose run --rm --no-deps worker
 jobhunter …` starts a one-off container of the worker image with the worker's configuration and secrets; it
@@ -42,8 +43,9 @@ Then pass `-b jh.cookies -H "Origin: $ORIGIN" -H 'X-JH-Request: 1'` to each call
 
 Sections 1 to 13 deploy, run, back up, restore, rotate and upgrade the production stack of `deploy/compose.yaml`
 on the VPS (M5). Each command in them runs in a root shell on the VPS (`sudo -i`), in the checkout of the
-release tag at `/opt/jobhunter`, and each compose command is `$JH …`, Task 21's production command line, set
-once:
+release tag at `/opt/jobhunter`, and each compose command is `$JH …`, Task 21's production command line. It is
+set once in each root shell, once section 2 has cloned the checkout (a shell variable ends with its shell, after
+a reboot for one; root's shell profile can hold the two lines):
 
 ```
 cd /opt/jobhunter
@@ -55,8 +57,12 @@ Compose without the two lock files reads no image, and `${app_image:?}` stops it
 stack runs takes `--no-deps`: without it Compose starts the service's dependencies again, `migrate` among them,
 which runs only while api and worker are stopped (section 10). "Section n" below is one of these sections, "§"
 a section of the design specification. Placeholders are in angle brackets (`<domain>`, `<dir>`). No secret's
-value is ever typed on a command line, printed or pasted. The sections after section 13, from **The web UI's
-operator paths** on, are M3's and M4's, with the bare compose commands of the introduction above.
+value is ever typed on a command line, printed or pasted, with one exception: `user totp enable` prints the
+otpauth URI, which holds the TOTP secret, for the authenticator app to read (section 11); clear the terminal and
+its scrollback afterwards. The sections after section 13, from **The web UI's operator paths** on, are M3's and
+M4's, written with the bare compose commands of the introduction above. On the VPS each of those runs as `$JH`
+with the same arguments: in `/opt/jobhunter` a bare docker compose finds no compose file, the files being in
+`deploy/`.
 
 ## 1. Deploy checklist
 
@@ -83,7 +89,7 @@ VPS. No secret goes into this repository, an issue or a chat.
 | GHCR: the release's images | run `release.yml`, merge its digest PR and check out the release tag (section 10); the VPS logs in to `ghcr.io` with a read-only token (section 2) |
 | The place of the offline recovery kit | off the VPS and offline, named in the deployment record (section 8) |
 | The embedder's export: fp32 (the one locked) or int8 | V7 on the VPS's CPU decides (section 13, item 9); int8 means a new `embedder/model.lock` and a new release (section 12) |
-| PRIVACY.md's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | `docs/PRIVACY.md`, under Operator, in the commit `release.yml` builds: the app image bundles the file when it is built |
+| PRIVACY.md's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | `docs/PRIVACY.md`, under Operator, in the commit `release.yml` builds: the app image bundles the file when it is built. Filling them there trips the markers check of `tests/unit/test_privacy_md.py` and puts the contact address into the repository, so how they are filled is a decision pending for the deployment step |
 | The exclusivity confirmations: the SerpApi account is used by this app only (C2), the Anthropic workspace by this installation only (C3) | the deployment record; a foreign use shows as `quota.serpapi_foreign_usage`, or as spend the app did not count |
 
 **The environment file** `/etc/jobhunter/jobhunter.env`, root's, mode 0640, written with an editor. It holds no
@@ -144,19 +150,24 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    that it does not come back at boot; `swapon --show` after a reboot lists nothing.
 2. **The checkout and the registry.** Install Docker Engine at its pinned version (section 1). Clone the
    repository to `/opt/jobhunter`, check out the release tag (section 10), and log in to GHCR with the
-   read-only token, read from a file:
+   read-only token, read from a file that is deleted afterwards (Docker keeps the login in root's
+   `~/.docker/config.json`):
 
    ```
    git clone <repository URL> /opt/jobhunter
    git -C /opt/jobhunter checkout <release tag>
    docker login ghcr.io --username <GitHub user> --password-stdin < <token file>
+   rm <token file>
    ```
+
+   Then set `JH` (the introduction).
 
 3. **The environment file.** `install -d -m 0755 /etc/jobhunter`, then write `/etc/jobhunter/jobhunter.env`
    (section 1) with an editor and `chmod 0640 /etc/jobhunter/jobhunter.env`. Then `$JH pull` fetches the
    release's images.
 4. **The secret files.** In a new directory `<dir>`, root's, mode 0700, make the generated values, then write
-   each provider key into its own file with an editor (never `echo`, never a command line):
+   each provider key into its own file with an editor (never `echo`, never a command line). On the VPS of a
+   first deployment:
 
    ```
    install -d -m 0700 <dir>
@@ -165,9 +176,17 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    for name in pg_bootstrap db_app db_migrator db_backup db_restore; do openssl rand -hex 24 > "<dir>/$name"; done
    ```
 
-   Copy `data_key` and `restic_password` into the offline recovery kit now, the data key labelled with its key
-   id (section 8). On the fresh host of a restore, `<dir>` takes the kit's current `data_key`,
-   `restic_password`, `s3_access_key_id` and `s3_secret_access_key` instead of new ones.
+   Then, on a first deployment only, copy `data_key` and `restic_password` into the offline recovery kit, the
+   data key labelled with its key id (section 8). On the fresh host of a restore (section 9), `data_key` and
+   `restic_password` are not made anew: copy the kit's `data_key`, `restic_password`, `s3_access_key_id` and
+   `s3_secret_access_key` into `<dir>`, and make the other generated values only:
+
+   ```
+   install -d -m 0700 <dir>
+   umask 077
+   openssl rand -base64 32 > "<dir>/session_secret"
+   for name in pg_bootstrap db_app db_migrator db_backup db_restore; do openssl rand -hex 24 > "<dir>/$name"; done
+   ```
 5. **Host setup**, by `scripts/host-setup.sh` (R22): a dry run first, which prints each command and runs none,
    then the real run:
 
@@ -275,6 +294,16 @@ Once, after host setup, in this order (section 13, items 5 and 6):
   resumes as a new attempt. The dead-man switch is what pages for a frozen worker (M0 Carry-forward 3): no run
   pings healthchecks, whose own alert reaches you even when the VPS is dead. In the app, `worker.heartbeat_stale`
   and `/readyz`'s `worker_heartbeat` show it.
+- **A changed environment file.** Compose applies a change of `/etc/jobhunter/jobhunter.env` only through `up`,
+  which recreates each service whose environment changed, and which also starts `migrate` again. So stop api
+  and worker first, then edit the file and start the stack:
+
+  ```
+  $JH stop api worker
+  $JH up -d --wait
+  ```
+
+  The offline recovery kit's copy of the file changes too (section 8).
 
 ## 5. Health check
 
@@ -282,7 +311,8 @@ Once, after host setup, in this order (section 13, items 5 and 6):
    `migrations`, `worker_heartbeat`, `embedder`).
 2. In the UI: Profile & Settings → System → Health shows the run and backup ages, the queues, the quota windows,
    the spend, the disk and table sizes, the embedder and the LangSmith state (`GET /api/system/health`).
-3. On the VPS: `$JH ps` (each service running, those with a healthcheck `healthy`, `migrate` exited 0) and
+3. On the VPS: `$JH ps -a` (each service running, those with a healthcheck `healthy`, `migrate` exited 0;
+   without `-a`, `ps` lists the running containers only) and
    `$JH logs worker --since 1h` (the logs hold ids, codes and counts, never personal data).
 4. After every boot: `systemctl status jobhunter-egress` shows the egress rule `active (exited)`, and
    `nft list table inet jobhunter_egress` lists it. The unit is ordered before Docker and fails open, so a rule
@@ -308,8 +338,8 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 | `run.orphaned_queue` | warn | auto | A queued run lost its queue job (a worker restart) and was failed. Nothing to do unless it repeats (then as `worker.heartbeat_stale`); the next success resolves it. |
 | `schedule.stale_data` | critical | auto | No successful run for twice the schedule's interval. Check the worker (`$JH ps`, section 4), System → Runs and Needs attention → Broken sources; the dead-man switch alarms for the same cause. A successful run resolves it. |
 | `worker.heartbeat_stale` | critical | auto | The worker's heartbeat is older than 60 s: `$JH ps worker` and `$JH logs worker --since 1h`. A frozen worker takes `$JH restart worker` (section 4). A fresh heartbeat resolves it. |
-| `embedder.unavailable` | warn | auto | An embedding failed in a run: `$JH ps embedder` and `$JH logs embedder` (memory, a failed start). It restarts by itself; the alert resolves once the embedder is healthy and the backlog is embedded. |
-| `embedder.checksum_mismatch` | critical | auto | The embedder's model files differ from `embedder/model.lock`. The image is pinned by digest, so its local copy is damaged or the release is wrong: `$JH rm -sf embedder`, `docker image rm <embedder_image of deploy/release.lock>`, `$JH pull embedder`, `$JH up -d --no-deps --wait embedder`. If it stays, report it and roll back (section 10). A checked start resolves it. |
+| `embedder.unavailable` | warn | auto | An embedding failed in a run: `$JH ps embedder` and `$JH logs embedder` (memory, a failed start). When the log shows `embedder.checksum_mismatch`, or the container keeps exiting with code 78, follow `embedder.checksum_mismatch` (next row). Otherwise it restarts by itself; the alert resolves once the embedder is healthy and the backlog is embedded. |
+| `embedder.checksum_mismatch` | critical | auto | The embedder's model files differ from `embedder/model.lock`. This alert is best effort: the real embedder exits 78 at a mismatch and restarts in a loop, so a mismatch shows mostly as `embedder.unavailable`, the readiness check `embedder` and the dead-man alarm, with `embedder.checksum_mismatch` in `$JH logs embedder`. The image is pinned by digest, so its local copy is damaged or the release is wrong: `$JH rm -sf embedder`, `docker image rm <embedder_image of deploy/release.lock>`, `$JH pull embedder`, `$JH up -d --no-deps --wait embedder`. If it stays, report it and roll back (section 10). A checked start resolves it. |
 | `source.breaker_open` | warn | auto | A source failed repeatedly and its breaker paused it; Needs attention → Broken sources shows its last error. It tries again by itself and resolves on a success; act on an error that lasts (a key: `source.auth_failed`). |
 | `source.auth_failed` | critical | auto | Rotate or renew the source's key in its secret file (section 7: `rapidapi_key`, `serpapi_key`, `adzuna_app_id`, `adzuna_app_key`), then `$JH restart worker`: the worker reads its secrets at its start (R6). A successful call resolves it. |
 | `source.contract_broken` | critical | auto | The source's responses no longer fit the envelope its adapter expects: the provider changed its API. Report it with the source and the run; Needs attention → Rejected raw items keeps the responses, to **[Replay]** once a fixed release is deployed (section 10). A valid response resolves it. |
@@ -376,8 +406,15 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 
 **Failing a draft by hand** (`profile.extract_generation_mismatch`). The draft the alert's context names
 (`draft_id`) stays `extracting_profile` with nothing to drive it on, and it holds the one open-draft slot, so
-no upload or paste starts. Fail it along the transition matrix's edge `extracting_profile → failed`, as the
-application role (the table's trigger checks the edge):
+no upload or paste starts. First check that no operation can still move it, by a read-only query that must
+return no row (a row: wait until that operation has ended):
+
+```
+$JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT id, kind, status FROM operations WHERE kind IN ('extract_profile_text', 'extract_profile') AND payload->>'draft_id' = '<draft_id>' AND status IN ('pending', 'running')"
+```
+
+Then fail it along the transition matrix's edge `extracting_profile → failed`, as the application role (the
+table's trigger checks the edge):
 
 ```
 $JH exec postgres psql -U jobhunter_app -d jobhunter -c "UPDATE profile_drafts SET status = 'failed', status_reason = 'attempts_exhausted', failure_code = 'attempts_exhausted', status_changed_at = now(), updated_at = now() WHERE id = <draft_id> AND status = 'extracting_profile'"
@@ -444,7 +481,7 @@ but pointless.
    | 0 | the report | Only the current key remains: step 3. |
    | 1 | `"error": "previous_key_remains"` | A ciphertext is still under the mounted previous key, sealed by a service that was not restarted: `$JH restart api worker`, then run it again. |
    | 2 | `"error": "no_previous_key"` | `data_key_previous` is empty, and a ciphertext under another key than the current one exists; nothing was rewritten. Mount the old key (step 2). |
-   | 3 | `"error": "other_keys_remain"` | Keys it was not given remain (`remaining_by_key_id`): the next pass mounts one of them, from the kit, as `data_key_previous`, restarts api and worker, and runs it again. |
+   | 3 | `"error": "other_keys_remain"` | Keys it was not given remain (`remaining_by_key_id`): the next pass installs one of them, copied from the kit, as `data_key_previous` (the copy deleted once installed), restarts api and worker, and runs it again. |
 
    Exit 1 is also `{"error": "database"}`, or `{"error": "unexpected", …}` naming the kind, the table and the
    row of a ciphertext that cannot be rotated; every rerun stops at that row until it is dealt with.
@@ -490,6 +527,34 @@ $JH exec backup jobhunter backup set
 $JH exec backup jobhunter backup ship
 $JH exec backup jobhunter backup restore-test
 ```
+
+**Before any volume is removed** (a rollback by restore, section 10; a timed restore onto the same VPS, section
+13). The manifests volume holds the only copy of every deletion manifest not shipped yet, and a restore replays
+the offsite stream only: a deletion never shipped would not be replayed, and the data it deleted would come
+back. So, before a `docker volume rm` or a `down` that removes volumes:
+
+1. Ship the manifests:
+
+   ```
+   $JH exec backup jobhunter backup ship
+   ```
+
+   Only exit 0 lets the procedure go on: `{"shipped": true, …}`, or `{"shipped": false, …}` when the stream was
+   shipped already. On `{"error": "backup_job_busy"}` or `{"error": "locked"}` (another backup job holds a
+   lock), run it again. On any other error, stop and remove no volume: fix the cause as the
+   `privacy.manifest_unshipped` row says (section 6), then ship again.
+2. Check that the latest shipment holds every manifest file, as the application role. api and worker may be
+   stopped, so a manifest's `status` can lag behind its shipment; this query reads the shipment itself:
+
+   ```
+   $JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT m.id, m.status, m.file_sha256 IS NOT NULL AS has_file FROM deletion_manifests m WHERE NOT EXISTS (SELECT 1 FROM manifest_shipment_items i WHERE i.shipment_id = (SELECT max(id) FROM manifest_shipments) AND i.manifest_uuid = m.manifest_uuid AND i.file_sha256 = m.file_sha256)"
+   ```
+
+   No row: nothing is left unshipped. A row with `has_file` true: ship again (step 1), and remove no volume
+   until the query returns no row. A row with `has_file` false is a purge that had not started deleting (its
+   deletions start only once its file exists, §19.5): the volumes take it with them, so note its id and request
+   that deletion again afterwards. While the api runs, System → Health's unshipped manifests and the alert
+   `privacy.manifest_unshipped` show the same.
 
 **The offline recovery kit** (R1). Only the kit restores a lost VPS: the backup sets are restic's, encrypted
 with `restic_password`, and the CV files, the CV texts and the TOTP secret in them are sealed with the data
@@ -543,8 +608,12 @@ worker stay stopped until the last step.
 
    ```
    install -o root -g 10010 -m 0440 <kit key file> /etc/jobhunter/secrets/data_key_previous
+   rm <kit key file>
    $JH run --rm --no-deps worker jobhunter crypto rotate
    ```
+
+   `<kit key file>` is the key copied from the kit onto the VPS; it is deleted once installed, and step 4
+   empties the installed one.
 
    On exit 3, `other_keys_remain`, its `remaining_by_key_id` names the key ids still present: the next pass
    installs one of them. On exit 0 only the current key remains. The current key's id is `base64 -d
@@ -575,7 +644,7 @@ The RTO is 4 h (§19.5), measured by the deployment step's timed restore (sectio
 **Releases** (R24; `.github/workflows/release.yml`). A release is dispatched by hand on the commit to deploy
 (Actions → Release → Run workflow). It pushes the app, backup, docparse and embedder images to GHCR, tagged
 with the commit, and opens the digest PR, which writes their digests into `deploy/release.lock`; a deploy runs
-what that PR merges.
+that PR's head commit, by its release tag (below).
 
 - The workflow needs the repository setting that lets GitHub Actions create pull requests (Settings → Actions →
   General → Workflow permissions); it is off by default.
@@ -584,20 +653,41 @@ what that PR merges.
   dispatching the workflows that offer it or by pushing a commit to its branch.
 - An attempt that fails after its push leaves its branch `release/<sha>-<run id>-<attempt>`: delete it.
 - The runner's disk for the real embedder build is checked at its first run.
-- Once the digest PR is merged, tag its merge commit (`git tag <release tag> <merge commit>`, then
-  `git push origin <release tag>`): the release tag is what the VPS checks out.
+- Once the digest PR is merged, tag its head commit, not the merge commit: the head's tree is the tree the
+  images were built from plus `deploy/release.lock`, while a merge commit can carry other commits that landed
+  meanwhile (`git tag <release tag> <head commit>`, then `git push origin <release tag>`). The release tag is
+  what the VPS checks out.
 
 **An upgrade** (§19.6):
 
 0. Check out the release tag (R24): `git fetch --tags`, then `git checkout <release tag>`, in `/opt/jobhunter`.
 1. `$JH pull`.
 2. A backup set and a shipment just before the change, which a rollback by restore starts from:
-   `$JH exec backup jobhunter backup set` (note its `set_id`), then `$JH exec backup jobhunter backup ship`.
+   `$JH exec backup jobhunter backup set` (note the `set_id` it prints), then
+   `$JH exec backup jobhunter backup ship`. On `{"error": "backup_job_busy"}` (another backup job runs), run it
+   again; on another error, fix it (the `backup.failed` row, section 6). Do not start the upgrade without a
+   `set_id` and a ship that exited 0.
 3. `$JH stop api worker`: `migrate` and `jobhunter manifests replay` run only with api and worker stopped
    (§19.5); the worker drains within its 120 s.
 4. `$JH run --rm migrate`, which exits 0.
 5. `$JH up -d --wait`; a run that was in flight resumes as a new attempt.
 6. The health check (section 5).
+
+**Host files a checkout changes.** A checkout gives the files the containers bind-mount, and the egress rule,
+new content that the running containers and the loaded rule do not see, and `up -d` recreates a container only
+when its compose configuration changed. After the checkout of step 0, or of a rollback, list what changed:
+
+```
+git diff --stat <previous release tag> <release tag> -- deploy/Caddyfile deploy/caddy deploy/postgres/postgresql.conf deploy/firewall
+```
+
+- `deploy/postgres/postgresql.conf`: `$JH restart postgres` in step 3, once api and worker are stopped.
+- `deploy/Caddyfile` or `deploy/caddy/`: `$JH restart caddy` after step 5.
+- `deploy/firewall/docker-user.nft`: `systemctl restart jobhunter-egress`.
+- `deploy/firewall/jobhunter-egress.service`: install it again (section 2, step 6 of the manual equivalent),
+  then `systemctl daemon-reload` and `systemctl restart jobhunter-egress`.
+
+A change of `/etc/jobhunter/jobhunter.env` is section 4's.
 
 Every `migrate` re-checks each completed manifest's postconditions, a few count queries per manifest, so its
 time grows with the number of manifests kept: negligible at this installation's scale, and the first place to
@@ -608,26 +698,34 @@ restores the last backup set when it reports `migrate_schema_ahead_incompatible`
 
 1. `git checkout <previous release tag>`, `$JH pull`, `$JH stop api worker`, `$JH run --rm migrate`.
 2. Exit 0, with the log line `migrate_schema_ahead_compatible`: the previous release runs on the newer schema,
-   and `/readyz` passes. `$JH up -d --wait`, then the health check.
+   and `/readyz` passes. `$JH up -d --wait`, then the host files that changed (above) and the health check.
 3. Exit 1, with the log line `migrate_schema_ahead_incompatible`: the newer schema is none the previous release
    can run on (a destructive revision, or a floor it does not know). Roll back by restore, with the previous
-   release still checked out: ship the last manifests, remove the data volumes, and restore the set of the
-   upgrade's step 2:
+   release still checked out, and only when it reads every manifest the newer release wrote (**Rollbacks and
+   the manifest format**, below). If it cannot, remove no volume: stay on the newer release
+   (`git checkout <release tag>`, then `$JH up -d --wait`) and roll forward with a fix. Otherwise:
+   1. Section 8's **Before any volume is removed**: the ship exits 0, and the check finds no manifest file left
+      unshipped. On any failure, stop here and remove no volume.
+   2. Remove the data volumes, and restore the set of the upgrade's step 2:
 
-   ```
-   $JH exec backup jobhunter backup ship
-   $JH down
-   docker volume rm jobhunter_pgdata jobhunter_cv_store jobhunter_manifests jobhunter_exports jobhunter_backup_staging
-   $JH up -d --wait postgres
-   $JH --profile restore run --rm restore jobhunter restore run --set <id>
-   ```
+      ```
+      $JH down
+      docker volume rm jobhunter_pgdata jobhunter_cv_store jobhunter_manifests jobhunter_exports jobhunter_backup_staging
+      $JH up -d --wait postgres
+      $JH --profile restore run --rm restore jobhunter restore run --set <id>
+      ```
 
-   Then section 9's steps 3 to 5. What was written after that set is lost, except the deletions: their
-   manifests are offsite, and the restore replays them.
+      Then section 9's steps 3 to 5. What was written after that set is lost, except the deletions: their
+      manifests are offsite, and the previous release's restore replays them, as it reads them (below).
 
-A release whose migration narrows a transition edge of an existing table, or changes the manifest format in a
-way the older parser refuses, declares its revision destructive (`db/compat.py`). Its rollback is therefore a
-restore, never a redeploy of the previous tag.
+**Rollbacks and the manifest format** (Ruling T31-2). A release whose migration narrows a transition edge of an
+existing table declares its revision destructive (`db/compat.py`): its rollback is a restore, never a redeploy
+of the previous tag. A change of the manifest format ships expand/contract instead: release N teaches the
+parser the new format while it still writes the old one, and release N+1 writes the new format. A rollback from
+N+1 lands on N, whose restore reads both, so the restore of a rollback replays every manifest of the stream.
+Should the previous release not read the newer manifests (a format change that skipped release N), its restore
+would stop at the first of them (`ManifestInvalid`, in its `migrate` step) after every volume was removed: so
+remove no volume, stay on the newer release, and roll forward with a fix.
 
 **The drill.** `tests/stack/test_prod_drills.py` rehearses an upgrade and its rollback on the compose test
 stack, never on the VPS. `scripts/build-prev-image.sh`, which takes no arguments and needs a clone with the
@@ -656,7 +754,8 @@ full history, builds the release before migration 0011 for it as `jobhunter-app:
 
 **A lost password**: `$JH run --rm --no-deps api jobhunter user set-password` asks for the new one twice and
 revokes every session. A lost authenticator: `$JH run --rm --no-deps api jobhunter user totp disable`, then
-`$JH run --rm --no-deps api jobhunter user totp enable` for a new one. A login lockout:
+`$JH run --rm --no-deps api jobhunter user totp enable` for a new one; it prints the otpauth URI, which holds
+the TOTP secret, and its QR code, so clear the terminal and its scrollback afterwards. A login lockout:
 `$JH run --rm --no-deps api jobhunter sessions unlock`.
 
 ## 12. The embedder model
@@ -692,38 +791,68 @@ what) or not attempted (why), in `docs/spikes/V21.md`, `docs/spikes/V15.md` and 
    (section 3, step 2).
 6. [ ] **The first start.** `$JH run --rm backup jobhunter backup init` against the real S3 bucket;
    `$JH up -d --wait`; `user create`; `/readyz` from outside (section 3).
-7. [ ] **V21: N1 on the VPS image.** api and docparse can neither resolve nor connect out, the worker can, and
-   the rule is loaded at boot (reboot once first):
+7. [ ] **V21: N1 on the VPS image.** The record is the N1 stack test, run on the VPS as `docs/spikes/V21.md`
+   says, with `JOBHUNTER_N1_OUTSIDE=1`: api and docparse can neither resolve nor connect out, the worker can,
+   its reach to the outside included. The test brings up the compose test stack, which uses the production
+   stack's subnets, and it loads and deletes the egress rule's table itself (it skips while the production
+   table is loaded). So the production stack and the rule stop for it, and start again after. From a scratch
+   checkout of the release tag, with uv (as for item 9):
 
    ```
-   $JH exec -T api python -I -c "import socket; socket.create_connection(('example.org', 443), 3)"
-   $JH exec -T docparse python -I -c "import socket; socket.create_connection(('example.org', 443), 3)"
-   $JH exec -T worker python -I -c "import socket; socket.create_connection(('example.org', 443), 3); print('connected')"
+   $JH down
+   systemctl stop jobhunter-egress
+   cd <scratch checkout>
+   JOBHUNTER_N1_OUTSIDE=1 uv run pytest -m stack -q -p no:cacheprovider tests/stack/test_prod_network.py
+   cd /opt/jobhunter
+   systemctl start jobhunter-egress
+   $JH up -d --wait
+   ```
+
+   N1 passes when every test of the module passes, `test_worker_reaches_outside` included. The module builds
+   the test stack's images (the embedder's `fake` target, so no model), makes its dummy secrets in the scratch
+   checkout and removes its own projects at the end; delete the scratch checkout afterwards. Then reboot once,
+   and check on the production stack that the rule loaded at boot and that the boundary holds. These hand
+   probes are a quick check, not the record. api and docparse connect to a literal address, so what fails is
+   the connection itself, not a name lookup:
+
+   ```
    systemctl status jobhunter-egress
    nft list table inet jobhunter_egress
+   $JH exec -T api python -I -c "import socket; socket.create_connection(('192.0.2.1', 443), 3)"
+   $JH exec -T docparse python -I -c "import socket; socket.create_connection(('192.0.2.1', 443), 3)"
+   $JH exec -T worker python -I -c "import socket; socket.create_connection(('example.org', 443), 3); print('connected')"
    ```
 
-   The first two fail with `socket.gaierror` (no outside name resolves); the worker prints `connected`; the
-   unit is `active (exited)` and the table is listed.
-8. [ ] **V20: N2 from two real client addresses.** Sign in from two networks (for example a phone on mobile
-   data and a fixed line). Each attempt records its client's own address, never Caddy's:
+   The unit is `active (exited)` and the table is listed. api and docparse fail at once with `OSError: [Errno
+   101] Network is unreachable`: they have no route out (192.0.2.1 is a documentation address). The worker
+   prints `connected`.
+8. [ ] **V20: N2 from two real client addresses**, with and without a spoofed header, as
+   `docs/spikes/V20.md` says. Sign in from two networks (for example a phone on mobile data and a fixed line).
+   Then, from one of them, send one login with a spoofed `X-Forwarded-For` (203.0.113.9, a documentation
+   address) and a deliberately wrong password, so that no secret is typed; it answers 401. Read the attempts:
 
    ```
+   curl -sS -H "Origin: https://<domain>" -H 'Content-Type: application/json' -H 'X-Forwarded-For: 203.0.113.9' --data '{"username": "<name>", "password": "<a wrong password>"}' https://<domain>/api/auth/login
    $JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT at, host(ip), success FROM login_attempts ORDER BY id DESC LIMIT 4"
    ```
+
+   Each attempt records its client's own address, never Caddy's, and the spoofed address appears nowhere:
+   Caddy replaces the header.
 
 9. [ ] **V7 on the VPS's CPU.** fp32 and int8 throughput, RSS and parity, with `docs/spikes/V7.md`'s commands,
    on the VPS host from a scratch checkout with uv, not in a container: `embedder/download_model.sh <model
    dir>`, the int8 file beside it with a scratch lock of its sha256, then `uv run --group embedder python
    scripts/spikes/v7_embedder.py <model dir>` and the same with `--onnx onnx/model_int8.onnx --fp32 <model
-   dir>`. This one measurement needs the host's own route to `huggingface.co` and the package index. The user
-   decides the export (M1 Deviation 47); a new embedder image if int8 (section 12).
+   dir>`. This one measurement needs the host's own route to `huggingface.co` and the package index. fp16 is
+   not measured: spec revision 3.7 (Task 32) drops the fp16 fallback, which V7 measured slower than fp32. The
+   user decides the export (M1 Deviation 47); a new embedder image if int8 (section 12).
 10. [ ] **V15.** `ops notify-test` arrives on the phone; `ops deadman-sync --show` shows the period (section 3,
     step 5); healthchecks' own alert route is tested once (its integration's test notification).
 11. [ ] **The first backups.** A first nightly backup set and a manifest shipment offsite (System → Health); a
     manual `$JH exec backup jobhunter backup restore-test`.
-12. [ ] **The timed restore.** From the offline recovery kit only, onto a second fresh VPS (or the same one
-    wiped), by section 9, against the RTO of 4 h; record the time.
+12. [ ] **The timed restore.** From the offline recovery kit only, by section 9, onto a second fresh VPS, or,
+    after section 8's **Before any volume is removed**, onto the same one wiped; against the RTO of 4 h. Record
+    the time.
 13. [ ] **A release deployed and rolled back** (section 10).
 14. [ ] **The soak.** A first free-sources collection, then 24 to 72 h of watching: the backup age, the dead-man
     pings, the alert delivery, the disk and the memory (`docker stats --no-stream`).
