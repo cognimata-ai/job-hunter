@@ -1,7 +1,7 @@
 // The files each Playwright project must discover (plan M4 Task 32): `check-list.mjs` (`npm run e2e:check`)
 // compares them with what `playwright test --list` finds, so a `testMatch` that matches nothing fails loudly.
-// Tasks 33 and 34 add their scenario files to `scenarios` (five and eleven). Plain data only: `check-list.mjs`
-// imports this file with Node's own type stripping.
+// Tasks 33 and 34 add their scenario files to `scenarios` (five and eleven), and M5 Task 30 E18's, the last. Plain
+// data only: `check-list.mjs` imports this file with Node's own type stripping.
 export const EXPECTED_SPECS: Record<"first-use" | "stack-setup" | "scenarios", readonly string[]> = {
   "first-use": [
     "00-session-cookie.spec.ts",
@@ -27,5 +27,6 @@ export const EXPECTED_SPECS: Record<"first-use" | "stack-setup" | "scenarios", r
     "17-e14-warnings.spec.ts",
     "18-e15-preset.spec.ts",
     "19-e17-needs-attention.spec.ts",
+    "20-e18-privacy.spec.ts",
   ],
 };

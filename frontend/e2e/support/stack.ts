@@ -1,10 +1,10 @@
 // The E2E stack from a spec (plan M4 Task 32): the four-file dev stack's compose command, psql as the bootstrap
 // role, the score lane's bucket, polling, the fake Batches API's script, the smoke user's credentials, E9's
 // grounded job and whether the worker is on both fakes (Task 33), E10's re-ingest pair, E17's seeded rejected
-// item and overrun buffer bound, and a posting's job (Task 34). It only runs `exec` and `run` against the
-// running stack, never `up`, so a local override layered at `up` (the SPA served from the host's build)
-// survives. A command's stdout is returned, never printed; a failure names the command's first words, its exit
-// status and the tail of its stderr.
+// item and overrun buffer bound, and a posting's job (Task 34); the deletion-manifest shipper's repository and
+// its run (M5 Task 30). It only runs `exec` and `run` against the running stack, never `up`, so a local override
+// layered at `up` (the SPA served from the host's build) survives. A command's stdout is returned, never printed;
+// a failure names the command's first words, its exit status and the tail of its stderr.
 import { spawn } from "node:child_process";
 import { REPO_ROOT } from "./paths";
 import { rememberSecret } from "./redact";
@@ -180,6 +180,19 @@ export async function jobOfPosting(sourceId: string, nativeId: string): Promise<
  * worker without the fixtures overlay a run would reach the providers. */
 export async function workerOnBothFakes(): Promise<boolean> {
   return (await scriptValue("smoke_m2", "all(smoke_m2.worker_flags().values())")) === "True";
+}
+
+/** The deletion-manifest shipper's local restic repository initialised (`jobhunter backup init` in a one-off
+ * `shipper` container, deploy/compose.dev.yaml; plan M5 Task 30): once for a new `restic_repo` volume, a no-op
+ * when it exists. The `shipper` image is built with the stack (`$DC --profile shipper build`, e2e.yml). */
+export async function initResticRepo(): Promise<void> {
+  await compose(["run", "--rm", "-T", "shipper", "jobhunter", "backup", "init"]);
+}
+
+/** The shipper run once (`jobhunter backup ship`, the `shipper` service's command): the deletion manifests
+ * completed since are shipped to the local repository and marked `shipped` ("Confirmed offsite"). */
+export async function runShipper(): Promise<void> {
+  await compose(["run", "--rm", "-T", "shipper"]);
 }
 
 /** The score lane's bucket refilled (`smoke_m3.ADVANCE_BUCKET`, Ruling T28-f): the month row's clock a month

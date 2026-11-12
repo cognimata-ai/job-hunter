@@ -7,9 +7,10 @@
 # its own; a dev container uses its pre-installed one), the sentinel check that no failure artefact keeps a
 # credential (`e2e:sentinel`: an invented login on a local stub, no stack; spec §16 L5486), the dev secrets
 # (dev-secrets.sh without a key: the fake LLM needs none), the stack (the embedder's `fake` target: no model
-# download) and the suite. The report and the test output (screenshots and page snapshots; under CI no trace,
-# which would hold the session cookies and the login bodies) are uploaded when the suite fails; the stack and its
-# volumes go in every case.
+# download) with the deletion-manifest shipper's image (the `shipper` profile, built with it: E18 initialises its
+# local restic repository and runs it on demand, plan M5 Task 30) and the suite. The report and the test output
+# (screenshots and page snapshots; under CI no trace, which would hold the session cookies and the login bodies)
+# are uploaded when the suite fails; the stack and its volumes go in every case.
 #
 # Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment), uv
 # and Node to exact versions, the images to the digests of deploy/images.lock. No secret is referenced: the token
@@ -59,6 +60,8 @@ jobs:
         run: npm --prefix frontend run e2e:sentinel
       - name: The dev secrets (the fake LLM needs no key)
         run: sudo scripts/dev-secrets.sh
+      - name: The E2E stack's images, the shipper's included (E18 runs it)
+        run: $DC --profile shipper build
       - name: The E2E stack
         run: $DC up -d --build --wait
       - name: The E2E suite

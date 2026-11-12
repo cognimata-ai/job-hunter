@@ -1,9 +1,10 @@
 """The CI `e2e` job (`.github/workflows/e2e.yml`; plan M4 Task 32, U2, R3, Rulings T32-a, F4-a): on pull
 requests to main and by hand only; the spec list checked before a browser, the stack or the suite; the
 sentinel check that no failure artefact keeps a credential (`e2e:sentinel`) run once the browser is installed
-and before the stack; every action pinned to a full commit SHA (checkout, setup-uv and setup-node as `ci.yml`
-pins them, upload-artifact as `eval-manual.yml` does); the report and the test output uploaded on a failure
-only, the stack and its volumes removed in every case; and no secret referenced."""
+and before the stack; the shipper's image built before the stack comes up (E18 runs it, plan M5 Task 30);
+every action pinned to a full commit SHA (checkout, setup-uv and setup-node as `ci.yml` pins them,
+upload-artifact as `eval-manual.yml` does); the report and the test output uploaded on a failure only, the
+stack and its volumes removed in every case; and no secret referenced."""
 
 import re
 from pathlib import Path
@@ -72,6 +73,7 @@ def test_the_spec_list_is_checked_before_the_run() -> None:
         index_of("npx --prefix frontend playwright install --with-deps chromium"),
         index_of("npm --prefix frontend run e2e:sentinel"),
         index_of("sudo scripts/dev-secrets.sh"),
+        index_of("$DC --profile shipper build"),  # E18 runs the shipper (plan M5 Task 30)
         index_of("$DC up -d --build --wait"),
         index_of("npm --prefix frontend run e2e"),
     ]
