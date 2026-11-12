@@ -393,28 +393,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "migrate":
         # Imported here: migrate pulls in procrastinate, langgraph and alembic, which `startup-check` (the
         # healthcheck path of every container) must not load.
-        from jobhunter.db.migrate import run_migrate
+        from jobhunter.db.migrate import SchemaAheadIncompatible, run_migrate
 
         db_role: DbRole = args.db_role
-        run_migrate(
-            startup_or_exit(MIGRATE_CONFIG_ROLES[db_role]),
-            steps=args.steps,
-            database=args.database,
-            manifest_dir=args.manifest_dir,
-            cv_dir=args.cv_dir,
-            exports_dir=args.exports_dir,
-            db_role=db_role,
-        )
+        try:
+            run_migrate(
+                startup_or_exit(MIGRATE_CONFIG_ROLES[db_role]),
+                steps=args.steps,
+                database=args.database,
+                manifest_dir=args.manifest_dir,
+                cv_dir=args.cv_dir,
+                exports_dir=args.exports_dir,
+                db_role=db_role,
+            )
+        except SchemaAheadIncompatible:
+            return 1  # logged (`migrate_schema_ahead_incompatible`): the RUNBOOK rolls back by restore
         return 0
     if args.command == "manifests":
         # Imported here, like `migrate`: `manifests replay` is its steps 1, 3 and 7 (§19.4), as the migrator.
-        from jobhunter.db.migrate import run_migrate
+        from jobhunter.db.migrate import SchemaAheadIncompatible, run_migrate
 
-        run_migrate(
-            startup_or_exit("migrate"),
-            steps=frozenset({"sequences", "replay"}),
-            manifest_dir=args.manifest_dir,
-        )
+        try:
+            run_migrate(
+                startup_or_exit("migrate"),
+                steps=frozenset({"sequences", "replay"}),
+                manifest_dir=args.manifest_dir,
+            )
+        except SchemaAheadIncompatible:
+            return 1  # logged, as for `migrate`
         return 0
     if args.command == "api":
         # Imported here: the api command needs uvicorn, and the app it serves FastAPI and the database layer.

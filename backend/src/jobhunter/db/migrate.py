@@ -21,6 +21,15 @@ subset of step groups (`STEP_GROUPS`), always in `MIGRATE_ORDER`; `database` and
 and the login of every step (`AppConfig.dsn`); `manifest_dir`, `cv_dir` and `exports_dir` replace the volumes
 of the configuration (`manifests_dir`, `cv_store_dir`, `exports_dir`), so a scratch run never touches the live
 ones.
+
+**A newer schema** (M5 Task 27, Deviation 32). Under the lock and before any step, `migrate` reads where the
+database stands to this code (`db.compat.schema_state`). `current` and `behind` run the steps as above.
+`ahead_compatible` (a rollback to this release from a newer one whose floor this code knows) logs
+`migrate_schema_ahead_compatible` with both heads and runs every selected step but the alembic one, which
+would refuse a head it does not know; the seed then leaves the transition matrix as the newer release wrote
+it (its schema's triggers check that one, `seed_defaults(sync_matrix=False)`), so it writes nothing.
+`ahead_incompatible` logs `migrate_schema_ahead_incompatible` with both heads and raises
+`SchemaAheadIncompatible` before any step (the CLI exits 1); the RUNBOOK rolls back by restore.
 """
 
 import asyncio
@@ -39,8 +48,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, DbRole
-from jobhunter.db.alembic_runner import upgrade_head
-from jobhunter.db.compat import chain_compat, record_compat
+from jobhunter.db.alembic_runner import code_head, upgrade_head
+from jobhunter.db.compat import SchemaState, chain_compat, database_heads, record_compat, schema_state
 from jobhunter.db.seed import seed_defaults
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
@@ -95,6 +104,11 @@ BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments"
 #            `backup.backup_set.BACKUP_JOB_LOCK_KEY`, M5 Task 26)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
+
+
+class SchemaAheadIncompatible(Exception):
+    """The database's schema is newer than this code and not one it runs on (`db.compat.schema_state`:
+    `ahead_incompatible`); `migrate` refuses it before any step, and the RUNBOOK rolls back by restore."""
 
 
 async def apply_explicit_grants(conn: AsyncConnection) -> list[str]:
@@ -154,7 +168,24 @@ async def _advance(conn: AsyncConnection, step: MigrateStep, manifest_dir: Path)
     log.info("migrate_identities_advanced", step=step, advanced=advanced)
 
 
-async def _run_step(step: MigrateStep, target: _Target, engine: AsyncEngine, now: datetime) -> None:
+async def _schema_state(engine: AsyncEngine) -> SchemaState:
+    """Where the database stands to this code (`db.compat.schema_state`); a newer schema is logged with both
+    heads, and an incompatible one refused (`SchemaAheadIncompatible`)."""
+    head = code_head()
+    async with engine.connect() as conn:
+        state = await schema_state(conn, code_head=head)
+        heads = list(await database_heads(conn))
+    if state == "ahead_compatible":
+        log.info("migrate_schema_ahead_compatible", database_heads=heads, code_head=head)
+    elif state == "ahead_incompatible":
+        log.error("migrate_schema_ahead_incompatible", database_heads=heads, code_head=head)
+        raise SchemaAheadIncompatible(f"the database's head {heads} is not one the code of {head} runs on")
+    return state
+
+
+async def _run_step(
+    step: MigrateStep, target: _Target, engine: AsyncEngine, now: datetime, state: SchemaState
+) -> None:
     match step:
         case "reconstruct_and_advance":
             async with engine.begin() as conn:
@@ -196,7 +227,8 @@ async def _run_step(step: MigrateStep, target: _Target, engine: AsyncEngine, now
                 await _advance(conn, step, target.manifest_dir)
         case "seed":
             async with engine.begin() as conn:
-                await seed_defaults(conn, now=now)
+                # On a newer schema the matrix is the newer release's (module docstring)
+                await seed_defaults(conn, now=now, sync_matrix=state != "ahead_compatible")
         case _:
             assert_never(step)
 
@@ -251,7 +283,8 @@ async def run_migrate_async(
     db_role: DbRole | None = None,
 ) -> list[MigrateStep]:
     """Run the steps of `MIGRATE_ORDER` that `steps` selects (every one without it) as `db_role` (default: the
-    configuration role's) on `database` (default: `JOBHUNTER_DB_NAME`); returns the steps run, in order.
+    configuration role's) on `database` (default: `JOBHUNTER_DB_NAME`); returns the steps run, in order. On a
+    newer schema the alembic step is skipped, or nothing runs (`SchemaAheadIncompatible`; module docstring).
 
     `manifest_dir`, `cv_dir` and `exports_dir` default to the configuration's volumes (module docstring).
     Concurrent runs on a database are serialised on `MIGRATE_LOCK_KEY`. `now` (default: the current time) is
@@ -277,10 +310,14 @@ async def run_migrate_async(
         async with _migrate_lock(target.dsn):
             engine = make_null_engine(target.sqlalchemy_dsn)
             try:
+                phase = "schema_state"
+                state = await _schema_state(engine)
+                if state == "ahead_compatible":
+                    order = tuple(step for step in order if step != "alembic")
                 for step in order:
                     phase = step
                     log.info("migrate_step", step=step)
-                    await _run_step(step, target, engine, moment)
+                    await _run_step(step, target, engine, moment, state)
             finally:
                 await engine.dispose()
     except Exception as exc:

@@ -19,17 +19,37 @@ destructive: no older code is promised to run on it.
 
 `migrate` validates the chain before Alembic moves the schema, and records it in `schema_compat`
 (`record_compat`) right after Alembic has upgraded to the head.
+
+**An older release on a newer schema** (Task 27, M5-R4 R2, Deviation 32). `schema_state` tells the code of a
+release where the database stands to it, from `alembic_version` and, for a head the code does not know, that
+head's `schema_compat` row, which the newer release's `migrate` recorded:
+
+- `current`: the database's head is the code's;
+- `behind`: every head is in the code's chain (an empty database has none): `migrate` upgrades it;
+- `ahead_compatible`: one head the code does not know, whose row names a floor in the code's chain (at or
+  before the code's head) and is not destructive. The code runs on it: `migrate` skips the alembic step
+  and `/readyz` passes, so a rollback is a redeploy of the previous release's images;
+- `ahead_incompatible`: anything else, a destructive head, a floor the code does not know, a head without
+  a row (or several heads): `migrate` refuses before any step and `/readyz` fails; the RUNBOOK rolls back
+  by restore.
+
+`classify_schema` is that rule without the database. The floors only move forward along a validated chain,
+so a floor the older code knows also means that no destructive revision lies between its head and the
+database's.
 """
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Final
+from typing import Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.alembic_runner import chain_modules
 from jobhunter.db.sql import q
+
+SchemaState = Literal["current", "behind", "ahead_compatible", "ahead_incompatible"]
 
 
 @dataclass(frozen=True)
@@ -144,3 +164,64 @@ async def record_compat(conn: AsyncConnection, *, chain: Sequence[CompatInfo] | 
         "destructive": [info.destructive for info in chain],
     }
     return len((await conn.execute(_UPSERT, params)).all())
+
+
+def known_revisions(code_head: str, modules: Sequence[ModuleType]) -> frozenset[str]:
+    """`code_head` and every revision it descends from among `modules`: the chain of the code whose head is
+    `code_head`, the schemas that code knows. A head outside `modules` knows itself alone."""
+    return frozenset(_ancestors_or_self(code_head, {str(m.revision): _parents(m) for m in modules}))
+
+
+@functools.cache
+def _code_known(code_head: str) -> frozenset[str]:
+    """`known_revisions` over this package's chain, read once per process (the migrations do not change while
+    it runs, and `/readyz` asks on every probe of a schema that is not current)."""
+    return known_revisions(code_head, chain_modules())
+
+
+def classify_schema(
+    heads: Sequence[str], records: Mapping[str, CompatInfo], *, code_head: str, known: Set[str]
+) -> SchemaState:
+    """The state of a database whose `alembic_version` holds `heads` to the code of `code_head`, whose chain
+    is `known` (`known_revisions`); `records` holds the database's `schema_compat` rows by revision (the
+    module docstring has the rule)."""
+    if tuple(heads) == (code_head,):
+        return "current"
+    if all(head in known for head in heads):
+        return "behind"
+    if len(heads) == 1 and (record := records.get(heads[0])) is not None:
+        if not record.destructive and record.compat_floor in known:
+            return "ahead_compatible"
+    return "ahead_incompatible"
+
+
+_HAS_VERSIONS: Final = q("SELECT to_regclass('public.alembic_version') IS NOT NULL")
+_HEADS: Final = q("SELECT version_num FROM alembic_version ORDER BY version_num")
+_HAS_COMPAT: Final = q("SELECT to_regclass('public.schema_compat') IS NOT NULL")
+_RECORDS: Final = q(
+    "SELECT revision, compat_floor, destructive FROM schema_compat "
+    "WHERE revision = ANY(CAST(:heads AS text[]))"
+)
+
+
+async def database_heads(conn: AsyncConnection) -> tuple[str, ...]:
+    """The revisions `alembic_version` holds, sorted; none for a database without that table (an empty
+    one)."""
+    if not (await conn.execute(_HAS_VERSIONS)).scalar_one():
+        return ()
+    return tuple(str(head) for head in (await conn.execute(_HEADS)).scalars())
+
+
+async def schema_state(conn: AsyncConnection, *, code_head: str) -> SchemaState:
+    """Where the database of `conn` stands to the code whose head is `code_head` (module docstring). Reads
+    only; the `schema_compat` rows are read only for heads the code does not know."""
+    heads = await database_heads(conn)
+    if heads == (code_head,):
+        return "current"
+    known = _code_known(code_head)
+    unknown = [head for head in heads if head not in known]
+    records: dict[str, CompatInfo] = {}
+    if unknown and (await conn.execute(_HAS_COMPAT)).scalar_one():
+        rows = await conn.execute(_RECORDS, {"heads": unknown})
+        records = {row.revision: CompatInfo(row.revision, row.compat_floor, row.destructive) for row in rows}
+    return classify_schema(heads, records, code_head=code_head, known=known)

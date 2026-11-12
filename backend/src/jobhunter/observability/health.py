@@ -3,7 +3,10 @@
 `check_readiness` answers; it never raises (ruling T14-e). Its probes, in this order:
 - `db`: a connection and `SELECT 1` within `DB_TIMEOUT_S`. When that fails, nothing else of the database is
   probed.
-- `migrations`: `alembic_version` holds exactly the code head.
+- `migrations`: the schema is one this code runs on (`db.compat.schema_state`, M5 Task 27):
+  `alembic_version` holds exactly the code head (`current`), or a newer head whose recorded floor this code
+  knows and that is not destructive (`ahead_compatible`, a rollback to this release). `behind` and
+  `ahead_incompatible` fail, with the state as the `reason`.
 - `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old
   (`heartbeats.heartbeat_fresh` over `heartbeats.HEARTBEAT_AGE_SQL`, which the api's heartbeat watch shares).
 - `embedder` (Task 22): the embedder's `/health` within `embeddings.HEALTH_TIMEOUT_S` is `ok`, with its
@@ -55,7 +58,7 @@ import asyncio
 import functools
 import platform
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -68,6 +71,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
+from jobhunter.db.compat import SchemaState, schema_state
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
 from jobhunter.heartbeats import HEARTBEAT_AGE_SQL, heartbeat_fresh
@@ -88,6 +92,8 @@ from jobhunter.wire import DecimalOut, usd_micro
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]
+# The schema states `migrations` passes (module docstring).
+READY_SCHEMA_STATES: Final[frozenset[SchemaState]] = frozenset({"current", "ahead_compatible"})
 
 DB_TIMEOUT_S: Final = 2.0
 # The client-side bound of the schema probes together; each one also has the server-side statement timeout.
@@ -97,7 +103,6 @@ PROBE_STATEMENT_TIMEOUT: Final = "2s"
 _PING: Final = q("SELECT 1")
 # `is_local`: for this transaction only, so the pooled connection gets its default back with the rollback.
 _SET_STATEMENT_TIMEOUT: Final = q("SELECT set_config('statement_timeout', :timeout, true)")
-_MIGRATION_VERSIONS: Final = q("SELECT version_num FROM alembic_version")
 _HEARTBEAT_AGE: Final = q(HEARTBEAT_AGE_SQL)
 # What the worker published at its start (`observability.langsmith.publish_tracing_state`); before that, no
 # row or NULL.
@@ -135,29 +140,39 @@ def _log_failed(
     )
 
 
-async def _rows(
-    conn: AsyncConnection, probe: ReadinessCode, statement: TextClause
-) -> Sequence[sa.Row[Any]] | None:
-    """The rows of `statement`, run in a savepoint; `None` (logged) when it failed with a database error."""
+async def _in_savepoint[T](
+    conn: AsyncConnection, probe: ReadinessCode, read: Callable[[AsyncConnection], Awaitable[T]]
+) -> T | None:
+    """What `read` returns, run in a savepoint; `None` (logged) when it failed with a database error."""
     try:
         async with conn.begin_nested():
-            rows = (await conn.execute(statement)).all()
+            return await read(conn)
     except sa.exc.DBAPIError as exc:
         if exc.connection_invalidated:
             raise _ConnectionLost(exc) from exc
         _log_failed(probe, exc)
         return None
-    return rows
+
+
+async def _rows(
+    conn: AsyncConnection, probe: ReadinessCode, statement: TextClause
+) -> Sequence[sa.Row[Any]] | None:
+    """The rows of `statement`, run in a savepoint; `None` (logged) when it failed with a database error."""
+
+    async def read(c: AsyncConnection) -> Sequence[sa.Row[Any]]:
+        return (await c.execute(statement)).all()
+
+    return await _in_savepoint(conn, probe, read)
 
 
 async def _schema_probes(conn: AsyncConnection, code_head: str) -> list[ReadinessCode]:
     failing: list[ReadinessCode] = []
 
-    versions = await _rows(conn, "migrations", _MIGRATION_VERSIONS)
-    if versions is None:
+    state = await _in_savepoint(conn, "migrations", functools.partial(schema_state, code_head=code_head))
+    if state is None:
         failing.append("migrations")
-    elif [row[0] for row in versions] != [code_head]:
-        _log_failed("migrations", reason="no_revision" if not versions else "revision_mismatch")
+    elif state not in READY_SCHEMA_STATES:
+        _log_failed("migrations", reason=state)
         failing.append("migrations")
 
     # The database clock, which also wrote `heartbeat_at`: the verdict `jobhunter worker-health` reaches too,

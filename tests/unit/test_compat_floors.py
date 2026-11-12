@@ -5,7 +5,7 @@ from types import ModuleType
 
 import pytest
 from jobhunter.db.alembic_runner import code_head
-from jobhunter.db.compat import CompatInfo, chain_compat, compat_of
+from jobhunter.db.compat import CompatInfo, chain_compat, classify_schema, compat_of, known_revisions
 
 M4_SCHEMA = "0009_m4_ui"
 M5_SCHEMA = "0010_m5_operations"
@@ -131,3 +131,37 @@ def test_a_fake_chain_reads_the_declarations_and_their_defaults() -> None:
 def test_a_floor_outside_the_chain_raises(modules: list[ModuleType], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         compat_of(modules)
+
+
+def test_a_destructive_migration_is_its_own_floor() -> None:
+    """A destructive revision declares `destructive = True` and itself as floor (its default floor), so no
+    older code runs on it or on any revision after it: their schema is `ahead_incompatible` to that code,
+    which is rolled back by restore. An expand revision is `ahead_compatible` to the code of its floor and
+    after."""
+    modules = [
+        fake("a", None),
+        fake("b", "a", compat_floor="a"),  # expand: a's code runs on it
+        fake("c", "b", destructive=True),  # destructive: its own floor without declaring one
+        fake("d", "c", compat_floor="c"),  # expand again, no further back than c
+    ]
+    records = {info.revision: info for info in compat_of(modules)}
+    assert records["c"] == CompatInfo("c", "c", True)
+    # declaring an older floor for it is refused
+    with pytest.raises(ValueError, match="c: destructive, so its compat_floor must be 'c', not 'b'"):
+        compat_of([*modules[:2], fake("c", "b", compat_floor="b", destructive=True)])
+
+    def state(database_head: str, code: str) -> str:
+        """The state of a database at `database_head` to the code of revision `code`."""
+        known = known_revisions(code, modules)
+        return classify_schema((database_head,), records, code_head=code, known=known)
+
+    assert state("b", "a") == "ahead_compatible"
+    assert state("c", "a") == state("c", "b") == "ahead_incompatible"
+    assert state("d", "b") == "ahead_incompatible"  # its floor, c, is newer than b's code
+    assert (state("d", "c"), state("d", "d")) == ("ahead_compatible", "current")
+    assert (state("c", "c"), state("b", "c")) == ("current", "behind")
+    # the record's flag alone refuses a head whose floor the code knows (what a destructive record says)
+    flagged = {**records, "b": CompatInfo("b", "a", True)}
+    assert classify_schema(("b",), flagged, code_head="a", known=known_revisions("a", modules)) == (
+        "ahead_incompatible"
+    )

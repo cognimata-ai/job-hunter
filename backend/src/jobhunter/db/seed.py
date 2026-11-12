@@ -391,7 +391,7 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
     return len(edges)
 
 
-async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
+async def seed_defaults(conn: AsyncConnection, *, now: datetime, sync_matrix: bool = True) -> None:
     """Write the default settings chain, rubric v1 and v2 and prompt-schema versions 1 and 2, the four single
     rows (`active_config`, `schedule_state`, `ranking_state` and M5's `deadman_state`, all NULL but its id),
     `sources` and the default source instances.
@@ -408,7 +408,9 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     and the pointers it holds (`settings_versions` carries all four: scope, model policy, execution config and
     evaluation policy), never from the file. So a second call with another `now` changes nothing. The one
     exception is the transition matrix, which is code-derived and replaced on every call
-    (`sync_transition_matrix`). The caller owns the transaction.
+    (`sync_transition_matrix`), unless `sync_matrix` is false: an older release's `migrate` on a newer
+    schema (M5 Task 27, `ahead_compatible`) leaves the newer release's matrix, which that schema's triggers
+    check, and then writes nothing. The caller owns the transaction.
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -468,4 +470,5 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     await conn.execute(q(_INSERT_SOURCES), [asdict(source) for source in SOURCES])
     await conn.execute(q(DEFAULT_INSTANCES_SQL))
 
-    await sync_transition_matrix(conn)
+    if sync_matrix:
+        await sync_transition_matrix(conn)
