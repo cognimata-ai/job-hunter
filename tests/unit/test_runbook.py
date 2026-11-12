@@ -20,9 +20,11 @@ checks it against what it documents:
 - a one-off `$JH run` whose service depends on `migrate` takes `--no-deps`, and api and worker are stopped
   before any command runs `migrate` (§19.5; Ruling T31-3 M11);
 - no data volume is removed before section 8's procedure ships the manifests and checks that none is left, and
-  section 10 states the manifest format's expand/contract rule (Rulings T31-2, T31-3 I1 and I3);
-- V21 is the N1 stack test on the VPS, and its hand probes of api and docparse connect to a literal address
-  (Ruling T31-3 I2);
+  section 10 states the manifest format's expand/contract rule (Rulings T31-2, T31-3 I1 and I3); section 8's
+  procedure stops api and worker before it ships and checks, and each block that removes a volume does too,
+  in that order, before the removal (Ruling T31-5);
+- V21 is the N1 stack test on the VPS, a skip counting as not passed, and its hand probes of api and docparse
+  connect to a literal address (Rulings T31-3 I2, T31-5);
 - every `scripts/…` path exists and takes the flags given to it, every `jobhunter …` command is a command of
   the CLI's parser with the options given to it, and every service a `$JH` command names is a service of
   `deploy/compose.yaml`.
@@ -165,6 +167,11 @@ APP: Final = frozenset({"api", "worker"})
 BEFORE_A_WIPE: Final = "**Before any volume is removed**"
 VOLUME_REMOVAL: Final = re.compile(r"docker volume rm .*jobhunter_manifests|\$JH down -v|\bwiped\b")
 SHIP: Final = "$JH exec backup jobhunter backup ship"
+STOP_APP: Final = "$JH stop api worker"
+VOLUME_RM: Final = re.compile(r"\bdocker volume rm\b")
+# A top-level item of a numbered list: a block that removes a volume starts at the item it is in.
+ITEM: Final = re.compile(r"^\d+\. ")
+SKIP_FAILS: Final = "a skipped test counts as not passed"
 # V21 on the VPS (Ruling T31-3 I2): the N1 stack test, and hand probes that connect to a literal address.
 N1: Final = "tests/stack/test_prod_network.py"
 ADDRESS_PROBE: Final = re.compile(r"create_connection\(\('\d{1,3}(?:\.\d{1,3}){3}', \d+\)")
@@ -538,6 +545,59 @@ def test_api_and_worker_stop_before_migrate() -> None:
     assert migrations
 
 
+def _wipe_blocks(markdown: str) -> list[list[tuple[bool, str]]]:
+    """Each block of `markdown` that removes a volume: the lines (`_lines`) from the top-level list item the
+    fenced `docker volume rm` is in (else the start) to that line."""
+    lines = _lines(markdown)
+    blocks: list[list[tuple[bool, str]]] = []
+    for index, (code, text) in enumerate(lines):
+        if code and VOLUME_RM.search(text):
+            items = [i for i in range(index) if not lines[i][0] and ITEM.match(lines[i][1])]
+            blocks.append(lines[(items[-1] if items else 0) : index + 1])
+    return blocks
+
+
+def _wipe_events(lines: list[tuple[bool, str]]) -> list[str]:
+    """The order of `lines`' steps before a wipe: `stop` (api and worker), `ship`, `check` (the unshipped-
+    manifest query, or a reference to section 8's procedure) and `removal` (a fenced `docker volume rm`)."""
+    events: list[str] = []
+    for code, text in lines:
+        if code:
+            pieces = [text]
+        else:
+            found = [(match.start(), " ".join(match[1].split())) for match in SPAN.finditer(text)]
+            found += [(match.start(), BEFORE_A_WIPE) for match in re.finditer(re.escape(BEFORE_A_WIPE), text)]
+            pieces = [piece for _, piece in sorted(found)]
+        for piece in pieces:
+            if piece == BEFORE_A_WIPE or "manifest_shipment_items" in piece:
+                events.append("check")
+            elif piece == SHIP:
+                events.append("ship")
+            elif piece.startswith("$JH stop ") and APP <= set(_jh_services(piece)):
+                events.append("stop")
+            elif code and VOLUME_RM.search(piece):
+                events.append("removal")
+    return events
+
+
+def test_each_volume_removal_stops_ships_and_checks_first() -> None:
+    """Section 8's procedure stops api and worker, then ships, then checks; each block that removes a volume
+    does the same before the removal, so no path relies on an earlier stop (Ruling T31-5)."""
+    kit = _section(KIT)
+    assert BEFORE_A_WIPE in kit, "section 8 has no procedure before a wipe"
+    procedure = _wipe_events(_lines(kit[kit.index(BEFORE_A_WIPE) + len(BEFORE_A_WIPE) :]))
+    in_order = sorted({"stop", "ship", "check"} & set(procedure), key=procedure.index)
+    assert in_order == ["stop", "ship", "check"], f"section 8's procedure: {procedure}"
+    blocks = [block for heading in SECTIONS for block in _wipe_blocks(_section(heading))]
+    assert blocks, "no block removes a volume"
+    for block in blocks:
+        events = _wipe_events(block)
+        before = events[: events.index("removal")]
+        assert "check" in before, f"{events}: no check before the removal"
+        first = min(before.index(step) for step in ("ship", "check") if step in before)
+        assert "stop" in before[:first], f"{events}: api and worker are not stopped before the ship and check"
+
+
 def test_no_volume_is_removed_before_the_manifests_are_shipped() -> None:
     kit = _section(KIT)
     assert BEFORE_A_WIPE in kit, "section 8 has no procedure before a wipe"
@@ -563,6 +623,7 @@ def test_v21_runs_n1_on_the_vps_and_probes_connecting_out_by_address() -> None:
     snippets = _snippets(_section(DEPLOYMENT))
     n1 = [s for s in snippets if s.startswith("JOBHUNTER_N1_OUTSIDE=1 ") and "pytest -m stack" in s]
     assert [s for s in n1 if s.endswith(f" {N1}")], "V21 runs the N1 stack test with the outside reach"
+    assert SKIP_FAILS in " ".join(_section(DEPLOYMENT).split()), "a skipped N1 test is no pass"
     probes = [s for s in snippets if re.match(r"\$JH exec -T (?:api|docparse) ", s)]
     assert {probe.split()[3] for probe in probes} == {"api", "docparse"}
     assert [probe for probe in probes if not ADDRESS_PROBE.search(probe)] == [], "connect to an address"

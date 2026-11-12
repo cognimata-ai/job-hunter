@@ -531,9 +531,16 @@ $JH exec backup jobhunter backup restore-test
 **Before any volume is removed** (a rollback by restore, section 10; a timed restore onto the same VPS, section
 13). The manifests volume holds the only copy of every deletion manifest not shipped yet, and a restore replays
 the offsite stream only: a deletion never shipped would not be replayed, and the data it deleted would come
-back. So, before a `docker volume rm` or a `down` that removes volumes:
+back. So, before a `docker volume rm` or a `down` that removes volumes, whatever was stopped before:
 
-1. Ship the manifests:
+1. Stop api and worker, so that no purge starts, or writes a manifest, after the check of step 3 (a purge is
+   requested through the api and runs in the worker). They stay stopped until the volumes are removed:
+
+   ```
+   $JH stop api worker
+   ```
+
+2. Ship the manifests:
 
    ```
    $JH exec backup jobhunter backup ship
@@ -543,18 +550,18 @@ back. So, before a `docker volume rm` or a `down` that removes volumes:
    shipped already. On `{"error": "backup_job_busy"}` or `{"error": "locked"}` (another backup job holds a
    lock), run it again. On any other error, stop and remove no volume: fix the cause as the
    `privacy.manifest_unshipped` row says (section 6), then ship again.
-2. Check that the latest shipment holds every manifest file, as the application role. api and worker may be
+3. Check that the latest shipment holds every manifest file, as the application role. api and worker are
    stopped, so a manifest's `status` can lag behind its shipment; this query reads the shipment itself:
 
    ```
    $JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT m.id, m.status, m.file_sha256 IS NOT NULL AS has_file FROM deletion_manifests m WHERE NOT EXISTS (SELECT 1 FROM manifest_shipment_items i WHERE i.shipment_id = (SELECT max(id) FROM manifest_shipments) AND i.manifest_uuid = m.manifest_uuid AND i.file_sha256 = m.file_sha256)"
    ```
 
-   No row: nothing is left unshipped. A row with `has_file` true: ship again (step 1), and remove no volume
+   No row: nothing is left unshipped. A row with `has_file` true: ship again (step 2), and remove no volume
    until the query returns no row. A row with `has_file` false is a purge that had not started deleting (its
    deletions start only once its file exists, §19.5): the volumes take it with them, so note its id and request
-   that deletion again afterwards. While the api runs, System → Health's unshipped manifests and the alert
-   `privacy.manifest_unshipped` show the same.
+   that deletion again afterwards. Before step 1, while the api still runs, System → Health's unshipped
+   manifests and the alert `privacy.manifest_unshipped` give an early view of the same.
 
 **The offline recovery kit** (R1). Only the kit restores a lost VPS: the backup sets are restic's, encrypted
 with `restic_password`, and the CV files, the CV texts and the TOTP secret in them are sealed with the data
@@ -704,9 +711,18 @@ restores the last backup set when it reports `migrate_schema_ahead_incompatible`
    release still checked out, and only when it reads every manifest the newer release wrote (**Rollbacks and
    the manifest format**, below). If it cannot, remove no volume: stay on the newer release
    (`git checkout <release tag>`, then `$JH up -d --wait`) and roll forward with a fix. Otherwise:
-   1. Section 8's **Before any volume is removed**: the ship exits 0, and the check finds no manifest file left
-      unshipped. On any failure, stop here and remove no volume.
-   2. Remove the data volumes, and restore the set of the upgrade's step 2:
+   1. Stop api and worker, and ship the manifests: the first two steps of section 8's procedure before a wipe,
+      so that this path relies on no earlier stop:
+
+      ```
+      $JH stop api worker
+      $JH exec backup jobhunter backup ship
+      ```
+
+      The ship must exit 0; on `{"error": "backup_job_busy"}` or `{"error": "locked"}`, run it again.
+   2. Then the check, step 3 of section 8's **Before any volume is removed**: it must return no row. On any
+      failure of these two steps, stop here and remove no volume.
+   3. Remove the data volumes, and restore the set of the upgrade's step 2:
 
       ```
       $JH down
@@ -802,13 +818,15 @@ what) or not attempted (why), in `docs/spikes/V21.md`, `docs/spikes/V15.md` and 
    $JH down
    systemctl stop jobhunter-egress
    cd <scratch checkout>
-   JOBHUNTER_N1_OUTSIDE=1 uv run pytest -m stack -q -p no:cacheprovider tests/stack/test_prod_network.py
+   JOBHUNTER_N1_OUTSIDE=1 uv run pytest -m stack -q -rs -p no:cacheprovider tests/stack/test_prod_network.py
    cd /opt/jobhunter
    systemctl start jobhunter-egress
    $JH up -d --wait
    ```
 
-   N1 passes when every test of the module passes, `test_worker_reaches_outside` included. The module builds
+   N1 passes only when every test of the module ran and passed, `test_worker_reaches_outside` included: a
+   skipped test counts as not passed, and so does a module that skips (it skips while the production table is
+   still loaded, or while another stack holds the subnets; `-rs` prints why). The module builds
    the test stack's images (the embedder's `fake` target, so no model), makes its dummy secrets in the scratch
    checkout and removes its own projects at the end; delete the scratch checkout afterwards. Then reboot once,
    and check on the production stack that the rule loaded at boot and that the boundary holds. These hand
@@ -851,8 +869,8 @@ what) or not attempted (why), in `docs/spikes/V21.md`, `docs/spikes/V15.md` and 
 11. [ ] **The first backups.** A first nightly backup set and a manifest shipment offsite (System → Health); a
     manual `$JH exec backup jobhunter backup restore-test`.
 12. [ ] **The timed restore.** From the offline recovery kit only, by section 9, onto a second fresh VPS, or,
-    after section 8's **Before any volume is removed**, onto the same one wiped; against the RTO of 4 h. Record
-    the time.
+    after section 8's **Before any volume is removed** (api and worker stopped, then the manifests shipped and
+    checked), onto the same one wiped; against the RTO of 4 h. Record the time.
 13. [ ] **A release deployed and rolled back** (section 10).
 14. [ ] **The soak.** A first free-sources collection, then 24 to 72 h of watching: the backup age, the dead-man
     pings, the alert delivery, the disk and the memory (`docker stats --no-stream`).
