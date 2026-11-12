@@ -27,6 +27,10 @@ The rotation drill (Task 28) needs no preceding image:
     JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q -p no:cacheprovider \
       tests/stack/test_prod_drills.py -k rotation_drill
 
+Both drills run in one session too (CI's and the acceptance run's whole module): each drill's fixture is
+function-scoped, so the upgrade drill's projects are removed (`down -v`) before the rotation drill's
+`prod_session` starts, which would otherwise find PT up and skip.
+
 Every secret it changes is a file of `.secrets/test`, PT's secrets directory (deploy/compose.test.env). It
 never reads a value: each new value is written by `openssl` in a child shell to a `mktemp` file (`Scratch`),
 and a file reaches a slot only by the two root commands of user decision M5-U6, run from the checkout with
@@ -162,7 +166,7 @@ def jobs_list(site: Site) -> list[int]:
     return [int(card["job_id"]) for card in site.get("/api/jobs?limit=100")["items"]]
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def stack() -> Iterator[None]:
     inspected = run(["docker", "image", "inspect", PREV_IMAGE], check=False)
     if inspected.returncode != 0:
@@ -259,7 +263,8 @@ from jobhunter.config import load_config
 print(json.dumps([crypto.key_id(key).hex() for key in crypto.data_keys(load_config("api"))]))
 """
 # Every CV file and text a row names, opened with the api's data key alone (the first of its keys): how many
-# there are, how many opened, and how many keys the api holds. No content is printed.
+# there are, how many opened (one that does not open is counted out, `crypto.DecryptError`), and how many keys
+# the api holds. No content is printed.
 OPENED: Final = """
 import json
 import psycopg
@@ -273,14 +278,25 @@ with psycopg.connect(cfg.dsn("psycopg")) as conn:
     rows = conn.execute("SELECT id, storage_path, raw_text_enc FROM cv_files ORDER BY id").fetchall()
 files = [name for _, name, _ in rows if name is not None]
 texts = [(cv_file_id, bytes(blob)) for cv_file_id, _, blob in rows if blob is not None]
+files_opened = texts_opened = 0
+for name in files:
+    try:
+        store.read(name, keys[:1])
+    except crypto.DecryptError:
+        continue
+    files_opened += 1
+for cv_id, blob in texts:
+    try:
+        store.decrypt_text(blob, keys[:1], cv_file_id=cv_id)
+    except crypto.DecryptError:
+        continue
+    texts_opened += 1
 print(json.dumps({
     "keys": len(keys),
     "files": len(files),
-    "files_opened": sum(1 for name in files if store.read(name, keys[:1]) is not None),
+    "files_opened": files_opened,
     "texts": len(texts),
-    "texts_opened": sum(
-        1 for cv_id, blob in texts if store.decrypt_text(blob, keys[:1], cv_file_id=cv_id) is not None
-    ),
+    "texts_opened": texts_opened,
 }))
 """
 # `db_app` as the running postgres container mounts it (its file from its start: the old one after an
@@ -402,7 +418,7 @@ def download(site: Site, export_id: int) -> list[str]:
     return zipfile.ZipFile(io.BytesIO(answer.content)).namelist()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def rotation_stack() -> Iterator[Scratch]:
     """The images built and postgres alone up (`prod_session("postgres")`), and the drill's scratch files; at
     the end, after a failure too, no rotation left in progress (`data_key_previous` empty again) and every

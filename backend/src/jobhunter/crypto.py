@@ -14,6 +14,12 @@ Failures never carry key material, plaintext or a key id: `DecryptError` has one
 `data_keys(cfg)` lists the keys of a configuration: the data key, which seals, and during a rotation the
 previous one, which still opens. It lives here rather than in the api so that the worker reads the keys
 without importing FastAPI.
+
+`blob_key_id(blob)` reads the key id a blob (or its first `HEADER_BYTES`) names. `SEALED_VALUES_SQL` is the
+one inventory of the database's sealed columns (`SEALED_COLUMNS`): every value `encrypt` sealed into a row, as
+one column `sealed`. The backup set's key ids and the data-key rotation's verification both read it, so a new
+sealed column is added here once (M5 Task 28); the CV files and export archives are files
+(`profile.storage`, `privacy.export`).
 """
 
 import hashlib
@@ -33,9 +39,18 @@ KEY_BYTES: Final = 32
 KEY_ID_BYTES: Final = 8
 NONCE_BYTES: Final = 12
 TAG_BYTES: Final = 16
-_NONCE_START: Final = 1 + KEY_ID_BYTES
+HEADER_BYTES: Final = 1 + KEY_ID_BYTES  # the version byte and the key id
+_NONCE_START: Final = HEADER_BYTES
 _CIPHERTEXT_START: Final = _NONCE_START + NONCE_BYTES
 _MIN_BLOB_BYTES: Final = _CIPHERTEXT_START + TAG_BYTES
+
+
+# The database columns that hold `encrypt`'s blobs (spec §16.9), and all their values as one column `sealed`.
+SEALED_COLUMNS: Final = (("cv_files", "raw_text_enc"), ("users", "totp_secret_enc"))
+SEALED_VALUES_SQL: Final = " UNION ALL ".join(
+    f"SELECT {column} AS sealed FROM {table}"  # noqa: S608 - the constant names above, never input
+    for table, column in SEALED_COLUMNS
+)
 
 
 class DecryptError(Exception):
@@ -50,6 +65,14 @@ def hkdf_sha256(root: bytes, info: bytes, length: int = 32) -> bytes:
 def key_id(key: bytes) -> bytes:
     """The first 8 bytes of `sha256(key)`."""
     return hashlib.sha256(key).digest()[:KEY_ID_BYTES]
+
+
+def blob_key_id(blob: bytes) -> bytes | None:
+    """The key id `blob` (or its first `HEADER_BYTES` bytes) names; `None` for one too short or of another
+    format version."""
+    if len(blob) < HEADER_BYTES or blob[0] != FORMAT_VERSION:
+        return None
+    return blob[1:HEADER_BYTES]
 
 
 def _require_aes256_key(key: bytes) -> None:

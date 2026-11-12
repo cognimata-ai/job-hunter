@@ -334,7 +334,8 @@ def _add_crypto_commands(commands: "argparse._SubParsersAction[argparse.Argument
         "rotate",
         help="re-encrypt every ciphertext under data_key_previous with data_key, resumably, then count what "
         "remains by key id; exit 0 when only data_key remains, 3 when other old keys remain, 2 without a "
-        "previous key",
+        "previous key, 1 when a ciphertext under data_key_previous remains (restart api and worker, run "
+        "again) or one cannot be rotated",
     )
 
 

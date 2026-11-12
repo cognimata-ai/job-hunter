@@ -21,16 +21,17 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
+import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter import cli, crypto, crypto_rotate
 from jobhunter.auth import totp, users
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.crypto_rotate import AFTER_BATCH, ROTATION_BATCH, RotationReport, rotate
+from jobhunter.crypto_rotate import AFTER_BATCH, ROTATION_BATCH, RotationFailed, RotationReport, rotate
 from jobhunter.db.transitions import transition
 from jobhunter.ids import uuid7
-from jobhunter.privacy.export import SEGMENT_BYTES, iter_decrypted, write_segments
+from jobhunter.privacy.export import SEGMENT_BYTES, iter_decrypted, segment_aad, write_segments
 from jobhunter.profile.storage import CvStore
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -52,6 +53,13 @@ _EXPORT_ROW: Final = sa.text(
     "INSERT INTO exports (status, expires_at) VALUES ('running', now() + interval '7 days') RETURNING id"
 )
 _EXPORTS: Final = sa.text("SELECT id, storage_path, sha256, size_bytes FROM exports ORDER BY id")
+_STALE_SHA256: Final = sa.text("UPDATE exports SET sha256 = :stale WHERE id = :e")
+_STORAGE_PATH: Final = sa.text("UPDATE exports SET storage_path = :p WHERE id = :e")
+_SEAL_TEXT_PSYCOPG: Final = "UPDATE cv_files SET raw_text_enc = %(enc)s WHERE id = %(i)s"
+_ENC_COLUMNS: Final = sa.text(
+    "SELECT table_name, column_name FROM information_schema.columns "
+    "WHERE table_schema = 'public' AND data_type = 'bytea' AND column_name LIKE '%\\_enc'"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,14 +331,14 @@ async def test_it_is_resumable_and_idempotent(
 async def test_the_verification_counts_remaining_ciphertexts_by_key_id(
     engine: AsyncEngine, make_config: Any, migrated: PgServer, volumes: tuple[Path, Path]
 ) -> None:
-    """Ciphertexts under A (mounted as previous), B (not mounted) and C (the data key): the rotation rewrites
-    A's; the verification counts B's, each ciphertext once, and leaves the data key's out. A file of the store
-    that no row names (an upload that failed, or a purged CV's file before its unlink) is no ciphertext of the
-    application: it is neither rewritten nor counted."""
-    a, b, c = os.urandom(32), os.urandom(32), os.urandom(32)
+    """Ciphertexts under A (mounted as previous), B and D (not mounted) and C (the data key): the rotation
+    rewrites A's; the verification counts B's and D's, each ciphertext once and each under its own key id, and
+    leaves the data key's out. A file of the store that no row names (an upload that failed, or a purged CV's
+    file before its unlink) is no ciphertext of the application: it is neither rewritten nor counted."""
+    a, b, c, d = (os.urandom(32) for _ in range(4))
     cfg = rotation_cfg(make_config, migrated, volumes, current=c, previous=a)
     store = CvStore(cfg.cv_store_dir)
-    for key in (a, a, b, c):
+    for key in (a, a, b, c, d):
         await seed_cv(engine, store, key)
     await seed_cv(engine, store, b, pasted=True)
     await seed_totp(engine, b)
@@ -340,12 +348,229 @@ async def test_the_verification_counts_remaining_ciphertexts_by_key_id(
 
     report = await rotate(cfg, engine, batch=ROTATION_BATCH)
 
-    # B's: a CV file and two texts, the TOTP secret, the export (one file of two segments).
+    # B's: a CV file and two texts, the TOTP secret, the export (one file of two segments); D's: a CV file and
+    # its text.
     assert report == RotationReport(
         rewritten={"cv_files": 2, "cv_texts": 2, "totp": 0, "exports": 0},
-        remaining_by_key_id={crypto.key_id(b).hex(): 5},
+        remaining_by_key_id={crypto.key_id(b).hex(): 5, crypto.key_id(d).hex(): 2},
     )
     assert (cfg.cv_store_dir / orphan).read_bytes() == orphan_bytes
+
+
+async def test_an_export_is_committed_alone(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    volumes: tuple[Path, Path],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two exports under the previous key, the second's archive cut short: the first is sealed again, renamed
+    and its row's sha256 committed before the second is read, so the second's `ExportCorrupt` leaves the first
+    whole, its row's hash the new file's. The run stops at the second (exit 1) and names it, on stdout and in
+    `crypto_rotate_failed`, by its kind, table and row id; its file is as it was, and no `.rotate` is left."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    first, second = [await seed_export(engine, cfg.exports_dir, old) for _ in range(2)]
+    cut = cfg.exports_dir / second.storage_path
+    cut.write_bytes(cut.read_bytes()[:-1])
+    cut_bytes = cut.read_bytes()
+    events: list[dict[str, Any]] = []
+
+    code, printed = await rotate_cli(
+        migrated, tmp_path, volumes, monkeypatch, capsys, current=new, previous=old, events=events
+    )
+
+    where = {"kind": "exports", "table": "exports", "row_id": second.export_id}
+    assert (code, printed) == (1, {"error": "unexpected", "error_class": "ExportCorrupt", **where})
+    [failed] = [event for event in events if event["event"] == "crypto_rotate_failed"]
+    assert {name: failed[name] for name in ("error_class", *where)} == {
+        "error_class": "ExportCorrupt",
+        **where,
+    }
+    await opened(engine, cfg, [new], [], [first])  # the new file, and its row's sha256 is the new file's
+    assert _segment_ids(cfg.exports_dir / first.storage_path) == [crypto.key_id(new).hex()] * 2
+    assert cut.read_bytes() == cut_bytes
+    assert leftovers(cfg) == []
+
+
+async def test_a_stale_export_hash_under_the_data_key_is_corrected(
+    engine: AsyncEngine, make_config: Any, migrated: PgServer, volumes: tuple[Path, Path]
+) -> None:
+    """An export already under the data key whose row holds another sha256 than its file's (a run stopped
+    between the rename and its commit): the pass corrects the row's hash and leaves the file as it is; it
+    re-encrypts nothing."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    export = await seed_export(engine, cfg.exports_dir, new)
+    async with engine.begin() as conn:
+        await conn.execute(_STALE_SHA256, {"stale": bytes(32), "e": export.export_id})
+    files = inodes(cfg)
+
+    report = await rotate(cfg, engine)
+
+    assert report == RotationReport(rewritten=NOTHING, remaining_by_key_id={})
+    await opened(engine, cfg, [new], [], [export])  # the row's sha256 is the file's again
+    assert inodes(cfg) == files
+
+
+async def test_a_run_stopped_inside_a_file_leaves_it_whole_and_the_next_clears_leftovers(
+    engine: AsyncEngine,
+    make_config: Any,
+    migrated: PgServer,
+    volumes: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash while an export's second segment is sealed: its `.rotate` file, holding the first, is removed
+    and the archive and its row are as they were (the CV, in its own committed batch, is done). A run killed
+    there would leave the `.rotate` file: planted in both volumes, the next run removes them first, so its own
+    `.rotate` names are free, and finishes the export."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    store = CvStore(cfg.cv_store_dir)
+    cv = await seed_cv(engine, store, old)
+    export = await seed_export(engine, cfg.exports_dir, old)
+    archive = cfg.exports_dir / export.storage_path
+    archive_bytes = archive.read_bytes()
+    second_segment = segment_aad(export.export_id, 1, True)
+    sealing = crypto.encrypt
+
+    def crash_at_the_second_segment(key: bytes, plaintext: bytes, *, aad: bytes) -> bytes:
+        if aad == second_segment:
+            raise SimulatedCrash("the second segment")
+        return sealing(key, plaintext, aad=aad)
+
+    monkeypatch.setattr(crypto, "encrypt", crash_at_the_second_segment)
+    with pytest.raises(RotationFailed) as stopped:
+        await rotate(cfg, engine)
+    assert (stopped.value.kind, stopped.value.row_id, stopped.value.error_class) == (
+        "exports",
+        export.export_id,
+        "SimulatedCrash",
+    )
+    assert archive.read_bytes() == archive_bytes
+    assert leftovers(cfg) == []
+    assert (await key_ids(engine, cfg))["cv_files"] == [crypto.key_id(new).hex()]
+
+    monkeypatch.setattr(crypto, "encrypt", sealing)
+    for planted in (
+        cfg.cv_store_dir / f"{cv.storage_path}.rotate",
+        archive.with_name(f"{archive.name}.rotate"),
+    ):
+        planted.write_bytes(b"left by a killed run")
+    report = await rotate(cfg, engine)
+
+    assert report == RotationReport(
+        rewritten={"cv_files": 0, "cv_texts": 0, "totp": 0, "exports": 1}, remaining_by_key_id={}
+    )
+    assert leftovers(cfg) == []
+    await opened(engine, cfg, [new], [cv], [export])
+
+
+async def test_a_ciphertext_sealed_under_the_previous_key_meanwhile_exits_1(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    volumes: tuple[Path, Path],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A service that was not restarted seals a CV text under the previous key after the rewrite passed it
+    (here, at the last batch's fault point): the verification still finds the previous key's id, so the
+    command exits 1 `previous_key_remains`, neither 0 nor 3."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    store = CvStore(cfg.cv_store_dir)
+    cv = await seed_cv(engine, store, old)
+    await seed_export(engine, cfg.exports_dir, old)
+    arrivals: list[str] = []
+
+    async def seal_under_the_previous_key_at_the_last_batch(name: str) -> None:
+        arrivals.append(name)
+        if len(arrivals) == 2:  # the CV batch, then the export, the last
+            sealed = store.encrypt_text(cv.text, [old], cv_file_id=cv.cv_file_id)
+            with psycopg.connect(migrated.dsn("app")) as conn:
+                conn.execute(_SEAL_TEXT_PSYCOPG, {"enc": sealed, "i": cv.cv_file_id})
+
+    monkeypatch.setattr(crypto_rotate, "afault_point", seal_under_the_previous_key_at_the_last_batch)
+    code, printed = await rotate_cli(
+        migrated, tmp_path, volumes, monkeypatch, capsys, current=new, previous=old
+    )
+
+    assert arrivals == [AFTER_BATCH, AFTER_BATCH]
+    assert (code, printed) == (
+        1,
+        {
+            "error": "previous_key_remains",
+            "rewritten": {"cv_files": 1, "cv_texts": 1, "totp": 0, "exports": 1},
+            "remaining_by_key_id": {crypto.key_id(old).hex(): 1},
+        },
+    )
+
+
+async def test_a_ciphertext_that_does_not_open_is_named_by_its_kind_and_row(
+    engine: AsyncEngine, make_config: Any, migrated: PgServer, volumes: tuple[Path, Path]
+) -> None:
+    """A CV text under the previous key that does not open (sealed for another row: its associated data
+    differs) stops the rotation with `RotationFailed` naming its kind, its table and its row id, and the class
+    of the error; its row is left as it was."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    store = CvStore(cfg.cv_store_dir)
+    cv = await seed_cv(engine, store, old, pasted=True)
+    foreign = store.encrypt_text("another row's text", [old], cv_file_id=cv.cv_file_id + 1)
+    async with engine.begin() as conn:
+        await conn.execute(_SEAL_TEXT, {"enc": foreign, "i": cv.cv_file_id})
+
+    with pytest.raises(RotationFailed) as stopped:
+        await rotate(cfg, engine)
+
+    failed = stopped.value
+    assert (failed.kind, failed.table, failed.row_id, failed.error_class) == (
+        "cv_texts",
+        "cv_files",
+        cv.cv_file_id,
+        "DecryptError",
+    )
+    assert str(failed) == f"cv_texts of cv_files row {cv.cv_file_id}: DecryptError"
+    assert (await key_ids(engine, cfg))["cv_texts"] == [crypto.key_id(old).hex()]
+
+
+async def test_the_sealed_column_inventory_is_every_enc_column_of_the_schema(engine: AsyncEngine) -> None:
+    """`crypto.SEALED_COLUMNS`, which the rotation's verification and the backup set's key ids both read,
+    names every `bytea` column `*_enc` of the schema: a sealed column a migration adds without it fails here,
+    before a verification could pass with its ciphertexts uncounted."""
+    async with engine.connect() as conn:
+        found = {
+            (str(row.table_name), str(row.column_name)) for row in (await conn.execute(_ENC_COLUMNS)).all()
+        }
+    assert found == set(crypto.SEALED_COLUMNS)
+
+
+@pytest.mark.parametrize("previous", [True, False], ids=["rewrite", "count"])
+async def test_an_export_path_that_is_no_file_name_stops_the_rewrite_and_the_count_alike(
+    engine: AsyncEngine, make_config: Any, migrated: PgServer, volumes: tuple[Path, Path], previous: bool
+) -> None:
+    """A `ready` export whose `storage_path` is no plain file name of the exports directory stops the rotation
+    in the rewrite (a previous key mounted) and in the count (none), alike, naming the export."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old if previous else None)
+    export = await seed_export(engine, cfg.exports_dir, old)
+    async with engine.begin() as conn:
+        await conn.execute(_STORAGE_PATH, {"p": f"../{export.storage_path}", "e": export.export_id})
+
+    with pytest.raises(RotationFailed) as stopped:
+        await rotate(cfg, engine)
+
+    failed = stopped.value
+    assert (failed.kind, failed.table, failed.row_id, failed.error_class) == (
+        "exports",
+        "exports",
+        export.export_id,
+        "ValueError",
+    )
 
 
 async def test_without_a_previous_key_it_refuses(
@@ -441,11 +666,12 @@ async def rotate_cli(
     *,
     current: bytes,
     previous: bytes | None,
+    events: list[dict[str, Any]] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """`jobhunter crypto rotate` as the worker against `server`, with `current` as its data key and
-    `previous`, or an empty file, as `data_key_previous`: its exit status and its one JSON line. Nothing it
-    prints or logs holds a key. It runs in a thread of its own, as its `asyncio.run` needs one without a
-    running event loop."""
+    `previous`, or an empty file, as `data_key_previous`: its exit status and its one JSON line (and, into
+    `events`, the JSON log events it wrote). Nothing it prints or logs holds a key. It runs in a thread of its
+    own, as its `asyncio.run` needs one without a running event loop."""
     secrets = tmp_path / f"secrets-{os.urandom(4).hex()}"
     secrets.mkdir()
     for source in server.secrets_dir("worker").iterdir():
@@ -474,4 +700,6 @@ async def rotate_cli(
                 assert shown not in out and shown not in err
     [line] = out.splitlines()
     printed: dict[str, Any] = json.loads(line)
+    if events is not None:
+        events.extend(json.loads(logged) for logged in err.splitlines() if logged.startswith("{"))
     return code, printed

@@ -48,7 +48,6 @@ Every path is `cfg.staging_dir`, `cfg.cv_store_dir` or `cfg.manifests_dir` (`/da
 import asyncio
 import hashlib
 import json
-import os
 import shutil
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -81,7 +80,6 @@ SET_TAG: Final = "set"
 DUMP_TIMEOUT_S: Final = 2 * 3600.0
 LIST_TIMEOUT_S: Final = 1800.0
 _HASH_CHUNK: Final = 1024 * 1024
-_HEADER_BYTES: Final = 1 + crypto.KEY_ID_BYTES
 # The backup jobs' one-key session advisory lock (module docstring; `db.migrate`'s key list).
 BACKUP_JOB_LOCK_KEY: Final = 7261006
 BACKUP_JOB_BUSY: Final = "backup_job_busy"
@@ -95,11 +93,12 @@ APPLICATION_TABLES: Final = (
     "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
     "WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname"
 )
-# The key ids of the database's ciphertexts (`crypto.encrypt`'s header: the version byte, then the key id).
+# The key ids of the database's ciphertexts (`crypto.encrypt`'s header: the version byte, then the key id), in
+# every sealed column (`crypto.SEALED_VALUES_SQL`, the one inventory the data-key rotation counts too).
 _DB_KEY_IDS: Final = (
-    "SELECT DISTINCT substring(s.sealed FROM 2 FOR %(id_bytes)s) FROM ("
-    "SELECT raw_text_enc AS sealed FROM cv_files UNION ALL SELECT totp_secret_enc FROM users) AS s "
-    "WHERE length(s.sealed) >= %(header_bytes)s AND get_byte(s.sealed, 0) = %(version)s"
+    "SELECT DISTINCT substring(s.sealed FROM 2 FOR %(id_bytes)s) FROM ("  # noqa: S608 - constant SQL only
+    + crypto.SEALED_VALUES_SQL
+    + ") AS s WHERE length(s.sealed) >= %(header_bytes)s AND get_byte(s.sealed, 0) = %(version)s"
 )
 
 log = get_logger("jobhunter.backup.backup_set")
@@ -209,7 +208,7 @@ async def _read_snapshot(conn: psycopg.AsyncConnection[Any]) -> _Snapshot:
         row_counts[table] = int(await _first(conn, query))
     params = {
         "id_bytes": crypto.KEY_ID_BYTES,
-        "header_bytes": _HEADER_BYTES,
+        "header_bytes": crypto.HEADER_BYTES,
         "version": crypto.FORMAT_VERSION,
     }
     key_ids = frozenset(bytes(row[0]) for row in await (await conn.execute(_DB_KEY_IDS, params)).fetchall())
@@ -271,19 +270,18 @@ async def _verify(runner: CommandRunner, dump: Path) -> _Dump:
 
 
 def _cv_key_ids(cv_store_dir: Path) -> tuple[int, frozenset[bytes]]:
-    """The CV store's files (those `CvStore.write` made) and the key ids of their headers; a file removed
-    meanwhile (retention) is not counted, and a file too short for a header names no key."""
+    """The CV store's files (those `CvStore.write` made) and the key ids of their headers
+    (`CvStore.header`); a file removed meanwhile (retention) is not counted, and a file too short for a
+    header names no key."""
+    store = CvStore(cv_store_dir)
     count, key_ids = 0, set()
-    for stored in CvStore(cv_store_dir).stored():
-        try:
-            fd = os.open(cv_store_dir / stored.storage_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except FileNotFoundError:
+    for stored in store.stored():
+        header = store.header(stored.storage_path)
+        if header is None:
             continue
-        with os.fdopen(fd, "rb") as file:
-            header = file.read(_HEADER_BYTES)
         count += 1
-        if len(header) == _HEADER_BYTES and header[0] == crypto.FORMAT_VERSION:
-            key_ids.add(header[1:])
+        if (key := crypto.blob_key_id(header)) is not None:
+            key_ids.add(key)
     return count, frozenset(key_ids)
 
 
