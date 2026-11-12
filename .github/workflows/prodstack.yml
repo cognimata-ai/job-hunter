@@ -7,8 +7,10 @@
 # (JOBHUNTER_STACK_PREBUILT=embedder: the stack modules use it as it is and never build it); the stack modules
 # (C32, C37, C39, V20, V22, and N1 with the outside reach, JOBHUNTER_N1_OUTSIDE=1: a hosted runner has a
 # direct route out); the preceding release's app image, `jobhunter-app:prev` (scripts/build-prev-image.sh
-# reads the parent of the commit that added migration 0011, so the checkout fetches the whole history); and
-# the upgrade-then-rollback and rotation drills as one module (each drill's fixture is function-scoped).
+# reads the parent of the commit that added migration 0011, so the checkout fetches the whole history); the
+# upgrade-then-rollback and rotation drills as one module (each drill's fixture is function-scoped); and
+# the M5 acceptance smoke (scripts/smoke_m5.py, Task 33), which builds nothing and runs on the images the
+# stack modules and the drills built, from fresh projects it removes again at its end.
 # test_prod_network.py loads and deletes the nft table `inet jobhunter_egress` with `sudo -n nft`, the
 # runner image's nft (to verify at the first run). Every project goes with its volumes, its profiled services
 # (restore, the probes) and orphans included, as tests/support/prodstack.down_v removes them, and
@@ -66,6 +68,8 @@ jobs:
         run: scripts/build-prev-image.sh
       - name: The drills (upgrade then rollback, rotation)
         run: JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q tests/stack/test_prod_drills.py
+      - name: The M5 acceptance smoke (thirteen checks on the images built above; it removes its projects)
+        run: uv run python scripts/smoke_m5.py
       - name: Remove PT and its volumes
         if: always()
         run: $PT --profile "*" down -v --remove-orphans
