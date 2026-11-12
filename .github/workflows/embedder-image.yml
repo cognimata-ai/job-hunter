@@ -1,11 +1,13 @@
-# The real embedder image (spec §2.1 U3, §16.8 check 7, §18.8's "embedder model checksum check"; plan M5 Task
-# 29): on a pull request that changes embedder/, and by hand. The build downloads the model files of
-# embedder/model.lock from Hugging Face at the locked revision and checks each against the lock
-# (download_model.sh); the image is then started once, as compose.yaml runs it (read-only, uid 10004, no
-# capability) and with no network at all, since the model is in the image. app.py checks /opt/model against
-# model.lock again at its start and exits 78 on a mismatch; the job passes only once `embedder-health` passes,
-# a 200 from /health with `"checksum_ok": true`, and fails when the embedder exits first or is not healthy
-# within 300 s, printing its log. The `fake` target, which downloads no model, is ci.yml's `images` job's.
+# The real embedder image (spec §2.1 U3, §16.8 check 7, §18.8's "embedder model checksum check";
+# plan M5 Task 29): on a pull request that changes embedder/ or what else the image is built from (its
+# `embedder` dependency group in pyproject.toml and uv.lock, the python and uv digests in deploy/images.lock),
+# and by hand. The build downloads the model files of embedder/model.lock from Hugging Face at the locked
+# revision and checks each against the lock (download_model.sh); the image is then started once, as compose.yaml
+# runs it (read-only, uid 10004, no capability) and with no network at all, since the model is in the image.
+# app.py checks /opt/model against model.lock again at its start and exits 78 on a mismatch; the job passes only
+# once `embedder-health` passes, a 200 from /health with `"checksum_ok": true`, and fails when the embedder
+# exits first or is not healthy within 300 s, printing its log. The `fake` target, which downloads no model, is
+# ci.yml's `images` job's.
 #
 # Supply chain as ci.yml: the checkout pinned to a full commit SHA (the release tag is the trailing comment),
 # the base images to the digests of deploy/images.lock. No secret is referenced: the token is read-only and the
@@ -14,7 +16,7 @@ name: Embedder image
 
 on:
   pull_request:
-    paths: ["embedder/**"]
+    paths: ["embedder/**", "pyproject.toml", "uv.lock", "deploy/images.lock"]
   workflow_dispatch: {}
 
 permissions:

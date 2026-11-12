@@ -26,7 +26,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+import pytest
 import yaml
+
+from tests.support import prodstack
 
 REPO: Final = Path(__file__).resolve().parents[2]
 WORKFLOWS: Final = REPO / ".github/workflows"
@@ -57,8 +60,10 @@ ROOT_BASES: Final = {
 PYTHON_BASES: Final = {"PYTHON_IMAGE": "python", "UV_IMAGE": "uv"}  # docparse/ and embedder/Dockerfile
 # compose's `build_ca: { file: "${SSL_CERT_FILE:-/dev/null}" }`, as `docker build` takes it
 BUILD_CA: Final = "id=build_ca,src=${SSL_CERT_FILE:-/dev/null}"
-# release.yml's tag of each image: the commit it was built from
-GHCR_TAG: Final = "ghcr.io/${{{{ github.repository_owner }}}}/jobhunter-{kind}:${{{{ github.sha }}}}"
+# release.yml's tag of each image: the commit it was built from, in the lowercased owner's namespace
+GHCR_TAG: Final = "${{{{ steps.lock.outputs.ghcr }}}}/jobhunter-{kind}:${{{{ github.sha }}}}"
+# The scans' shared vulnerability-DB cache (Ruling T29-8): Trivy's default cache directory, on the runner.
+TRIVY_CACHE: Final = "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy"
 # The Global Constraints' command lines (`e2e.yml` defines `DC` the same way).
 PT: Final = (
     "docker compose -p jobhunter-prodtest --env-file deploy/images.lock --env-file deploy/compose.test.env "
@@ -80,6 +85,10 @@ MODULES_RUN: Final = (
 DRILLS_RUN: Final = (
     "JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q tests/stack/test_prod_drills.py"
 )
+# A `git` and a `gh` that record their arguments, after their own name, in the same file.
+FAKE_RECORDER: Final = """#!/bin/sh
+printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_DIR/calls"
+"""
 # A `docker` that records its arguments and answers from FAKE_* variables (the container's state, its health
 # from the FAKE_HEALTHY_AFTER-th `exec` on, `image inspect`'s status), and a `sleep` that returns at once.
 FAKE_DOCKER: Final = """#!/bin/sh
@@ -201,11 +210,17 @@ def pins(path: Path) -> dict[str, str]:
 
 
 def run_script(script: str, tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    """`script` under `bash -e` (a `run` step's shell) in `tmp_path`, with the fake `docker` and `sleep` first
-    on PATH."""
+    """`script` under `bash -e` (a `run` step's shell) in `tmp_path`, with the fake `docker`, `sleep`, `git`
+    and `gh` first on PATH."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name, body in (("docker", FAKE_DOCKER), ("sleep", "#!/bin/sh\nexit 0\n")):
+    fakes = (
+        ("docker", FAKE_DOCKER),
+        ("sleep", "#!/bin/sh\nexit 0\n"),
+        ("git", FAKE_RECORDER),
+        ("gh", FAKE_RECORDER),
+    )
+    for name, body in fakes:
         (bin_dir / name).write_text(body, "utf-8")
         (bin_dir / name).chmod(0o755)
     full_env = {
@@ -281,6 +296,8 @@ def test_the_scan_fails_on_a_fixable_critical() -> None:
             "--rm",
             "-v",
             "/var/run/docker.sock:/var/run/docker.sock",
+            "-v",
+            TRIVY_CACHE,  # one DB download for the three scans
             from_lock("trivy"),
             "image",
             "--scanners",
@@ -358,11 +375,21 @@ def test_prodstack_runs_the_stack_modules_then_the_drills() -> None:
     assert not any("if" in step for step in found[: order[-1] + 1])
 
 
-def test_prodstack_always_tears_down_every_project(tmp_path: Path) -> None:
+def test_prodstack_always_tears_down_every_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     job = load(PRODSTACK)["jobs"]["prodstack"]
     found = steps_of(job)
     tail = found[-4:]
-    assert [command(step) for step in tail[:3]] == ["$PT down -v", "$PB down -v", "$S3 down -v"]
+    # as prod_session's own teardown (`prodstack.down_v`): the profiled services (restore, the probes) and
+    # orphans too, which a cancelled drill can leave behind
+    seen: list[list[str]] = []
+    monkeypatch.setattr(prodstack, "run", lambda argv, **_: seen.append(argv))
+    prodstack.down_v(["compose"])
+    (down,) = seen
+    teardown = shlex.join(down[1:])
+    assert teardown == "--profile '*' down -v --remove-orphans"
+    assert [command(step) for step in tail[:3]] == [
+        f'${name} --profile "*" down -v --remove-orphans' for name in ("PT", "PB", "S3")
+    ]
     assert [step for step in found if "if" in step] == tail
     assert all(step["if"] == "always()" for step in tail)  # after a failure or a cancel too
     assert index_of(found, DRILLS_RUN) < found.index(tail[0])
@@ -371,7 +398,9 @@ def test_prodstack_always_tears_down_every_project(tmp_path: Path) -> None:
     for step, line in zip(tail[:3], (PT, PB, S3), strict=True):
         (tmp_path / "calls").unlink(missing_ok=True)
         assert run_script(str(step["run"]), tmp_path, env).returncode == 0
-        assert docker_calls(tmp_path) == [f"{line.removeprefix('docker ')} down -v"]
+        assert docker_calls(tmp_path) == [
+            f"{line.removeprefix('docker ')} --profile * down -v --remove-orphans"
+        ]
     # and Task 27's image goes last, when it is there; its absence (an earlier failure) is not a second one
     remove = str(tail[3]["run"])
     for status, calls in (
@@ -386,8 +415,17 @@ def test_prodstack_always_tears_down_every_project(tmp_path: Path) -> None:
 def test_release_is_dispatch_only_and_writes_release_lock(tmp_path: Path) -> None:
     doc = load(RELEASE)
     assert triggers(doc) == {"workflow_dispatch": {}}
-    assert doc["permissions"] == {"contents": "write", "packages": "write", "pull-requests": "write"}
-    found = steps_of(only_job(doc))
+    # least privilege per job: the workflow's token reads only; `build` may push packages and nothing else,
+    # `pr` may push a branch and open a PR and has no packages permission
+    assert doc["permissions"] == {"contents": "read"}
+    assert list(doc["jobs"]) == ["build", "pr"]
+    build, pr = doc["jobs"]["build"], doc["jobs"]["pr"]
+    assert build["permissions"] == {"contents": "read", "packages": "write"}
+    assert pr["permissions"] == {"contents": "write", "pull-requests": "write"}
+    assert pr["needs"] == "build" and "needs" not in build
+    # every value a script uses comes from its environment: no expression inside a `run`
+    assert not [step for step in all_steps(RELEASE) if "${{" in str(step.get("run", ""))]
+    found = steps_of(build)
     names = [action(step) for step in found if "uses" in step]
     assert names == ["actions/checkout", *DOCKER_ACTIONS, *["docker/build-push-action"] * 3]
     login = next(step for step in found if action(step) == "docker/login-action")
@@ -396,17 +434,18 @@ def test_release_is_dispatch_only_and_writes_release_lock(tmp_path: Path) -> Non
         "username": "${{ github.actor }}",
         "password": "${{ secrets.GITHUB_TOKEN }}",
     }
-    # the base images and the CA bundle file, as outputs of the `lock` step
+    # the base images, the CA bundle file and the owner's GHCR namespace, lowercased, from the `lock` step
     (lock_step,) = [step for step in found if step.get("id") == "lock"]
     (tmp_path / "deploy").mkdir()
     shutil.copy(LOCK, tmp_path / "deploy/images.lock")
     output = tmp_path / "output"
-    env = {"GITHUB_OUTPUT": str(output)}
+    env = {"GITHUB_OUTPUT": str(output), "GITHUB_REPOSITORY_OWNER": "Cognimata-AI"}
     assert run_script(str(lock_step["run"]), tmp_path, env).returncode == 0
     lock = lock_lines()
     assert dict(line.split("=", 1) for line in output.read_text("utf-8").splitlines()) == {
         **{name: lock[name] for name in ROOT_BASES.values()},
         "build_ca": "/dev/null",  # SSL_CERT_FILE unset, as compose's `${SSL_CERT_FILE:-/dev/null}`
+        "ghcr": "ghcr.io/cognimata-ai",  # GHCR takes lowercase names only
     }
     # the four images: the root Dockerfile's two targets, docparse and the real embedder, each pushed
     builds = {step["id"]: step["with"] for step in found if action(step) == "docker/build-push-action"}
@@ -426,14 +465,24 @@ def test_release_is_dispatch_only_and_writes_release_lock(tmp_path: Path) -> Non
         assert given["secret-files"] == "build_ca=${{ steps.lock.outputs.build_ca }}", kind
         assert given["push"] is True, kind
         assert given["tags"] == GHCR_TAG.format(kind=kind), kind
-    # deploy/release.lock from the four digests, one line per variable compose.yaml reads from it
-    (write,) = [step for step in found if "> deploy/release.lock" in str(step.get("run", ""))]
+    # the digests and the namespace leave `build` as its outputs and reach `pr` through `needs.build.outputs`
+    assert build["outputs"] == {
+        "ghcr": "${{ steps.lock.outputs.ghcr }}",
+        **{kind: f"${{{{ steps.{kind}.outputs.digest }}}}" for kind in expected},
+    }
+    later = steps_of(pr)
+    assert [action(step) for step in later if "uses" in step] == ["actions/checkout"]
+    (write,) = [step for step in later if "> deploy/release.lock" in str(step.get("run", ""))]
     assert write["env"] == {
-        "OWNER": "${{ github.repository_owner }}",
-        **{f"{kind.upper()}_DIGEST": f"${{{{ steps.{kind}.outputs.digest }}}}" for kind in expected},
+        "GHCR": "${{ needs.build.outputs.ghcr }}",
+        **{f"{kind.upper()}_DIGEST": f"${{{{ needs.build.outputs.{kind} }}}}" for kind in expected},
     }
     digests = {kind: f"sha256:{str(n) * 64}" for n, kind in enumerate(expected, start=1)}
-    env = {"OWNER": "owner", "GITHUB_SHA": "f" * 40, **{f"{k.upper()}_DIGEST": d for k, d in digests.items()}}
+    env = {
+        "GHCR": "ghcr.io/owner",
+        "GITHUB_SHA": "f" * 40,
+        **{f"{k.upper()}_DIGEST": d for k, d in digests.items()},
+    }
     (tmp_path / "deploy/release.lock").write_text("app_image=stale\n", "utf-8")
     assert run_script(str(write["run"]), tmp_path, env).returncode == 0
     lines = (tmp_path / "deploy/release.lock").read_text("utf-8").splitlines()
@@ -442,18 +491,41 @@ def test_release_is_dispatch_only_and_writes_release_lock(tmp_path: Path) -> Non
     assert all(_DIGEST.fullmatch(line.split("=", 1)[1]) for line in written)
     compose = (REPO / "deploy/compose.yaml").read_text("utf-8")
     assert set(re.findall(r"\$\{(\w+_image):\?\}", compose)) == {line.split("=", 1)[0] for line in written}
-    # then the digest PR, last, with the job's token
-    pr = found[-1]
-    assert found.index(write) == len(found) - 2
-    assert pr["env"] == {"GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}
-    script = str(pr["run"])
-    assert "git add deploy/release.lock" in script and "gh pr create" in script
-    assert "git push" in script and "--force" not in script
+    # an empty output (a digest, or the namespace) fails the step: no lock line ends in a bare `@`
+    for missing in ("GHCR", *(f"{kind.upper()}_DIGEST" for kind in expected)):
+        done = run_script(str(write["run"]), tmp_path, {**env, missing: ""})
+        assert done.returncode != 0 and missing in done.stderr, missing
+    # then the digest PR, last, with the job's token, from a branch of this run's own attempt
+    pr_step = later[-1]
+    assert later.index(write) == len(later) - 2
+    assert pr_step["env"] == {"GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}
+    sha = "a" * 40
+    env = {
+        "GITHUB_SHA": sha,
+        "GITHUB_RUN_ID": "1234",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_REF_NAME": "develop",  # the branch it was run on, whichever it is
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "owner/job-hunter",
+    }
+    (tmp_path / "calls").unlink(missing_ok=True)
+    assert run_script(str(pr_step["run"]), tmp_path, env).returncode == 0
+    calls = docker_calls(tmp_path)
+    branch = (
+        f"release/{sha}-1234-2"  # a re-run (attempt 3) or another dispatch (another run id) never meets it
+    )
+    assert calls[:2] == [f"git switch --create {branch}", "git add deploy/release.lock"]
+    assert calls[2].startswith("git -c user.name=github-actions[bot] ") and " commit --message " in calls[2]
+    assert calls[3:5] == ["gh auth setup-git", f"git push origin {branch}"]  # the token reaches git first
+    assert calls[5].startswith(f"gh pr create --base develop --head {branch} --title ")
+    assert len(calls) == 6 and not any("--force" in call for call in calls)
 
 
 def test_the_embedder_build_runs_only_on_embedder_changes_or_dispatch(tmp_path: Path) -> None:
     doc = load(EMBEDDER)
-    assert triggers(doc) == {"pull_request": {"paths": ["embedder/**"]}, "workflow_dispatch": {}}
+    # embedder/, and what else the image is built from: its dependency group and the python and uv digests
+    paths = ["embedder/**", "pyproject.toml", "uv.lock", "deploy/images.lock"]
+    assert triggers(doc) == {"pull_request": {"paths": paths}, "workflow_dispatch": {}}
     assert doc["permissions"] == {"contents": "read"}
     job = only_job(doc)
     found = steps_of(job)
@@ -470,6 +542,8 @@ def test_the_embedder_build_runs_only_on_embedder_changes_or_dispatch(tmp_path: 
     (name,) = values(argv, "--name")
     assert values(argv, "--network") == ["none"] and "--read-only" in argv
     assert values(argv, "--user") == ["10004:10004"]
+    assert values(argv, "--cap-drop") == ["ALL"]
+    assert values(argv, "--security-opt") == ["no-new-privileges:true"]
     # passes once `embedder-health` does (a 200 with checksum_ok: true), fails when the embedder exits first
     # (exit 78 on a checksum mismatch) or is not healthy in time
     (wait,) = [step for step in found if "embedder-health" in str(step.get("run", ""))]
@@ -530,5 +604,5 @@ def test_no_secret_but_the_github_token_is_referenced() -> None:
                 assert step["with"]["persist-credentials"] is False, path
     # and no environment of the jobs this task writes holds one
     assert set(load(PRODSTACK)["jobs"]["prodstack"]["env"]) == {"PT", "PB", "S3"}
-    for job in (load(CI)["jobs"]["images"], only_job(load(EMBEDDER)), only_job(load(RELEASE))):
+    for job in (load(CI)["jobs"]["images"], only_job(load(EMBEDDER)), *load(RELEASE)["jobs"].values()):
         assert "env" not in job

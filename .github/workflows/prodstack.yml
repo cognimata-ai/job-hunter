@@ -10,8 +10,10 @@
 # reads the parent of the commit that added migration 0011, so the checkout fetches the whole history); and
 # the upgrade-then-rollback and rotation drills as one module (each drill's fixture is function-scoped).
 # test_prod_network.py loads and deletes the nft table `inet jobhunter_egress` with `sudo -n nft`, the
-# runner image's nft (to verify at the first run). Every project goes with its volumes, and `jobhunter-app:prev` is removed, in every
-# case: each in a step of its own, so one failing leaves the next to run.
+# runner image's nft (to verify at the first run). Every project goes with its volumes, its profiled services
+# (restore, the probes) and orphans included, as tests/support/prodstack.down_v removes them, and
+# `jobhunter-app:prev` is removed, in every case: each in a step of its own, so one failing leaves the next to
+# run.
 #
 # Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment),
 # uv to an exact version, the images to the digests of deploy/images.lock. No secret is referenced: the token
@@ -66,13 +68,13 @@ jobs:
         run: JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q tests/stack/test_prod_drills.py
       - name: Remove PT and its volumes
         if: always()
-        run: $PT down -v
+        run: $PT --profile "*" down -v --remove-orphans
       - name: Remove PB and its volumes
         if: always()
-        run: $PB down -v
+        run: $PB --profile "*" down -v --remove-orphans
       - name: Remove the S3 stand-in and its volumes
         if: always()
-        run: $S3 down -v
+        run: $S3 --profile "*" down -v --remove-orphans
       # Task 27's drill leaves the image tagged; it is absent only when an earlier step failed before building it
       - name: Remove jobhunter-app:prev
         if: always()

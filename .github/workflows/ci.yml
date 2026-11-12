@@ -151,7 +151,9 @@ jobs:
   # x-app-build passes it (SSL_CERT_FILE, /dev/null when unset). Then Trivy, by its digest in the lock, scans
   # the app, backup and docparse images through the Docker socket, and the job fails on a CRITICAL
   # vulnerability that has a fix (`--ignore-unfixed`). It scans vulnerabilities only (`--scanners vuln`): the
-  # repository's secrets are gitleaks' (the lint job), and .dockerignore keeps .secrets out of every image.
+  # repository's secrets are gitleaks' (the lint job), and .dockerignore keeps .secrets out of every image. The
+  # three scans share one cache, `$RUNNER_TEMP/trivy-cache` as Trivy's /root/.cache/trivy, so the job downloads
+  # the vulnerability DB once.
   images:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -195,15 +197,18 @@ jobs:
           -t jobhunter-embedder:ci-fake .
       - name: scan the app image
         run: >-
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy"
+          "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
           image --scanners vuln --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-app:ci
       - name: scan the backup image
         run: >-
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy"
+          "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
           image --scanners vuln --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-backup:ci
       - name: scan the docparse image
         run: >-
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy"
+          "$(grep ^trivy= deploy/images.lock | cut -d= -f2)"
           image --scanners vuln --exit-code 1 --severity CRITICAL --ignore-unfixed jobhunter-docparse:ci
 
   frontend:

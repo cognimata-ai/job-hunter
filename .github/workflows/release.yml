@@ -1,17 +1,23 @@
 # The release (spec §19.6; plan M5 Task 29, R11, Deviation 40): dispatched by hand only, at deployment, so
-# nothing is pushed until the user runs it. It builds the app (`runtime`), backup (`backup`), docparse and real
-# embedder images with Buildx, pushes them to GHCR with the job's own GITHUB_TOKEN, tagged with the commit
-# (`ghcr.io/<owner>/jobhunter-<name>:<sha>`), writes deploy/release.lock from their digests, the four
-# `<name>_image=ghcr.io/<owner>/jobhunter-<name>@sha256:<digest>` lines deploy/compose.yaml reads, and opens the
-# digest PR from the branch `release/<sha>` into the branch it was run on. The deploy runs what that PR merges.
+# nothing is pushed until the user runs it. Two jobs, each with only the token permissions it needs:
+# - `build` (packages: write) builds the app (`runtime`), backup (`backup`), docparse and real embedder images
+#   with Buildx and pushes them to GHCR with the job's own GITHUB_TOKEN, tagged with the commit
+#   (`ghcr.io/<owner>/jobhunter-<name>:<sha>`, the owner lowercased, as GHCR requires), and outputs their
+#   digests;
+# - `pr` (contents: write, pull-requests: write) writes deploy/release.lock from those digests, the four
+#   `<name>_image=ghcr.io/<owner>/jobhunter-<name>@sha256:<digest>` lines deploy/compose.yaml reads (each digest
+#   required: an empty one fails the step), and opens the digest PR into the branch the workflow was run on,
+#   from a branch of its own attempt, `release/<sha>-<run id>-<run attempt>`, so a re-run or another dispatch on
+#   the same commit never meets an earlier branch. The deploy runs what that PR merges.
 #
 # Every build takes its base images from the digests of deploy/images.lock, and the optional `build_ca` secret
 # as compose's x-app-build passes it (SSL_CERT_FILE, /dev/null when unset; a hosted runner has none). The PR
 # needs the repository setting that lets GitHub Actions create pull requests; a PR the GITHUB_TOKEN opens
-# starts no workflow of its own.
+# starts no workflow of its own. Every value a script uses comes from its environment, never from a `${{ }}`
+# inside the script.
 #
 # Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment),
-# the base images to digests. No secret but the GITHUB_TOKEN: the checkout does not keep it, and the PR step
+# the base images to digests. No secret but the GITHUB_TOKEN: the checkouts do not keep it, and the PR step
 # hands it to git through gh for its one push.
 name: Release
 
@@ -19,27 +25,37 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
-  packages: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ghcr: ${{ steps.lock.outputs.ghcr }}
+      app: ${{ steps.app.outputs.digest }}
+      backup: ${{ steps.backup.outputs.digest }}
+      docparse: ${{ steps.docparse.outputs.digest }}
+      embedder: ${{ steps.embedder.outputs.digest }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - name: The base images of deploy/images.lock and the build_ca file
+      - name: The base images of deploy/images.lock, the build_ca file and the GHCR namespace
         id: lock
         run: |
-          grep -E '^(python|uv|node|restic|pgvector)=' deploy/images.lock >> "$GITHUB_OUTPUT"
-          echo "build_ca=${SSL_CERT_FILE:-/dev/null}" >> "$GITHUB_OUTPUT"
+          {
+            grep -E '^(python|uv|node|restic|pgvector)=' deploy/images.lock
+            echo "build_ca=${SSL_CERT_FILE:-/dev/null}"
+            echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -61,7 +77,7 @@ jobs:
             PGVECTOR_IMAGE=${{ steps.lock.outputs.pgvector }}
           secret-files: build_ca=${{ steps.lock.outputs.build_ca }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/jobhunter-app:${{ github.sha }}
+          tags: ${{ steps.lock.outputs.ghcr }}/jobhunter-app:${{ github.sha }}
       - name: The backup image
         id: backup
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -77,7 +93,7 @@ jobs:
             PGVECTOR_IMAGE=${{ steps.lock.outputs.pgvector }}
           secret-files: build_ca=${{ steps.lock.outputs.build_ca }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/jobhunter-backup:${{ github.sha }}
+          tags: ${{ steps.lock.outputs.ghcr }}/jobhunter-backup:${{ github.sha }}
       - name: The docparse image
         id: docparse
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -89,7 +105,7 @@ jobs:
             UV_IMAGE=${{ steps.lock.outputs.uv }}
           secret-files: build_ca=${{ steps.lock.outputs.build_ca }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/jobhunter-docparse:${{ github.sha }}
+          tags: ${{ steps.lock.outputs.ghcr }}/jobhunter-docparse:${{ github.sha }}
       - name: The embedder image (the model download, checked against embedder/model.lock)
         id: embedder
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -102,28 +118,40 @@ jobs:
             UV_IMAGE=${{ steps.lock.outputs.uv }}
           secret-files: build_ca=${{ steps.lock.outputs.build_ca }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/jobhunter-embedder:${{ github.sha }}
+          tags: ${{ steps.lock.outputs.ghcr }}/jobhunter-embedder:${{ github.sha }}
+
+  pr:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: deploy/release.lock
         env:
-          OWNER: ${{ github.repository_owner }}
-          APP_DIGEST: ${{ steps.app.outputs.digest }}
-          BACKUP_DIGEST: ${{ steps.backup.outputs.digest }}
-          DOCPARSE_DIGEST: ${{ steps.docparse.outputs.digest }}
-          EMBEDDER_DIGEST: ${{ steps.embedder.outputs.digest }}
+          GHCR: ${{ needs.build.outputs.ghcr }}
+          APP_DIGEST: ${{ needs.build.outputs.app }}
+          BACKUP_DIGEST: ${{ needs.build.outputs.backup }}
+          DOCPARSE_DIGEST: ${{ needs.build.outputs.docparse }}
+          EMBEDDER_DIGEST: ${{ needs.build.outputs.embedder }}
         run: |
           {
             echo "# The release images of $GITHUB_SHA, by digest (.github/workflows/release.yml)."
-            echo "app_image=ghcr.io/$OWNER/jobhunter-app@$APP_DIGEST"
-            echo "backup_image=ghcr.io/$OWNER/jobhunter-backup@$BACKUP_DIGEST"
-            echo "docparse_image=ghcr.io/$OWNER/jobhunter-docparse@$DOCPARSE_DIGEST"
-            echo "embedder_image=ghcr.io/$OWNER/jobhunter-embedder@$EMBEDDER_DIGEST"
+            echo "app_image=${GHCR:?}/jobhunter-app@${APP_DIGEST:?}"
+            echo "backup_image=${GHCR:?}/jobhunter-backup@${BACKUP_DIGEST:?}"
+            echo "docparse_image=${GHCR:?}/jobhunter-docparse@${DOCPARSE_DIGEST:?}"
+            echo "embedder_image=${GHCR:?}/jobhunter-embedder@${EMBEDDER_DIGEST:?}"
           } > deploy/release.lock
           cat deploy/release.lock
       - name: The digest PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          branch="release/$GITHUB_SHA"
+          branch="release/${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git switch --create "$branch"
           git add deploy/release.lock
           git -c user.name="github-actions[bot]" \
@@ -131,6 +159,7 @@ jobs:
             commit --message "chore(release): the image digests of $GITHUB_SHA"
           gh auth setup-git
           git push origin "$branch"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
             --title "chore(release): the image digests of ${GITHUB_SHA:0:12}" \
-            --body "deploy/release.lock: the app, backup, docparse and embedder images built from $GITHUB_SHA by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            --body "deploy/release.lock: the four images built from $GITHUB_SHA by $run_url"
