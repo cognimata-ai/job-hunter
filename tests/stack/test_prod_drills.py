@@ -17,9 +17,9 @@ the drill's subject. At the end, after a failure too, `prod_session` removes the
 (`down -v`). The drill never removes an image: `jobhunter-app:prev` stays tagged, for the operator to remove
 (CI removes it in an `if: always()` step, Task 29).
 
-The site is driven as in tests/stack/test_prod_restore.py, whose browser (`Site`, logged in as that module's
-dummy user), seed inputs and log reader it reuses: a collection on the fixtures and a confirmed profile from
-the recorded Claude streams, no paid or external call.
+The site is driven as in tests/stack/test_prod_restore.py, by the browser (`Site`, logged in as the stack
+modules' dummy user), the seed inputs and the log reader both share (`tests.support.prodsite`): a collection
+on the fixtures and a confirmed profile from the recorded Claude streams, no paid or external call.
 """
 
 import subprocess
@@ -29,7 +29,7 @@ from typing import Any, Final
 import pytest
 from jobhunter.db.migrate import MIGRATE_ORDER
 
-from tests.stack import test_prod_restore as restore
+from tests.support.prodsite import PASSWORD, SEED_INPUTS, USERNAME, Site, events, wait_for
 from tests.support.prodstack import PT, REPO, create_user, prod_session, psql, run, up
 
 pytestmark = pytest.mark.stack
@@ -51,6 +51,7 @@ KEPT: Final = (
     "queries",
     "watchlist_companies",
 )
+NONE_MISSING: Final[dict[str, list[int]]] = {table: [] for table in KEPT}
 READY_WITHIN_S: Final = 60
 
 
@@ -69,7 +70,7 @@ def migrate() -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
     """`$PT run --rm migrate` (§19.6's step 2) with the release the environment names: its outcome and the
     JSON events it logged (stdout and stderr)."""
     done = run([*PT, "run", "--rm", "-T", "migrate"], timeout=600, check=False)
-    return done, restore.events(f"{done.stdout}\n{done.stderr}")
+    return done, events(f"{done.stdout}\n{done.stderr}")
 
 
 def steps_of(found: list[dict[str, Any]]) -> list[str]:
@@ -82,16 +83,19 @@ def snapshot() -> dict[str, Any]:
         table: {int(n) for n in psql(PT, f"SELECT id FROM {table}").split()}  # noqa: S608
         for table in KEPT
     }
-    return {"ids": ids, "profile": one("SELECT profile_version_id FROM active_config WHERE id = 1")}
+    return {"ids": ids, "profile": active_profile()}
 
 
-def intact(before: dict[str, Any]) -> bool:
-    """Every row `before` holds is still there (a scheduled collection may add rows, nothing may go), and the
-    active profile version is the same."""
-    after = snapshot()
-    return after["profile"] == before["profile"] and all(
-        before["ids"][table] <= after["ids"][table] for table in KEPT
-    )
+def missing(before: dict[str, Any]) -> dict[str, list[int]]:
+    """Per table of `KEPT`, the ids `before` holds that are gone (a scheduled collection may add rows, nothing
+    may go): every list is empty while the data is intact (`NONE_MISSING`), and a failure names the table and
+    its ids."""
+    after = snapshot()["ids"]
+    return {table: sorted(before["ids"][table] - after[table]) for table in KEPT}
+
+
+def active_profile() -> str:
+    return one("SELECT profile_version_id FROM active_config WHERE id = 1")
 
 
 def images() -> dict[str, str]:
@@ -100,16 +104,16 @@ def images() -> dict[str, str]:
     return dict(line.split(" ", 1) for line in listed.splitlines() if line.strip())
 
 
-def readyz(site: restore.Site) -> tuple[int, Any]:
+def readyz(site: Site) -> tuple[int, Any]:
     answer = site.http.get("/readyz")
     return answer.status_code, answer.json()
 
 
-def ready(site: restore.Site) -> None:
-    restore.wait_for(lambda: readyz(site)[0] == 200, within_s=READY_WITHIN_S, what="/readyz 200")
+def ready(site: Site) -> None:
+    wait_for(lambda: readyz(site)[0] == 200, within_s=READY_WITHIN_S, what="/readyz 200")
 
 
-def jobs_list(site: restore.Site) -> list[int]:
+def jobs_list(site: Site) -> list[int]:
     """The first page of the Jobs list, its job ids."""
     return [int(card["job_id"]) for card in site.get("/api/jobs?limit=100")["items"]]
 
@@ -139,9 +143,9 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
     up(PT, build=False)
     assert set(images().values()) == {PREV_IMAGE}
     assert one("SELECT version_num FROM alembic_version") == PREV_HEAD
-    create_user(PT, restore.USERNAME, restore.PASSWORD)
-    site = restore.Site(PT)
-    assert one(restore.SEED_INPUTS).count("|") == 2
+    create_user(PT, USERNAME, PASSWORD)
+    site = Site(PT)
+    assert one(SEED_INPUTS).count("|") == 2
     site.collect(include_paid=True)
     version = site.confirmed_profile()
     before = snapshot()
@@ -161,9 +165,11 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
         f"{PREV_HEAD} false"
     )
     assert one("SELECT to_regclass('operations_purge_manifest') IS NOT NULL") == "t"
-    site = restore.Site(PT)
+    site = Site(PT)
     ready(site)
-    assert intact(before) and jobs_list(site)
+    assert missing(before) == NONE_MISSING
+    assert active_profile() == before["profile"]
+    assert jobs_list(site)
 
     # The rollback: the preceding release's images again, on the 0011 schema
     monkeypatch.setenv("app_image", PREV_IMAGE)
@@ -175,10 +181,12 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
     up(PT, build=False)
     assert set(images().values()) == {PREV_IMAGE}
     assert one("SELECT version_num FROM alembic_version") == HEAD  # nothing was downgraded
-    site = restore.Site(PT)  # the login works
+    site = Site(PT)  # the login works
     ready(site)
     assert readyz(site) == (200, {})
-    assert intact(before) and jobs_list(site)
+    assert missing(before) == NONE_MISSING
+    assert active_profile() == before["profile"]
+    assert jobs_list(site)
 
     # 0011 made destructive in the database: the preceding release refuses it
     psql(PT, f"UPDATE schema_compat SET destructive = true WHERE revision = '{HEAD}'")  # noqa: S608

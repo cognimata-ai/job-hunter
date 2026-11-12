@@ -20,30 +20,38 @@ site's own internal root), and by the CLI in the containers (`jobhunter backup â
 `jobhunter restore verify`, `migrate`). Where the API has no route for a step (a tombstoning pass, which the
 worker's daily schedule opens; a second profile version), a short script runs the app's own function in the
 worker container; the fixtures hold no job that mixes Adzuna with another source, so Fable's sequence
-makes one by moving an Adzuna posting onto a Greenhouse job before the set (`MIX`). No real S3 and no paid
-call: the worker is on the fixtures and the recorded Claude streams. No secret value is printed: the password
-below is this module's own dummy user's, and key ids are hex ids.
+makes one by moving an Adzuna posting onto a Greenhouse job before the set (`MIX`). The browser (`Site`), the
+dummy user and the readers of a command's output are `tests.support.prodsite`'s, which the drills share. No
+real S3 and no paid call: the worker is on the fixtures and the recorded Claude streams. No secret value is
+printed: the dummy user's password is no secret, and key ids are hex ids.
 """
 
 import json
 import os
-import ssl
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import Any, Final
 
-import httpx
 import pytest
 
+from tests.support.prodsite import (
+    PASSWORD,
+    SEED_INPUTS,
+    USERNAME,
+    Site,
+    backup,
+    events,
+    in_worker,
+    last_json,
+    named,
+    one,
+    wait_for,
+)
 from tests.support.prodstack import (
-    ORIGIN,
     PB,
     PT,
     STACK_SERVICES,
-    caddy_root_pem,
     create_user,
     down_v,
-    logs_tail,
     other_stack_up,
     prod_session,
     psql,
@@ -51,38 +59,18 @@ from tests.support.prodstack import (
     s3_down,
     up,
 )
-from tests.support.profile import SYNTHETIC_CV, SYNTHETIC_PROFILE, minimal_pdf
+from tests.support.profile import SYNTHETIC_PROFILE
 
 pytestmark = pytest.mark.stack
 
-USERNAME: Final = "restoretest"
-PASSWORD: Final = "Messingglocke-Lindenblatt-9"  # this module's own dummy user's
 ROLES: Final = ("api", "worker", "migrate", "backup", "restore")
 MARKER: Final = "--- startup-check passed ---"
 SECRETS_CHECK: Final = (
     f'jobhunter startup-check --role "$1" && echo "{MARKER}" && id -u && id -G && '
     'for f in /run/secrets/*; do stat -c "%n %u:%g %a" "$f"; done'
 )
-POLL_S: Final = 2.0
 RESTORE_TIMEOUT_S: Final = 1200
 FAULT: Final = "privacy.purge.before_file"
-TERMINAL: Final = frozenset({"succeeded", "partial", "failed", "cancelled"})
-# The inputs of a collection (smoke_m1's, plan Deviation 3): a query and the Greenhouse board on the fixtures,
-# both enabled in the active settings version.
-SEED_INPUTS: Final = """
-WITH q AS (INSERT INTO queries (text, lang, origin) VALUES ('software engineer', 'en', 'user') RETURNING id),
-c AS (INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, detection,
-  validation_status, validated_at) VALUES ('getyourguide', 'getyourguide', 'greenhouse', 'getyourguide',
-  'manual', 'ok', now()) RETURNING id),
-i AS (INSERT INTO source_instances (source_id, instance_key, watchlist_company_id)
-  SELECT 'greenhouse', 'getyourguide', c.id FROM c RETURNING id),
-s AS (UPDATE settings_versions v SET payload = jsonb_set(jsonb_set(v.payload, '{queries}',
-  v.payload->'queries' || jsonb_build_array(jsonb_build_object('query_id', (SELECT id FROM q), 'enabled',
-  true))), '{watchlist}', v.payload->'watchlist' || jsonb_build_array(jsonb_build_object(
-  'watchlist_company_id', (SELECT id FROM c),
-  'enabled', true))) FROM active_config a WHERE a.id = 1 AND v.id = a.settings_version_id RETURNING v.id)
-SELECT (SELECT id FROM q), (SELECT id FROM i), (SELECT id FROM s)
-"""
 # The mixed job the fixtures lack (no Adzuna ad of theirs is another source's too): the first Adzuna posting
 # moved onto the first Greenhouse job, which then holds postings of both sources; that job's id.
 MIX: Final = """
@@ -194,143 +182,10 @@ COUNTED: Final = (
     "settings_versions",
     "exports",
 )
-_RUN_STATUS: Final = "SELECT status FROM runs WHERE id = {run_id}"
 STATE: dict[str, Any] = {}
 
 
 # ---- helpers -----------------------------------------------------------------------------------------------
-
-
-def last_json(stdout: str) -> Any:
-    """The JSON line a command printed last on stdout."""
-    return json.loads([line for line in stdout.splitlines() if line.strip()][-1])
-
-
-def events(stderr: str) -> list[dict[str, Any]]:
-    """The JSON log events a command wrote to stderr (lines that are no JSON object are compose's own)."""
-    found = []
-    for line in stderr.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and "event" in event:
-            found.append(event)
-    return found
-
-
-def named(found: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
-    return [event for event in found if event["event"] == name]
-
-
-def wait_for(probe: Callable[[], Any], *, within_s: float, what: str, argv: list[str] = PT) -> Any:
-    """`probe()` until it returns a truthy value, polled every `POLL_S` for at most `within_s`."""
-    deadline = time.monotonic() + within_s
-    while not (found := probe()):
-        if time.monotonic() >= deadline:
-            pytest.fail(f"{what} not within {within_s:g} s:\n{logs_tail(argv, 'worker', 'backup')}")
-        time.sleep(POLL_S)
-    return found
-
-
-def one(argv: list[str], sql: str) -> str:
-    return psql(argv, sql).strip()
-
-
-def backup(argv: list[str], command: str) -> Any:
-    """`jobhunter backup <command>` in the site's running backup container; what it printed."""
-    return last_json(run([*argv, "exec", "-T", "backup", "jobhunter", "backup", command], timeout=900).stdout)
-
-
-def in_worker(argv: list[str], script: str, stdin: str | None = None) -> Any:
-    """`script` run by the app's python in the site's worker container; the JSON it printed."""
-    done = run([*argv, "exec", "-T", "worker", "python", "-I", "-c", script], stdin=stdin, timeout=300)
-    return last_json(done.stdout)
-
-
-class Site:
-    """A browser of a site: a TLS client of its Caddy, logged in as this module's user."""
-
-    def __init__(self, argv: list[str]) -> None:
-        self.argv = argv
-        context = ssl.create_default_context(cadata=caddy_root_pem(argv))
-        self.http = httpx.Client(base_url=ORIGIN, verify=context, timeout=30)
-        wait_for(self._healthy, within_s=120, what="Caddy and the api", argv=argv)
-        login = self.http.post(
-            "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}, headers={"Origin": ORIGIN}
-        )
-        assert login.status_code == 204, login.text
-
-    def _healthy(self) -> bool:
-        try:
-            return self.http.get("/healthz").status_code == 200
-        except httpx.TransportError:
-            return False
-
-    def headers(self) -> dict[str, str]:
-        return {"Origin": ORIGIN, "X-JH-Request": "1", "Idempotency-Key": f"restore-test-{time.time_ns()}"}
-
-    def post(self, path: str, expected: int, **kwargs: Any) -> Any:
-        answer = self.http.post(path, headers=self.headers(), **kwargs)
-        assert answer.status_code == expected, (path, answer.status_code, answer.text)
-        return answer.json()
-
-    def get(self, path: str) -> Any:
-        answer = self.http.get(path)
-        assert answer.status_code == 200, (path, answer.status_code)
-        return answer.json()
-
-    def export_download(self, export_id: int) -> tuple[int, str | None]:
-        answer = self.http.get(f"/api/privacy/exports/{export_id}", params={"download": "1"})
-        body = answer.json() if answer.headers.get("content-type", "").startswith("application/") else {}
-        return answer.status_code, body.get("code")
-
-    def ready_export(self) -> int:
-        export_id = int(self.post("/api/privacy/export", 202, json={})["export_id"])
-        wait_for(
-            lambda: self.get(f"/api/privacy/exports/{export_id}")["status"] == "ready",
-            within_s=180,
-            what=f"export {export_id} ready",
-            argv=self.argv,
-        )
-        return export_id
-
-    def collect(self, *, include_paid: bool) -> int:
-        """A manual run, to its end; its id (it must have succeeded)."""
-        run_id = int(self.post("/api/runs", 202, json={"include_paid": include_paid})["run"]["id"])
-        status = wait_for(
-            lambda: (s := one(self.argv, _RUN_STATUS.format(run_id=run_id))) in TERMINAL and s,
-            within_s=900,
-            what=f"run {run_id}",
-            argv=self.argv,
-        )
-        assert status == "succeeded", (run_id, status)
-        return run_id
-
-    def confirmed_profile(self) -> int:
-        """The synthetic CV uploaded, reviewed, extracted on the recorded streams and confirmed; the
-        version."""
-        pdf = minimal_pdf(SYNTHETIC_CV.splitlines())
-        draft = int(
-            self.post("/api/profile/cv", 202, files={"file": ("Lebenslauf.pdf", pdf, "application/pdf")})[
-                "draft_id"
-            ]
-        )
-        path = f"/api/profile/drafts/{draft}"
-        self.wait_draft(path, "text_review")
-        self.post(f"{path}/text-review", 202)
-        self.wait_draft(path, "ready")
-        return int(
-            self.post(f"{path}/confirm", 201, json={"expected_rescore_ack": True})["profile_version_id"]
-        )
-
-    def wait_draft(self, path: str, status: str) -> None:
-        def reached() -> bool:
-            found = self.get(path)["status"]
-            assert found != "failed", path
-            return bool(found == status)
-
-        wait_for(reached, within_s=180, what=f"draft {status}", argv=self.argv)
 
 
 def lose_and_restore(set_id: int | None) -> tuple[Any, list[dict[str, Any]]]:
