@@ -10,6 +10,7 @@ back afterwards. Every datum is invented.
 """
 
 import copy
+import hashlib
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -306,4 +307,20 @@ async def test_the_replayed_phase_refuses_a_pending_retry_until_completed(
     assert (after.ok, after.failures) == (True, [])
     row = await one(db.engine, _MANIFEST, u=opened.manifest_uuid)
     assert row.status == "completed" and row.file_sha256 is not None
-    assert (stream / manifest_file_name(opened.manifest_uuid)).is_file()
+    written = stream / manifest_file_name(opened.manifest_uuid)
+    assert hashlib.sha256(written.read_bytes()).digest() == bytes(row.file_sha256)
+
+    # Review M2 (§19.5 step 8): the phase holds only while the completed manifest's file is in the stream, as
+    # the row records it.
+    content = written.read_bytes()
+    written.unlink()
+    async with db.engine.connect() as conn:
+        missing = await verify_replayed(conn, stream, files=db.files)
+    assert not missing.ok and f"manifest_file_missing:{opened.manifest_uuid}" in missing.failures
+    written.write_bytes(b"{}")
+    async with db.engine.connect() as conn:
+        differs = await verify_replayed(conn, stream, files=db.files)
+    assert not differs.ok and f"manifest_file_differs:{opened.manifest_uuid}" in differs.failures
+    written.write_bytes(content)
+    async with db.engine.connect() as conn:
+        assert (await verify_replayed(conn, stream, files=db.files)).ok

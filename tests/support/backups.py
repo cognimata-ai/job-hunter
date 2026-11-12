@@ -15,6 +15,9 @@ directories and the listed files it is given into a new snapshot, each under its
 copies the content of the snapshot's `subfolder` into `target`, as `restic restore <id>:<subfolder> --target`
 does (a subfolder the snapshot lacks fails as restic does). `failing` names the calls that raise
 `ResticError` instead (e.g. `snapshots` for an unreachable repository); `restores` records each restore.
+`whole_paths` names subfolders whose restore lands under `target` at their whole path, as a restore naming no
+subfolder would (`restic restore <id> --target`): the files one level deeper, or more, than the step expects.
+`stored(snapshot, path)` is where a snapshot holds a backed-up file, for a test to alter it.
 """
 
 import shutil
@@ -164,8 +167,13 @@ class FakeRepository(Restic):
         super().__init__(cfg, Unreachable())
         self.root = root
         self.failing = set(failing)
+        self.whole_paths: set[str] = set()
         self.infos: list[SnapshotInfo] = []
         self.restores: list[Restored] = []
+
+    def stored(self, snapshot: str, path: Path) -> Path:
+        """Where `snapshot` holds the backed-up file `path`."""
+        return self._inside(self.root / snapshot, path)
 
     def _fail(self, command: str) -> None:
         if command in self.failing:
@@ -203,4 +211,5 @@ class FakeRepository(Restic):
         source = self._inside(self.root / snapshot, subfolder)
         if not source.is_dir():
             raise ResticError("restore", "failed", 1)
-        shutil.copytree(source, target, dirs_exist_ok=True)
+        landing = self._inside(target, subfolder) if subfolder in self.whole_paths else target
+        shutil.copytree(source, landing, dirs_exist_ok=True)

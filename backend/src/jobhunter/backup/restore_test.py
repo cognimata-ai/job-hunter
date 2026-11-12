@@ -22,8 +22,10 @@ Then, after a failure too, the scratch database is dropped (as `jobhunter_restor
 scratch directory removed, and the run becomes `succeeded` with its report (the set and snapshot, the stream,
 both verification reports, the migrate steps and the exports ended: ids, codes and counts only), or `failed`
 with `error` = `<step>:<code>` (the step's `RestoreFailed` code, or an unforeseen error's class) and the
-report so far, and `RestoreTestFailed` is raised. A failed run raises `backup.restore_test_failed` through the
-worker's `backup_health` reconciler (Task 7): no alert is raised here.
+report so far, and `RestoreTestFailed` is raised. An exception outside every step (the cleanup's included)
+fails the run too, as `unexpected:<error class>`: a run is never left `running` by its own process. A failed
+run raises `backup.restore_test_failed` through the worker's `backup_health` reconciler (Task 7): no alert is
+raised here.
 """
 
 import shutil
@@ -64,6 +66,8 @@ from jobhunter.types import JSONValue
 RESTORE_TEST_DB: Final = "jobhunter_restore_test"
 RESTORE_TEST_STAGING: Final = "restore_test"
 TEMPLATE_DB: Final = "jobhunter_template"
+# The error's step for a failure outside every step (`unexpected:<error class>`, review M7).
+UNEXPECTED: Final = "unexpected"
 SCRATCH_DIRS: Final = ("set", "manifests", "cv", "exports")
 
 _START: Final = q(
@@ -222,15 +226,19 @@ async def run_restore_test(
         report: dict[str, JSONValue] = {}
         error: str | None = None
         failed_at: RestoreStep | None = None
+        cause: Exception | None = None
         try:
-            await _steps(cfg, restic, runner, engine, run_id, report, now=clock())
+            try:
+                await _steps(cfg, restic, runner, engine, run_id, report, now=clock())
+            finally:
+                await _clean_up(cfg)
         except RestoreFailed as failed:
-            error, failed_at = f"{failed.step}:{failed.error}", failed.step
-        finally:
-            await _clean_up(cfg)
+            error, failed_at, cause = f"{failed.step}:{failed.error}", failed.step, failed
+        except Exception as exc:  # noqa: BLE001 - outside every step: recorded `unexpected:<class>`, re-raised
+            error, cause = f"{UNEXPECTED}:{type(exc).__name__}", exc
         await _end(engine, run_id, report, error=error)
         if error is not None:
             log.error("restore_test_failed", run_id=run_id, step=failed_at, error=error)
-            raise RestoreTestFailed(run_id, error)
+            raise RestoreTestFailed(run_id, error) from cause
         log.info("restore_test_succeeded", run_id=run_id, set_id=report.get("set_id"))
         return run_id

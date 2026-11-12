@@ -392,6 +392,27 @@ def status_of(argv: list[str], manifest_uuid: str) -> str:
     return one(argv, f"SELECT status FROM deletion_manifests WHERE manifest_uuid = '{manifest_uuid}'")  # noqa: S608
 
 
+def completions_of(argv: list[str], manifest_uuid: str) -> int:
+    """How many completed replays a manifest's `replay_log` records (entries with their counts)."""
+    return int(
+        one(
+            argv,
+            "SELECT count(*) FROM deletion_manifests m "  # noqa: S608 - a uuid the database wrote
+            "CROSS JOIN LATERAL jsonb_array_elements(m.replay_log) e "
+            f"WHERE m.manifest_uuid = '{manifest_uuid}' AND e ? 'counts'",
+        )
+    )
+
+
+def replay_logs(argv: list[str]) -> str:
+    """Every manifest's `replay_log`, by uuid, as the database holds it."""
+    return one(
+        argv,
+        "SELECT coalesce(string_agg(manifest_uuid::text || '=' || replay_log::text, ' ' "
+        "ORDER BY manifest_uuid), '') FROM deletion_manifests",
+    )
+
+
 def uuid_of(argv: list[str], manifest_id: int) -> str:
     return one(argv, f"SELECT manifest_uuid FROM deletion_manifests WHERE id = {manifest_id}")  # noqa: S608
 
@@ -430,7 +451,7 @@ def test_a_backup_before_any_manifest_restores(stack: None) -> None:
     run([*PT, "down"], timeout=300)  # A's volumes are kept: A is needed again
     try:
         printed, found = lose_and_restore(None)
-        assert printed == {"restored": True}
+        assert (printed["restored"], printed["set_id"]) == (True, set_id)
         assert len(named(found, "manifest_stream_empty")) == 1
         assert verified(found) == [("restored", True), ("replayed", True)]
         [staged] = named(found, "restore_set_staged")
@@ -508,7 +529,9 @@ def test_c32_vps_loss_after_a_shipped_deletion(stack: None) -> None:
     manifest names, is `purged` by the replay and answers 410 `gone`."""
     down_v(PT)
     printed, found = lose_and_restore(None)
-    assert printed == {"restored": True}
+    # Review M3: the set and the data key ids its ciphertexts name (the CV file's), hex ids only, on stdout.
+    assert (printed["restored"], printed["set_id"]) == (True, STATE["set"])
+    assert printed["data_key_ids"] and all(len(key) == 16 for key in printed["data_key_ids"])
     assert verified(found) == [("restored", True), ("replayed", True)]
     [stream] = named(found, "manifest_stream_restored")
     assert stream["manifests"] >= 2
@@ -555,13 +578,7 @@ def test_purge_then_tombstone_then_restore_on_the_stack(stack: None) -> None:
     # inserted, replayed and completed each, once.
     for manifest_uuid in (STATE["purge_uuid"], STATE["tombstone_uuid"]):
         assert status_of(PB, manifest_uuid) in ("completed", "shipped")
-        replays = one(
-            PB,
-            "SELECT count(*) FROM deletion_manifests m "  # noqa: S608 - a uuid the database wrote
-            "CROSS JOIN LATERAL jsonb_array_elements(m.replay_log) e "
-            f"WHERE m.manifest_uuid = '{manifest_uuid}' AND e ? 'counts'",
-        )
-        assert replays == "1", manifest_uuid
+        assert completions_of(PB, manifest_uuid) == 1, manifest_uuid
 
 
 def test_c37_newer_manifest_replays_once(stack: None) -> None:
@@ -594,9 +611,14 @@ def test_c37_newer_manifest_replays_once(stack: None) -> None:
     )
     new_uuid = one(PB, f"SELECT manifest_uuid FROM deletion_manifests WHERE id = {manifest}")  # noqa: S608
 
-    before = counts(PB)
+    before, logs_before = counts(PB), replay_logs(PB)
     run([*PB, "run", "--rm", "-T", "migrate"], timeout=600)
     assert counts(PB) == before  # it deleted nothing
+    # Review M6: nothing was replayed again: every manifest's `replay_log` is as it was, and the two restored
+    # manifests still hold exactly one completion each (C37's "replayed once").
+    assert replay_logs(PB) == logs_before
+    for manifest_uuid in (STATE["purge_uuid"], STATE["tombstone_uuid"]):
+        assert completions_of(PB, manifest_uuid) == 1, manifest_uuid
     assert min(new_jobs) > restored.get("jobs", 0)
     assert int(version["version"]) > restored.get("profile_versions", 0)
     assert manifest > restored.get("deletion_manifests", 0)
@@ -633,7 +655,7 @@ def test_c39_pending_retry_completes_before_verify(stack: None) -> None:
     down_v(PT)
 
     printed, found = lose_and_restore(set_id)
-    assert printed == {"restored": True}
+    assert (printed["restored"], printed["set_id"]) == (True, set_id)
     classified = named(found, "replay_classified")
     assert classified and classified[0]["outcomes"].get("pending_retry") == 1
     assert len(named(found, "replay_pending_completed")) == 1

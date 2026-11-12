@@ -336,74 +336,6 @@ def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.Argume
     scrub.add_argument("output", help="the fixture directory to write, e.g. tests/contract/fixtures")
 
 
-def _restore_verify(args: argparse.Namespace) -> int:
-    """`restore verify` as the `restore` role (the migrator's login): one JSON line, the phase's report (exit
-    0 when it holds, else 1), or `{"error": "<code>"}` (exit 1). The `restored` phase reads the set's
-    `backup_set.json` where `restore run` stages it (`<staging_dir>/restore`) and the set's snapshot id from
-    restic, and commits the closing of the backup rows only when it holds; `replayed` reads the stream and the
-    mounted `cv_store` and `exports` volumes."""
-    # Imported here: the checks load the replay's modules, the database layer and the restic wrapper.
-    import asyncio
-    import json
-
-    from jobhunter.backup.restic import Restic, ResticError
-    from jobhunter.backup.restore import RESTORE_STAGING, null_engine
-    from jobhunter.backup.runner import SubprocessRunner
-    from jobhunter.observability.logging import configure_logging
-    from jobhunter.privacy.manifests import FileRoots
-    from jobhunter.privacy.restore_verify import VerifyReport, verify_replayed, verify_restored
-
-    cfg = startup_or_exit("restore")
-    configure_logging(cfg.log_level, stream=sys.stderr)
-
-    async def restored() -> VerifyReport | str:
-        staged = cfg.staging_dir / RESTORE_STAGING / "backup_set.json"
-        try:
-            inventory = json.loads(staged.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return "backup_set_not_staged"
-        if not isinstance(inventory, dict) or inventory.get("set_id") != args.set:
-            return "backup_set_not_staged"
-        if cfg.restic is None:
-            return "not_configured"
-        try:
-            found = await Restic(cfg, SubprocessRunner()).snapshots(tags=[f"set:{args.set}"])
-        except ResticError as failed:
-            return failed.code
-        if not found:
-            return "backup_set_not_found"
-        engine = null_engine(cfg, database=args.database)
-        try:
-            async with engine.connect() as conn:
-                async with conn.begin() as transaction:
-                    report = await verify_restored(conn, inventory, snapshot_id=found[-1].id)
-                    if not report.ok:
-                        await transaction.rollback()
-            return report
-        finally:
-            await engine.dispose()
-
-    async def replayed() -> VerifyReport:
-        engine = null_engine(cfg, database=args.database)
-        try:
-            async with engine.connect() as conn:
-                files = FileRoots(cv_store=cfg.cv_store_dir, exports=cfg.exports_dir)
-                return await verify_replayed(conn, cfg.manifests_dir, files=files)
-        finally:
-            await engine.dispose()
-
-    try:
-        outcome = asyncio.run(restored() if args.phase == "restored" else replayed())
-    except Exception as exc:  # noqa: BLE001 - the printed code is the outcome; never a message or traceback
-        print(json.dumps({"error": "unexpected", "error_class": type(exc).__name__}))
-        return 1
-    if isinstance(outcome, str):
-        print(json.dumps({"error": outcome}))
-        return 1
-    print(json.dumps({"phase": outcome.phase, "ok": outcome.ok, "failures": outcome.failures}))
-    return 0 if outcome.ok else 1
-
-
 def _worker_health() -> int:
     """The worker's container HEALTHCHECK: one read of `worker_heartbeat` as the application role.
 
@@ -536,11 +468,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return run_backup_command(args)
     if args.command == "restore":
-        if args.restore_command == "verify":
-            return _restore_verify(args)
         # Imported here, like `backup`: the restore needs the restic wrapper, migrate and the database layer.
-        from jobhunter.cli_backup import run_restore_command
+        from jobhunter.cli_backup import run_restore_command, run_restore_verify_command
 
+        if args.restore_command == "verify":
+            return run_restore_verify_command(args)
         return run_restore_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.

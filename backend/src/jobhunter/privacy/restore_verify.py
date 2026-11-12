@@ -23,8 +23,12 @@ every `deletion_manifests` row is `satisfied` by §19.5's table (`replay.classif
 `files`): `completed` or `shipped`, every postcondition holding (its file postconditions checked in `files`:
 the mounted `cv_store` and `exports` volumes for `restore verify`, the scratch directories for the restore
 test) and no fence of it active; so a former pending retry passes only once `migrate` completed it and wrote
-its file. Then no purge fence is active at all, and every identity's next value lies above every bound of the
-stream and of the recorded manifests (`identities.manifest_bounds`, the bounds the advancement used).
+its file. That file is checked itself (review M2, §19.5 step 8): every `completed` or `shipped` row's
+`<manifest_uuid>.json` must be in the stream (migrate step 1 rewrites any it lacks from `scope`), its bytes
+hashing to the row's `file_sha256` (`manifest_file_missing:<uuid>`, `manifest_file_differs:<uuid>`), since
+the classification alone rates such a row from its `scope`. Then no purge fence is active at all, and every
+identity's next value lies above every bound of the stream and of the recorded manifests
+(`identities.manifest_bounds`, the bounds the advancement used).
 
 A report's failures name a check with ids, table names and counts only, never content. Each report is logged
 (`restore_verified`).
@@ -45,7 +49,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.identities import manifest_bounds, next_identity_values
-from jobhunter.privacy.manifests import FileRoots, ManifestConflict, ManifestInvalid
+from jobhunter.privacy.manifests import FileRoots, ManifestConflict, ManifestInvalid, read_manifest_file
 from jobhunter.sources.http import MAX_BODY_BYTES
 from jobhunter.types import JSONValue
 
@@ -64,6 +68,10 @@ _BODIES: Final = q(
 )
 _SET_ROW: Final = q("SELECT status, restic_snapshot_id FROM backup_sets WHERE id = :id")
 _ACTIVE_FENCES: Final = q("SELECT id FROM purge_fences WHERE released_at IS NULL ORDER BY id")
+_ENDED: Final = q(
+    "SELECT manifest_uuid, file_sha256 FROM deletion_manifests WHERE status IN ('completed', 'shipped') "
+    "ORDER BY manifest_uuid"
+)
 
 log = get_logger("jobhunter.privacy.restore_verify")
 
@@ -235,6 +243,22 @@ async def verify_restored(
     return _report("restored", failures)
 
 
+async def _file_failures(conn: AsyncConnection, manifest_dir: Path) -> list[str]:
+    """Each completed or shipped manifest whose file the stream lacks or holds with other bytes (module
+    docstring)."""
+    failures: list[str] = []
+    for row in await conn.execute(_ENDED):
+        try:
+            data = read_manifest_file(manifest_dir, row.manifest_uuid)
+        except OSError:  # a link or a directory in the file's place: no file of the stream
+            data = None
+        if data is None:
+            failures.append(f"manifest_file_missing:{row.manifest_uuid}")
+        elif hashlib.sha256(data).digest() != bytes(row.file_sha256):
+            failures.append(f"manifest_file_differs:{row.manifest_uuid}")
+    return failures
+
+
 async def verify_replayed(conn: AsyncConnection, manifest_dir: Path, *, files: FileRoots) -> VerifyReport:
     """Phase `replayed` (module docstring): every manifest satisfied on the volumes `files`, no purge fence
     active, every identity above every bound."""
@@ -242,12 +266,12 @@ async def verify_replayed(conn: AsyncConnection, manifest_dir: Path, *, files: F
     # never imports when it loads (O1, `tests/unit/test_backup_roles.py`); only this phase reads them.
     from jobhunter.privacy.replay import classify_stream
 
-    failures: list[str] = []
+    failures = await _file_failures(conn, manifest_dir)
     try:
         classified = await classify_stream(conn, manifest_dir, files=files)
         bounds = await manifest_bounds(conn, manifest_dir)
     except (ManifestInvalid, ManifestConflict, FileNotFoundError) as exc:
-        return _report("replayed", [f"stream:{type(exc).__name__}"])
+        return _report("replayed", [*failures, f"stream:{type(exc).__name__}"])
     failures += [f"manifest:{c.manifest_uuid}:{c.outcome}" for c in classified if c.outcome != "satisfied"]
     if fences := [int(fence) for fence in (await conn.execute(_ACTIVE_FENCES)).scalars()]:
         failures.append(f"purge_fences_active:{fences[:LOGGED_FAILURES]}")

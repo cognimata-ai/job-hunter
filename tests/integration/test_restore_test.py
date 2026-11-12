@@ -278,3 +278,39 @@ async def test_the_restore_test_replays_a_submitted_batch_without_worker_credent
     assert [e["submission_id"] for e in skipped] == [seed.live_submission_id]
     # The application database keeps its own state: the live purge already deleted the submission there.
     assert await scalar(engine, _SUBMISSION, s=seed.live_submission_id) == 0
+
+
+async def test_an_error_outside_a_step_still_fails_the_run(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review M7: an exception raised outside every step (here making the scratch database's engine, between
+    two steps) ends the run `failed` with `unexpected:<class>` and the report so far, never `running`; the
+    scratch database and directory are dropped all the same."""
+    set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+
+    def broken(*args: object, **kwargs: object) -> AsyncEngine:
+        raise RuntimeError("an engine that cannot be made")
+
+    monkeypatch.setattr(restore_test, "null_engine", broken)
+
+    with pytest.raises(RestoreTestFailed) as failed:
+        await restore_tested(backup_cfg, repo, runner, backup_engine)
+
+    assert failed.value.error == "unexpected:RuntimeError"
+    row = await one(engine, _RUN, id=failed.value.run_id)
+    assert (row.status, row.error, row.backup_set_id) == ("failed", "unexpected:RuntimeError", set_id)
+    assert row.finished_at is not None
+    assert row.report == {
+        "stream": None,
+        "set_id": set_id,
+        "restic_snapshot_id": repo.infos[-1].id,
+        "cv_files": 0,
+    }
+    assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)
+    assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []

@@ -10,19 +10,30 @@ restore runs into a database of its own on the test server, created empty from `
 (`ContainerRunner`: `/opt/pgclient/bin` exists only in the backup image). Every datum is invented.
 """
 
+import asyncio
 import hashlib
+import json
 import os
+import secrets
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
+from jobhunter import cli, cli_backup, crypto
 from jobhunter.backup.backup_set import run_backup_set
-from jobhunter.backup.restore import RestoreFailed, run_restore
+from jobhunter.backup.restore import (
+    RestoreFailed,
+    RestoreResult,
+    complete_restore,
+    load_dump,
+    restore_set,
+    run_restore,
+)
 from jobhunter.backup.shipper import ship_manifests
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
@@ -39,8 +50,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
 from tests.support.backups import FakeRepository, Restored, shipment
-from tests.support.pg import PgServer, config_for
-from tests.support.restore import ContainerRunner, RestoredDatabase, restored_database
+from tests.support.pg import PgServer, config_for, pg_one, pg_rows, server_env
+from tests.support.restore import (
+    ContainerRunner,
+    RestoredDatabase,
+    drop_database,
+    empty_database,
+    restored_database,
+)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -289,16 +306,19 @@ async def test_each_restore_names_its_subfolder_and_target(
     write_manifest_file(site.manifests, manifest)
     await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
     store = CvStore(site.cv)
-    named = store.write(b"%PDF-1.7 an invented CV", [os.urandom(32)]).storage_path
-    orphan = store.write(b"%PDF-1.7 a CV whose row is gone", [os.urandom(32)]).storage_path
+    keys = [os.urandom(32) for _ in range(2)]
+    named = store.write(b"%PDF-1.7 an invented CV", [keys[0]]).storage_path
+    orphan = store.write(b"%PDF-1.7 a CV whose row is gone", [keys[1]]).storage_path
     async with engine.begin() as conn:
         await conn.execute(_CV_FILE, {"h": hashlib.sha256(b"cv").digest(), "p": named})
     set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     stream_snapshot, set_snapshot = repo.infos[0].id, repo.infos[-1].id
     site.lose()
 
-    await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=set_id, clock=utcnow)
+    result = await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=set_id, clock=utcnow)
 
+    # Review M3: the set restored and the hex ids of the data keys its ciphertexts name (both CV files').
+    assert result == RestoreResult(set_id, set_snapshot, tuple(sorted(crypto.key_id(k).hex() for k in keys)))
     assert repo.restores == [
         Restored(stream_snapshot, str(site.manifests), site.manifests),
         Restored(set_snapshot, str(site.staging / "set"), site.staging / "restore"),
@@ -312,3 +332,264 @@ async def test_each_restore_names_its_subfolder_and_target(
     assert sorted(path.name for path in site.cv.iterdir()) == [named]  # the orphan removed at step 7
     assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
     assert orphan != named
+
+
+# ---- the refusals (review M1) ------------------------------------------------------------------------------
+
+
+async def test_a_database_that_is_not_empty_is_refused(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    site: Site,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+) -> None:
+    """R16: a restore into the migrated application database (the shared one, which has `alembic_version`)
+    stops at its first step with `database_not_empty`: nothing restored, nothing loaded, nothing created."""
+    set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    site.lose()
+    calls = len(runner.calls)
+
+    with pytest.raises(RestoreFailed) as failed:
+        await run_restore(
+            config_for(migrated, "restore", **site.env), repo, runner, set_id=None, clock=utcnow
+        )
+
+    assert (failed.value.step, failed.value.error) == ("refuse", "database_not_empty")
+    assert repo.restores == [] and len(runner.calls) == calls
+    assert not site.manifests.exists() and not (site.staging / "restore").exists()
+    assert (await one(engine, _SET_ROW, id=set_id)).status == "succeeded"  # the live row, untouched
+
+
+async def test_a_cv_store_that_is_not_empty_is_refused(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+) -> None:
+    """R16: one file left in `cv_store` stops the restore with `cv_store_not_empty`, before restic is asked
+    anything; the file stays and the database stays empty."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    site.lose()
+    left = site.cv / "left-behind.bin"
+    left.write_bytes(b"a file of the lost site")
+
+    with pytest.raises(RestoreFailed) as failed:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    assert (failed.value.step, failed.value.error) == ("refuse", "cv_store_not_empty")
+    assert repo.restores == [] and left.read_bytes() == b"a file of the lost site"
+    assert not await scalar(target.engine, _REVISION)
+
+
+@pytest.mark.parametrize(
+    ("deeper", "step", "error"),
+    [
+        ("manifests", "stream", "manifest_stream_not_restored"),
+        ("set", "set", "backup_set_not_restored"),
+        ("cv", "cv", "cv_not_restored"),
+    ],
+)
+async def test_files_restored_off_their_exact_paths_stop_the_restore(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    deeper: str,
+    step: str,
+    error: str,
+) -> None:
+    """A restore whose files land one level deeper than the step expects (as a restore naming no subfolder
+    would) is checked before the restore goes on, and stops it at that step with its code."""
+    write_manifest_file(site.manifests, a_manifest(max_alert=50))
+    await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    site.lose()
+    subfolder = {"manifests": site.manifests, "set": site.staging / "set", "cv": site.cv}[deeper]
+    repo.whole_paths.add(str(subfolder))
+
+    with pytest.raises(RestoreFailed) as failed:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    assert (failed.value.step, failed.value.error) == (step, error)
+    assert repo.restores[-1].subfolder == str(subfolder)
+    assert not (site.staging / "restore").exists()
+
+
+def _dump_altered(path: Path) -> None:
+    path.write_bytes(path.read_bytes() + b"\0")
+
+
+def _json_unparsable(path: Path) -> None:
+    path.write_text("{not json", encoding="utf-8")
+
+
+def _json_of_another_set(path: Path) -> None:
+    inventory = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**inventory, "set_id": inventory["set_id"] + 1}), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("name", "alter", "error"),
+    [
+        ("jobhunter.dump", _dump_altered, "dump_sha256_mismatch"),
+        ("backup_set.json", _json_unparsable, "backup_set_json_invalid"),
+        ("backup_set.json", _json_of_another_set, "backup_set_id_mismatch"),
+    ],
+)
+async def test_a_set_whose_files_do_not_match_stops_the_restore(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    name: str,
+    alter: Callable[[Path], None],
+    error: str,
+) -> None:
+    """The staged set is checked before anything is loaded: a dump whose sha256 is not `backup_set.json`'s, a
+    json that does not parse, and a json of another set than the snapshot's tag each stop the restore at step
+    2, the database still empty and the staging removed."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    alter(repo.stored(repo.infos[-1].id, site.staging / "set" / name))
+    site.lose()
+    loads = len(pg_restored(runner))
+
+    with pytest.raises(RestoreFailed) as failed:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    assert (failed.value.step, failed.value.error) == ("set", error)
+    assert len(pg_restored(runner)) == loads and not await scalar(target.engine, _REVISION)
+    assert not (site.staging / "restore").exists()
+
+
+# ---- the CLI: `restore run` prints the set's data key ids, `restore verify` (review M3, M1, M4) ------------
+
+
+@pytest.fixture
+def cli_db(migrated: PgServer) -> Iterator[str]:
+    """An empty database for a CLI test, made and dropped synchronously (the CLI runs its own event loop)."""
+    name = f"jh_restore_cli_{secrets.token_hex(4)}"
+    empty_database(migrated, name)
+    try:
+        yield name
+    finally:
+        drop_database(migrated, name)
+
+
+def as_restore_role(
+    monkeypatch: pytest.MonkeyPatch,
+    server: PgServer,
+    site: Site,
+    db_name: str,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+) -> None:
+    """The process environment of the `restore` container on `db_name` and the site's volumes; its restic is
+    `repo` and its PostgreSQL client `runner`."""
+    for name, value in server_env(server, "restore", JOBHUNTER_DB_NAME=db_name, **site.env).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(cli_backup, "Restic", lambda cfg, client: repo)
+    monkeypatch.setattr(cli_backup, "SubprocessRunner", lambda: runner)
+
+
+def ran(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, Any]:
+    """`jobhunter <argv>`'s exit status and the one JSON line it printed; never a traceback."""
+    code = cli.main(list(argv))
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err
+    [line] = out.splitlines()
+    return code, json.loads(line)
+
+
+def test_restore_run_prints_the_sets_data_key_ids(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    cli_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review M3: `restore run` prints the set it restored and the data key ids its ciphertexts name, in hex
+    only, on its one stdout line: the operator runs one `crypto rotate` pass per key id (Task 28)."""
+    key = os.urandom(32)
+    stored = CvStore(site.cv).write(b"%PDF-1.7 an invented CV", [key]).storage_path
+    pg_rows(
+        migrated,
+        "migrator",
+        "INSERT INTO cv_files (sha256, mime, size_bytes, storage_path) "
+        "VALUES ('\\x01', 'application/pdf', 1, %s)",
+        stored,
+    )
+    set_id = asyncio.run(run_backup_set(backup_cfg, repo, runner, clock=utcnow))
+    site.lose()
+    as_restore_role(monkeypatch, migrated, site, cli_db, repo, runner)
+
+    code, printed = ran(capsys, "restore", "run")
+
+    assert (code, printed) == (
+        0,
+        {"restored": True, "set_id": set_id, "data_key_ids": [crypto.key_id(key).hex()]},
+    )
+    assert key.hex() not in json.dumps(printed)
+
+
+def test_restore_verify_prints_each_phase(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    cli_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`restore verify` as the `restore` role, one JSON line each time: without a staged set,
+    `backup_set_not_staged` (exit 1, no traceback); `--phase restored` on a loaded set holds (exit 0, the
+    set's row closed) and fails on an inventory that is not the database's (exit 1, nothing written);
+    `--phase replayed` holds after the rest of the restore and fails on a manifest of the stream that the
+    database never replayed (exit 1)."""
+    set_id = asyncio.run(run_backup_set(backup_cfg, repo, runner, clock=utcnow))
+    site.lose()
+    as_restore_role(monkeypatch, migrated, site, cli_db, repo, runner)
+    restored = ("restore", "verify", "--set", str(set_id), "--phase", "restored")
+    replayed = ("restore", "verify", "--set", str(set_id), "--phase", "replayed")
+
+    assert ran(capsys, *restored) == (1, {"error": "backup_set_not_staged"})
+
+    cfg = config_for(migrated, "restore", JOBHUNTER_DB_NAME=cli_db, **site.env)
+    staged = asyncio.run(
+        restore_set(repo, set_id=set_id, subfolder=site.staging / "set", target=site.staging / "restore")
+    )
+    asyncio.run(load_dump(cfg, runner, staged, db_role="migrator"))
+    inventory_file = site.staging / "restore" / "backup_set.json"
+    inventory = json.loads(inventory_file.read_text(encoding="utf-8"))
+    count = inventory["manifest_count"]
+    inventory_file.write_text(json.dumps({**inventory, "manifest_count": count + 1}), encoding="utf-8")
+    row = f"SELECT status FROM backup_sets WHERE id = {set_id}"  # noqa: S608 - an int
+    assert ran(capsys, *restored) == (
+        1,
+        {"phase": "restored", "ok": False, "failures": [f"manifest_count:{count}:{count + 1}"]},
+    )
+    assert pg_one(migrated, "migrator", row, db=cli_db) == ("running",)
+    inventory_file.write_text(json.dumps(inventory), encoding="utf-8")
+    assert ran(capsys, *restored) == (0, {"phase": "restored", "ok": True, "failures": []})
+    assert pg_one(migrated, "migrator", row, db=cli_db) == ("succeeded",)
+
+    site.manifests.mkdir(mode=0o700)  # restore run's step 1 makes it (an empty stream)
+    asyncio.run(complete_restore(cfg, now=utcnow()))
+    assert ran(capsys, *replayed) == (0, {"phase": "replayed", "ok": True, "failures": []})
+    stray = a_manifest(max_alert=50)
+    write_manifest_file(site.manifests, stray)
+    code, printed = ran(capsys, *replayed)
+    assert (code, printed["phase"], printed["ok"]) == (1, "replayed", False)
+    assert f"manifest:{stray['manifest_uuid']}:replayed" in printed["failures"]

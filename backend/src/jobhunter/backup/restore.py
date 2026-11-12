@@ -57,7 +57,12 @@ exits 1):
 Finally, whatever the outcome, `<staging_dir>/restore` is removed: its `jobhunter.dump` is a full copy of the
 database that no later purge would reach. Step 9 (start `api` and `worker`) is the operator's. The paths are
 `cfg.manifests_dir`, `cfg.staging_dir` and `cfg.cv_store_dir` (`/data/manifests`, `/data/staging`, `/data/cv`
-in the image). `complete_restore` is steps 7, 7b and 8 alone, on a database a restore loaded.
+in the image). `complete_restore` is steps 7, 7b and 8 alone, on a database a restore loaded. `run_restore`
+returns the set restored with its data key ids (`RestoreResult`), which `restore run` prints.
+
+**`restore_verify`** is `jobhunter restore verify --set <id> --phase restored|replayed [--database <db>]`
+(review M4; `cli_backup` parses and prints): the `restored` phase is step 5's `check_restored` on a set an
+operator staged in `<staging_dir>/restore`, the `replayed` phase step 8.
 
 Log lines carry steps, codes, ids and counts only: no row content, no path of a file's content, no secret.
 """
@@ -79,6 +84,7 @@ import psycopg
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from jobhunter import crypto
 from jobhunter.backup.backup_set import (
     DUMP_NAME,
     DUMP_TIMEOUT_S,
@@ -110,6 +116,8 @@ MANIFEST_STREAM_MISSING: Final = "manifest_stream_missing"
 VERIFY_FAILED: Final = "verify_failed"
 RESTIC_FAILED: Final = "restic_failed"
 _SET_TAG_PREFIX: Final = f"{SET_TAG}:"
+# A data key id as `backup_set.json` lists it: `crypto.key_id`, in hex.
+_KEY_ID: Final = re.compile(rf"[0-9a-f]{{{2 * crypto.KEY_ID_BYTES}}}")
 _HASH_CHUNK: Final = 1024 * 1024
 
 RestoreStep = Literal[
@@ -192,16 +200,21 @@ def _holds_a_directory(directory: Path) -> bool:
     return any(entry.is_dir(follow_symlinks=False) for entry in _entries(directory))
 
 
+async def latest_snapshot(restic: Restic, tag: str) -> SnapshotInfo | None:
+    """The newest snapshot tagged `tag` (`Restic.snapshots` sorts them by time), `None` when there is none."""
+    found = await restic.snapshots(tags=[tag])
+    return found[-1] if found else None
+
+
 async def restore_stream(restic: Restic, *, subfolder: Path, target: Path) -> SnapshotInfo | None:
     """Step 1 (module docstring): the latest `manifests` snapshot's `subfolder` restored into `target`, which
     is created first; that snapshot, or `None` for an empty stream. `RestoreFailed('stream', …)` when the
     files are not where they must be."""
-    found = await restic.snapshots(tags=[MANIFESTS_TAG])
+    latest = await latest_snapshot(restic, MANIFESTS_TAG)
     await asyncio.to_thread(target.mkdir, mode=0o700, parents=True, exist_ok=True)
-    if not found:
+    if latest is None:
         log.info("manifest_stream_empty")
         return None
-    latest = found[-1]
     await restic.restore(snapshot=latest.id, subfolder=str(subfolder), target=target)
     manifests = [
         e.name for e in _entries(target) if e.name.endswith(".json") and e.is_file(follow_symlinks=False)
@@ -249,6 +262,21 @@ class StagedSet:
     def dump(self) -> Path:
         return self.directory / DUMP_NAME
 
+    @property
+    def data_key_ids(self) -> tuple[str, ...]:
+        """The hex ids of the data keys the set's ciphertexts name (checked when it was staged)."""
+        return tuple(cast(list[str], self.inventory["data_key_ids"]))
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    """What `restore run` restored: the set, its snapshot, and the hex ids of the data keys its ciphertexts
+    name, for the operator's `crypto rotate` passes (one per key id other than the current key, Task 28)."""
+
+    set_id: int
+    snapshot_id: str
+    data_key_ids: tuple[str, ...]
+
 
 def _read_inventory(staged: Path, snapshot: SnapshotInfo) -> Mapping[str, JSONValue]:
     """`backup_set.json` beside the dump, checked against the dump and the snapshot's tag (module
@@ -263,6 +291,9 @@ def _read_inventory(staged: Path, snapshot: SnapshotInfo) -> Mapping[str, JSONVa
     set_id = inventory.get("set_id") if isinstance(inventory, dict) else None
     if not isinstance(set_id, int) or not isinstance(inventory.get("dump_sha256"), str):
         raise RestoreFailed("set", "backup_set_json_invalid")
+    keys = inventory.get("data_key_ids")
+    if not isinstance(keys, list) or not all(isinstance(k, str) and _KEY_ID.fullmatch(k) for k in keys):
+        raise RestoreFailed("set", "backup_set_json_invalid")  # hex key ids only: what `restore run` prints
     if _tagged_set(snapshot) != set_id:
         raise RestoreFailed("set", "backup_set_id_mismatch")
     if _sha256_of(dump) != inventory["dump_sha256"]:
@@ -273,10 +304,7 @@ def _read_inventory(staged: Path, snapshot: SnapshotInfo) -> Mapping[str, JSONVa
 async def restore_set(restic: Restic, *, set_id: int | None, subfolder: Path, target: Path) -> StagedSet:
     """Step 2 (module docstring): the set's snapshot (`set:<set_id>`, else the latest `set`), its `subfolder`
     restored into `target` (made fresh), and its `backup_set.json` checked."""
-    found = await restic.snapshots(tags=[SET_TAG if set_id is None else f"{_SET_TAG_PREFIX}{set_id}"])
-    if not found:
-        raise RestoreFailed("set", "backup_set_not_found")
-    latest = found[-1]
+    latest = await _set_snapshot(restic, set_id, step="set")
     await asyncio.to_thread(_fresh, target)
     await restic.restore(snapshot=latest.id, subfolder=str(subfolder), target=target)
     inventory = await asyncio.to_thread(_read_inventory, target, latest)
@@ -285,9 +313,17 @@ async def restore_set(restic: Restic, *, set_id: int | None, subfolder: Path, ta
         "restore_set_staged",
         set_id=staged.set_id,
         snapshot_id=latest.id,
-        data_key_ids=list(cast(list[str], inventory.get("data_key_ids", []))),
+        data_key_ids=list(staged.data_key_ids),
     )
     return staged
+
+
+async def _set_snapshot(restic: Restic, set_id: int | None, *, step: RestoreStep) -> SnapshotInfo:
+    """The snapshot of the set `set_id` (`set:<id>`), else the latest `set`; `backup_set_not_found`."""
+    latest = await latest_snapshot(restic, SET_TAG if set_id is None else f"{_SET_TAG_PREFIX}{set_id}")
+    if latest is None:
+        raise RestoreFailed(step, "backup_set_not_found")
+    return latest
 
 
 async def restore_cv_files(restic: Restic, staged: StagedSet, *, subfolder: Path, target: Path) -> int:
@@ -471,7 +507,7 @@ async def complete_restore(cfg: AppConfig, *, now: datetime) -> VerifyReport:
 
 async def _restore(
     cfg: AppConfig, restic: Restic, runner: CommandRunner, *, set_id: int | None, now: datetime, staging: Path
-) -> None:
+) -> RestoreResult:
     with restore_step("refuse"):
         await _refuse_unless_empty(cfg)
     with restore_step("stream"):
@@ -493,6 +529,7 @@ async def _restore(
     with restore_step("cv"):
         await restore_cv_files(restic, staged, subfolder=cfg.cv_store_dir, target=cfg.cv_store_dir)
     await complete_restore(cfg, now=now)
+    return RestoreResult(staged.set_id, staged.snapshot.id, staged.data_key_ids)
 
 
 async def run_restore(
@@ -502,17 +539,63 @@ async def run_restore(
     *,
     set_id: int | None,
     clock: Callable[[], datetime],
-) -> None:
+) -> RestoreResult:
     """Restore the backup set `set_id` (the latest without one) and the latest manifest stream into the empty
-    application database and volumes of `cfg`, as §19.5 orders it (module docstring). `RestoreFailed` names
-    the step that stopped it; `<staging_dir>/restore` is removed whatever the outcome."""
+    application database and volumes of `cfg`, as §19.5 orders it (module docstring); the set restored and
+    its data key ids (review M3: `restore run` prints them). `RestoreFailed` names the step that stopped it;
+    `<staging_dir>/restore` is removed whatever the outcome."""
     staging = cfg.staging_dir / RESTORE_STAGING
     log.info("restore_started", set_id=set_id)
     try:
-        await _restore(cfg, restic, runner, set_id=set_id, now=clock(), staging=staging)
+        result = await _restore(cfg, restic, runner, set_id=set_id, now=clock(), staging=staging)
     except RestoreFailed as failed:
         log.error("restore_failed", step=failed.step, error=failed.error)
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    log.info("restore_completed", set_id=set_id)
+    log.info("restore_completed", set_id=result.set_id)
+    return result
+
+
+# ---- `jobhunter restore verify` ----------------------------------------------------------------------------
+
+
+async def _staged_by_hand(restic: Restic, *, set_id: int, directory: Path) -> StagedSet:
+    """The set `set_id` as an operator staged it in `directory` (`restore run`'s own staging is gone once it
+    ends), checked as step 2 checks it; `backup_set_not_staged` without its `backup_set.json`."""
+    if not await asyncio.to_thread((directory / INVENTORY_NAME).is_file):
+        raise RestoreFailed("verify_restored", "backup_set_not_staged")
+    snapshot = await _set_snapshot(restic, set_id, step="verify_restored")
+    return StagedSet(snapshot, directory, await asyncio.to_thread(_read_inventory, directory, snapshot))
+
+
+async def restore_verify(
+    cfg: AppConfig,
+    restic: Restic | None,
+    *,
+    set_id: int,
+    phase: Literal["restored", "replayed"],
+    database: str | None = None,
+) -> VerifyReport:
+    """`jobhunter restore verify` (review M4) on `database` (default `JOBHUNTER_DB_NAME`) as the
+    migrator. `restored`: the set `set_id` staged in `<staging_dir>/restore`, checked by step 5 itself
+    (`check_restored`: it commits the closing of the backup rows only when the check holds, with the
+    empty-stream rule when the repository holds no `manifests` snapshot). `replayed`: step 8 on the stream
+    and the mounted volumes of `cfg`. The report; `RestoreFailed` for a phase that cannot run
+    (`backup_set_not_staged`, `backup_set_not_found`, `not_configured` without restic, `restic_failed`, a
+    staged set's own checks)."""
+    engine = null_engine(cfg, database=database)
+    try:
+        if phase == "replayed":
+            with restore_step("verify_replayed"):
+                async with engine.connect() as conn:
+                    files = FileRoots(cv_store=cfg.cv_store_dir, exports=cfg.exports_dir)
+                    return await verify_replayed(conn, cfg.manifests_dir, files=files)
+        with restore_step("verify_restored"):
+            if restic is None:
+                raise RestoreFailed("verify_restored", "not_configured")
+            staged = await _staged_by_hand(restic, set_id=set_id, directory=cfg.staging_dir / RESTORE_STAGING)
+            stream = await latest_snapshot(restic, MANIFESTS_TAG)
+            return await check_restored(engine, staged, stream=stream)
+    finally:
+        await engine.dispose()

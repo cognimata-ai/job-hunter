@@ -27,9 +27,12 @@ while another backup job runs (nothing was written; Ruling T26-1 (a) T24-4 M1), 
 message).
 
 `jobhunter restore run [--set <id>]` (`run_restore_command`), the `restore` service's command, starts as the
-`restore` role (the migrator's login, restic) and runs `restore.run_restore`: it prints `{"restored": true}`
-(exit 0; the set restored and its data key ids are logged, `restore_set_staged`), or `{"error", "step"}` with
-the step that stopped it (exit 1).
+`restore` role (the migrator's login, restic) and runs `restore.run_restore`: it prints `{"restored": true,
+"set_id", "data_key_ids"}` (exit 0), the key ids in hex only, for the operator's `crypto rotate` passes; or
+`{"error", "step"}` with the step that stopped it (exit 1). `jobhunter restore verify --set <id> --phase
+restored|replayed [--database <db>]` (`run_restore_verify_command`, review M4) starts as the same role and
+runs `restore.restore_verify`: it prints the phase's report `{"phase", "ok", "failures"}` (exit 0 when it
+holds, else 1), or `{"error"}` for a phase that cannot run (exit 1).
 """
 
 import argparse
@@ -49,7 +52,7 @@ from sqlalchemy.pool import NullPool
 from jobhunter.backup.backup_set import BackupJobBusy, BackupSetFailed, run_backup_set
 from jobhunter.backup.prune import PruneFailed, run_prune
 from jobhunter.backup.restic import Restic, ResticError
-from jobhunter.backup.restore import RestoreFailed, run_restore
+from jobhunter.backup.restore import RestoreFailed, restore_verify, run_restore
 from jobhunter.backup.restore_test import RestoreTestFailed, run_restore_test
 from jobhunter.backup.runner import CommandRunner, SubprocessRunner
 from jobhunter.backup.scheduler import BackupJob, JobName, fail_interrupted, run_scheduler, wait_for_database
@@ -203,13 +206,30 @@ async def _restore_run(cfg: AppConfig, set_id: int | None) -> tuple[Printed, boo
         return {"error": "not_configured"}, False
     runner = SubprocessRunner()
     try:
-        await run_restore(cfg, Restic(cfg, runner), runner, set_id=set_id, clock=utcnow)
+        result = await run_restore(cfg, Restic(cfg, runner), runner, set_id=set_id, clock=utcnow)
     except RestoreFailed as failed:
         return {"error": failed.error, "step": failed.step}, False
-    return {"restored": True}, True
+    return {"restored": True, "set_id": result.set_id, "data_key_ids": list(result.data_key_ids)}, True
 
 
 def run_restore_command(args: argparse.Namespace) -> int:
     """`restore run [--set <id>]` as the `restore` role (module docstring); the exit status is the outcome."""
     cfg = startup_or_exit("restore")
     return _outcome(cfg, lambda: _restore_run(cfg, args.set))
+
+
+async def _restore_verify(cfg: AppConfig, args: argparse.Namespace) -> tuple[Printed, bool]:
+    restic = None if cfg.restic is None else Restic(cfg, SubprocessRunner())
+    try:
+        report = await restore_verify(cfg, restic, set_id=args.set, phase=args.phase, database=args.database)
+    except RestoreFailed as failed:
+        return {"error": failed.error}, False
+    failures: list[JSONValue] = [*report.failures]
+    return {"phase": report.phase, "ok": report.ok, "failures": failures}, report.ok
+
+
+def run_restore_verify_command(args: argparse.Namespace) -> int:
+    """`restore verify --set <id> --phase restored|replayed [--database <db>]` as the `restore` role (module
+    docstring); the exit status is the outcome."""
+    cfg = startup_or_exit("restore")
+    return _outcome(cfg, lambda: _restore_verify(cfg, args))
