@@ -571,6 +571,13 @@ $JH exec backup jobhunter backup ship
 $JH exec backup jobhunter backup restore-test
 ```
 
+**A lost lock.** A ship and a prune each hold a lock in PostgreSQL for the length of their job, on a session
+of their own. When that session ends while the job runs (PostgreSQL restarted, the connection cut), `backup
+ship` prints `{"error": "ship_lock_lost"}` and a prune's run fails `prune:ShipLockLost`: the job wrote
+nothing (no receipt; no snapshot forgotten, no receipt removed), and the next run repeats it, the scheduler's
+within 5 minutes for a ship and on Sunday for a prune. Nothing else is needed; if it recurs, find out why
+PostgreSQL restarts or drops the backup container's connections (`$JH logs postgres`).
+
 A restore test started by hand restores the latest set into a scratch database and `/data/staging/restore_test`
 and removes both when it ends. If that process is killed hard (an OOM, a `kill -9`), nothing removes that full
 copy of the database until another restore test or a restart of the backup service: so run
@@ -636,7 +643,7 @@ back. So, before a `docker volume rm` or a `down` that removes volumes, whatever
 
    Only exit 0 lets the procedure go on: `{"shipped": true, …}`, or `{"shipped": false, …}` when the stream was
    shipped already. On `{"error": "locked"}` (restic's repository lock, which a prune can hold longer than a
-   ship waits), run it again; a ship never prints `backup_job_busy`, since it waits for a ship already
+   ship waits) or `{"error": "ship_lock_lost"}` (a lost lock, above), run it again; a ship never prints `backup_job_busy`, since it waits for a ship already
    running. On any other error, stop and remove no volume: fix the cause as the `privacy.manifest_unshipped`
    row says (section 6), then ship again.
 3. Check that the latest shipment holds every manifest file, as the application role. api and worker are

@@ -22,9 +22,11 @@ prints one JSON line on stdout:
 
 A failure prints `{"error": "<code>"}` (exit 1): `not_configured` without `RESTIC_REPOSITORY`, a set's,
 a prune's or a restore test's `<step>:<error class or code>` with its `set_id` or `run_id`, `backup_job_busy`
-while another backup job runs (nothing was written; Ruling T26-1 (a) T24-4 M1), a `ResticError` code
-(`backup.restic`), `database` for a database error, else `unexpected` with the error's class (never its
-message).
+while another backup job runs (nothing was written; Ruling T26-1 (a) T24-4 M1), `ship_lock_lost` when the
+shipment lock's session ended during a ship (`shipper.ShipLockLost`: nothing was written, and the next ship
+repeats it; the final re-review's M4-1), a `ResticError` code (`backup.restic`), `database` for a database
+error (SQLAlchemy's, or psycopg's on a lock's own connection), else `unexpected` with the error's class
+(never its message).
 
 `jobhunter restore run [--set <id>]` (`run_restore_command`), the `restore` service's command, starts as the
 `restore` role (the migrator's login, restic) and runs `restore.run_restore`: it prints `{"restored": true,
@@ -45,6 +47,7 @@ from dataclasses import asdict
 from types import MappingProxyType
 from typing import Any, Final
 
+import psycopg
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -56,7 +59,7 @@ from jobhunter.backup.restore import RestoreFailed, restore_verify, run_restore
 from jobhunter.backup.restore_test import RestoreTestFailed, run_restore_test
 from jobhunter.backup.runner import CommandRunner, SubprocessRunner
 from jobhunter.backup.scheduler import BackupJob, JobName, fail_interrupted, run_scheduler, wait_for_database
-from jobhunter.backup.shipper import ship_manifests
+from jobhunter.backup.shipper import ShipLockLost, ship_manifests
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.observability.logging import configure_logging
@@ -177,9 +180,11 @@ async def _run(cfg: AppConfig, args: argparse.Namespace) -> tuple[Printed, bool]
         return {"error": failed.error, "set_id": failed.set_id}, False
     except (PruneFailed, RestoreTestFailed) as failed:
         return {"error": failed.error, "run_id": failed.run_id}, False
+    except ShipLockLost:
+        return {"error": "ship_lock_lost"}, False
     except ResticError as failed:
         return {"error": failed.code}, False
-    except SQLAlchemyError:
+    except (SQLAlchemyError, psycopg.Error):
         return {"error": "database"}, False
 
 

@@ -658,6 +658,19 @@ def test_each_volume_removal_stops_ships_and_checks_first() -> None:
         assert "stop" in before[:first], f"{events}: api and worker are not stopped before the ship and check"
 
 
+def test_a_lost_shipment_lock_is_explained() -> None:
+    """The final re-review's M4-1: `backup ship` prints `ship_lock_lost` (`cli_backup`), and a prune fails
+    `prune:ShipLockLost`, when the lock's session ended during the job (a PostgreSQL restart). Section 8 says
+    what that means: the job wrote nothing, and the next run repeats it; the procedure before a wipe runs
+    the ship again on it."""
+    kit = " ".join(_section(KIT).split())
+    codes = ('`{"error": "ship_lock_lost"}`', "`prune:ShipLockLost`")
+    assert [code for code in codes if code not in kit] == []
+    assert [p for p in ("wrote nothing", "the next run repeats it") if p not in kit] == []
+    procedure = kit[kit.index(BEFORE_A_WIPE) :]
+    assert "ship_lock_lost" in procedure.split("run it again")[0], "the wipe's ship runs again on it"
+
+
 def test_no_volume_is_removed_before_the_manifests_are_shipped() -> None:
     kit = _section(KIT)
     assert BEFORE_A_WIPE in kit, "section 8 has no procedure before a wipe"
