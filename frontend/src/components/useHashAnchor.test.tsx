@@ -77,6 +77,22 @@ describe("useHashAnchor", () => {
     expect(scrolledIds(scrolled)).toEqual(["target"]);
   });
 
+  it("lets go at a scroll it did not cause, as a scrollbar or assistive technology makes", () => {
+    // plan M5 Task 33, Ruling T33-15: such a scroll sends none of the input events
+    scrolled.mockImplementation(() => {
+      setScrollY(1_000); // where the pin puts the page
+    });
+    render(<Page hash="target" />);
+    const [observer] = FakeObserver.made;
+    window.dispatchEvent(new Event("scroll")); // the pin's own scroll
+    observer.fire();
+    expect(scrolledIds(scrolled)).toEqual(["target", "target"]);
+    setScrollY(400); // the user's
+    window.dispatchEvent(new Event("scroll"));
+    observer.fire();
+    expect(scrolledIds(scrolled)).toEqual(["target", "target"]);
+  });
+
   it(`lets go after ${String(PIN_MS)} ms`, () => {
     vi.useFakeTimers();
     render(<Page hash="target" />);

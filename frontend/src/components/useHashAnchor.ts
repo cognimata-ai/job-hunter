@@ -9,12 +9,16 @@
 // So when the page mounts, or its hash changes, and the hash names an element, the hook acts unless the router
 // restored a scroll position: on a page still at its top (the router found nothing to scroll to) or with the
 // element at its scroll margin (the router just scrolled it there), it scrolls the element into view, then again
-// whenever the document's size changes, until the user's first pointer, wheel, touch or key input, or `PIN_MS`,
-// whichever comes first. A position the router restored (back and forward) is left as it is.
+// whenever the document's size changes, until the user's first pointer, wheel, touch or key input, any scroll it
+// did not cause (the scrollbar, assistive technology: the page is no longer where the last pin put it; plan M5
+// Task 33, Ruling T33-15), or `PIN_MS`, whichever comes first. A position the router restored (back and
+// forward) is left as it is.
 import { useEffect } from "react";
 
 /** How long the hook holds the element at most. */
 export const PIN_MS = 10_000;
+/** How far, in px, the page may be from where the last pin put it before a scroll counts as the user's. */
+const MOVED_PX = 2;
 const USER_INPUT = ["pointerdown", "wheel", "touchstart", "keydown"] as const;
 
 /** Whether the element sits at its scroll margin from the viewport's top, where scrolling it into view puts it. */
@@ -30,13 +34,21 @@ export function useHashAnchor(hash: string): void {
     if (target === null || !(window.scrollY === 0 || atScrollMargin(target))) {
       return undefined;
     }
+    let pinnedAt = window.scrollY;
     const pin = (): void => {
       target.scrollIntoView();
+      pinnedAt = window.scrollY;
     };
     const observer = new ResizeObserver(pin);
+    const onScroll = (): void => {
+      if (Math.abs(window.scrollY - pinnedAt) > MOVED_PX) {
+        stop(); // the page moved, and not by a pin
+      }
+    };
     const stop = (): void => {
       observer.disconnect();
       window.clearTimeout(timer);
+      window.removeEventListener("scroll", onScroll);
       for (const type of USER_INPUT) {
         window.removeEventListener(type, stop, true);
       }
@@ -45,6 +57,7 @@ export function useHashAnchor(hash: string): void {
     for (const type of USER_INPUT) {
       window.addEventListener(type, stop, { capture: true, passive: true });
     }
+    window.addEventListener("scroll", onScroll, { passive: true });
     pin();
     observer.observe(document.body);
     return stop;
