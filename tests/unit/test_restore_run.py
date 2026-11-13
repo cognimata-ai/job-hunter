@@ -671,6 +671,65 @@ async def test_a_shipment_during_a_prune_waits_for_it_and_is_never_forgotten(
         assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
 
 
+_END_SHIP_SESSION: Final = (
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'jobhunter-backup-ship'"
+)
+
+
+async def test_a_shipment_whose_lock_session_ends_during_its_upload_never_receipts_what_a_prune_forgot(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final re-review's round-3 sequence (R3-C1), with the real shipper, prune and restore over the
+    fakes. A set predates M2; `{M1}` ships with its receipt (A). M2 is written, and a shipment lists `{M1,
+    M2}`, confirms its lock and uploads snapshot B, timestamped before A (the clock stepped back). Its lock
+    session ends during the upload; a prune then takes the free lock, anchors on A's receipt and forgets B as
+    older. The shipment writes its receipt on its lock's session (final fix E1), so it writes none:
+    `ShipLockLost`. The next ship therefore finds the stream unlike A's items and uploads it again, and a
+    restore of the older set replays M2."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2 = a_manifest(max_alert=50), a_manifest(max_alert=51)
+    write_manifest_file(site.manifests, m1)
+    first = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    write_manifest_file(site.manifests, m2)
+    upload = repo.backup
+    uploaded: list[str] = []
+
+    async def the_session_ends_during_the_upload(**kwargs: Any) -> str:
+        repo.shift = -timedelta(hours=1)
+        uploaded.append(await upload(**kwargs))  # B, visible in the repository
+        repo.shift = timedelta(0)
+        assert pg_rows(migrated, "superuser", _END_SHIP_SESSION) == [(True,)]
+        await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
+        return uploaded[0]
+
+    monkeypatch.setattr(repo, "backup", the_session_ends_during_the_upload)
+    with pytest.raises(shipper.ShipLockLost):
+        await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    monkeypatch.setattr(repo, "backup", upload)
+
+    assert repo.forgets[0] == ("ids", uploaded)  # B, older than A by its time
+    assert [info.id for info in repo.infos if "manifests" in info.tags] == [first.snapshot_id]
+    assert await scalars(backup_engine, _RECEIPT_SNAPSHOTS) == [first.snapshot_id]  # none for B
+    again = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    assert (again.shipped, again.files) == (True, 2)
+    site.lose()
+    await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    for manifest in (m1, m2):
+        assert stream_file(site, manifest).read_bytes() == canonical_bytes(manifest)
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+
+
+_RECEIPT_SNAPSHOTS: Final = sa.text("SELECT restic_snapshot_id FROM manifest_shipments ORDER BY id")
+
+
 async def completed_manifest(engine: AsyncEngine, site: Site, *, max_alert: int) -> ManifestRow:
     """A golden-case deletion that deletes nothing, as the worker leaves it: its row recorded with its file's
     hash and `completed`, its file in the site's manifests volume."""

@@ -22,13 +22,25 @@ lock (7261006), the order `db.migrate` registers (`LOCK_ORDER`; a shipper never 
 it from its receipt read through its listing and its forget of the `manifests` snapshots; it releases it
 before the sets' forget. No shipment lands in between: one would otherwise be receipted after the read and,
 timestamped before the anchor by a clock stepped back, forgotten as older (the final re-review's R2-C1). A
-shipment meanwhile waits for the prune, then ships. Just before it forgets or removes anything, the prune
-confirms it still holds the lock (`shipper.HeldShipLock.confirm`, final fix D2): a lock session that ended
-took the lock with it, so the run fails `prune:ShipLockLost`, with nothing forgotten or removed.
+shipment meanwhile waits for the prune, then ships.
+
+**On the lock's session** (final fix E1; the final re-review's R3-C1). The lock's session can end at any
+point (a PostgreSQL restart, a cut connection), and a shipment may land once it has. So the prune reads the
+latest receipt, and removes false receipts, in transactions on that session
+(`shipper.HeldShipLock.transaction`): while it lives it holds the lock, so what it read is still the latest
+receipt when the removal commits, and a session that ended took the lock and the removal with it (the run
+fails `prune:ShipLockLost`, nothing removed). Its decision is taken against the one listing it made under the
+lock, and it never takes the lock again to go on with that listing. The removal walks only the receipts at or
+below the one it read, and the forget passes only ids from that listing, so a snapshot a later shipment made
+is never forgotten by the run. Just before the forget, restic's and not the database's, it confirms it still
+holds the lock (`shipper.HeldShipLock.confirm`, final fix D2): a lock session that ended took the lock with
+it, so the run fails `prune:ShipLockLost`, with nothing forgotten. A shipment that loses its lock in turn
+writes no receipt (`shipper`), so no snapshot the prune lists, forgets or not, gains one afterwards.
 
 **A false receipt is removed** (final fix D1 (b)). A latest receipt whose snapshot restic does not list
 proves nothing, and the shipper's unchanged-stream check would trust it for ever. So, in the same locked step
-and one transaction, the prune removes it: the receipt row locked (`FOR UPDATE`, so the `manifest_shipping`
+and one transaction on the lock's session, the prune removes it: the receipt row locked (`FOR UPDATE`, so the
+`manifest_shipping`
 reconciler cannot mark a manifest with it meanwhile), each manifest it shipped returned `shipped ->
 completed` by `unship_manifest` (`shipped_at` and `shipment_id` cleared, `completed_at` kept; migration
 0012, final fix E2: the backup role's one way to change a manifest, as it holds no UPDATE on them), its
@@ -54,13 +66,14 @@ failing, and then `privacy.manifest_unshipped` pages.
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
+import psycopg
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.backup.backup_set import SET_TAG, BackupJobFailed, backup_job_lock
 from jobhunter.backup.restic import Restic
-from jobhunter.backup.shipper import MANIFESTS_TAG, ship_lock
+from jobhunter.backup.shipper import MANIFESTS_TAG, HeldShipLock, ship_lock
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
@@ -70,22 +83,23 @@ _START: Final = q(
     "INSERT INTO backup_runs (kind, status, started_at) VALUES ('prune', 'running', :started_at) RETURNING id"
 )
 
-# The latest receipt: the newest shipment's (module docstring, "Why the receipt anchors it"); locked when the
-# prune may remove it ("A false receipt is removed").
-_LATEST_RECEIPT: Final = q("SELECT id, restic_snapshot_id FROM manifest_shipments ORDER BY id DESC LIMIT 1")
-_LATEST_RECEIPT_LOCKED: Final = q(
-    "SELECT id, restic_snapshot_id FROM manifest_shipments ORDER BY id DESC LIMIT 1 FOR UPDATE"
+# The receipts, read and removed on the lock's session (module docstring; psycopg's own parameters). The
+# latest receipt: the newest shipment's ("Why the receipt anchors it"); then, locked when the prune may remove
+# it ("A false receipt is removed"), the latest at or below the one read under the lock.
+_LATEST_RECEIPT: Final = "SELECT id, restic_snapshot_id FROM manifest_shipments ORDER BY id DESC LIMIT 1"
+_RECEIPT_LOCKED: Final = (
+    "SELECT id, restic_snapshot_id FROM manifest_shipments WHERE id <= %s ORDER BY id DESC LIMIT 1 FOR UPDATE"
 )
-_ITEM_COUNT: Final = q("SELECT count(*) FROM manifest_shipment_items WHERE shipment_id = :shipment")
+_ITEM_COUNT: Final = "SELECT count(*) FROM manifest_shipment_items WHERE shipment_id = %s"
 # Each manifest the receipt shipped, returned to `completed` by `unship_manifest` (migration 0012, the backup
 # role's one way to change a manifest, final fix E2): the ids first, then the function on each.
-_UNSHIP: Final = q(
+_UNSHIP: Final = (
     "WITH shipped AS MATERIALIZED (SELECT id FROM deletion_manifests "
-    "WHERE shipment_id = :shipment AND status = 'shipped') "
+    "WHERE shipment_id = %s AND status = 'shipped') "
     "SELECT count(*) FILTER (WHERE unship_manifest(id)) FROM shipped"
 )
-_REMOVE_ITEMS: Final = q("DELETE FROM manifest_shipment_items WHERE shipment_id = :shipment")
-_REMOVE_RECEIPT: Final = q("DELETE FROM manifest_shipments WHERE id = :shipment")
+_REMOVE_ITEMS: Final = "DELETE FROM manifest_shipment_items WHERE shipment_id = %s"
+_REMOVE_RECEIPT: Final = "DELETE FROM manifest_shipments WHERE id = %s"
 
 log = get_logger("jobhunter.backup.prune")
 
@@ -130,39 +144,54 @@ class _ManifestsPruned:
     removed: tuple[int, ...]
 
 
-async def _remove_false_receipts(engine: AsyncEngine, listed: Collection[str]) -> list[_FalseReceipt]:
-    """In one transaction, the latest receipt while restic does not list its snapshot: its manifests returned
-    to `completed`, its items and its row deleted; then the one below it (module docstring)."""
+async def _count(conn: psycopg.AsyncConnection[Any], statement: str, shipment: int) -> int:
+    row = await (await conn.execute(statement, (shipment,))).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+async def _remove_false_receipts(
+    held: HeldShipLock, latest: int, listed: Collection[str]
+) -> list[_FalseReceipt]:
+    """In one transaction on the lock's session, the latest receipt at or below `latest` (the one read under
+    the lock) while `listed` (the listing taken under the lock) lacks its snapshot: its manifests returned to
+    `completed`, its items and its row deleted; then the one below it (module docstring). `ShipLockLost`, with
+    nothing removed, once the session has ended."""
     removed: list[_FalseReceipt] = []
-    async with engine.begin() as conn:
-        while (receipt := (await conn.execute(_LATEST_RECEIPT_LOCKED)).first()) is not None:
-            if receipt.restic_snapshot_id in listed:
+    async with held.transaction() as conn:
+        while (receipt := await (await conn.execute(_RECEIPT_LOCKED, (latest,))).fetchone()) is not None:
+            shipment, snapshot_id = int(receipt[0]), str(receipt[1])
+            if snapshot_id in listed:
                 break
-            params = {"shipment": int(receipt.id)}
-            items = int((await conn.execute(_ITEM_COUNT, params)).scalar_one())
-            returned = int((await conn.execute(_UNSHIP, params)).scalar_one())
-            await conn.execute(_REMOVE_ITEMS, params)
-            await conn.execute(_REMOVE_RECEIPT, params)
-            removed.append(_FalseReceipt(int(receipt.id), receipt.restic_snapshot_id, items, returned))
+            items = await _count(conn, _ITEM_COUNT, shipment)
+            returned = await _count(conn, _UNSHIP, shipment)
+            await conn.execute(_REMOVE_ITEMS, (shipment,))
+            await conn.execute(_REMOVE_RECEIPT, (shipment,))
+            removed.append(_FalseReceipt(shipment, snapshot_id, items, returned))
     return removed
 
 
-async def _prune_manifests(
-    cfg: AppConfig, restic: Restic, engine: AsyncEngine, run_id: int
-) -> _ManifestsPruned:
-    """Under the shipment lock: forget the `manifests` snapshots strictly older than the latest receipt's, or
-    remove the false receipts when restic does not list its snapshot (module docstring)."""
+async def _latest_receipt(held: HeldShipLock) -> tuple[int, str] | None:
+    """The latest receipt's shipment and snapshot ids, read on the lock's session (module docstring)."""
+    async with held.transaction() as conn:
+        row = await (await conn.execute(_LATEST_RECEIPT)).fetchone()
+    return None if row is None else (int(row[0]), str(row[1]))
+
+
+async def _prune_manifests(cfg: AppConfig, restic: Restic, run_id: int) -> _ManifestsPruned:
+    """Under the shipment lock, on its session: forget the `manifests` snapshots strictly older than the
+    latest receipt's, or remove the false receipts when restic does not list its snapshot (module
+    docstring)."""
     async with ship_lock(cfg, holder="prune") as held:
-        async with engine.connect() as conn:
-            latest = (await conn.execute(_LATEST_RECEIPT)).first()
+        latest = await _latest_receipt(held)
         if latest is None:
             log.info("manifests_forget_skipped", run_id=run_id, reason="no_receipt")
             return _ManifestsPruned(0, "no_receipt", ())
+        latest_id, latest_snapshot = latest
         snapshots = await restic.snapshots(tags=[MANIFESTS_TAG])
-        anchor = next((snapshot for snapshot in snapshots if snapshot.id == latest.restic_snapshot_id), None)
+        anchor = next((snapshot for snapshot in snapshots if snapshot.id == latest_snapshot), None)
         if anchor is None:
-            await held.confirm()
-            removed = await _remove_false_receipts(engine, {snapshot.id for snapshot in snapshots})
+            # no confirmation first: the removal commits on the lock's session or not at all
+            removed = await _remove_false_receipts(held, latest_id, {snapshot.id for snapshot in snapshots})
             for receipt in removed:
                 log.warning(
                     "manifest_receipt_removed",
@@ -195,7 +224,7 @@ async def _prune(
         run_id = int((await conn.execute(_START, {"started_at": clock()})).scalar_one())
     log.info("backup_prune_started", run_id=run_id, **sets)
     try:
-        manifests = await _prune_manifests(cfg, restic, engine, run_id)
+        manifests = await _prune_manifests(cfg, restic, run_id)
         await restic.forget_prune(tag=SET_TAG, **sets)
     except Exception as exc:  # recorded as `prune:<error class>`, then raised as PruneFailed
         error = f"prune:{type(exc).__name__}"

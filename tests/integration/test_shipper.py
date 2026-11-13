@@ -330,6 +330,54 @@ async def test_a_shipper_whose_lock_session_ended_uploads_nothing(
     assert not list(backup_cfg.staging_dir.iterdir())
 
 
+@pytest.mark.parametrize("meanwhile", ["nothing", "another_shipper_ships"])
+async def test_a_shipper_whose_lock_session_ends_during_its_upload_writes_no_receipt(
+    migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, meanwhile: str
+) -> None:
+    """The shipper writes its receipt on the session that holds the shipment lock (final fix E1), so a
+    session that ended during the upload, after the confirmation before restic started, took the lock and
+    the receipt with it: `ShipLockLost`, no receipt, its list file removed. Another shipment may hold the
+    lock by then (the final re-review's round-3 N-1): shipper A lists `{M1}` and its session ends while it
+    uploads; B ships `{M1, M2}` with its receipt; A then writes nothing, so B's receipt stays the latest and
+    no prune can anchor on A's older list. With nothing else meanwhile, the next ship finds no receipt and
+    uploads the stream again; after B's, it finds the stream shipped."""
+    restic = FakeRestic(backup_cfg)
+    m1 = manifest_file(backup_cfg.manifests_dir)
+    uploaded: list[str] = []
+    backup = restic.backup
+
+    async def upload(**kwargs: Any) -> str:
+        snapshot = await backup(**kwargs)
+        if not uploaded:  # shipper A: its session ends during the upload
+            uploaded.append(snapshot)
+            assert pg_rows(migrated, "superuser", _END_SESSION) == [(True,)]
+            if meanwhile == "another_shipper_ships":
+                m2 = manifest_file(backup_cfg.manifests_dir)
+                b = await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
+                assert (b.shipped, b.files) == (True, 2)
+                uploaded.append(f"B:{m2[0]}")
+        return snapshot
+
+    restic.backup = upload  # type: ignore[method-assign]
+    with pytest.raises(Exception) as stopped:  # the class is checked below
+        await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
+
+    assert type(stopped.value).__name__ == "ShipLockLost"
+    assert not list(backup_cfg.staging_dir.iterdir())
+    receipts = await shipments(backup_engine)
+    assert uploaded[0] not in [receipt.restic_snapshot_id for receipt in receipts]
+    again = await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
+    if meanwhile == "nothing":
+        assert receipts == []
+        assert (again.shipped, again.files) == (True, 1)
+        [receipt] = await shipments(backup_engine)
+        assert await items(backup_engine, receipt.id) == {m1}
+    else:
+        [receipt] = receipts  # B's, the latest
+        assert receipt.restic_snapshot_id == f"{2:064x}" and len(await items(backup_engine, receipt.id)) == 2
+        assert again == ShipResult(shipped=False, snapshot_id=None, files=2)
+
+
 async def test_a_restic_failure_writes_no_row(backup_cfg: AppConfig, backup_engine: AsyncEngine) -> None:
     manifest_file(backup_cfg.manifests_dir)
     restic = FakeRestic(backup_cfg, failure=ResticError("backup", "incomplete", 3))

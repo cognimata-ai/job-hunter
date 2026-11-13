@@ -18,6 +18,7 @@ wrapper (`Restic`) is the real one on top of it, and the database is the shared 
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -29,11 +30,13 @@ import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter import __version__, crypto
+from jobhunter.backup import prune
 from jobhunter.backup.backup_set import PG_DUMP, PG_RESTORE, BackupJobBusy, BackupSetFailed, run_backup_set
 from jobhunter.backup.prune import PruneFailed, run_prune
 from jobhunter.backup.restic import RESTIC_BIN, Restic
 from jobhunter.backup.restore_test import run_restore_test
 from jobhunter.backup.runner import CommandResult
+from jobhunter.backup.shipper import ShipResult, ship_manifests
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.migrate import BACKUP_DELETE_TABLES, BACKUP_GRANT_TABLES
@@ -47,7 +50,7 @@ from psycopg import sql
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
-from tests.support.backups import backup_run, backup_set, manifest
+from tests.support.backups import FakeRestic, backup_run, backup_set, manifest
 from tests.support.pg import PgServer, config_for, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -771,6 +774,88 @@ async def test_a_prune_whose_shipment_lock_session_ended_forgets_no_manifests_sn
     assert [call.argv[1] for call in commands.calls] == ["snapshots"]
     row = await one(engine, _RUN, id=failed.value.run_id)
     assert (row.status, row.error) == ("failed", "prune:ShipLockLost")
+
+
+_END_PRUNE_SESSION: Final = (
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'jobhunter-backup-prune'"
+)
+
+
+@pytest.mark.parametrize("step", ["forget", "receipt_removal"])
+async def test_a_shipment_after_a_prune_lost_its_lock_is_neither_removed_nor_forgotten(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+) -> None:
+    """The final re-review's round-3 sequence (R3-C1, its second path), with the real prune and shipper. The
+    prune has read the latest receipt and listed the `manifests` snapshots under the shipment lock, and
+    decided: to forget the snapshots older than the receipt's, which restic lists, or to remove the receipt,
+    whose snapshot it does not list. Then its lock session ends (after its confirmation, before its forget;
+    before its removal), and a shipment lands with its receipt. The prune forgets only ids of its listing, so
+    never the new snapshot (final fix E1); and it reads and removes receipts on the lock's session, so the
+    removal fails `prune:ShipLockLost` with nothing removed, where it would have removed the new, genuine
+    receipt against its old listing."""
+    false_receipt = "e5" * 32  # restic lists no `e…` snapshot
+    receipted = (OLDER_RECEIPTED, RECEIPTED) if step == "forget" else (OLDER_RECEIPTED, false_receipt)
+    async with backup_engine.begin() as conn:
+        for snapshot in receipted:
+            await conn.execute(_RECEIPT, {"snapshot": snapshot})
+    commands = FakeCommands(migrated, listing=manifests_listing())
+    restic = Restic(backup_cfg, commands)
+    landed: list[ShipResult] = []
+
+    async def the_lock_is_lost_and_a_shipment_lands() -> None:
+        assert pg_rows(migrated, "superuser", _END_PRUNE_SESSION) == [(True,)]
+        (backup_cfg.manifests_dir / f"{uuid.uuid4()}.json").write_bytes(b"{}")
+        landed.append(await ship_manifests(backup_cfg, FakeRestic(backup_cfg), backup_engine, clock=utcnow))
+
+    if step == "forget":
+        forget = restic.forget_snapshots
+
+        async def forget_after_the_loss(ids: Sequence[str]) -> None:
+            await the_lock_is_lost_and_a_shipment_lands()
+            await forget(ids)
+
+        restic.forget_snapshots = forget_after_the_loss  # type: ignore[method-assign]
+    else:
+        remove = prune._remove_false_receipts
+
+        async def remove_after_the_loss(*args: Any, **kwargs: Any) -> Any:
+            await the_lock_is_lost_and_a_shipment_lands()
+            return await remove(*args, **kwargs)
+
+        monkeypatch.setattr(prune, "_remove_false_receipts", remove_after_the_loss)
+
+    if step == "forget":
+        run_id = await run_prune(backup_cfg, restic, backup_engine, clock=utcnow)
+    else:
+        with pytest.raises(PruneFailed) as failed:
+            await run_prune(backup_cfg, restic, backup_engine, clock=utcnow)
+        run_id = failed.value.run_id
+
+    [shipment] = landed
+    assert shipment.shipped and shipment.snapshot_id is not None
+    # its receipt survives, beside every receipt the prune found
+    assert [row.restic_snapshot_id for row in await rows(engine, _RECEIPTS)] == [
+        *receipted,
+        shipment.snapshot_id,
+    ]
+    forgotten = [
+        call.argv for call in commands.calls if call.argv[1] == "forget" and "--tag" not in call.argv
+    ]
+    assert all(shipment.snapshot_id not in argv for argv in forgotten)
+    row = await one(engine, _RUN, id=run_id)
+    if step == "forget":
+        [ids] = forgotten
+        assert ids[ids.index("--") + 1 :] == [OLDER_RECEIPTED, OLDER_PARTIAL]  # its listing's, by id
+        assert row.status == "succeeded"
+    else:
+        assert forgotten == []
+        assert (row.status, row.error) == ("failed", "prune:ShipLockLost")
 
 
 async def test_prune_takes_its_counts_from_the_settings_and_records_a_failure(

@@ -3,7 +3,8 @@
 
 **One shipper at a time** (final review C1): `ship_manifests` holds the shipment lock `SHIP_LOCK_KEY`
 (7261007, a one-key session advisory lock on a dedicated autocommit connection as `jobhunter_backup`,
-`ship_lock`) from its listing of the stream through the upload and its receipt. A second shipper (the
+`ship_lock`) from its listing of the stream through the upload and its receipt, which it writes on that same
+connection (`HeldShipLock.transaction`, final fix E1). A second shipper (the
 scheduler's while one runs by hand, say) waits for it, polling every `LOCK_POLL_S` with no snapshot held and
 logging `manifest_ship_waiting` once, then lists the stream itself: it never skips, so a `backup ship` that
 exits 0 shipped, or found shipped, every file there when it started. The snapshots are therefore made in the
@@ -17,13 +18,23 @@ starts, the shipper confirms on the lock's connection that its session is alive 
 (`HeldShipLock.confirm`, final fix D2): a session that ended (a PostgreSQL restart, a cut connection) took
 the lock with it, and another shipper may hold it now, so it stops with `ShipLockLost`, uploading nothing.
 
+**The receipt commits under the lock or not at all** (final fix E1; the final re-review's R3-C1). A session
+can end during the upload, after that confirmation. A prune may then take the free lock, anchor on the
+latest receipt and forget the new snapshot as older (a clock stepped back), or another shipper may ship a
+newer list. So the receipt is written in one transaction on the lock's own session: while the session lives
+it holds the lock, so a receipt that commits did so under it; a session that ended took the lock and the
+transaction with it, and the shipper stops with `ShipLockLost`, writing nothing. Its snapshot then has no
+receipt, which claims nothing, and the next ship uploads the stream again. The read of the latest receipt's
+items, before the upload, may run on another connection: only a live lock session writes a receipt, so none
+changes while this one lives, and once it has ended this shipper writes none.
+
 `ship_manifests` reads the stream: the regular files of `cfg.manifests_dir` named `<manifest_uuid>.json` with
 the uuid in canonical form (`privacy.manifests.manifest_file_name`), never a `*.tmp` being written (its name
 ends in `.json.tmp`), each hashed (sha256). When the stream's `(uuid, sha256)` set equals the items of the
 latest shipment, or the stream is empty (no purge yet: restic makes no snapshot of nothing), nothing is
 shipped. Otherwise it lists every file of the stream, one absolute path per line, in a file of
 `cfg.staging_dir` (removed afterwards), runs one `restic backup --files-from-verbatim <list> --tag
-manifests`, and then, in one transaction as `jobhunter_backup`, inserts a `manifest_shipments` row (the
+manifests`, and then, in one transaction on the lock's session, inserts a `manifest_shipments` row (the
 snapshot id, and `shipped_at` read from the clock then, under the lock, so a shipper that waited never
 records the time it started at and shipments agree in time with their order, final fix B10) with one
 `manifest_shipment_items` row per file: exactly the files the snapshot holds, since a listed file that cannot
@@ -81,20 +92,21 @@ _LATEST_ITEMS: Final = q(
     "SELECT manifest_uuid, file_sha256 FROM manifest_shipment_items "
     "WHERE shipment_id = (SELECT max(id) FROM manifest_shipments)"
 )
-_SHIPMENT: Final = q(
-    "INSERT INTO manifest_shipments (restic_snapshot_id, shipped_at) VALUES (:snapshot, :now) RETURNING id"
+# The receipt, written on the lock's session (psycopg's own parameters).
+_SHIPMENT: Final = (
+    "INSERT INTO manifest_shipments (restic_snapshot_id, shipped_at) VALUES (%s, %s) RETURNING id"
 )
-_ITEM: Final = q(
-    "INSERT INTO manifest_shipment_items (shipment_id, manifest_uuid, file_sha256) "
-    "VALUES (:shipment, :uuid, :sha)"
+_ITEM: Final = (
+    "INSERT INTO manifest_shipment_items (shipment_id, manifest_uuid, file_sha256) VALUES (%s, %s, %s)"
 )
 
 log = get_logger("jobhunter.backup.shipper")
 
 
 class ShipLockLost(Exception):
-    """The shipment lock's session ended, or no longer holds the lock, before an irreversible step: the step
-    was not taken (no upload, no forget, no receipt removed)."""
+    """The shipment lock's session ended, or no longer holds the lock, before an irreversible step or before
+    the transaction on its session committed: the step was not taken (no upload, no forget), and nothing of
+    the transaction was written (no receipt, none removed)."""
 
 
 @dataclass(frozen=True)
@@ -115,6 +127,21 @@ class HeldShipLock:
         if row is None or not row[0]:
             log.warning("ship_lock_lost", lock_key=SHIP_LOCK_KEY, holder=self.holder)
             raise ShipLockLost
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        """A transaction on the lock's own session, for the receipts' reads and writes (final fix E1): while
+        the session lives it holds the lock, so what commits here commits under it; a session that ended
+        before the COMMIT took the lock and the transaction with it, and nothing of it is written:
+        `ShipLockLost`. Another database error is raised as it is."""
+        try:
+            async with self.conn.transaction():
+                yield self.conn
+        except psycopg.OperationalError as exc:
+            if not (self.conn.broken or self.conn.closed):
+                raise
+            log.warning("ship_lock_lost", lock_key=SHIP_LOCK_KEY, holder=self.holder)
+            raise ShipLockLost from exc
 
 
 @dataclass(frozen=True)
@@ -216,6 +243,21 @@ def _remove(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+async def _receipt(
+    held: HeldShipLock, snapshot_id: str, shipped_at: datetime, files: Sequence[_StreamFile]
+) -> int:
+    """The receipt of `snapshot_id`, which holds exactly `files`: its `manifest_shipments` row and one item
+    per file, in one transaction on the lock's session (module docstring); the shipment's id."""
+    async with held.transaction() as conn:
+        row = await (await conn.execute(_SHIPMENT, (snapshot_id, shipped_at))).fetchone()
+        if row is None:
+            raise RuntimeError("the receipt's INSERT returned no id")
+        shipment = int(row[0])
+        async with conn.cursor() as cursor:
+            await cursor.executemany(_ITEM, [(shipment, file.manifest_uuid, file.sha256) for file in files])
+    return shipment
+
+
 async def _backup(cfg: AppConfig, restic: Restic, files: Sequence[_StreamFile], held: HeldShipLock) -> str:
     """One `manifests` snapshot of exactly `files`, through a list file in the staging directory, once the
     shipment lock is confirmed held just before restic starts."""
@@ -231,7 +273,8 @@ async def ship_manifests(
     cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, clock: Callable[[], datetime]
 ) -> ShipResult:
     """Ship the manifest stream unless it is unchanged, under the shipment lock from the listing through the
-    receipt (module docstring); the receipt's `shipped_at` is read from `clock` under the lock."""
+    receipt, which commits on the lock's session or not at all (module docstring); the receipt's
+    `shipped_at` is read from `clock` under the lock."""
     async with ship_lock(cfg) as held:
         files = _stream(cfg.manifests_dir)
         current = {(file.manifest_uuid, file.sha256) for file in files}
@@ -239,13 +282,6 @@ async def ship_manifests(
             log.info("manifests_unchanged", files=len(files))
             return ShipResult(shipped=False, snapshot_id=None, files=len(files))
         snapshot_id = await _backup(cfg, restic, files, held)
-        async with engine.begin() as conn:
-            shipment = int(
-                (await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": clock()})).scalar_one()
-            )
-            await conn.execute(
-                _ITEM,
-                [{"shipment": shipment, "uuid": file.manifest_uuid, "sha": file.sha256} for file in files],
-            )
+        shipment = await _receipt(held, snapshot_id, clock(), files)
     log.info("manifests_shipped", files=len(files), shipment_id=shipment)
     return ShipResult(shipped=True, snapshot_id=snapshot_id, files=len(files))
