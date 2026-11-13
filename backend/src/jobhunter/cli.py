@@ -313,8 +313,8 @@ def _add_restore_commands(commands: "argparse._SubParsersAction[argparse.Argumen
     restore_commands = restore.add_subparsers(dest="restore_command", required=True)
     run = restore_commands.add_parser(
         "run",
-        help="restore the latest manifest stream and a backup set into the empty database and volumes, "
-        "migrate, replay and verify (the restore service's command)",
+        help="restore the manifest stream (the union of every manifests snapshot) and a backup set into the "
+        "empty database and volumes, migrate, replay and verify (the restore service's command)",
     )
     run.add_argument(
         "--set", type=_set_id, metavar="ID", help="the backup set to restore (default: the latest)"

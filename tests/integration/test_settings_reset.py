@@ -7,14 +7,18 @@ the active profile, a row above the purge's bound). Each test runs it as the pur
 holds `active_config FOR UPDATE`. Every datum is invented.
 """
 
+import asyncio
 import copy
 from datetime import datetime
 from typing import Any, Final, cast
 
+import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db import seed
 from jobhunter.db.seed import anchor_utc_for, ensure_hashed, latest_slot_at_or_before, load_settings_v1
+from jobhunter.observability.deadman import DEADMAN_LOCK_KEY
 from jobhunter.privacy.kinds import delete_everything
 from jobhunter.settings import validate
 from jobhunter.settings.derive import derived, ensure_derived
@@ -22,6 +26,8 @@ from jobhunter.settings.model import Settings
 from jobhunter.settings.reset import reset_to_defaults
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.pg import PgServer, blocked_or_done
+from tests.support.procs import await_until
 from tests.support.purges import Purger, completed
 from tests.support.scoring import activate_score_tuple
 
@@ -74,6 +80,33 @@ def default_settings() -> Settings:
 async def default_rows(conn: AsyncConnection) -> Any:
     """The derived rows of the default document (found by hash; `migrate` seeded them)."""
     return await ensure_derived(conn, derived(default_settings(), profile=None))
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["a_disabled_default", "the_enabled_default"])
+async def test_a_reset_to_a_disabled_schedule_waits_for_a_dead_man_send(
+    engine: AsyncEngine, migrated: PgServer, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """Final re-review N8 (final fix C9): the reset writes `schedule_state` as the save's `schedule` action
+    does, so a default that disables the schedule first takes the dead-man lock as a transaction lock: it
+    waits for a send in progress (here, a session holding the lock), and no ping follows a disable it commits.
+    The enabled default, the one shipped, takes no lock."""
+    shipped = load_settings_v1()
+
+    def default() -> dict[str, Any]:
+        document = cast(dict[str, Any], copy.deepcopy(shipped))
+        document["schedule"]["enabled"] = enabled
+        return document
+
+    monkeypatch.setattr(seed, "load_settings_v1", default)
+    with psycopg.connect(migrated.dsn("app"), autocommit=True) as sender:
+        sender.execute("SELECT pg_advisory_lock(%s::bigint)", (DEADMAN_LOCK_KEY,))
+        task = asyncio.create_task(reset(engine, utcnow()))
+        try:
+            await await_until(lambda: blocked_or_done(migrated, task), 10)
+            assert task.done() is enabled
+        finally:
+            sender.execute("SELECT pg_advisory_unlock(%s::bigint)", (DEADMAN_LOCK_KEY,))
+        await asyncio.wait_for(task, 10)
 
 
 async def test_the_reset_needs_no_gate_and_creates_no_tuple_or_operation(engine: AsyncEngine) -> None:

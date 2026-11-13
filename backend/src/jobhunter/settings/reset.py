@@ -17,7 +17,8 @@ ranking after it (the last lock):
    `pending_scope_version_id` NULL; the rubric and prompt-schema versions are left as they are;
 5. `schedule_state` reset by the save's own `schedule` action (`settings.save.reset_schedule`, §3.4): the
    anchor on `now`'s date in the display zone, the interval, `enabled`, the cursor at the latest slot at or
-   before `now`, and the new version.
+   before `now`, and the new version; a default that disables the schedule first takes the dead-man lock, as
+   a disabling save does, so no ping follows the reset (final fix C9; the shipped default is enabled).
 
 It creates no tuple, no operation and no bulk operation, and returns the new version's id. Ids only reach a
 log line.

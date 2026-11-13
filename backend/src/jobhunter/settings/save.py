@@ -345,9 +345,12 @@ async def reset_schedule(
     """`schedule_state` reset in one statement for the settings version `version_id` holding `settings`
     (module docstring, step 6's `schedule` action): the anchor on `now`'s date in the display zone, the
     interval, `enabled`, the cursor at the latest slot at or before `now`, and the version. The save's
-    `schedule` action and delete-everything's reset (`settings.reset`, M5 Task 16) share it. `LookupError`
-    without the row."""
+    `schedule` action and delete-everything's reset (`settings.reset`, M5 Task 16) share it, and with it the
+    dead-man lock a disable takes first, as a transaction lock (module docstring, final review M1; final fix
+    C9). `LookupError` without the row."""
     schedule = settings.schedule
+    if not schedule.enabled:  # a disable: between two dead-man sends, never during one
+        await conn.execute(_DEADMAN_LOCK, {"key": DEADMAN_LOCK_KEY})
     interval_s = schedule.interval_hours * _SECONDS_PER_HOUR
     anchor = anchor_utc_for(now, schedule.anchor_local, settings.display.timezone)
     result = await conn.execute(
@@ -366,9 +369,7 @@ async def reset_schedule(
 
 
 async def _apply_schedule(a: _Activation) -> None:
-    if not a.proposed.schedule.enabled:  # a disable: between two dead-man sends, never during one
-        await a.conn.execute(_DEADMAN_LOCK, {"key": DEADMAN_LOCK_KEY})
-    await reset_schedule(a.conn, a.proposed, version_id=a.version_id, now=a.now)
+    await reset_schedule(a.conn, a.proposed, version_id=a.version_id, now=a.now)  # a disable takes the lock
 
 
 async def _apply_collection(a: _Activation) -> None:

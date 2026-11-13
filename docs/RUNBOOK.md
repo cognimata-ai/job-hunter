@@ -529,8 +529,8 @@ already open keep working, and the restart ends the window.
 the prune on Sundays at 02:30 (`JOBHUNTER_BACKUP_PRUNE_CRON`), which keeps 7 daily, 4 weekly and 3 monthly
 sets, and forgets the `manifests` snapshots older than the latest one a shipment confirmed (that one holds
 every manifest shipped up to it, and newer ones are kept, so no manifest is lost, §19.5); the restore test on
-the first Sunday of the month at 03:30 (`JOBHUNTER_RESTORE_TEST_CRON`). One backup job runs at a time: another prints `{"error": "backup_job_busy"}`
-and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
+the first Sunday of the month at 03:30 (`JOBHUNTER_RESTORE_TEST_CRON`). One backup job runs at a time:
+another prints `{"error": "backup_job_busy"}` and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
 the scheduler's runs waits for it, then ships what is left, so it never prints `backup_job_busy`. A restore
 reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set,
 shipment and restore test, with their ages. By hand, each printing one JSON line:
@@ -573,9 +573,10 @@ back. So, before a `docker volume rm` or a `down` that removes volumes, whatever
    ```
 
    Only exit 0 lets the procedure go on: `{"shipped": true, …}`, or `{"shipped": false, …}` when the stream was
-   shipped already. On `{"error": "backup_job_busy"}` or `{"error": "locked"}` (another backup job holds a
-   lock), run it again. On any other error, stop and remove no volume: fix the cause as the
-   `privacy.manifest_unshipped` row says (section 6), then ship again.
+   shipped already. On `{"error": "locked"}` (restic's repository lock, which a prune can hold longer than a
+   ship waits), run it again; a ship never prints `backup_job_busy`, since it waits for a ship already
+   running. On any other error, stop and remove no volume: fix the cause as the `privacy.manifest_unshipped`
+   row says (section 6), then ship again.
 3. Check that the latest shipment holds every manifest file, as the application role. api and worker are
    stopped, so a manifest's `status` can lag behind its shipment; this query reads the shipment itself:
 
@@ -707,8 +708,9 @@ that PR's head commit, by its release tag (below).
 1. `$JH pull`.
 2. A backup set and a shipment just before the change, which a rollback by restore starts from:
    `$JH exec backup jobhunter backup set` (note the `set_id` it prints), then
-   `$JH exec backup jobhunter backup ship`. On `{"error": "backup_job_busy"}` (another backup job runs), run it
-   again; on another error, fix it (the `backup.failed` row, section 6). Do not start the upgrade without a
+   `$JH exec backup jobhunter backup ship`. On the set's `{"error": "backup_job_busy"}` (another backup job
+   runs), or either's `{"error": "locked"}` (restic's repository lock), run that command again; on another
+   error, fix it (the `backup.failed` row, section 6). Do not start the upgrade without a
    `set_id` and a ship that exited 0.
 3. `$JH stop api worker`: `migrate` and `jobhunter manifests replay` run only with api and worker stopped
    (§19.5); the worker drains within its 120 s.
@@ -757,7 +759,7 @@ restores the last backup set when it reports `migrate_schema_ahead_incompatible`
       $JH exec backup jobhunter backup ship
       ```
 
-      The ship must exit 0; on `{"error": "backup_job_busy"}` or `{"error": "locked"}`, run it again.
+      The ship must exit 0; on `{"error": "locked"}`, run it again (a ship never prints `backup_job_busy`).
    2. Then the check, step 3 of section 8's **Before any volume is removed**: it must return no row. On any
       failure of these two steps, stop here and remove no volume.
    3. Remove the data volumes, and restore the set of the upgrade's step 2:

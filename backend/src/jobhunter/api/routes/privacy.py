@@ -64,7 +64,8 @@ content deletes (empty for another kind, and before the content is recorded). Ev
 delete-everything.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
-`jobhunter.api.routes.privacy.utcnow`. Ids, statuses and the client address only reach a log line.
+`jobhunter.api.routes.privacy.utcnow`. Ids and statuses only reach a log line, never the client address (the
+re-authentication logs its outcome only, final review M1).
 """
 
 import asyncio
