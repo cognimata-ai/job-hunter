@@ -699,16 +699,19 @@ def test_the_backup_role_writes_its_four_tables_and_nothing_else(migrated: PgSer
         "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
         "VALUES (gen_random_uuid(), 'source_purge', 'executing')",
         "DELETE FROM backup_sets",
+        "UPDATE deletion_manifests SET scope = scope",  # only the columns that un-ship a manifest (fix D1)
+        "DELETE FROM deletion_manifests",
     ):
         with pytest.raises(psycopg.Error) as refusal:
             pg_one(migrated, "backup", denied)
         assert refusal.value.sqlstate == "42501", denied  # insufficient_privilege
 
+    # DELETE on the two receipt tables: the prune removes a false receipt (final fix D1)
     assert pg_rows(migrated, "migrator", _BACKUP_WRITES) == [
         ("backup_runs", True, True, False, False),
         ("backup_sets", True, True, False, False),
-        ("manifest_shipment_items", True, True, False, False),
-        ("manifest_shipments", True, True, False, False),
+        ("manifest_shipment_items", True, True, True, False),
+        ("manifest_shipments", True, True, True, False),
     ]
 
 
