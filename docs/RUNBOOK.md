@@ -284,7 +284,8 @@ Once, after host setup, in this order (section 13, items 5 and 6):
 ## 4. Start and stop, and a frozen worker
 
 - **Start:** `$JH up -d --wait`. **Stop:** `$JH stop`, graceful: the worker drains within its 120 s, and a run
-  in flight resumes as a new attempt at the next start. Never `--scale worker=…`: the worker is a singleton
+  in flight resumes as a new attempt at the next start; the backup service lets a running job end, which can
+  take up to 10 minutes (section 8). Never `--scale worker=…`: the worker is a singleton
   (§3.3, `replicas: 1`).
 - **A frozen worker.** With one replica, a paused or swap-storming worker is never replaced: Docker restarts a
   container that exits, not one that hangs or turns unhealthy. Restart it:
@@ -445,7 +446,7 @@ content, so it would keep the running containers with the old value (R6); a rest
 |---|---|
 | `session_secret` | `$JH restart api`; it logs the user out (every session ends) |
 | `anthropic_key`, `rapidapi_key`, `serpapi_key`, `adzuna_app_id`, `adzuna_app_key`, `langsmith_key`, `ntfy_token`, `healthchecks_ping_url`, `healthchecks_api_key` | `$JH restart worker` |
-| `s3_access_key_id`, `s3_secret_access_key` | `$JH restart backup` (the restore container is one-off); the offline recovery kit takes the new keys |
+| `s3_access_key_id`, `s3_secret_access_key` | `$JH restart backup` (the restore container is one-off; during a backup job the restart waits up to 10 minutes, section 8); the offline recovery kit takes the new keys |
 | `data_key` | the data key's procedure (below) |
 | `db_app`, `db_migrator`, `db_backup`, `db_restore` | `scripts/rotate-db-role.sh` (below) |
 
@@ -526,14 +527,21 @@ sets; the restore test on the first Sunday of the month at 03:30 (`JOBHUNTER_RES
 snapshots are never forgotten. One backup job runs at a time: another prints `{"error": "backup_job_busy"}`
 and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
 the scheduler's runs waits for it, then ships what is left, so it never prints `backup_job_busy`. A restore
-reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set, shipment and restore test, with their ages. By
-hand, each printing one JSON line:
+reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set,
+shipment and restore test, with their ages. By hand, each printing one JSON line:
 
 ```
 $JH exec backup jobhunter backup set
 $JH exec backup jobhunter backup ship
 $JH exec backup jobhunter backup restore-test
 ```
+
+**A restart of the backup service waits for its job.** `$JH restart backup`, `$JH stop` and an `up` that
+recreates the service let a running job finish: the service has a stop grace of 10 minutes (§19.5). Between
+jobs it stops at once. During a job it can take up to those 10 minutes: expect that during the nightly set
+(from 01:15), the Sunday prune (from 02:30) and the monthly restore test (the first Sunday, from 03:30), or a
+job started by hand. A job still running when the 10 minutes end is killed and recorded `interrupted`; the next
+start removes what it left (a restore test's scratch database and staging).
 
 **Before any volume is removed** (a rollback by restore, section 10; a timed restore onto the same VPS, section
 13). The manifests volume holds the only copy of every deletion manifest not shipped yet, and a restore replays
