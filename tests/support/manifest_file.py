@@ -8,8 +8,12 @@ The file is a `job_tombstone` of job 1. Its content is computed by the kind's ow
 over `JobTombstone.compute`, with `max_identity_ids` read on the stack's database as that role), and written
 by `write_manifest_file`, so a replay of the manifest stream (the `migrate` service's, a restore's) takes
 it: its `max_ids` hold every identity table, `score_targets` among them, which the kind's `execute` reads.
-The tests' databases hold no job 1, so the content tombstones nothing (its `fence` op names no job) and a
-replay of it deletes nothing. No row is written: the manifest is never recorded.
+On a fresh database there is no job 1, so the content tombstones nothing (its `fence` op names no job) and a
+replay of it deletes nothing; on a kept one, `JobTombstone.compute`'s due rule leaves out a job 1 that is not
+due, so it tombstones only what retention would. The writer records no row, but a `migrate` that replays the
+stream afterwards (the shipper's dependency, a restore) records the manifest from its file (§19.5:
+`replayed`, then completed), and that row stays: a test that writes here removes its file at its end and
+says what its database keeps (`tests/stack/test_backup_image.py`).
 
 The script prints one JSON line, `{"written": [<uuid>, <sha256 hex>], "stream": {<uuid>: <sha256 hex>}}`: the
 file it wrote, and every file of the stream; `written_manifest` reads it.

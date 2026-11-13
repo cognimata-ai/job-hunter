@@ -11,6 +11,16 @@ the repository starts empty, and at its end runs `$DC down` (never `-v`) and rem
 other volume of the project it created; every other volume of `jobhunter-dev`, its database among them,
 stays. The volume test removes the volumes it creates. The module is skipped while a stack runs: the dev stack
 itself, or another project on the dev stack's subnet.
+
+**What the shipping test leaves** (plan M5 Task 33, Ruling T33-15). It writes one manifest file
+(`tests.support.manifest_file`) and removes it at its end, after a failure too. The `migrate` the shipper
+depends on replays the stream, so that manifest is recorded in the project's database: a `deletion_manifests`
+row, completed, then shipped against the fixture's repository, which goes with its volume. That row is the
+stream's record (§19.5, kept indefinitely) and is not removed here: no test deletes a manifest row by hand,
+and while it stands the next `migrate` writes its file again from the row's scope (step 1,
+`identities.rewrite_missing_files`). So on a kept `jobhunter-dev` database the test leaves that manifest (a
+`job_tombstone` that tombstoned nothing it would not); run the module after `$DC down -v`, as the acceptance
+runs do, and the database volume is the test's own and goes at its end with everything in it.
 """
 
 import json
@@ -277,6 +287,18 @@ def test_ship_into_a_local_repository(dev_project: set[str]) -> None:
     # nothing.
     writer = run(*DC, "run", "--rm", "-T", "--no-deps", "migrate", "python", "-c", WRITE_MANIFEST, "migrate")
     manifest_uuid, sha, stream = written_manifest(writer.stdout)
+    try:
+        _ship_the_stream(manifest_uuid, sha, stream, dev_project)
+    finally:  # the file leaves the manifests volume (module docstring), through the one-off `migrate`
+        removed = f"/data/manifests/{manifest_uuid}.json"  # a canonical uuid (`written_manifest`)
+        run(*DC, "run", "--rm", "-T", "--no-deps", "migrate", "rm", "-f", removed)
+    listed = run(*DC, "run", "--rm", "-T", "--no-deps", "migrate", "ls", "/data/manifests").stdout.split()
+    assert f"{manifest_uuid}.json" not in listed
+
+
+def _ship_the_stream(manifest_uuid: str, sha: str, stream: dict[str, str], dev_project: set[str]) -> None:
+    """The shipper ships the stream with the test's manifest: one `manifests` snapshot naming every file, and
+    one shipment row with an item per file."""
     assert stream[manifest_uuid] == sha
     if f"{DEV_PROJECT}_manifests" not in dev_project:
         assert list(stream) == [manifest_uuid]  # a new volume: its one manifest is this test's
