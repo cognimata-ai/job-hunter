@@ -358,6 +358,7 @@ def computed_keys(function: Function) -> Iterator[int]:
     no string literal, by subscript or `.get` (final fix D5): such a key may be `"max_ids"`, and the check
     follows the bounds only from a literal one."""
     for node in ast.walk(function.node):
+        key: ast.expr | None
         if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
             source, key = node.value, node.slice
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
