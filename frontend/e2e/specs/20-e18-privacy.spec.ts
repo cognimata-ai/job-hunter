@@ -1,6 +1,7 @@
 // E18 (spec §18.7, §15.7, §20.3-§20.6, §19.5; plan M5 Task 30): Privacy & data on the set-up stack, the last
-// spec of all because it deletes everything (one worker, the files in name order). Privacy & data's link scrolls
-// to the privacy statement, whose contents scroll to each of its sections. (a) Export → ready → the download: a
+// spec of all because it deletes everything (one worker, the files in name order). A fresh load of the privacy
+// statement's address shows it and keeps it in view while the page fills in (plan M5 Task 33); Privacy & data's
+// link scrolls to it, and its contents scroll to each of its sections. (a) Export → ready → the download: a
 // zip (`PK\x03\x04`) whose central directory names README.txt and jobs.json. (b) Delete everything: Submit stays
 // disabled until the exact phrase (a wrong one is marked), and a wrong password is refused with the
 // `reauth_failed` text. (c) The phrase and the password: 202, "Deleting…", the completion ends the session and
@@ -99,7 +100,16 @@ test("E18: the export downloads a zip; delete everything takes the exact phrase 
   const user = await smokeUser();
   await initResticRepo(); // the shipper's local repository: `backup init` once for a new volume, a no-op after
 
-  // The privacy statement: Privacy & data links to it, and its contents link to its sections.
+  // The privacy statement: a fresh load of its address (a reload, a bookmark) shows it, and keeps it in view once
+  // the parts above it have read their data, the Health panel's last group among them (plan M5 Task 33).
+  await page.goto("/settings#privacy-statement");
+  const statementTitle = page
+    .getByRole("region", { name: en["privacy_statement.title"] })
+    .getByRole("heading", { name: en["privacy_statement.title"], level: 2 });
+  await expect(statementTitle).toBeInViewport();
+  await expect(page.getByRole("region", { name: en["health.versions"] }).getByRole("code").first()).toBeAttached();
+  await expect(statementTitle).toBeInViewport();
+  // Privacy & data links to it, and its contents link to its sections.
   await page.goto("/settings#privacy");
   await expect(page.getByRole("region", { name: en["settings.section.privacy"] })).toBeVisible();
   await expectNoSeriousA11yViolations(page);

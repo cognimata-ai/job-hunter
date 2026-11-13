@@ -5,11 +5,13 @@
 // and Watchlist Task 29's, Scoring & models Task 30's, Privacy & data Task 31's. System (Task 31, Ruling T31-a)
 // holds the framed Display & notifications part (`#display`), then its operational parts, which have no panel.
 // Under the sections, the privacy statement (`#privacy-statement`, plan M5 Task 20), which Privacy & data links
-// to: outside that section's frame, so its Save stays beside its fields.
-import { Link } from "@tanstack/react-router";
+// to: outside that section's frame, so its Save stays beside its fields. The part the hash names is brought into
+// view and held there while the sections fill in (`useHashAnchor`, plan M5 Task 33).
+import { Link, useLocation } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import pages from "../app/Pages.module.css";
+import { useHashAnchor } from "../components/useHashAnchor";
 import { BudgetSection } from "../settings/BudgetSection";
 import { CvSection } from "../settings/cv/CvSection";
 import { QueriesSection } from "../settings/QueriesSection";
@@ -71,6 +73,7 @@ export function ProfileSettingsPage() {
 
 function SettingsPage() {
   const { t } = useTranslation();
+  useHashAnchor(useLocation({ select: (location) => location.hash }));
   return (
     <div className={styles.page}>
       <h1 className={pages.title}>{t("settings.title")}</h1>
