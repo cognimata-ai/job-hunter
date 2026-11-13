@@ -61,6 +61,7 @@ from tests.support.prodsite import (
     USERNAME,
     Site,
     backup,
+    close_sites,
     events,
     last_json,
     wait_for,
@@ -164,6 +165,16 @@ def ready(site: Site) -> None:
 def jobs_list(site: Site) -> list[int]:
     """The first page of the Jobs list, its job ids."""
     return [int(card["job_id"]) for card in site.get("/api/jobs?limit=100")["items"]]
+
+
+@pytest.fixture(autouse=True)
+def sites_closed() -> Iterator[None]:
+    """Every `Site` the test opened, closed at its end, after a failure too (`prodsite.close_sites`, Ruling
+    F-7 (2)): none is left for the garbage collector, whose warning of an unclosed socket `-W error` fails."""
+    try:
+        yield
+    finally:
+        close_sites()
 
 
 @pytest.fixture

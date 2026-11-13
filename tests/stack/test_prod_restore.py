@@ -40,6 +40,7 @@ from tests.support.prodsite import (
     USERNAME,
     Site,
     backup,
+    close_sites,
     events,
     in_worker,
     last_json,
@@ -274,6 +275,16 @@ def uuid_of(argv: list[str], manifest_id: int) -> str:
 
 
 # ---- the sequence ------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def sites_closed() -> Iterator[None]:
+    """Every `Site` the test opened, closed at its end, after a failure too (`prodsite.close_sites`, Ruling
+    F-7 (2)): none is left for the garbage collector, whose warning of an unclosed socket `-W error` fails."""
+    try:
+        yield
+    finally:
+        close_sites()
 
 
 @pytest.fixture(scope="module")

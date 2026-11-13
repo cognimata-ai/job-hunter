@@ -5,7 +5,10 @@ carry T27-3 (1): no test module imports another).
 
 - `Site(argv)` is a TLS client of the site's Caddy (`https://localhost:8443`, verified against the site's
   own internal root), logged in as `USERNAME`; it collects on the fixtures, confirms the synthetic profile
-  from the recorded Claude streams and makes an export `ready`, through the API alone.
+  from the recorded Claude streams and makes an export `ready`, through the API alone. Its client is closed
+  deterministically (Ruling F-7 (2)): by `close()` or a `with` block, and every `Site` still open is closed by
+  `close_sites()`, which the modules that use one call at the end of each test. A client left to the garbage
+  collector would warn of its unclosed socket during whichever test collects it, which `-W error` fails.
 - `wait_for` polls a probe every `POLL_S` within a bound, `one` reads one value as the bootstrap role,
   `last_json` the JSON line a command printed last, `events` the JSON log events it wrote, `named` those of
   one name; `backup` runs a `jobhunter backup` command in the site's backup container and `in_worker` a script
@@ -97,18 +100,48 @@ def in_worker(argv: list[str], script: str, stdin: str | None = None) -> Any:
     return last_json(done.stdout)
 
 
+# Every `Site` opened and not closed yet, oldest first (module docstring).
+_OPEN: Final[list["Site"]] = []
+
+
+def close_sites() -> None:
+    """Close every `Site` still open (module docstring); none is left open."""
+    while _OPEN:
+        _OPEN[-1].close()
+
+
 class Site:
-    """A browser of a site: a TLS client of its Caddy, logged in as `USERNAME`."""
+    """A browser of a site: a TLS client of its Caddy, logged in as `USERNAME`. Closed by `close()`, a `with`
+    block or `close_sites()` (module docstring)."""
 
     def __init__(self, argv: list[str]) -> None:
         self.argv = argv
         context = ssl.create_default_context(cadata=caddy_root_pem(argv))
         self.http = httpx.Client(base_url=ORIGIN, verify=context, timeout=30)
-        wait_for(self._healthy, within_s=120, what="Caddy and the api", argv=argv)
-        login = self.http.post(
-            "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}, headers={"Origin": ORIGIN}
-        )
-        assert login.status_code == 204, login.text
+        _OPEN.append(self)
+        try:
+            wait_for(self._healthy, within_s=120, what="Caddy and the api", argv=argv)
+            login = self.http.post(
+                "/api/auth/login",
+                json={"username": USERNAME, "password": PASSWORD},
+                headers={"Origin": ORIGIN},
+            )
+            assert login.status_code == 204, login.text
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the client and its sockets. Idempotent."""
+        self.http.close()
+        if self in _OPEN:
+            _OPEN.remove(self)
+
+    def __enter__(self) -> "Site":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _healthy(self) -> bool:
         try:
