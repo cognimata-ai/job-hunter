@@ -74,6 +74,41 @@ describe("AlertsList", () => {
     });
   });
 
+  it("an acknowledged or resolved alert hands the focus to the alerts' heading, as its buttons have gone", async () => {
+    // plan M5 Task 33, the visual pass: the focus fell to the document's body, and a keyboard user started again
+    // from the page's top
+    const api = fakeApi({ signedIn: true });
+    api.alerts = [alertRow(), alertRow({ id: 4, code: "run.failed_invariant", severity: "critical" })];
+    api.routes.set("POST /api/alerts/3/ack", () => {
+      api.alerts = api.alerts.filter((alert) => alert.id !== 3);
+      return json({ id: 3, acknowledged_at: "2026-11-03T07:00:00Z" });
+    });
+    api.routes.set("POST /api/alerts/4/resolve", () => {
+      api.alerts = [];
+      return json(alertRow({ id: 4, status: "resolved", resolved_at: "2026-11-03T07:00:00Z" }));
+    });
+    const user = userEvent.setup();
+    const app = renderInProviders(<AlertsList />);
+    app.queryClient.setQueryData(STATUS_KEY, statusOut());
+    const heading = screen.getByRole("heading", { name: en["settings_system.alerts"] });
+    const acked = (await within(panel()).findByText(en["alert.quota.unaccounted_usage"])).closest("li") as HTMLElement;
+    await user.click(within(acked).getByRole("button", { name: en["alerts.ack"] }));
+    await waitFor(() => {
+      expect(acked.isConnected).toBe(false);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+
+    const resolved = within(panel()).getByText(en["alert.run.failed_invariant"]).closest("li") as HTMLElement;
+    await user.click(within(resolved).getByRole("button", { name: en["alerts.resolve"] }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["alerts.resolve"] }));
+    expect(await within(panel()).findByText(en["alerts.empty_open"])).toBeTruthy();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+  });
+
   it("shows Resolve only for manual alerts", async () => {
     const api = fakeApi({ signedIn: true });
     api.alerts = [

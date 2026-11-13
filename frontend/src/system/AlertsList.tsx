@@ -10,12 +10,13 @@
 // and every tab is read again; a refusal (404, 409 `not_manual`) shows in the row, and the tabs are read again
 // too.
 import * as Tabs from "@radix-ui/react-tabs";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
+import { useFocusFallback } from "../components/useFocusFallback";
 import { useToast } from "../components/Toaster";
 import { useServerText } from "../i18n/index";
 import { closedSet } from "../settings/fields";
@@ -130,9 +131,12 @@ function AlertTab({ status }: { status: AlertStatus }) {
 export function AlertsList() {
   const { t } = useTranslation();
   const serverText = useServerText();
+  const section = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useFocusFallback(section, heading); // an acknowledged or resolved alert leaves its tab with its buttons
   return (
-    <section id="alerts" aria-labelledby="alerts-heading" className={parts.part}>
-      <h3 id="alerts-heading" className={parts.title}>{t("settings_system.alerts")}</h3>
+    <section ref={section} id="alerts" aria-labelledby="alerts-heading" className={parts.part}>
+      <h3 ref={heading} id="alerts-heading" tabIndex={-1} className={parts.title}>{t("settings_system.alerts")}</h3>
       <Tabs.Root defaultValue="open" className={styles.tabs}>
         <Tabs.List aria-label={t("settings_system.alerts_tabs")} className={styles.tabList}>
           {STATUSES.map((status) => (

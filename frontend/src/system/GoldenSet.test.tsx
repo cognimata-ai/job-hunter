@@ -1,4 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import en from "../i18n/en.json";
 import { fakeApi, goldenCase, json, manifestOut, problem, requestsTo } from "../test/api";
@@ -161,6 +162,26 @@ describe("GoldenSet", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("a confirmed delete hands the focus to the set's heading, as the row's Delete has gone", async () => {
+    // plan M5 Task 33, the visual pass: the dialog gave the focus back to a Delete that was no longer there
+    const api = fakeApi({ signedIn: true });
+    api.goldenCases = [goldenCase()];
+    api.routes.set("DELETE /api/golden-cases/1", () => json({ manifest_id: 9 }, 202));
+    api.manifests = [manifestOut({ id: 9, kind: "golden_case_delete", status: "executing", completed_at: null, shipped_at: null })];
+    const user = userEvent.setup();
+    renderInProviders(<GoldenSet />);
+    await screen.findByText("Backend Engineer (Python)", { selector: "td" });
+    await user.click(within(rowOf("Backend Engineer (Python)")).getByRole("button", { name: /^Delete/ }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["golden.delete"] }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(within(rowOf("Backend Engineer (Python)")).getByText(en["golden.deletion_requested"])).toBeTruthy();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: en["settings_system.golden"] }));
+    });
   });
 
   it("a requested deletion whose read is refused is not read again", async () => {

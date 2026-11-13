@@ -10,13 +10,14 @@
 // so the deleted case leaves the table. A requested case's flags rest. A refusal shows at the row by its code
 // (`PrivacyProblem`). Every write reads the set and the golden runs' gate again.
 import { useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useId, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { useAnnounce } from "../components/LiveRegion";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
+import { useFocusFallback } from "../components/useFocusFallback";
 import { useServerText } from "../i18n/index";
 import { GOLDEN_RUNS_KEY } from "../settings/EvalStatus";
 import tables from "../settings/tables.module.css";
@@ -139,6 +140,9 @@ export function GoldenSet() {
   const { t } = useTranslation();
   const cases = useGoldenCases();
   const [requested, setRequested] = useState<Requested[]>([]);
+  const section = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useFocusFallback(section, heading); // a requested deletion replaces its row's Delete, a deleted case leaves
   const request = (golden: GoldenCaseOut) => (manifestId: number) => {
     setRequested((list) => [{ caseId: golden.id, title: golden.title, manifestId }, ...list.filter((r) => r.manifestId !== manifestId)]);
   };
@@ -177,8 +181,8 @@ export function GoldenSet() {
     );
   }
   return (
-    <section id="golden-set" aria-labelledby="golden-heading" className={parts.part}>
-      <h3 id="golden-heading" className={parts.title}>{t("settings_system.golden")}</h3>
+    <section ref={section} id="golden-set" aria-labelledby="golden-heading" className={parts.part}>
+      <h3 ref={heading} id="golden-heading" tabIndex={-1} className={parts.title}>{t("settings_system.golden")}</h3>
       {body}
       {requested.length > 0 && <RequestedDeletions requested={requested} />}
     </section>

@@ -31,12 +31,13 @@
 // read again every 60 s in the background while it shows, so a batch's "from" time turns into its Release.
 import { useNavigate } from "@tanstack/react-router";
 import type { TFunction } from "i18next";
-import { type ReactNode, useId, useMemo, useState } from "react";
+import { type ReactNode, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
+import { useFocusFallback } from "../components/useFocusFallback";
 import { useToast } from "../components/Toaster";
 import codes from "../i18n/codes.json";
 import { intlLocale, useServerText } from "../i18n/index";
@@ -134,9 +135,12 @@ function Block({ name, count, shown, children }: { name: Section; count: number;
   const format = useFormat();
   const id = useId();
   const more = count - shown;
+  const block = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useFocusFallback(block, heading); // an item an action dealt with leaves on the next read, its buttons with it
   return (
-    <section aria-labelledby={id} className={styles.block}>
-      <h4 id={id} className={styles.blockTitle}>
+    <section ref={block} aria-labelledby={id} className={styles.block}>
+      <h4 ref={heading} id={id} tabIndex={-1} className={styles.blockTitle}>
         <span>{serverText("attention_section", name)}</span>{" "}
         <span className={cx(styles.count, count > 0 && styles.countSome)}>{format.number(count)}</span>
       </h4>

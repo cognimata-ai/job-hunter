@@ -1,4 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import codes from "../i18n/codes.json";
@@ -514,6 +515,33 @@ describe("NeedsAttention", () => {
       expect(within(await block("failed_purges")).getByText(en["attention.nothing"])).toBeTruthy();
     });
     expect(app.router.state.location.pathname).toBe("/settings");
+  });
+
+  it("a retried purge that leaves the list hands the focus to its block's heading", async () => {
+    // plan M5 Task 33, the visual pass: the dialog gave the focus back to Retry, which the next read removed
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({
+      failed_purges: {
+        count: 1,
+        items: [{ manifest_id: 12, kind: "source_purge", created_at: "2026-11-03T04:00:00Z", operation_id: 81, last_error_code: "postcondition_failed", attempts: 0 }],
+      },
+    });
+    api.routes.set("POST /api/system/purges/81/retry", () => {
+      api.attention = attentionOut();
+      return json({ operation_id: 82, manifest_id: 12 }, 202);
+    });
+    const user = userEvent.setup();
+    renderApp("/settings#system");
+    const failed = item(await block("failed_purges"), /#12/);
+    await user.click(within(failed).getByRole("button", { name: en["attention.purge_retry"] }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.purge_retry_confirm"] }));
+    await waitFor(async () => {
+      expect(within(await block("failed_purges")).getByText(en["attention.nothing"])).toBeTruthy();
+    });
+    const purges = await block("failed_purges");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(purges).getByRole("heading", { level: 4 }));
+    });
   });
 
   it("a refused purge retry shows by its code at its item", async () => {
