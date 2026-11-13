@@ -10,17 +10,19 @@ reaches is left out. A bound read is a subscript or a `.get` of a manifest's bou
 scope>["max_ids"]` or `<content or scope>.get("max_ids", …)`, a `:=` whose value is one, a name bound to one
 in the same function (by `=`, an annotated `=` or `:=`, an alias of an alias included: final fix C4), a
 parameter named `max_ids` or `bounds` (the modules' names for them), or any parameter a call in the module
-gives one. A key of the content (`content`, `scope`, a name bound to one, or a parameter a call in the
-module gives it) that is no string literal fails the check, since it may be `"max_ids"` (final fixes D5 and
-E3); so does any use of the content but a subscript, a `.get`, an argument of a function of the module, an
-alias and an identity test (another method of it, its iteration, a function outside the module given it
-whole: final fix E3). Any other use of a tracked bound (iterated, its `.items()`, kept on an attribute) fails
-the check too, as an unhandled use. Its key is a string, a module constant, a loop variable
-over a literal or a module constant (a tuple's element too), a local name bound to such a literal, or a
-parameter, resolved through every call of its function in the module (a `*args` parameter through every
-argument from its position on). A read whose key cannot be resolved fails the check as well, by function and
-line, and so does a manifest's bounds passed whole to a function outside the module, unless `PASSED_OUT` names
-it: a pure function, whose reads are found by calling it.
+gives one. A key of the content (`content`, `scope`, a name bound to one, or a parameter a call in the module
+gives it) that is no string literal fails the check, since it may be `"max_ids"` (final fixes D5 and E3); so
+does any use of the content but a subscript, a `.get`, an argument of a function of the module that binds to a
+named parameter of it, by position or by keyword (the final re-review's R4-M2), an alias and an identity test
+(another method of it, its iteration, a function outside the module given it whole: final fix E3; an argument
+that lands in a `*args` or `**kwargs` parameter, or follows an unpacking, where no name holds it: R4-M1). Any
+other use of a tracked bound (iterated, its `.items()`, kept on an attribute, given to a function of the
+module in no named parameter) fails the check too, as an unhandled use. Its key is a string, a module
+constant, a loop variable over a literal or a module constant (a tuple's element too), a local name bound to
+such a literal, or a parameter, resolved through every call of its function in the module (a `*args` parameter
+through every argument from its position on). A read whose key cannot be resolved fails the check as well, by
+function and line, and so does a manifest's bounds passed whole to a function outside the module, unless
+`PASSED_OUT` names it: a pure function, whose reads are found by calling it.
 
 A kind declares the keys it requires (`max_ids_keys`) and those a later release added
 (`max_ids_keys_added`, final fix C3): a table created empty after a manifest was written has no row within
@@ -33,8 +35,10 @@ whole to another module; an added key read by subscript or with another default;
 alias or an alias of an alias; a use of the bounds the check does not follow (iterated, kept on an attribute);
 the bounds taken by `.get("max_ids")`, with or without a default, a computed key of the content, and a
 subscripted `:=` (final fix D5); a computed key on an alias of the content, another method of the content
-(`__getitem__`), and the content iterated (final fix E3). A read planted in `compute` alone is left out, and
-an added key read as `.get(key, 0)` passes, as the check says.
+(`__getitem__`), and the content iterated (final fix E3); the content or the bounds given to a `*args` or
+`**kwargs` parameter or after an unpacking (R4-M1). A keyword argument is followed into its parameter, a
+keyword-only one too (R4-M2). A read planted in `compute` alone is left out, and an added key read as
+`.get(key, 0)`, or a declared bound read through a keyword call, passes, as the check says.
 """
 
 import ast
@@ -312,12 +316,13 @@ def bounds_names(function: Function, given: AbstractSet[str] = frozenset()) -> s
     return names
 
 
-def unhandled_uses(function: Function, holders: set[str]) -> Iterator[int]:
+def unhandled_uses(function: Function, holders: set[str], known: Mapping[str, Function]) -> Iterator[int]:
     """The line of every use of a manifest's bounds in `function` that the check does not follow (final fix
     C4): any but a subscript read, a `.get(...)` read, an argument of a call (whose callee `escapes_in` and
-    `given_bounds` judge) and the value bound to a name (an alias). A use is of a name that holds them, of
-    a `["max_ids"]` subscript or a `.get("max_ids", …)`, or of a `:=` whose value holds them (final fix
-    D5)."""
+    `given_bounds` judge; for a function of the module, one that binds to a named parameter of it, by
+    position or by keyword: `binds_to_a_parameter`) and the value bound to a name (an alias). A use is of a
+    name that holds them, of a `["max_ids"]` subscript or a `.get("max_ids", …)`, or of a `:=` whose value
+    holds them (final fix D5)."""
     parents = {child: node for node in ast.walk(function.node) for child in ast.iter_child_nodes(node)}
     aliased = {id(value) for target, value in bindings(function) if isinstance(target, ast.Name)}
     for node in ast.walk(function.node):
@@ -336,9 +341,9 @@ def unhandled_uses(function: Function, holders: set[str]) -> Iterator[int]:
             and isinstance(parents.get(parent), ast.Call)
             and cast(ast.Call, parents[parent]).func is parent
         )
-        argument = isinstance(parent, ast.Call) and (
-            node in parent.args or any(keyword.value is node for keyword in parent.keywords)
-        )
+        call = argument_of(node, parents)
+        callee = None if call is None else callee_of(call, function, known)
+        argument = call is not None and (callee is None or binds_to_a_parameter(call, node, known[callee]))
         if not (read or get or argument or id(node) in aliased):
             yield node.lineno
 
@@ -415,6 +420,37 @@ def given_content(known: Mapping[str, Function]) -> dict[str, set[str]]:
     return given
 
 
+def argument_of(node: ast.expr, parents: Mapping[ast.AST, ast.AST]) -> ast.Call | None:
+    """The call `node` is an argument of, by position or as a keyword's value (`f(c=node)`: its parent is the
+    `ast.keyword`, the final re-review's R4-M2); `None` for any other use."""
+    parent = parents.get(node)
+    if isinstance(parent, ast.keyword) and parent.value is node:
+        parent = parents.get(parent)
+        return parent if isinstance(parent, ast.Call) else None
+    if isinstance(parent, ast.Call) and any(arg is node for arg in parent.args):
+        return parent
+    return None
+
+
+def binds_to_a_parameter(call: ast.Call, node: ast.expr, callee: Function) -> bool:
+    """Whether the argument `node` of `call` binds to a named parameter of `callee`, the one `given_content`
+    and `given_bounds` then hold it in: a positional argument within the named positional parameters, with no
+    unpacking (`*xs`) before it, or a keyword naming a parameter that takes one. An argument that lands in
+    `*args` or `**kwargs`, a `**mapping` and one after an unpacking bind to no name the check follows (the
+    final re-review's R4-M1)."""
+    args = callee.node.args
+    positional = [arg.arg for arg in (*args.posonlyargs, *args.args)]
+    if callee.owner is not None:
+        positional = positional[1:]  # self
+    for at, arg in enumerate(call.args):
+        if isinstance(arg, ast.Starred):
+            return False
+        if arg is node:
+            return at < len(positional)
+    by_keyword = {arg.arg for arg in (*args.args, *args.kwonlyargs)}
+    return any(keyword.value is node and keyword.arg in by_keyword for keyword in call.keywords)
+
+
 def _literal(key: ast.expr | None) -> bool:
     return isinstance(key, ast.Constant) and isinstance(key.value, str)
 
@@ -426,10 +462,12 @@ def content_uses(
     `scope`) that the check cannot follow, with what it is. Its bounds are `content["max_ids"]`, or a `.get`
     of that literal key, so a key that is no string literal, by subscript or `.get`, may be `"max_ids"`: a
     `computed key` (final fix D5, and on an alias, final fix E3). Any use but a subscript, a `.get`, an
-    argument of a function of the module (whose parameter then holds it, `given_content`), the value bound
-    to a name (an alias) and an identity test (`is None`) is an `unhandled use of the content` (final fix
-    E3): another method (`__getitem__`, `items`, `values`), an iteration, a function outside the module given
-    it whole. A branch of a conditional expression is judged by that expression's use."""
+    argument of a function of the module that binds to a named parameter of it, by position or by keyword
+    (whose parameter then holds it, `given_content`; the final re-review's R4-M2), the value bound to a name
+    (an alias) and an identity test (`is None`) is an `unhandled use of the content` (final fix E3): another
+    method (`__getitem__`, `items`, `values`), an iteration, a function outside the module given it whole, an
+    argument that lands in a `*args` or `**kwargs` parameter or follows an unpacking, where no name holds it
+    (R4-M1). A branch of a conditional expression is judged by that expression's use."""
     parents = {child: node for node in ast.walk(function.node) for child in ast.iter_child_nodes(node)}
     aliased = {id(value) for target, value in bindings(function) if isinstance(target, ast.Name)}
     for found in ast.walk(function.node):
@@ -458,10 +496,9 @@ def content_uses(
             if not (call.args and _literal(call.args[0])):
                 yield node.lineno, "computed key"
             continue
-        argument = isinstance(parent, ast.Call) and (
-            node in parent.args or any(keyword.value is node for keyword in parent.keywords)
-        )
-        if argument and callee_of(cast(ast.Call, parent), function, known) is not None:
+        call = argument_of(node, parents)
+        callee = None if call is None else callee_of(call, function, known)
+        if call is not None and callee is not None and binds_to_a_parameter(call, node, known[callee]):
             continue
         if id(node) in aliased:
             continue
@@ -596,7 +633,7 @@ def bound_reads(tree: ast.Module, namespace: Mapping[str, Any], procedure: str) 
     for name in sorted(replay_reach(known, procedure)):
         holders = bounds_names(known[name], given[name])
         reads.unresolved += [
-            f"{name}:{line} (unhandled use)" for line in unhandled_uses(known[name], holders)
+            f"{name}:{line} (unhandled use)" for line in unhandled_uses(known[name], holders, known)
         ]
         contents = content_names(known[name], given_contents[name])
         reads.unresolved += [
@@ -819,6 +856,66 @@ PLANTS: Final = {
         "",
         (),
         ["execute:1 (unhandled use of the content)"],
+    ),
+    # the final re-review's round-4 forms (R4-M1, R4-M2): an argument that binds to no named parameter of the
+    # callee (its `*args` or `**kwargs`, or one after an unpacking) holds the content or the bounds where no
+    # name the check follows does; a keyword argument that names a parameter is followed
+    "the_content_into_a_variadic_parameter": (
+        "execute",
+        "_planted(content)",
+        'def _planted(*args):\n    c = args[0]\n    k = "max_ids"\n    c[k]["planted"]',
+        (),
+        ["execute:1 (unhandled use of the content)"],
+    ),
+    "the_content_into_a_keyword_variadic_parameter": (
+        "execute",
+        "_planted(c=content)",
+        'def _planted(**kwargs):\n    k = "max_ids"\n    return kwargs["c"][k]["planted"]',
+        (),
+        ["execute:1 (unhandled use of the content)"],
+    ),
+    "the_content_after_an_unpacking": (
+        "execute",
+        "_planted(*(), content)",
+        'def _planted(c):\n    k = "max_ids"\n    return c[k]["planted"]',
+        (),
+        ["execute:1 (unhandled use of the content)"],
+    ),
+    "the_bounds_into_a_variadic_parameter": (
+        "execute",
+        '_planted(content["max_ids"])',
+        "def _planted(*limits):\n    return limits[0][PLANTED_KEY]",
+        (),
+        ["execute:1 (unhandled use)"],
+    ),
+    "the_content_by_keyword": (
+        "execute",
+        "_planted(c=content)",
+        'def _planted(c):\n    k = "max_ids"\n    return c[k]["planted"]',
+        (),
+        ["_planted:3 (computed key)"],
+    ),
+    "the_content_by_keyword_to_a_keyword_only_parameter": (
+        "execute",
+        "_planted(run, c=content)",
+        'def _planted(run, *, c):\n    k = "max_ids"\n    return c[k]["planted"]',
+        (),
+        ["_planted:3 (computed key)"],
+    ),
+    "the_bounds_by_keyword": (
+        "execute",
+        '_planted(limits=content["max_ids"])',
+        "def _planted(limits):\n    return limits[PLANTED_KEY]",
+        (),
+        ["undeclared:planted"],
+    ),
+    # accepted: a keyword call that reads a declared bound (R4-M2's control)
+    "a_declared_bound_read_through_a_keyword_call": (
+        "execute",
+        "_planted(c=content)",
+        'def _planted(c):\n    return c["max_ids"][TARGETS_BOUND]',
+        (),
+        [],
     ),
     # accepted: an added key read as 0 where an older manifest lacks it (final fix C3)
     "an_added_key_read_as_0_when_absent": (
