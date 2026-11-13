@@ -8,6 +8,10 @@
 // quote, an ordered item, HTML, a link) is a paragraph of its own characters, and an unclosed `**` or `` ` ``
 // is text too. Each heading gets an id from its text (`1. Purpose and controller` → `1-purpose-and-controller`),
 // unique within the document.
+//
+// The Operator section's five markers (`[set at deployment: …]`) stay in the repository; `fillOperator` puts the
+// deployment's values in their place (M5 follow-ups Task F1, `GET /api/privacy/operator`), in text spans only,
+// after the parse: a value is text, whatever characters it has.
 
 export type Inline = { kind: "text" | "strong" | "code"; text: string };
 
@@ -169,4 +173,49 @@ export function parsePrivacyDoc(md: string): Block[] {
     blocks.push({ kind: "p", inlines: parseInlines(text.join(" ")) });
   }
   return blocks;
+}
+
+/** The statement's operator markers, in its order, and the operator file's key whose value takes each one's
+ * place (`docs/PRIVACY.md`, under Operator; `tests/unit/test_privacy_md.py` holds the document to them). */
+export const OPERATOR_MARKERS = {
+  "[set at deployment: operator name]": "operator",
+  "[set at deployment: contact address]": "contact",
+  "[set at deployment: controller name]": "controller",
+  "[set at deployment: VPS provider]": "vps_provider",
+  "[set at deployment: S3 backup provider]": "s3_provider",
+} as const;
+
+export type OperatorKey = (typeof OPERATOR_MARKERS)[keyof typeof OPERATOR_MARKERS];
+/** The operator file's values (`OperatorOut`); `null` for one the server does not have. */
+export type OperatorValues = Record<OperatorKey, string | null>;
+
+const MARKER = /\[set at deployment:[^\]\n]*\]/g;
+const MARKER_KEYS: ReadonlyMap<string, OperatorKey> = new Map(Object.entries(OPERATOR_MARKERS));
+
+/** `blocks` with each marker in a text span replaced by its value; a marker without a value (`values` null, or
+ * that key's null) or of no key stays, and so does a code span (the document's own text). The value is inserted
+ * as it is: `replace` reads no pattern in what its function returns. */
+export function fillOperator(blocks: Block[], values: OperatorValues | null): Block[] {
+  if (values === null) {
+    return blocks;
+  }
+  const fillText = (text: string): string =>
+    text.replace(MARKER, (marker) => {
+      const key = MARKER_KEYS.get(marker);
+      return (key === undefined ? null : values[key]) ?? marker;
+    });
+  const fill = (inlines: Inline[]): Inline[] =>
+    inlines.map((inline) => (inline.kind === "text" ? { kind: "text", text: fillText(inline.text) } : inline));
+  return blocks.map((block): Block => {
+    switch (block.kind) {
+      case "p":
+        return { kind: "p", inlines: fill(block.inlines) };
+      case "ul":
+        return { kind: "ul", items: block.items.map(fill) };
+      case "table":
+        return { kind: "table", head: block.head.map(fill), rows: block.rows.map((row) => row.map(fill)) };
+      default:
+        return block;
+    }
+  });
 }

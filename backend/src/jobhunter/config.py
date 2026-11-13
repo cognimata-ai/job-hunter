@@ -32,6 +32,7 @@ import httpx
 from jobhunter.backup.cron import cron_refusal
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
+from jobhunter.privacy import operator
 from jobhunter.secret_names import SECRET_NAMES
 
 Role = Literal["api", "worker", "migrate", "backup", "restore"]
@@ -60,6 +61,9 @@ DEFAULT_SPA_DIR: Final = Path("/opt/spa")
 # encrypted export archives (§20.3: the worker writes them, the api serves them).
 DEFAULT_MANIFESTS_DIR: Final = Path("/data/manifests")
 DEFAULT_EXPORTS_DIR: Final = Path("/data/exports")
+# M5 follow-ups Task F1 (spec §19.2, §20.6): where the api reads the privacy statement's operator file, the
+# read-only mount of the host's /etc/jobhunter/operator.json (`privacy.operator`).
+DEFAULT_OPERATOR_FILE: Final = Path("/run/config/operator.json")
 # M5 Task 10 (Deviation 29): the backup container's `backup_staging` volume, where the backup and restore jobs
 # stage what they back up or restore (Tasks 24 and 26), and the default home of restic's cache.
 DEFAULT_STAGING_DIR: Final = Path("/data/staging")
@@ -286,6 +290,9 @@ class AppConfig:
     # manifests' files, and `JOBHUNTER_EXPORTS_DIR`, where the export archives are kept.
     manifests_dir: Path
     exports_dir: Path
+    # M5 follow-ups Task F1: `JOBHUNTER_OPERATOR_FILE`, the operator file of the privacy statement, which the
+    # api reads at its start and a prod api cannot start without (`operator_file`).
+    operator_file: Path
     # M5 Task 10: `JOBHUNTER_STAGING_DIR`, the backup and restore jobs' staging directory (every staging path
     # of Tasks 24 and 26 is under it), and the restic repository (`None` without `RESTIC_REPOSITORY`).
     staging_dir: Path
@@ -471,6 +478,7 @@ def load_config(
         spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
         manifests_dir=Path(env.get("JOBHUNTER_MANIFESTS_DIR") or DEFAULT_MANIFESTS_DIR),
         exports_dir=Path(env.get("JOBHUNTER_EXPORTS_DIR") or DEFAULT_EXPORTS_DIR),
+        operator_file=Path(env.get("JOBHUNTER_OPERATOR_FILE") or DEFAULT_OPERATOR_FILE),
         staging_dir=staging_dir,
         restic=_restic_settings(env, staging_dir),
         backup=_backup_settings(env),
@@ -723,6 +731,22 @@ def _check_public_origin(cfg: AppConfig) -> None:
         raise StartupCheckFailed("public_origin", "JOBHUNTER_PUBLIC_ORIGIN must use https in prod")
 
 
+def _check_operator_file(cfg: AppConfig) -> None:
+    """M5 follow-ups Task F1 (Ruling FU-1, fail-closed): a prod api has a valid operator file
+    (`operator_file`), so no deployment goes live with a statement of placeholders; outside prod the file is
+    optional. The detail names the path and the problem (`privacy.operator.load`), never a value."""
+    if cfg.env != "prod" or cfg.role != "api":
+        return
+    try:
+        details = operator.load(cfg.operator_file)
+    except operator.OperatorFileInvalid as exc:
+        raise StartupCheckFailed(
+            "operator_file", f"the operator file {cfg.operator_file} {exc.reason}"
+        ) from None
+    if details is None:
+        raise StartupCheckFailed("operator_file", f"the operator file {cfg.operator_file} is missing")
+
+
 def run_startup_assertions(cfg: AppConfig) -> None:
     """Run the startup assertions of §16.8 in order; the first failure raises `StartupCheckFailed`."""
     env = cfg.environ
@@ -773,6 +797,8 @@ def run_startup_assertions(cfg: AppConfig) -> None:
 
     # Also after the §16.8 checks (ruling T18-c): the edge's CSRF check compares `Origin` with this value.
     _check_public_origin(cfg)
+    # Then (M5 follow-ups F1, Ruling FU-1): the privacy statement's operator file, for a prod api.
+    _check_operator_file(cfg)
 
     # §10.6 L3880 (M3 Task 4): the cached score prefix rests on a rubric block of at least 600 tokens.
     _check_rubric_block()

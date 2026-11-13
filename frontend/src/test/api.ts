@@ -2,7 +2,7 @@
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
 // stats, watchlist, golden-run and shipped-version reads, the System section's reads (needs attention, runs,
 // score cycles, alerts by status, golden cases, health), the deletion manifests (the list and each one), the
-// settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
+// privacy statement's operator values, the settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
 // answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
@@ -38,6 +38,7 @@ type AlertOut = components["schemas"]["AlertOut"];
 type GoldenCaseOut = components["schemas"]["GoldenCaseOut"];
 type SystemHealthOut = components["schemas"]["SystemHealthOut"];
 type ManifestOut = components["schemas"]["ManifestOut"];
+type OperatorOut = components["schemas"]["OperatorOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -1049,6 +1050,8 @@ export interface FakeApi {
   /** The deletion manifests, newest first: `GET /api/privacy/manifests` lists them, `GET …/{id}` answers one
    * (none, by default). */
   manifests: ManifestOut[];
+  /** What `GET /api/privacy/operator` answers (all null, a server without an operator file, by default). */
+  operator: OperatorOut;
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -1089,6 +1092,7 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     goldenCases: [],
     health: healthOut(),
     manifests: [],
+    operator: { operator: null, contact: null, controller: null, vps_provider: null, s3_provider: null },
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -1194,6 +1198,9 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     if (method === "GET" && manifestId !== undefined) {
       const manifest = api.manifests.find((m) => m.id === Number(manifestId));
       return Promise.resolve(manifest === undefined ? problem(404, "not_found") : json(manifest));
+    }
+    if (method === "GET" && path === "/api/privacy/operator") {
+      return Promise.resolve(json(api.operator));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

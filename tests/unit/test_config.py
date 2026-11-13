@@ -17,6 +17,7 @@ from jobhunter.config import (
     load_config,
     run_startup_assertions,
 )
+from jobhunter.privacy.operator import FIELDS
 
 
 def b64(n: int, fill: bytes = b"k") -> bytes:
@@ -43,6 +44,13 @@ API_SECRETS = {"session_secret": b64(32, b"s"), "data_key": b64(32, b"d"), "db_a
 # M5 Task 5 (O5): a prod worker's ping URL ends in the check's uuid; a low-entropy stand-in.
 HC_PING_URL = "https://hc-ping.example/00000000-0000-4000-8000-000000000001"
 WORKER_SECRETS = {"data_key": b64(32), "db_app": b"pw"}
+
+
+def operator_env(tmp_path: Path) -> dict[str, str]:
+    """M5 follow-ups Task F1: a valid operator file, which a prod api needs (`operator_file`)."""
+    path = tmp_path / "operator.json"
+    path.write_text(json.dumps(dict.fromkeys(FIELDS, "x")), encoding="utf-8")
+    return {"JOBHUNTER_OPERATOR_FILE": str(path)}
 
 
 def check_of(role: Role, env: dict[str, str], secrets_dir: Path) -> str:
@@ -619,7 +627,8 @@ def origin_failure(tmp_path: Path, env_name: str, origin: str) -> StartupCheckFa
 )
 def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name: str, origin: str) -> None:
     d = write_secrets(tmp_path / "s", **API_SECRETS)
-    cfg = load_config("api", {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin}, d)
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin, **operator_env(tmp_path)}
+    cfg = load_config("api", env, d)
     run_startup_assertions(cfg)
     assert cfg.public_origin == origin
 
@@ -920,7 +929,7 @@ def test_anthropic_log_debug_or_info_is_refused_in_prod(tmp_path: Path, value: s
 @pytest.mark.parametrize(("env_name", "value"), [("prod", "warning"), ("prod", ""), ("dev", "debug")])
 def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: str) -> None:
     # outside prod the app's logging setup holds the SDK's loggers at WARNING (tests/unit/test_redact.py)
-    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value}
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value, **operator_env(tmp_path)}
     run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))
 
 
@@ -997,7 +1006,9 @@ def test_ntfy_in_prod_runs_after_healthchecks_in_prod_and_only_for_a_prod_worker
         run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
     run_startup_assertions(
         load_config(
-            "api", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "a", **API_SECRETS)
+            "api",
+            {**BASE_ENV, "JOBHUNTER_ENV": "prod", **operator_env(tmp_path)},
+            write_secrets(tmp_path / "a", **API_SECRETS),
         )
     )
 

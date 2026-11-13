@@ -169,7 +169,7 @@ In summary (section 16 of the design specification has the detail):
 
 ## Operator
 
-The operator fills in these fields at deployment.
+The values below come from the deployment's operator file, which the operator keeps on the server.
 
 - **Operator:** [set at deployment: operator name]
 - **Contact address:** [set at deployment: contact address]

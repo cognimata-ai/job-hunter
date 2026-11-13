@@ -14,6 +14,10 @@ engine.
 The SPA (M4 Task 19) is `api.state.spa`, an `api.static.SpaFiles` on `cfg.spa_dir`, set with the rest of the
 state: the 404 handler of `api.errors` offers it what no route matched, so it is no Mount.
 
+The privacy statement's operator details (M5 follow-ups Task F1) are `api.state.operator`, read once from
+`cfg.operator_file` with the rest of the state (`privacy.operator.at_start`; `None` outside prod without a
+valid file), so a changed file applies after `restart api`.
+
 The embedder client (Task 22) is an `embeddings.EmbedderClient` on `cfg.embedder_url`, which readiness and
 system health probe. The lifespan's HTTP client is closed when the lifespan ends. An injected app (tests) gets
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
@@ -90,6 +94,8 @@ from jobhunter.embeddings import EmbedderClient, make_http_client
 from jobhunter.observability.heartbeat_watch import watch_heartbeat
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.privacy import operator
+from jobhunter.privacy.operator import OperatorDetails
 from jobhunter.worker.tasks import make_queue_app
 
 METRICS_PORT: Final = 8001
@@ -190,6 +196,7 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
         api.state.queue = queue
         api.state.embedder = EmbedderClient(cfg.embedder_url, embedder_http)
         api.state.spa = SpaFiles(cfg.spa_dir)
+        api.state.operator = _operator_details(cfg)
         watch = asyncio.create_task(
             watch_heartbeat(engine, clock=utcnow, stop=stop_watch), name="heartbeat_watch"
         )
@@ -213,6 +220,11 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
                             await embedder_http.aclose()
                     finally:
                         await engine.dispose()
+
+
+def _operator_details(cfg: AppConfig) -> OperatorDetails | None:
+    """The operator details the api serves for its whole run (`privacy.operator.at_start`)."""
+    return operator.at_start(cfg.operator_file, prod=cfg.env == "prod")
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:
@@ -285,6 +297,7 @@ def create_app(
         api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
         api.state.embedder = EmbedderClient(cfg.embedder_url, make_http_client())
         api.state.spa = SpaFiles(cfg.spa_dir)
+        api.state.operator = _operator_details(cfg)
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 

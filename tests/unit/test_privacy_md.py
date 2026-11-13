@@ -1,8 +1,9 @@
 """`docs/PRIVACY.md`, the privacy statement of spec §20.6 (plan M5 Task 19, Deviations 2, 3, 18 and 19, Ruling
 T19-1).
 
-The SPA's Privacy & data page renders it with a Markdown subset and anchors its sections (Task 20), and the
-RUNBOOK's deploy checklist fills its operator fields (Task 31). So:
+The SPA's Privacy & data page renders it with a Markdown subset and anchors its sections (Task 20), and puts
+the values of the deployment's operator file in place of its operator fields' markers (M5 follow-ups Task F1:
+the repository keeps the markers). So:
 
 - its `##` sections are §20.6's ten items and `## Operator`, in that order, with no level-1 heading (the page
   has its own title, Ruling T19-3 I3);
@@ -12,6 +13,7 @@ RUNBOOK's deploy checklist fills its operator fields (Task 31). So:
 - §4's table is §20.6's, word for word;
 - §8 carries the gazetteer's GeoNames attribution, §7 the Adzuna badge's;
 - the operator fields are exactly the five markers, under `## Operator`, and nothing in it is e-mail-shaped;
+  one marker for each key of the operator file, and the section says where the values come from;
 - it uses only headings, paragraphs, bullet lists, tables, `**bold**` and `` `code` ``;
 - the typed phrases, the export's period and its record's, and the login throttle it states are the code's;
 - §2 states the client addresses HEAD logs and stores, and how long it keeps them (Rulings T19-2 (1),
@@ -28,7 +30,7 @@ from typing import Final
 
 from jobhunter.api.routes.privacy import DELETE_EVERYTHING_PHRASE, PURGE_ADZUNA_PHRASE
 from jobhunter.auth import throttle
-from jobhunter.privacy import retention
+from jobhunter.privacy import operator, retention
 from jobhunter.privacy.export import EXPORT_ROWS_KEPT, EXPORT_TTL
 from jobhunter.privacy.kinds.job_tombstone import JobTombstone
 from jobhunter.privacy.kinds.profile_purge import ProfilePurge
@@ -102,6 +104,11 @@ OPERATOR_FIELDS: Final = (
     "[set at deployment: controller name]",
     "[set at deployment: VPS provider]",
     "[set at deployment: S3 backup provider]",
+)
+
+# The Operator section's line (F1): the values come from the server's operator file, not the repository.
+OPERATOR_LINE: Final = (
+    "The values below come from the deployment's operator file, which the operator keeps on the server."
 )
 
 MARKER: Final = re.compile(r"\[set at deployment:[^\]\n]*\]")
@@ -217,6 +224,15 @@ def test_the_operator_fields_are_marked_for_deployment() -> None:
     operator = "\n".join(section(lines_of(PRIVACY), "## Operator"))
     assert MARKER.findall(operator) == list(OPERATOR_FIELDS)
     assert EMAIL.search(text) is None, "no e-mail address before deployment"
+
+
+def test_the_operator_file_fills_the_markers() -> None:
+    """F1: one marker per key of the operator file (the SPA's `OPERATOR_MARKERS` maps them in this order), and
+    the section's line says the values come from that file."""
+    assert len(OPERATOR_FIELDS) == len(operator.FIELDS)
+    lines = section(lines_of(PRIVACY), "## Operator")
+    assert OPERATOR_LINE in lines
+    assert "fills in these fields" not in " ".join(lines)
 
 
 def test_only_the_rendered_markdown_subset_is_used() -> None:

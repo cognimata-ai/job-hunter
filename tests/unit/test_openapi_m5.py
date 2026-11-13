@@ -30,6 +30,8 @@ M5_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("post", "/api/privacy/purge-source"): KEYED_PRIVACY,
     ("get", "/api/privacy/manifests"): {"400", "401", "422", "429"},
     ("get", "/api/privacy/manifests/{manifest_id}"): {"401", "404", "422", "429"},
+    # M5 follow-ups Task F1: the statement's operator values, no parameter.
+    ("get", "/api/privacy/operator"): {"401", "429"},
     ("post", "/api/system/purges/{operation_id}/retry"): {"401", "403", "404", "409", "422", "429"},
     ("delete", "/api/golden-cases/{case_id}"): {"401", "403", "404", "409", "422", "429"},
 }
@@ -131,6 +133,14 @@ def test_the_privacy_documents_name_their_fields(document: dict[str, Any]) -> No
     assert schemas["AttentionOut"]["properties"]["failed_purges"] == {
         "$ref": "#/components/schemas/FailedPurgesSectionOut"
     }
+    # F1: the five operator values, each a string or, outside prod without a valid operator file, null.
+    operator = schemas["OperatorOut"]
+    assert set(operator["required"]) == {"operator", "contact", "controller", "vps_provider", "s3_provider"}
+    assert set(operator["properties"]) == set(operator["required"])
+    for name, field in operator["properties"].items():
+        assert field["anyOf"] == [{"type": "string"}, {"type": "null"}], name
+    read = document["paths"]["/api/privacy/operator"]["get"]["responses"]["200"]["content"]
+    assert read["application/json"]["schema"] == {"$ref": "#/components/schemas/OperatorOut"}
     download = document["paths"]["/api/privacy/exports/{export_id}"]["get"]["responses"]["200"]["content"]
     assert set(download) == {"application/json", "application/zip"}
     deleted = document["paths"]["/api/golden-cases/{case_id}"]["delete"]["responses"]

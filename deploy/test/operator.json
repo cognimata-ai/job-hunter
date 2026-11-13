@@ -1,0 +1,7 @@
+{
+  "operator": "Test Operator",
+  "contact": "operator@example.org",
+  "controller": "Test Controller",
+  "vps_provider": "Test VPS Provider",
+  "s3_provider": "Test S3 Provider"
+}

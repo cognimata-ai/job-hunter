@@ -116,7 +116,17 @@ services:
       <<: *app-env
       JOBHUNTER_PUBLIC_ORIGIN: ${JOBHUNTER_PUBLIC_ORIGIN:?}
     secrets: [session_secret, data_key, data_key_previous, db_app]
-    volumes: [cv_store:/data/cv, exports:/data/exports:ro] # the encrypted CV uploads (§12.1); export downloads
+    volumes:
+      - cv_store:/data/cv # the encrypted CV uploads (§12.1)
+      - exports:/data/exports:ro # export downloads
+      # The privacy statement's operator values (§19.2, §20.6): the operator's own file, which the api reads at
+      # its start and a prod api cannot start without (`operator_file`). No directory is made in place of a
+      # missing file: the api's container is not created without it.
+      - type: bind
+        source: /etc/jobhunter/operator.json
+        target: /run/config/operator.json
+        read_only: true
+        bind: { create_host_path: false }
     networks: [proxy, internal] # both internal: no route to the internet
     healthcheck:
       test: ["CMD", "jobhunter", "http-check", "http://127.0.0.1:8000/healthz"]

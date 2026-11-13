@@ -1,6 +1,7 @@
-"""`/api/privacy`: the export, delete everything, the Adzuna purge and the deletion manifests (spec
+"""`/api/privacy`: the export, delete everything, the Adzuna purge, the deletion manifests (spec
 §20.3-§20.5, §19.5, §14.2; plan M5 Task 18, M5-U4, D13, D18, Deviations 3, 21 and 22, Rulings T15-4 and
-T18-1), for a logged-in session.
+T18-1) and the privacy statement's operator values (§20.6, §19.2; M5 follow-ups Task F1, Ruling FU-1), for a
+logged-in session.
 
 The edge lets every request under `/api/privacy/` through delete-everything's `global` fence
 (`edge.fence_exempt`): each request refuses it itself where it must (the export's and the source purge's 409
@@ -63,6 +64,13 @@ with §14.3's signed cursor (sort `MANIFESTS_SORT`, `desc`, `last_key = [id]`, n
 content deletes (empty for another kind, and before the content is recorded). Every manifest survives
 delete-everything.
 
+**The operator values** (`GET /operator`): the five values of the deployment's operator file, which the SPA
+puts in place of the statement's markers, as the api read them once at its start (`api.state.operator`,
+`privacy.operator.at_start`); all five null outside prod without a valid file (a prod api does not start
+without one, `operator_file`). They change only when the api starts again, so the SPA reads them once per
+session (its query cache, emptied at the logout and at a session's end); no HTTP cache is asked to keep them
+past the session. No value reaches a log line.
+
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.privacy.utcnow`. Ids and statuses only reach a log line, never the client address (the
 re-authentication logs its outcome only, final review M1).
@@ -83,7 +91,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from jobhunter.api.argon2_gate import Argon2Gate
-from jobhunter.api.deps import get_argon2_gate, get_config, get_data_keys, get_engine, require_session
+from jobhunter.api.deps import (
+    get_argon2_gate,
+    get_config,
+    get_data_keys,
+    get_engine,
+    get_operator_details,
+    require_session,
+)
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.api.models import UtcDatetime, clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
@@ -106,6 +121,7 @@ from jobhunter.privacy.export import ExportCorrupt, iter_decrypted, request_expo
 from jobhunter.privacy.kinds.delete_everything import request_delete_everything
 from jobhunter.privacy.kinds.source_purge import request_source_purge
 from jobhunter.privacy.manifests import ManifestKind, ManifestStatus
+from jobhunter.privacy.operator import OperatorDetails
 from jobhunter.worker.runs import RunEnd, observe_run_ends
 from jobhunter.worker.tasks import defer_in_tx
 
@@ -245,6 +261,17 @@ class ManifestOut(BaseModel):
 class ManifestsPageOut(BaseModel):
     items: list[ManifestOut]
     next_cursor: str | None
+
+
+class OperatorOut(BaseModel):
+    """The privacy statement's operator values, from the deployment's operator file: each a string, or all
+    null when the server has no operator file (outside production)."""
+
+    operator: str | None = Field(description="Who operates the deployment")
+    contact: str | None = Field(description="Where to send a privacy concern")
+    controller: str | None = Field(description="The controller of the personal data")
+    vps_provider: str | None = Field(description="The provider of the server")
+    s3_provider: str | None = Field(description="The provider of the offsite backups")
 
 
 # ---- the shared steps --------------------------------------------------------------------------------------
@@ -646,3 +673,22 @@ async def get_manifest(
     if row is None:
         raise Problem(404, "not_found", "Deletion not found")
     return _manifest(row)
+
+
+# ---- the operator values -----------------------------------------------------------------------------------
+
+
+@router.get("/operator", response_model=OperatorOut)
+async def get_operator(
+    details: Annotated[OperatorDetails | None, Depends(get_operator_details)],
+) -> OperatorOut:
+    """The privacy statement's operator values, which take the place of its placeholders."""
+    if details is None:
+        return OperatorOut(operator=None, contact=None, controller=None, vps_provider=None, s3_provider=None)
+    return OperatorOut(
+        operator=details.operator,
+        contact=details.contact,
+        controller=details.controller,
+        vps_provider=details.vps_provider,
+        s3_provider=details.s3_provider,
+    )

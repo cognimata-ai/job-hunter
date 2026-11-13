@@ -80,7 +80,7 @@ VPS. No secret goes into this repository, an issue or a chat.
 | LangSmith: an EU workspace, a service key, the project `jobhunter-prod`, its trace retention and quota | the secret `langsmith_key`; the project and the EU endpoint are fixed in `deploy/compose.yaml`; the trace retention and the quota are set in the workspace |
 | The Anthropic API key of an Anthropic workspace this installation alone uses (C3) | the secret `anthropic_key` |
 | The JSearch (RapidAPI), SerpApi and Adzuna keys; the SerpApi account is used by this app only (C2) | the secrets `rapidapi_key`, `serpapi_key`, `adzuna_app_id` and `adzuna_app_key` |
-| The VPS: provider, EU region, 4 vCPU (AVX-512 VNNI preferred), 16 GB, ≥ 100 GB NVMe, OS image, LUKS where offered | the provider's order; the provider also goes into PRIVACY.md (below); no swap, or encrypted swap only (section 2) |
+| The VPS: provider, EU region, 4 vCPU (AVX-512 VNNI preferred), 16 GB, ≥ 100 GB NVMe, OS image, LUKS where offered | the provider's order; the provider also goes into the operator file (below); no swap, or encrypted swap only (section 2) |
 | Docker Engine: one pinned version, no older than the one N1's DNS assertion passed on | the host's package manager, holding that version; both versions go into the deployment record |
 | Domain and DNS: an A record only, no AAAA (the networks run without IPv6, Deviation 36) | `JOBHUNTER_DOMAIN` (`<domain>`) and `JOBHUNTER_PUBLIC_ORIGIN` (`https://<domain>`); the A record names the VPS before the first start (ACME) |
 | The ACME e-mail: an operator mailbox | `JOBHUNTER_ACME_EMAIL` (`<operator mailbox>`) |
@@ -89,7 +89,7 @@ VPS. No secret goes into this repository, an issue or a chat.
 | GHCR: the release's images | run `release.yml`, merge its digest PR and check out the release tag (section 10); the VPS logs in to `ghcr.io` with a read-only token (section 2) |
 | The place of the offline recovery kit | off the VPS and offline, named in the deployment record (section 8) |
 | The embedder's export: fp32 (the one locked) or int8 | V7 on the VPS's CPU decides (section 13, item 9); int8 means a new `embedder/model.lock` and a new release (section 12) |
-| PRIVACY.md's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | `docs/PRIVACY.md`, under Operator, in the commit `release.yml` builds: the app image bundles the file when it is built. Filling them there trips the markers check of `tests/unit/test_privacy_md.py` and puts the contact address into the repository, so how they are filled is a decision pending for the deployment step |
+| The privacy statement's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | the operator file `/etc/jobhunter/operator.json` on the VPS (section 2, item 3), never the repository: a JSON object of exactly the keys `operator`, `contact`, `controller`, `vps_provider` and `s3_provider`, each a string of at most 200 characters without control characters. Compose mounts it read-only into the api only; the statement shows the values in place of the markers `docs/PRIVACY.md` keeps. The api does not start without a valid file (startup check `operator_file`, which names the problem, never a value); a changed file applies after `$JH restart api` |
 | The exclusivity confirmations: the SerpApi account is used by this app only (C2), the Anthropic workspace by this installation only (C3) | the deployment record; a foreign use shows as `quota.serpapi_foreign_usage`, or as spend the app did not count |
 
 **The environment file** `/etc/jobhunter/jobhunter.env`, root's, mode 0640, written with an editor. It holds no
@@ -163,9 +163,25 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
 
    Then set `JH` (the introduction).
 
-3. **The environment file.** `install -d -m 0755 /etc/jobhunter`, then write `/etc/jobhunter/jobhunter.env`
-   (section 1) with an editor and `chmod 0640 /etc/jobhunter/jobhunter.env`. Then `$JH pull` fetches the
-   release's images.
+3. **The environment file and the operator file.** `install -d -m 0755 /etc/jobhunter`, then write
+   `/etc/jobhunter/jobhunter.env` (section 1) with an editor and `chmod 0640 /etc/jobhunter/jobhunter.env`.
+   Then write the operator file `/etc/jobhunter/operator.json` with an editor, the privacy statement's five
+   values (section 1) in place of the placeholders:
+
+   ```
+   {
+     "operator": "<operator name>",
+     "contact": "<contact address>",
+     "controller": "<controller name>",
+     "vps_provider": "<VPS provider>",
+     "s3_provider": "<S3 backup provider>"
+   }
+   ```
+
+   and `chmod 0644 /etc/jobhunter/operator.json`: root's, readable by the api's user. It holds no secret, but
+   personal details: it never goes into the repository. Host setup's startup checks (item 5) need it: the
+   api's refuses a missing or invalid file, and compose does not create the api's container without it. Then
+   `$JH pull` fetches the release's images.
 4. **The secret files.** In a new directory `<dir>`, root's, mode 0700, make the generated values, then write
    each provider key into its own file with an editor (never `echo`, never a command line). On the VPS of a
    first deployment:
@@ -651,9 +667,9 @@ On a fresh host (a lost VPS, or the timed restore of section 13), from the offli
 worker stay stopped until the last step.
 
 1. Host setup (section 2), with the kit's current `data_key`, `restic_password`, `s3_access_key_id` and
-   `s3_secret_access_key` in `<dir>`, and its `/etc/jobhunter/jobhunter.env`; the other secrets are new (the
-   database passwords made afresh, the providers' keys from the providers). The DNS A record names the new
-   host. No `backup init`: the repository exists.
+   `s3_secret_access_key` in `<dir>`, its `/etc/jobhunter/jobhunter.env`, and the operator file written again
+   (section 2, item 3); the other secrets are new (the database passwords made afresh, the providers' keys from
+   the providers). The DNS A record names the new host. No `backup init`: the repository exists.
 2. The restore:
 
    ```
@@ -874,7 +890,7 @@ what) or not attempted (why), in `docs/spikes/V21.md`, `docs/spikes/V15.md` and 
 
 1. [ ] **The VPS.** Provision it (section 1): EU, 4 vCPU with AVX-512 VNNI preferred, 16 GB, ≥ 100 GB NVMe,
    LUKS where offered, no swap or encrypted swap only, the pinned Docker Engine version; SSH key-only.
-2. [ ] **The inputs.** The deploy checklist's inputs (section 1), PRIVACY.md's operator fields, and the
+2. [ ] **The inputs.** The deploy checklist's inputs (section 1), the operator file's five values, and the
    exclusivity confirmations (C2, C3).
 3. [ ] **The release.** Run `release.yml`, merge the digest PR, check out the release tag on the VPS (section
    10).

@@ -5,12 +5,15 @@
 // sections, where Privacy & data links to it: inside that section's frame its Save would follow the whole
 // statement. Its `##` sections are headings a level below its own, each anchored (`privacy-statement-<id>`), with
 // a list of contents linking to them. The document is English: in another UI language a note says so, and its
-// text is marked `lang="en"`.
+// text is marked `lang="en"`. Its Operator section's markers show the deployment's values once they are read
+// (`useOperator`, M5 follow-ups Task F1), as text; until then, and on a server without an operator file, the
+// markers themselves.
 import { Link } from "@tanstack/react-router";
-import { Fragment } from "react";
+import { Fragment, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import source from "../../../docs/PRIVACY.md?raw";
-import { type Block, type Inline, parsePrivacyDoc } from "./privacyDoc";
+import { useOperator } from "./privacyApi";
+import { type Block, fillOperator, type Inline, parsePrivacyDoc } from "./privacyDoc";
 import styles from "./PrivacyStatement.module.css";
 
 export const STATEMENT_ID = "privacy-statement";
@@ -80,6 +83,8 @@ export function StatementBlocks({ blocks }: { blocks: Block[] }) {
 
 export function PrivacyStatement() {
   const { t, i18n } = useTranslation();
+  const operator = useOperator();
+  const blocks = useMemo(() => fillOperator(BLOCKS, operator.data ?? null), [operator.data]);
   return (
     <section id={STATEMENT_ID} aria-labelledby={`${STATEMENT_ID}-heading`} className={styles.statement}>
       <h2 id={`${STATEMENT_ID}-heading`} className={styles.title}>{t("privacy_statement.title")}</h2>
@@ -94,7 +99,7 @@ export function PrivacyStatement() {
         </ol>
       </nav>
       <div lang="en" className={styles.doc}>
-        <StatementBlocks blocks={BLOCKS} />
+        <StatementBlocks blocks={blocks} />
       </div>
     </section>
   );

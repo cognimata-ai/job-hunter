@@ -2,7 +2,8 @@
 §16.6, §16.8, §19.1, §19.2): every role passes its startup assertions under its real uid with the 0440
 `root:10010` secret files, the stack comes up healthy, Caddy serves TLS with §16.6's headers and the `__Host-`
 session cookie, readiness answers through it and the metrics do not, its logs hold no client address, and the
-api's edge limits logins per client address, which it reads from Caddy's X-Forwarded-For.
+api's edge limits logins per client address, which it reads from Caddy's X-Forwarded-For. The api serves the
+test stack's fictional operator file, mounted read-only into it alone (M5 follow-ups Task F1).
 
 Run explicitly with `-m stack`, with no other stack on 172.30.0.0/24 (the dev stack: `$DC down` first):
 
@@ -29,6 +30,7 @@ import pytest
 from jobhunter.api.edge import SECURITY_HEADERS
 
 from tests.support.prodstack import (
+    DEPLOY,
     ORIGIN,
     PT,
     caddy_root_pem,
@@ -54,6 +56,8 @@ PROBES: Final = {"probe1": "172.30.1.11", "probe2": "172.30.1.12"}
 WITHIN_S: Final = 60.0
 TMP: Final = "/tmp"  # noqa: S108 - the containers' /tmp
 GIB: Final = 1024**3
+OPERATOR_PATH: Final = "/api/privacy/operator"
+OPERATOR_FILE: Final = "/run/config/operator.json"
 
 
 @pytest.fixture(scope="module")
@@ -172,6 +176,24 @@ def test_tls_headers_and_the_session_cookie_through_caddy(tls: ssl.SSLContext, u
         assert not any(part.lower().startswith("domain") for part in attributes)
         session = http.get("/api/auth/session")
         assert session.status_code == 200 and session.json()["username"] == USERNAME
+
+
+def test_the_api_serves_the_test_operator_file(tls: ssl.SSLContext, user: None) -> None:
+    """F1: `deploy/test/operator.json`, mounted read-only at the setting's default in the api and in no other
+    service, is what `GET /api/privacy/operator` answers a session through Caddy, and nothing without one."""
+    expected = json.loads((DEPLOY / "test/operator.json").read_text(encoding="utf-8"))
+    with client(tls) as http:
+        assert http.get(OPERATOR_PATH).status_code == 401
+        login = http.post("/api/auth/login", json=login_body(), headers={"Origin": ORIGIN})
+        assert login.status_code == 204, login.text
+        r = http.get(OPERATOR_PATH)
+        assert (r.status_code, r.json()) == (200, expected)
+    mounts = run([*PT, "exec", "-T", "api", "cat", "/proc/mounts"]).stdout.splitlines()
+    by_target = {fields[1]: fields for fields in (line.split() for line in mounts)}
+    assert by_target[OPERATOR_FILE][3].split(",")[0] == "ro"
+    for service in ("worker", "caddy", "docparse", "backup"):
+        found = run([*PT, "exec", "-T", service, "cat", "/proc/mounts"]).stdout
+        assert OPERATOR_FILE not in found, service
 
 
 def test_readyz_through_caddy(tls: ssl.SSLContext) -> None:

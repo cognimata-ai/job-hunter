@@ -10,6 +10,8 @@ checks it against what it documents:
 - the deploy checklist (section 1) names every secret of `deploy/secrets.example`, every environment variable
   `deploy/compose.yaml` reads, PRIVACY.md's operator fields and the deployment's other inputs, the bucket's
   noncurrent-version expiry is 30 days and no other (Ruling T32-2), and the file holds nothing e-mail-shaped;
+- the operator file (M5 follow-ups Task F1): the checklist names it and its five keys, and host setup has it
+  written before its startup checks run, on a first deployment and on a restore's fresh host;
 - no rotation is followed by an `up -d`: in section 7 each secret install is followed by a restart, and the
   rows of the two key alerts say `$JH restart worker`;
 - every `startup-check` names its role, the role of the service it runs in, and host setup names all five;
@@ -41,6 +43,7 @@ import yaml
 from jobhunter import cli
 from jobhunter.config import Role
 from jobhunter.observability.catalogue import CATALOGUE, RESOLVE_ON_ACK
+from jobhunter.privacy.operator import FIELDS as OPERATOR_KEYS
 
 REPO: Final = Path(__file__).resolve().parents[2]
 RUNBOOK: Final = REPO / "docs/RUNBOOK.md"
@@ -413,6 +416,25 @@ def test_the_deploy_checklist_names_every_deployment_input() -> None:
     assert len(bucket) == 1, bucket
     assert re.findall(r"\b(\d+) days\b", bucket[0]) == ["30"], "the deleted versions' expiry is 30 days only"
     assert EMAIL.search(_text()) is None, "no e-mail address: the ACME e-mail is a placeholder"
+
+
+OPERATOR_FILE: Final = "/etc/jobhunter/operator.json"
+
+
+def test_the_operator_file_is_written_before_host_setup() -> None:
+    """F1 (Ruling FU-1): a prod api does not start without the operator file, and host setup runs the api's
+    startup check, so section 2 has it written first; a restore's host setup (section 9) has it too."""
+    checklist = _section(CHECKLIST)
+    assert OPERATOR_FILE in checklist
+    assert [key for key in OPERATOR_KEYS if f"`{key}`" not in checklist] == []
+    host = _section(HOST_SETUP)
+    assert OPERATOR_FILE in host
+    assert host.index(OPERATOR_FILE) < host.index("sudo scripts/host-setup.sh --secrets-from <dir> --dry-run")
+    assert f"chmod 0644 {OPERATOR_FILE}" in _snippets(host)
+    code, _ = _split(host)
+    assert all(f'"{key}": ' in "\n".join(code) for key in OPERATOR_KEYS)
+    assert "operator file" in _section(RESTORE).split("2. The restore")[0]
+    assert "operator file" in _section(DEPLOYMENT)
 
 
 def test_no_up_d_follows_a_rotation() -> None:

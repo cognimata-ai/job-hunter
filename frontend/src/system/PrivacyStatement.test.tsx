@@ -1,10 +1,10 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import doc from "../../../docs/PRIVACY.md?raw";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
 import i18n from "../i18n/index";
-import { fakeApi } from "../test/api";
+import { fakeApi, requestsTo } from "../test/api";
 import { renderApp } from "../test/app";
 import { readText } from "../test/readText.mjs";
 import { parsePrivacyDoc } from "./privacyDoc";
@@ -63,8 +63,9 @@ describe("PrivacyStatement", () => {
     // the licence URI is text in a code span, never a link out
     expect(within(section).getByText("https://creativecommons.org/licenses/by/4.0/").tagName).toBe("CODE");
     expect(section.querySelector('a[href^="http"]')).toBeNull();
-    // the operator's fields as the document has them
+    // the operator's fields as the document has them: the server has no operator file (dev, test)
     expect(within(section).getByText("[set at deployment: operator name]", { exact: false })).toBeTruthy();
+    expect(requestsTo(api, "GET /api/privacy/operator")).toHaveLength(1);
 
     // no Markdown left in the text, no element the document could not have made
     const text = body?.textContent ?? "";
@@ -79,6 +80,47 @@ describe("PrivacyStatement", () => {
     const source = readText(new URL("./PrivacyStatement.tsx", HERE));
     expect(source).not.toMatch(/dangerouslySetInnerHTML|innerHTML|outerHTML|insertAdjacentHTML|DOMParser/);
     expect(source).toContain("docs/PRIVACY.md?raw");
+  });
+
+  it("puts the operator file's values in place of the markers, as text, read once for the session", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.operator = {
+      operator: "Test Operator",
+      contact: "operator@example.org",
+      controller: "Test <b>Controller</b>",
+      vps_provider: "Test **VPS** Provider",
+      s3_provider: "Test S3 $& Provider",
+    };
+    const app = renderApp("/settings#privacy-statement");
+    const section = await statement();
+    const operator = await within(section).findByText("Test Operator", { exact: false });
+    const list = operator.closest("ul");
+    expect(list?.previousElementSibling?.previousElementSibling?.id).toBe("privacy-statement-operator");
+    expect([...(list?.querySelectorAll("li") ?? [])].map((li) => li.textContent)).toEqual([
+      "Operator: Test Operator",
+      "Contact address: operator@example.org",
+      "Controller: Test <b>Controller</b>",
+      "VPS provider: Test **VPS** Provider",
+      "S3 backup provider: Test S3 $& Provider",
+    ]);
+    // the values are text: no element of theirs, no marker left, and the labels stay bold
+    expect(section.querySelectorAll("b")).toHaveLength(0);
+    expect(list?.querySelectorAll("strong")).toHaveLength(5);
+    expect(section.textContent).not.toContain("set at deployment");
+    // section 1's controller and section 10's contact still point to the Operator section
+    expect(section.textContent).toContain("is named under Operator at the end of this statement");
+
+    // read once for the session: back on the page after another, the values are not read again
+    await act(async () => {
+      await app.router.navigate({ to: "/" });
+    });
+    await act(async () => {
+      await app.router.navigate({ to: "/settings", hash: "privacy-statement" });
+    });
+    expect(await within(await statement()).findByText("Test Operator", { exact: false })).toBeTruthy();
+    expect(requestsTo(api, "GET /api/privacy/operator")).toHaveLength(1);
+    // a read of the session, which a poll would not be: it keeps the session alive like any page's reads
+    expect(requestsTo(api, "GET /api/privacy/operator")[0]?.headers.get("X-JH-Background")).toBeNull();
   });
 
   it("shows HTML in the document as text", () => {

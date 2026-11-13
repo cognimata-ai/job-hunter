@@ -16,6 +16,7 @@ from jobhunter.config import AppConfig
 from jobhunter.crypto import data_keys
 from jobhunter.embeddings import EmbedderClient
 from jobhunter.geo.gazetteer import Gazetteer
+from jobhunter.privacy.operator import OperatorDetails
 
 # The request header of the SPA's polls: `X-JH-Background: 1` (that exact value only) marks a poll, not a
 # user's action, which `require_session` validates without sliding the session's idle expiry (plan M4, D28).
@@ -48,6 +49,18 @@ def get_config(request: Request) -> AppConfig:
 def get_data_keys(request: Request) -> list[bytes]:
     """The data keys of the app's config (`crypto.data_keys`): the sealing one first, then a previous one."""
     return data_keys(get_config(request))
+
+
+def get_operator_details(request: Request) -> OperatorDetails | None:
+    """The privacy statement's operator details, read once when the app started (`app._operator_details`);
+    `None` outside prod without a valid operator file."""
+    state = request.app.state
+    if not hasattr(state, "operator"):
+        raise RuntimeError("the api state has no operator details: the lifespan has not run")
+    details = state.operator
+    if details is not None and not isinstance(details, OperatorDetails):
+        raise RuntimeError("the api state's operator details are of another type")
+    return details
 
 
 def get_code_head(request: Request) -> str:

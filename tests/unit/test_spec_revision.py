@@ -261,6 +261,7 @@ M5_ROUTES = frozenset(
         ("GET", "/api/privacy/exports/{}"),
         ("POST", "/api/system/purges/{}/retry"),
         ("DELETE", "/api/golden-cases/{}"),
+        ("GET", "/api/privacy/operator"),  # M5 follow-ups Task F1: the statement's operator values
     }
 )
 

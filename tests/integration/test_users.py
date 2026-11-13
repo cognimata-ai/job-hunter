@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from jobhunter.auth import totp, users
 from jobhunter.auth.passwords import WeakPassword, verify_password
 from jobhunter.clock import utcnow
 from jobhunter.crypto import DecryptError, decrypt
+from jobhunter.privacy.operator import FIELDS
 
 from tests.support.pg import pg_one, pg_rows
 
@@ -219,7 +221,7 @@ def _cli(env: dict[str, str], *args: str, stdin: str = "") -> subprocess.Complet
     )
 
 
-def test_cli_create_with_stdin_never_echoes(migrated, proc_env) -> None:
+def test_cli_create_with_stdin_never_echoes(migrated, proc_env, tmp_path) -> None:
     env = proc_env("api", migrated)
     r = subprocess.run(
         [
@@ -238,14 +240,19 @@ def test_cli_create_with_stdin_never_echoes(migrated, proc_env) -> None:
         text=True,
     )
     assert r.returncode == 0 and PW not in r.stdout + r.stderr
+    # In prod the api role's startup assertions pass first: a prod api has its operator file (M5 follow-up
+    # F1).
+    operator_file = tmp_path / "operator.json"
+    operator_file.write_text(json.dumps(dict.fromkeys(FIELDS, "x")), encoding="utf-8")
     r = subprocess.run(
         [sys.executable, "-m", "jobhunter.cli", "user", "create", "--username", "x", "--password-stdin"],
         input=PW + "\n",
-        env={**env, "JOBHUNTER_ENV": "prod"},
+        env={**env, "JOBHUNTER_ENV": "prod", "JOBHUNTER_OPERATOR_FILE": str(operator_file)},
         capture_output=True,
         text=True,
     )
-    assert r.returncode == 2
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--password-stdin is refused" in r.stderr
 
 
 def test_cli_create_stores_a_verifiable_hash_and_refuses_a_second_user(migrated, proc_env) -> None:

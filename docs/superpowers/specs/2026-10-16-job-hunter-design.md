@@ -5155,6 +5155,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | GET | `/api/privacy/manifests` | Deletion statuses | keyset paged, newest first → `{items, next_cursor}`, each item as below |
 | GET | `/api/privacy/manifests/{id}` | Deletion status | → `{id, kind, status: executing \| completed \| shipped, created_at, completed_at, shipped_at, deleted_golden_case_ids}`. The UI reports a deletion as done only at `shipped` (§19.5). |
 | POST | `/api/privacy/purge-source` | Purge a source's data | `{source: "adzuna", confirm: "PURGE ADZUNA", password, totp?}` → 202 `{manifest_id}` |
+| GET | `/api/privacy/operator` | The statement's operator values | → `{operator, contact, controller, vps_provider, s3_provider}`, the operator file's strings (§19.2, §20.6), all null outside `prod` without a valid file |
 | GET | `/api/openapi.json` | OpenAPI 3.1 | authenticated; not listed in its own document (§14.5) |
 | GET | `/healthz` | Liveness | unauthenticated → 200 `{status: "ok"}` |
 | GET | `/readyz` | Readiness | unauthenticated → 200 or 503 `{failing: [component codes]}`, with no details beyond codes |
@@ -5554,6 +5555,7 @@ Every process runs these checks at start, for its role: `api`, `worker`, `migrat
 8. In `prod`, the worker has the healthchecks ping URL **and** Management API key (§17.7); the ping URL is an https URL that ends in the check's UUID (`healthchecks_ping_url_form`); and `NTFY_TOPIC_URL` is an https URL (`ntfy_in_prod`).
 9. For `api`, no provider, Anthropic, LangSmith, ntfy, healthchecks or S3 secret is mounted.
 10. For `backup` and `restore`, an `s3:` repository has both S3 keys (`restic_s3_credentials`).
+11. In `prod`, for `api`, the operator file (§19.2) is present, readable and valid (`operator_file`).
 
 Secrets are never written to the DB, logs, traces, fixtures or images. The structlog redaction processor drops or masks these keys: `authorization`, `cookie`, `set-cookie`, `x-rapidapi-key`, `api_key`, `app_key`, `app_id`, `password`, `token`, `secret`, `redirect_url`, `outbound_url_private`, `description*`, `profile*`, `cv*`, `stripped_text`, `reviewed_text`, `raw_text*`. It also masks emails, phone numbers and key-shaped strings inside values. CI runs `gitleaks` on every push.
 
@@ -6317,6 +6319,13 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `JOBHUNTER_RESTORE_TEST_CRON` | backup | optional | Monthly restore test (default `30 3 * * 0`, run on the first Sunday of the month only: 03:30 UTC) |
 | `JOBHUNTER_BACKUP_KEEP_DAILY` / `_WEEKLY` / `_MONTHLY` | backup | optional | Retention (defaults 7 / 4 / 3) |
 
+**The operator file** `/etc/jobhunter/operator.json` (root's, mode 0644; no secret, but personal, so never in the repository) holds the privacy statement's five operator values (§20.6): a JSON object with exactly the keys `operator`, `contact`, `controller`, `vps_provider` and `s3_provider`, each a string that is not blank, of at most 200 characters, with no control character. Any other key or type is refused.
+
+- **Mount.** Compose bind-mounts it read-only into `api` only, at `/run/config/operator.json`, the default of `JOBHUNTER_OPERATOR_FILE`, which compose leaves unset. It makes no directory in place of a missing file, so the api's container is not created without one.
+- **Reading.** The api reads it once, at its start: a changed file applies after `restart api`.
+- **Check.** In `prod` the startup check `operator_file` (§16.8) refuses to start the api when the file is missing, unreadable, not valid JSON or not valid by these rules, naming the path and the problem, never a value (Ruling FU-1). In `dev` and `test` it is optional; without a valid one the statement shows its markers, and an invalid one is logged by its path and problem.
+- **No leak.** No log line, metric, export or trace carries a value.
+
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL`, `ANTHROPIC_API_KEY` and `LANGSMITH_GATEWAY` MUST NOT be set in production. The startup assertions enforce this, and they also refuse to start a service that has a secret mounted that its role does not need (§16.8).
 
 ### 19.3 Migrations
@@ -6763,7 +6772,7 @@ Afterwards, no Adzuna-derived text, salary or score remains in the database, in 
 9. **Security measures** (§16) in summary.
 10. **How to report a concern** (the operator contact is set at deployment).
 
-Then an **Operator** section with five marked fields: the operator name, the contact address, the controller name, the VPS provider and the S3 backup provider. The SPA renders `docs/PRIVACY.md` at build time as React elements (no route, no HTML injection; in English in both UI languages, §15.7), so the fields are bundled into the app image when it is built: filling them in the repository commits the operator's contact details to it and trips the marker test of `tests/unit/test_privacy_md.py`. How they are filled is a decision for the user at the deployment step: fill them in the release commit, or serve an override file.
+Then an **Operator** section with five marked fields: the operator name, the contact address, the controller name, the VPS provider and the S3 backup provider. The SPA renders `docs/PRIVACY.md` at build time as React elements (no route, no HTML injection; in English in both UI languages, §15.7). The repository keeps the five markers (the marker test of `tests/unit/test_privacy_md.py`), so no operator detail is committed or bundled into an image: the values come from the deployment's **operator file** (§19.2; the user's decision, option A), which the section's line names. `GET /api/privacy/operator` serves them to a session, read by the api once at its start, and the SPA puts each value in place of its marker as text, never as HTML, reading them once per session. In `prod` the api does not start without a valid file (Ruling FU-1, fail-closed), so no deployment goes live with a statement of placeholders; in `dev` and `test` the statement shows the markers when the server has no valid file (the route answers all five as null).
 
 ---
 

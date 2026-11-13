@@ -11,6 +11,9 @@
 // - **The reads** are background polls (`X-JH-Background: 1`): an export every 3 s while it runs, the deletions
 //   every 10 s while one is not `shipped` (D18: done only then).
 // - **The retry of a failed purge** (`POST /api/system/purges/{operation_id}/retry`) is not keyed (§14.1).
+// - **The statement's operator values** (`GET /api/privacy/operator`, M5 follow-ups Task F1) are read once per
+//   session: the api reads its operator file only when it starts, and the query cache is emptied at the logout
+//   and when a session ends (`expireSession`).
 //
 // `useSingleFlight` sends a destructive request at most once at a time: a second submit before React has drawn
 // the busy button (a double click) is dropped.
@@ -38,10 +41,12 @@ export type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
 type ManifestsPageOut = components["schemas"]["ManifestsPageOut"];
 type ExportQueuedOut = components["schemas"]["ExportQueuedOut"];
 type PurgeRetryOut = components["schemas"]["PurgeRetryOut"];
+export type OperatorOut = components["schemas"]["OperatorOut"];
 
 export const MANIFESTS_KEY = ["privacy", "manifests"] as const;
 export const MANIFEST_KEY = ["privacy", "manifest"] as const;
 export const EXPORT_KEY = ["privacy", "export"] as const;
+export const OPERATOR_KEY = ["privacy", "operator"] as const;
 
 /** How often a running export is read again. */
 export const EXPORT_POLL_MS = 3_000;
@@ -92,6 +97,17 @@ export function useExport(exportId: number | null): UseQueryResult<ExportOut, Pr
     queryFn: ({ signal }) => apiSend<ExportOut>(`/api/privacy/exports/${String(exportId)}`, { signal, background: true }),
     enabled: exportId !== null,
     refetchInterval: (query) => (query.state.data?.status === "running" ? EXPORT_POLL_MS : false),
+  });
+}
+
+/** The privacy statement's operator values (`GET /api/privacy/operator`), all null when the server has no
+ * operator file; read once for the session (never stale, kept until the cache is emptied). */
+export function useOperator(): UseQueryResult<OperatorOut, ProblemError> {
+  return useQuery({
+    queryKey: OPERATOR_KEY,
+    queryFn: ({ signal }) => apiSend<OperatorOut>("/api/privacy/operator", { signal }),
+    staleTime: Infinity,
+    gcTime: Infinity,
   });
 }
 

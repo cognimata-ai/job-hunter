@@ -646,6 +646,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/privacy/operator": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Operator
+         * @description The privacy statement's operator values, which take the place of its placeholders.
+         */
+        get: operations["get_operator_api_privacy_operator_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/privacy/purge-source": {
         parameters: {
             query?: never;
@@ -3764,6 +3784,38 @@ export interface components {
              * @enum {string}
              */
             status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready";
+        };
+        /**
+         * OperatorOut
+         * @description The privacy statement's operator values, from the deployment's operator file: each a string, or all
+         *     null when the server has no operator file (outside production).
+         */
+        OperatorOut: {
+            /**
+             * Contact
+             * @description Where to send a privacy concern
+             */
+            contact: string | null;
+            /**
+             * Controller
+             * @description The controller of the personal data
+             */
+            controller: string | null;
+            /**
+             * Operator
+             * @description Who operates the deployment
+             */
+            operator: string | null;
+            /**
+             * S3 Provider
+             * @description The provider of the offsite backups
+             */
+            s3_provider: string | null;
+            /**
+             * Vps Provider
+             * @description The provider of the server
+             */
+            vps_provider: string | null;
         };
         /**
          * PaidSearchOut
@@ -8291,6 +8343,44 @@ export interface operations {
             };
             /** @description Invalid path (`validation_failed`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_operator_api_privacy_operator_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperatorOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
