@@ -22,6 +22,16 @@ reads it (`parse_manifest` of its canonical bytes, then that hash).
   otherwise `checked`, and replayed again. Without `files` no `file_remove` can be verified: a manifest with
   one is `checked`.
 
+**The bounds** (final review M3, M8): before any postcondition is read or anything written, the content of
+every manifest of the stream and of every recorded row is checked for the `max_ids` keys its replay reads
+(`required_bounds`): those its kind's procedure reads (`KindProcedure.max_ids_keys`, which each kind declares
+beside the code that reads them) and those its typed operations' selectors read (`manifests.bound_keys`). A
+manifest that lacks one (a release whose procedure reads a table an older release's manifest never bounded)
+raises `ManifestBoundMissing`, a `ManifestInvalid` naming the manifest's uuid, its kind and the first missing
+key, logged `replay_bound_missing` with the three, and `migrate` stops as for any refused file
+(`migrate_failed`, the step and the error's class), every manifest unreplayed. A pending retry without a hash
+has no content yet: it is computed under the restored schema, every key present.
+
 **The replay** (`replay_stream`) ends at once when every manifest is `satisfied`. Otherwise:
 - **phase A** (Ruling T25-3: each manifest's effects at its place in the stream). One transaction under
   `active_config FOR UPDATE` (§3.3.3 step 2): the rows the database lacks inserted; every replayed manifest's
@@ -107,10 +117,12 @@ from jobhunter.privacy.identities import read_stream
 from jobhunter.privacy.kinds import delete_everything, golden_case, job_tombstone, profile_purge, source_purge
 from jobhunter.privacy.manifests import (
     FileRoots,
+    ManifestBoundMissing,
     ManifestConflict,
     ManifestContent,
     ManifestRow,
     Operation,
+    bound_keys,
     canonical_bytes,
     check_postconditions,
     complete_manifest,
@@ -297,18 +309,41 @@ async def _holds(
     return not found and not await proc.postconditions(conn, content)
 
 
+def required_bounds(content: ManifestContent) -> frozenset[str]:
+    """The `max_ids` keys a replay of `content` reads (module docstring, "The bounds"): its kind's
+    (`KindProcedure.max_ids_keys`) and its typed operations' (`manifests.bound_keys`); none of a kind no
+    procedure replays, which is refused by its own name."""
+    proc = KINDS.get(content["kind"])
+    return frozenset() if proc is None else proc.max_ids_keys | bound_keys(content)
+
+
+def _check_bounds(manifest_uuid: UUID, content: ManifestContent) -> None:
+    """`ManifestBoundMissing` (logged `replay_bound_missing`) when `content`'s `max_ids` lacks a key its
+    replay reads (module docstring, "The bounds"); the first missing key in name order is named."""
+    if missing := sorted(required_bounds(content) - content["max_ids"].keys()):
+        kind = content["kind"]
+        log.error("replay_bound_missing", manifest_uuid=str(manifest_uuid), kind=kind, key=missing[0])
+        raise ManifestBoundMissing(str(manifest_uuid), kind, missing[0])
+
+
 async def _classify(conn: AsyncConnection, manifest_dir: Path, files: FileRoots | None) -> list[_Entry]:
     stream = {UUID(content["manifest_uuid"]): content for content in read_stream(manifest_dir)}
     rows = {row.manifest_uuid: row for row in await _rows(conn)}
-    entries: list[_Entry] = []
+    found: list[tuple[UUID, ManifestContent | None, ManifestRow | None, ManifestContent | None]] = []
     for manifest_uuid in sorted(stream.keys() | rows.keys()):
         content, row = stream.get(manifest_uuid), rows.get(manifest_uuid)
+        if row is not None and content is not None:
+            _same_manifest(row, content)
+        recorded = content if content is not None or row is None else _recorded_content(row)
+        found.append((manifest_uuid, content, row, recorded))
+    for manifest_uuid, _, _, recorded in found:  # before any postcondition reads a bound (final review M3)
+        if recorded is not None:
+            _check_bounds(manifest_uuid, recorded)
+    entries: list[_Entry] = []
+    for manifest_uuid, content, row, recorded in found:
         if row is None:
             entries.append(_Entry(manifest_uuid, "replayed", content, None))
             continue
-        if content is not None:
-            _same_manifest(row, content)
-        recorded = content if content is not None else _recorded_content(row)
         if row.status == "executing":
             outcome: Outcome = "replayed" if content is not None else "pending_retry"
         elif recorded is None:

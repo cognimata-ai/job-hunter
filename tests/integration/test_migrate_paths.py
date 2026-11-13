@@ -12,7 +12,9 @@ Each test has a server of its own; the bounds that cover every table take the id
 from the shared migrated server. Step 7 replays the stream (M5 Task 25): every manifest here is of a kind
 whose procedure deletes only the rows its operations name (a golden-case deletion, a tombstone), so a
 manifest the database has no row for is inserted, replayed and completed without touching the rows of the
-test, and the next `migrate` finds it `satisfied`. Every manifest and row is invented.
+test, and the next `migrate` finds it `satisfied`. A tombstone's `max_ids` holds the one key its kind reads,
+`score_targets` (final review M3: a replay refuses a manifest without it). Every manifest and row is
+invented.
 """
 
 import asyncio
@@ -213,7 +215,8 @@ async def test_first_installation_with_and_without_manifests_on_the_volume(
         bounds = {table: 1000 + 10 * i for i, (table, _) in enumerate(head)}
         write_manifest_file(cfg.manifests_dir, content(kind="golden_case_delete", max_ids=bounds))
         write_manifest_file(
-            cfg.manifests_dir, content(kind="job_tombstone", max_ids={}, operations=listed_jobs([5000]))
+            cfg.manifests_dir,
+            content(kind="job_tombstone", max_ids={"score_targets": 0}, operations=listed_jobs([5000])),
         )
         bounds["procrastinate_jobs"] = 5000
     volume = files_in(cfg.manifests_dir)
@@ -247,7 +250,9 @@ async def test_a_first_installation_advances_the_queue_past_listed_job_ids(
     listed = [17, 23, 42]
     # Its `max_ids` bound on the queue lies below the ids it lists: the listed ids themselves must count.
     listing = content(
-        kind="job_tombstone", max_ids={"procrastinate_jobs": 10}, operations=listed_jobs(listed)
+        kind="job_tombstone",
+        max_ids={"procrastinate_jobs": 10, "score_targets": 0},
+        operations=listed_jobs(listed),
     )
     write_manifest_file(cfg.manifests_dir, listing)
     with capture_logs() as logs:
@@ -394,7 +399,10 @@ async def test_a_restored_database_with_a_newer_stream_advances_above_it(
         ),
     )
     write_manifest_file(
-        stream, content(kind="job_tombstone", max_ids={"alerts": 65}, operations=listed_jobs([60]))
+        stream,
+        content(
+            kind="job_tombstone", max_ids={"alerts": 65, "score_targets": 0}, operations=listed_jobs([60])
+        ),
     )
     columns = await columns_of(server, role, db)
     before = maxima(server, columns, role, db)

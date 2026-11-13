@@ -127,6 +127,7 @@ from jobhunter.privacy.deletion_graph import select_ids
 from jobhunter.privacy.fences import FenceSpec, purge_in_progress
 from jobhunter.privacy.manifests import (
     SELECTOR_ALL,
+    THREAD_FORMS,
     Bound,
     ManifestContent,
     ManifestKind,
@@ -236,6 +237,50 @@ _POINTERS: Final = (
 )
 
 _IDS: Final = "CAST(:ids AS bigint[])"
+
+# The `max_ids` keys the procedure reads (`max_ids_keys`, which a replay checks every manifest for): phase B's
+# bound of every table it deletes or settles by bound (steps 2 to 11), step 8's pointers' tables, and the
+# owners of the checkpoint threads.
+BOUNDS_READ: Final = frozenset(
+    {
+        "operations",
+        "batch_submissions",
+        "llm_spend_ledger",
+        "bulk_operations",
+        "score_targets",
+        "llm_calls",
+        "eval_runs",
+        "golden_cases",
+        "score_feedback",
+        "batch_items",
+        "llm_tuples",
+        "jobs",
+        "duplicate_groups",
+        "job_tombstones",
+        "fetch_requests",
+        "raw_responses",
+        "raw_items",
+        "ats_snapshots",
+        "coverage_intervals",
+        "coverage_cells",
+        "queries",
+        "source_instances",
+        "watchlist_companies",
+        "score_cycles",
+        "runs",
+        "profile_versions",
+        "query_proposals",
+        "profile_drafts",
+        "cv_files",
+        "embeddings",
+        "settings_versions",
+        "api_idempotency",
+        "login_attempts",
+        "login_lockouts",
+    }
+    | {names for _, _, names in _POINTERS}
+    | {form.owner for form in THREAD_FORMS}
+)
 
 
 def _in_bound(column: str) -> str:
@@ -853,6 +898,7 @@ class DeleteEverything:
 
     kind: ManifestKind = KIND
     deletes_exports: bool = True
+    max_ids_keys: frozenset[str] = BOUNDS_READ
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime

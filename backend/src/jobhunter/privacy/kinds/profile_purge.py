@@ -115,6 +115,8 @@ from jobhunter.worker.tasks import Deferrer
 
 KIND: Final = "profile_purge"
 REQUEST_KEY: Final = "profile_version_id"
+# The one `max_ids` key the procedure reads (`max_ids_keys`, which a replay checks every manifest for).
+TARGETS_BOUND: Final = "score_targets"
 CANCELLED: Final = "profile_purged"  # the reason of a proposal operation A0 cancels
 AFTER_REDACTION: Final = "privacy.profile_purge.after_redaction"  # the fault points (module docstring)
 BEFORE_TARGET_CHUNK: Final = "privacy.profile_purge.before_target_chunk"
@@ -491,6 +493,7 @@ class ProfilePurge:
 
     kind: ManifestKind = KIND
     deletes_exports: bool = True
+    max_ids_keys: frozenset[str] = frozenset({TARGETS_BOUND})
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime
@@ -507,7 +510,7 @@ class ProfilePurge:
     async def execute(self, run: PurgeRun, content: ManifestContent) -> None:
         tuples = _named(content, "row_delete", "score_targets")
         targets_deleted = (
-            await _delete_targets(run, tuples, content["max_ids"]["score_targets"]) if tuples else 0
+            await _delete_targets(run, tuples, content["max_ids"][TARGETS_BOUND]) if tuples else 0
         )
         await _redact_content(run, content)
         cases = _named(content, "row_delete", "golden_cases")

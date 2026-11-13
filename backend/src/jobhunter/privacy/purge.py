@@ -17,8 +17,10 @@ registers one): `compute` (A2, after the quiesce, under the fence: the content o
 `postconditions` (the kind's own, checked in phase C after the typed ones), `reapply_admission` (replay's
 re-application of A0's effects beyond the manifest, its fences and its operation, at the manifest's place in
 the stream; `high_water` is each table's greatest id when the replay began, so a row above it is the replay's
-own: a no-op for every kind but the source purge) and `deletes_exports` (true for every kind but
-`job_tombstone`: M5-R3, Deviation 18).
+own: a no-op for every kind but the source purge), `deletes_exports` (true for every kind but
+`job_tombstone`: M5-R3, Deviation 18) and `max_ids_keys`, the `max_ids` keys the procedure reads (its
+`execute`, its `postconditions` and, for the source purge, the rebuild), which a replay checks every manifest
+of the kind for before it starts (`replay.required_bounds`, final review M3).
 `compute_content` runs `compute` and completes what the kind cannot know: `fenced_at` (and a watermark's)
 becomes the fence's commit cutoff the quiesce waited from (`fences.fence_committed_at`), and a kind that
 deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["exports"]`.
@@ -377,6 +379,7 @@ class KindProcedure(Protocol):
 
     kind: ManifestKind
     deletes_exports: bool
+    max_ids_keys: frozenset[str]
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime

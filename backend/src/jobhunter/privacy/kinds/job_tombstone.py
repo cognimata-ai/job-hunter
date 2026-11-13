@@ -68,6 +68,8 @@ from jobhunter.worker.tasks import Deferrer
 KIND: Final = "job_tombstone"
 REQUEST_KEY: Final = "job_ids"
 FENCE_KEY: Final = "jobs"  # the `fence` op's key of a `jobs` fence
+# The one `max_ids` key the procedure reads (`max_ids_keys`, which a replay checks every manifest for).
+TARGETS_BOUND: Final = "score_targets"
 TOMBSTONE_AFTER: Final = timedelta(days=90)
 TOMBSTONE_BATCH: Final = 200
 TOMBSTONE_BATCHES_PER_RUN: Final = 10
@@ -225,6 +227,7 @@ class JobTombstone:
 
     kind: ManifestKind = KIND
     deletes_exports: bool = False
+    max_ids_keys: frozenset[str] = frozenset({TARGETS_BOUND})
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime
@@ -251,7 +254,7 @@ class JobTombstone:
                 (int(r.id), None if r.merged_into_job_id is None else int(r.merged_into_job_id))
                 for r in await conn.execute(_JOBS_OF_CONTENT, {"ids": ids})
             ]
-        bound = content["max_ids"]["score_targets"]
+        bound = content["max_ids"][TARGETS_BOUND]
         for root, graph in _forest(rows).items():
             purged = await deletion_graph.purge_job_graph(
                 run, root, graph, write_tombstone=True, target_bound=bound

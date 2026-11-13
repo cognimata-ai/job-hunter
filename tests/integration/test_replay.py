@@ -38,6 +38,7 @@ from jobhunter.privacy.kinds import source_purge
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.privacy.manifests import (
     FileRoots,
+    ManifestBoundMissing,
     ManifestConflict,
     ManifestContent,
     ManifestInvalid,
@@ -49,6 +50,7 @@ from jobhunter.privacy.manifests import (
     complete_manifest,
     insert_manifest,
     manifest_file_name,
+    max_identity_ids,
     read_manifest,
     record_manifest,
     write_manifest_file,
@@ -332,6 +334,89 @@ async def test_a_bad_file_stops_migrate(
     assert await scalar(engine, _MANIFEST_ROWS) == 0  # nothing replayed: no row inserted, no fence
     assert await scalar(engine, sa.text("SELECT count(*) FROM purge_fences")) == 0
     assert sorted(os.listdir(stream)) == files
+
+
+_NONE: Final = 2**40  # an id no row has
+
+
+def bounded_by(kind: ManifestKind) -> list[Operation]:
+    """Operations of `kind` that make its procedure read its bounds when replayed (each names rows no
+    database holds)."""
+    if kind == "job_tombstone":
+        return [
+            {"op": "fence", "kind": "jobs", "key": "jobs", "job_ids": [_NONE]},
+            {"op": "row_delete", "table": "jobs", "ids": [_NONE], "bound": {"by": "id"}},
+        ]
+    if kind == "profile_purge":
+        return [
+            {"op": "fence", "kind": "profile", "key": str(_NONE), "job_ids": []},
+            {
+                "op": "row_delete",
+                "table": "score_targets",
+                "ids": [_NONE],
+                "bound": {"by": "parent", "table": "llm_tuples", "column": "llm_tuple_id"},
+            },
+        ]
+    if kind == "source_purge":
+        return [
+            {"op": "row_delete", "table": "postings", "selector": "source:adzuna", "bound": {"by": "id"}},
+            {"op": "fence", "kind": "source", "key": ADZUNA, "job_ids": []},
+        ]
+    if kind == "delete_everything":
+        return [
+            {"op": "row_delete", "table": "llm_calls", "selector": "all", "bound": {"by": "id"}},
+            {"op": "row_delete", "table": "settings_versions", "selector": "all", "bound": {"by": "id"}},
+        ]
+    return [{"op": "row_delete", "table": "golden_cases", "ids": [_NONE], "bound": {"by": "id"}}]
+
+
+@pytest.mark.parametrize(
+    ("kind", "missing"),
+    [
+        ("job_tombstone", "score_targets"),
+        ("profile_purge", "score_targets"),
+        ("source_purge", "posting_observations"),
+        ("delete_everything", "llm_spend_ledger"),
+        ("golden_case_delete", None),
+    ],
+)
+async def test_a_manifest_whose_max_ids_lacks_a_key_its_kind_reads_stops_migrate(
+    engine: AsyncEngine, make_config: ConfigFactory, purger: Purger, kind: ManifestKind, missing: str | None
+) -> None:
+    """Final review M3, M8 (parked item 6): a manifest of the stream whose `max_ids` lacks a key its kind
+    reads (a release reading a table an older manifest never bounded) stops step 7 before any replay step,
+    with `ManifestBoundMissing` naming the manifest, its kind and the key, logged by the replay and as
+    `migrate_failed` by `migrate`: no row, no fence, nothing deleted. The keys are each kind's own
+    (`KindProcedure.max_ids_keys`: what its procedure reads, every one an identity table any manifest bounds)
+    and those its typed operations' selectors read. A golden-case deletion reads none: its content with an
+    empty `max_ids` replays."""
+    async with engine.connect() as conn:
+        bounds = await max_identity_ids(conn)
+    assert purge.KINDS[kind].max_ids_keys <= bounds.keys()  # what a manifest the app wrote always holds
+    built = content(
+        kind=kind,
+        operations=bounded_by(kind),
+        max_ids={} if missing is None else {t: v for t, v in bounds.items() if t != missing},
+    )
+    write_manifest_file(purger.cfg.manifests_dir, built)
+
+    if missing is None:
+        await migrate(make_config, purger, steps=frozenset({"replay"}))
+        assert await scalar(engine, _MANIFEST_ROWS) == 1
+        return
+    with capture_logs() as logs, pytest.raises(ManifestBoundMissing) as stopped:
+        await migrate(make_config, purger, steps=frozenset({"replay"}))
+
+    refused = stopped.value
+    assert (refused.manifest_uuid, refused.kind, refused.key) == (built["manifest_uuid"], kind, missing)
+    assert refused.reason == "bound_missing" and isinstance(refused, ManifestInvalid)
+    assert [
+        (e["manifest_uuid"], e["kind"], e["key"]) for e in logs if e["event"] == "replay_bound_missing"
+    ] == [(built["manifest_uuid"], kind, missing)]
+    (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
+    assert (failed["step"], failed["error_type"]) == ("replay", "ManifestBoundMissing")
+    assert await scalar(engine, _MANIFEST_ROWS) == 0
+    assert await scalar(engine, sa.text("SELECT count(*) FROM purge_fences")) == 0
 
 
 @pytest.mark.parametrize("defect", ["another_kind", "another_hash", "completed_without_content"])

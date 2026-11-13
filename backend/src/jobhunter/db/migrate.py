@@ -13,8 +13,10 @@ Step 7 replays the deletion-manifest stream in two phases (`privacy.replay.repla
 manifests classified by §19.5's table, then, when one is to be replayed, every destructive operation of the
 stream with every fence active, one rebuild over the stored affected jobs, and one transaction that verifies
 every postcondition and releases the fences. A file of the stream that does not parse or is named for another
-uuid (`ManifestInvalid`) or a postcondition that fails (`ReplayFailed`, the fences kept) stops `migrate` like
-any failing step. Its file operations use the volumes of the run (`cv_dir`, `exports_dir`).
+uuid (`ManifestInvalid`), a manifest whose `max_ids` lacks a key its kind reads (`ManifestBoundMissing`, a
+`ManifestInvalid` naming the manifest, its kind and the key, before anything is replayed) or a postcondition
+that fails (`ReplayFailed`, the fences kept) stops `migrate` like any failing step. Its file operations use
+the volumes of the run (`cv_dir`, `exports_dir`).
 
 The flags (M5 Task 23, Deviation 38) serve the restore code and the restore test (§19.5): `steps` runs a
 subset of step groups (`STEP_GROUPS`), always in `MIGRATE_ORDER`; `database` and `db_role` select the database

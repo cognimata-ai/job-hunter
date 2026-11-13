@@ -171,6 +171,9 @@ ROW_CHUNK: Final = 500  # instances, calls and source rows per chunk
 EMBEDDING_ROUNDS: Final = 3
 EMBEDDING_REUSED: Final = "embedding_reused"  # the wait's error code (module docstring, phase B step 4)
 LOGGED_IDS: Final = 20
+# The `max_ids` keys the procedure reads (`max_ids_keys`, which a replay checks every manifest for): phase B's
+# targets, postings and fetch requests, and the rebuild's bound (`_recorded_bound`).
+BOUNDS_READ: Final = frozenset({"score_targets", "postings", "posting_observations", "fetch_requests"})
 
 _IDS: Final = "CAST(:ids AS bigint[])"
 _TAINTED_IDS: Final = "CAST(:tainted AS bigint[])"
@@ -904,6 +907,7 @@ class SourcePurge:
 
     kind: ManifestKind = KIND
     deletes_exports: bool = True
+    max_ids_keys: frozenset[str] = BOUNDS_READ
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime

@@ -123,6 +123,7 @@ class FencedKind:
 
     kind: ManifestKind = "retention_purge"
     deletes_exports: bool = True
+    max_ids_keys: frozenset[str] = frozenset()  # its row is named by id: it reads no bound
     keep_the_row: bool = False
     deadlocks: int = 0
     chunks: list[frozenset[int]] = field(default_factory=list)

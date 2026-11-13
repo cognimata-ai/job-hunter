@@ -18,7 +18,9 @@ other bytes raises `ManifestConflict`, and a manifest's file is never overwritte
 and `migrate` runs alone, so no second writer of a uuid races the check before the rename. `parse_manifest`
 reads a file of the stream and raises `ManifestInvalid(reason)` for one a replay must not trust:
 `not_json`, `unknown_format`, `unknown_op`, `invalid` (any other shape than the format's, an extra field
-included) and `name_mismatch` (a file name other than `<manifest_uuid>.json`).
+included) and `name_mismatch` (a file name other than `<manifest_uuid>.json`). The replay adds
+`bound_missing` (`ManifestBoundMissing`, with the manifest's uuid, its kind and the key): a `max_ids` without
+a key its replay reads, its typed operations' (`bound_keys`) or its kind's.
 
 **The rows.** `insert_manifest` inserts the `executing` row with a UUIDv7, the request (ids only) and an empty
 `scope`, `created_at` the caller's `now` (A0, with its fences: `fences.insert_fence`). `record_manifest` (A3)
@@ -116,7 +118,9 @@ ManifestKind = Literal[
 ]
 ManifestStatus = Literal["executing", "completed", "shipped"]
 FenceKind = Literal["global", "source", "profile", "jobs"]
-InvalidReason = Literal["not_json", "unknown_format", "unknown_op", "invalid", "name_mismatch"]
+InvalidReason = Literal[
+    "not_json", "unknown_format", "unknown_op", "invalid", "name_mismatch", "bound_missing"
+]
 
 # Each TypedDict of the format refuses an extra field and a value of another type when a file is parsed.
 _FORMAT: Final = ConfigDict(extra="forbid", strict=True)
@@ -203,6 +207,18 @@ class ManifestInvalid(Exception):
     def __init__(self, reason: InvalidReason) -> None:
         super().__init__(reason)
         self.reason: InvalidReason = reason
+
+
+class ManifestBoundMissing(ManifestInvalid):
+    """A manifest whose `max_ids` lacks a key its kind reads (`replay`, final review M3): its uuid, its kind
+    and the key, which its message names too (ids and names only)."""
+
+    def __init__(self, manifest_uuid: str, kind: str, key: str) -> None:
+        super().__init__("bound_missing")
+        self.args = (f"deletion manifest {manifest_uuid} ({kind}): max_ids has no bound for {key}",)
+        self.manifest_uuid = manifest_uuid
+        self.kind = kind
+        self.key = key
 
 
 class ManifestConflict(Exception):
@@ -866,6 +882,29 @@ async def _ledger(conn: AsyncConnection, content: ManifestContent) -> list[Viola
         detail = f"{_rows(n, 'request entry', 'request entries')} reserved or dispatched without its call"
         return [Violation(deleting[0], "row_delete", "llm_spend_ledger", detail)]
     return []
+
+
+def bound_keys(content: ManifestContent) -> frozenset[str]:
+    """The `max_ids` keys `content`'s typed operations read when their postconditions are checked: each
+    selector's bound (its table's own for an `id` bound, its parent's for a `parent` one, every `THREAD_FORMS`
+    owner's for a `thread` one; a `created_at` bound reads none, nor do ids) and, for a manifest that deletes
+    `llm_calls`, `llm_spend_ledger` (G04). `replay` refuses a manifest that lacks one before it starts."""
+    keys: set[str] = set()
+    for op in content["operations"]:
+        if op["op"] != "row_delete":
+            continue
+        if op["table"] == "llm_calls":
+            keys.add("llm_spend_ledger")
+        if "selector" not in op:
+            continue
+        bound = op["bound"]
+        if bound["by"] == "id":
+            keys.add(op["table"])
+        elif bound["by"] == "parent" and "table" in bound:
+            keys.add(bound["table"])
+        elif bound["by"] == "thread":
+            keys.update(form.owner for form in THREAD_FORMS)
+    return frozenset(keys)
 
 
 async def check_postconditions(
