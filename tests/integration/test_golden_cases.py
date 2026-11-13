@@ -48,6 +48,10 @@ _INSTANCE: Final = sa.text("SELECT * FROM det_results WHERE id = :i")
 _RESULT: Final = sa.text("SELECT * FROM llm_results WHERE id = :i")
 _ACTIVE: Final = sa.text("SELECT profile_version_id, scope_version_id FROM active_config WHERE id = 1")
 HOUR: Final = timedelta(hours=1)
+# A lineage row: the revision's title drawn from Adzuna (no posting named: lineage survives its posting).
+_LINEAGE: Final = sa.text(
+    "INSERT INTO job_revision_sources (job_revision_id, field, source_id) VALUES (:r, 'title', 'adzuna')"
+)
 
 
 async def one(engine: AsyncEngine, statement: sa.TextClause, row_id: int) -> Any:
@@ -62,8 +66,11 @@ async def feedback(engine: AsyncEngine, job_id: int, **kwargs: Any) -> golden.Fe
 
 
 async def test_a_label_writes_the_score_snapshot_and_upserts_the_case(engine: AsyncEngine) -> None:
+    """The snapshot records the sources its scores derive from (final fix C2): the revision's lineage and the
+    instance's `det_inputs`, so a source purge finds it after retention has nulled its foreign keys."""
     async with engine.begin() as conn:
         scored = await scored_job(conn)
+        await conn.execute(_LINEAGE, {"r": scored.job.revision_id})
     made = await feedback(engine, scored.job.job_id)
     row = await one(engine, _FEEDBACK, made.feedback_id)
     instance = await one(engine, _INSTANCE, scored.det_result_id)
@@ -88,6 +95,7 @@ async def test_a_label_writes_the_score_snapshot_and_upserts_the_case(engine: As
         "model_policy_id": result.model_policy_id,
         "scope_version_id": scored.scope_version_id,
         "det_result_id": scored.det_result_id,
+        "sources": sorted({"adzuna", *scored.sources}),
     }
     case = await one(engine, _CASE, made.golden_case_id)
     async with engine.connect() as conn:

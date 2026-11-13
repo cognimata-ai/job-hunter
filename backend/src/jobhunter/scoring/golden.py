@@ -228,6 +228,11 @@ _CURRENT: Final = q(
     "JOIN llm_results r ON r.id = cs.llm_result_id JOIN det_results d ON d.id = cs.det_result_id "
     "WHERE cs.job_id = :j"
 )
+# The sources the revision's lineage names (§20.5): with the instance's `det_inputs` sources, what a label's
+# scores derive from, recorded in its snapshot (final fix C2).
+_REVISION_SOURCES: Final = q(
+    "SELECT DISTINCT source_id FROM job_revision_sources WHERE job_revision_id = :revision ORDER BY source_id"
+)
 _INSERT_FEEDBACK: Final = q(
     "INSERT INTO score_feedback (job_id, job_revision_id, profile_version_id, llm_result_id, det_result_id, "
     "score_snapshot, kind, label, comment, created_at) VALUES (:job, :revision, :profile, :result, :det, "
@@ -297,7 +302,9 @@ async def record_feedback(
     fenced job is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (module docstring). The
     job's current published result of the active tuple and its instance under the active scope
     (`current_scores`) are snapshotted into `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's
-    ids, the scope and the instance), and the golden case of (revision, the tuple's profile) is upserted with
+    ids, the scope and the instance, and `sources`: every source the revision's lineage or the instance's
+    `det_inputs` names, sorted, so a source purge finds the label after retention has nulled its foreign keys,
+    final fix C2), and the golden case of (revision, the tuple's profile) is upserted with
     the active scope, the instance's `det_inputs` as its frozen snapshot and their source ids,
     `source = 'week1'` for a label and `'feedback'` for a "wrong score" (an update keeps the case's source).
     No published result is a 409 `conflict_state` (so is every job with no profile active: `active_config`
@@ -329,6 +336,9 @@ async def record_feedback(
         "scope_version_id": int(row.scope_version_id),
         "det_result_id": int(row.det_result_id),
     }
+    lineage = (await conn.execute(_REVISION_SOURCES, {"revision": int(row.job_revision_id)})).scalars()
+    sources = sorted({str(source) for source in lineage} | set(snapshot_sources(row.det_inputs)))
+    snapshot["sources"] = list[JSONValue](sources)
     common = {"revision": int(row.job_revision_id), "profile": int(row.profile_version_id), "now": now}
     feedback_id = int(
         (

@@ -21,7 +21,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import procrastinate
 import pytest
@@ -63,7 +63,7 @@ from tests.support.m3 import insert_golden_case, insert_job
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.privacy_seed import seed_two_year_old_graph
 from tests.support.procs import await_until
-from tests.support.purges import Purger, completed, manifest_of
+from tests.support.purges import Detached, Purger, completed, detached_feedback, manifest_of
 from tests.support.scoring import fence_jobs
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
@@ -340,15 +340,21 @@ async def test_a_fenced_job_is_absent_from_the_export(engine: AsyncEngine, expor
     assert after["jobs.json"]  # the other jobs stay
 
 
+@pytest.mark.parametrize("label", ["of_the_tainted_revision", "tombstoning", "score_history"])
 async def test_after_an_adzuna_purge_the_exported_feedback_holds_no_adzuna_score(
-    engine: AsyncEngine, exporter: Exporter, purger: Purger
+    engine: AsyncEngine, exporter: Exporter, purger: Purger, label: str
 ) -> None:
-    """Final review I1, §20.5: no Adzuna-derived score remains in an export. The seed's label of the mixed
-    job's tainted revision is exported after the Adzuna purge with its kind, label and comment, and its
-    `score_snapshot` null; before the purge it held the copied score."""
+    """Final review I1, §20.5: no Adzuna-derived score remains in an export. A label is exported after the
+    Adzuna purge with its kind, label and comment, and its `score_snapshot` null; before the purge it held the
+    copied score. The label is the seed's, of the mixed job's tainted revision, or one detached from its
+    provenance by tombstoning or the score-history rule, whose snapshot records Adzuna among its sources
+    (final re-review N1, final fix C2)."""
     async with engine.begin() as conn:
         seed = await seed_two_year_old_graph(conn, now=utcnow())
-    feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    if label == "of_the_tainted_revision":
+        feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    else:
+        feedback = await detached_feedback(engine, cast(Detached, label))
     keys = crypto.data_keys(exporter.deps.cfg)
 
     async def exported() -> dict[str, Any]:

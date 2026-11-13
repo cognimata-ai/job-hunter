@@ -79,9 +79,11 @@ from tests.support.purges import (
     IS_FENCED,
     JOB,
     PROVENANCE_SOURCES,
+    Detached,
     Purger,
     completed,
     completions,
+    detached_feedback,
     one,
     recomputed,
     request_delete_everything,
@@ -470,6 +472,40 @@ async def test_a_source_purge_replay_redacts_the_feedback_snapshots_it_froze(
         for op in source.scope["operations"]
         if op["op"] == "field_redact" and op["table"] == "score_feedback"
     ] == [[feedback]]
+
+    assert await migrate_restored(make_config, restored, purger.cfg.manifests_dir) == list(MIGRATE_ORDER)
+
+    await assert_replayed(restored.engine, restored.files, source)
+    after = await one(restored.engine, _FEEDBACK, f=feedback)
+    assert after.score_snapshot is None
+    assert (after.kind, after.label, after.comment) == (before.kind, before.label, before.comment)
+
+
+@pytest.mark.parametrize("by", ["tombstoning", "score_history"])
+async def test_a_source_purge_replay_redacts_a_detached_feedback_snapshot(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    purger: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
+    by: Detached,
+) -> None:
+    """Final re-review N1: a label detached from its provenance by tombstoning or the score-history rule,
+    whose snapshot records Adzuna among its sources (final fix C2), is in a backup set taken before the purge.
+    The manifest froze its id by those sources, so the replay redacts it as the live purge did."""
+    await seeded(engine)
+    feedback = await detached_feedback(engine, by)
+    await backup_set(migrated, restored)
+    before = await one(restored.engine, _FEEDBACK, f=feedback)
+    assert before.score_snapshot is not None
+    source = await finished(purger, await request_source_purge(engine))
+    assert source.scope is not None
+    [frozen] = [
+        op["ids"]
+        for op in source.scope["operations"]
+        if op["op"] == "field_redact" and op["table"] == "score_feedback"
+    ]
+    assert feedback in frozen
 
     assert await migrate_restored(make_config, restored, purger.cfg.manifests_dir) == list(MIGRATE_ORDER)
 

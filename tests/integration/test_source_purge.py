@@ -56,7 +56,7 @@ from tests.support.m2 import insert_eval_run, insert_profile_chain
 from tests.support.m3 import Job, active_ids, insert_cycle, insert_golden_case, insert_job
 from tests.support.observations import stated
 from tests.support.privacy_seed import SEED_AGE, SeedIds, seed_two_year_old_graph
-from tests.support.purges import Purger, completed, manifest_of
+from tests.support.purges import Detached, Purger, completed, detached_feedback, manifest_of
 from tests.support.reconcile import run_reconciler
 from tests.support.scoring import (
     activate_score_tuple,
@@ -589,6 +589,25 @@ async def test_feedback_score_snapshots_drawn_from_adzuna_are_redacted_keeping_t
         assert after.score_snapshot is None
         assert (after.kind, after.label, after.comment) == tuple(before[feedback])[1:]
     assert tuple(await one(engine, _FEEDBACK, f=kept)) == tuple(before[kept])
+
+
+@pytest.mark.parametrize("by", ["tombstoning", "score_history"])
+async def test_a_detached_feedback_snapshot_drawn_from_adzuna_is_redacted(
+    engine: AsyncEngine, purger: Purger, by: Detached
+) -> None:
+    """Final re-review N1: tombstoning, or the score-history rule, nulls a label's foreign keys long before a
+    purge, so no key names what its scores were copied from. The snapshot records its sources (final fix C2),
+    and the purge freezes every one that names Adzuna, detached or not: redacted, its label kept."""
+    await seeded(engine)
+    feedback = await detached_feedback(engine, by)
+    before = await one(engine, _FEEDBACK, f=feedback)
+
+    manifest = await purged(engine, purger, await request(engine))
+
+    assert feedback in operations(manifest, "field_redact", "score_feedback")
+    after = await one(engine, _FEEDBACK, f=feedback)
+    assert after.score_snapshot is None
+    assert (after.kind, after.label, after.comment) == tuple(before)[1:]
 
 
 async def test_a_feedback_snapshot_written_again_fails_the_postcondition(

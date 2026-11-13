@@ -39,9 +39,11 @@ within `max_ids`:
   revision: a tainted revision's go with its targets); `row_delete golden_cases` (active or not: the agreement
   overrides the exemption); `row_delete llm_calls` (the other eval calls whose `input_refs` name a tainted
   revision, no case's deletion taking them); `field_redact score_feedback score_snapshot` (final review I1:
-  the feedback rows within the bound whose snapshot of L, M, U, coverage and confidence draws on the source,
+  the feedback rows within the bound whose snapshot of L, M, U, coverage and confidence draws on the source:
   their scored revision tainted, their result on a tainted revision or their det instance naming the source,
-  frozen here by id while those keys still name them; their kind, label and comment stay);
+  frozen here by id while those keys still name them, or their snapshot's recorded `sources` naming it,
+  whatever keys retention nulled before (final fix C2; a snapshot written before that rule records none);
+  their kind, label and comment stay);
   `row_delete postings`, `ad_keys` and `fetch_requests` with the
   selector `source:<source>` (bounded by id, by `created_at <= fenced_at` for the keys); `field_redact jobs
   current_revision_id` of the affected jobs whose current revision is tainted; `row_delete job_revisions` of
@@ -233,13 +235,15 @@ _EVAL_CALLS: Final = q(
     "AND (c.golden_case_id IS NULL OR NOT (c.golden_case_id = ANY(CAST(:cases AS bigint[])))) "
     "ORDER BY c.id"
 )
-# The feedback within the bound whose score snapshot draws on the source (module docstring, final review I1).
+# The feedback within the bound whose score snapshot draws on the source (module docstring, final review I1):
+# by its foreign keys, or by the sources its snapshot records, which retention cannot null (final fix C2).
 _FEEDBACK: Final = q(
     "SELECT f.id FROM score_feedback f WHERE f.id <= :bound AND f.score_snapshot IS NOT NULL AND ("  # noqa: S608
     f"f.job_revision_id = ANY({_TAINTED_IDS}) "
     "OR EXISTS (SELECT 1 FROM llm_results r WHERE r.id = f.llm_result_id "
     f"AND r.job_revision_id = ANY({_TAINTED_IDS})) "
-    f"OR EXISTS (SELECT 1 FROM det_results d WHERE d.id = f.det_result_id AND {_NAMES_SOURCE})) ORDER BY f.id"
+    f"OR EXISTS (SELECT 1 FROM det_results d WHERE d.id = f.det_result_id AND {_NAMES_SOURCE}) "
+    "OR f.score_snapshot -> 'sources' @> jsonb_build_array(CAST(:source AS text))) ORDER BY f.id"
 )
 _CURRENT_TAINTED: Final = q(
     "SELECT id FROM jobs WHERE id = ANY(CAST(:jobs AS bigint[])) "  # noqa: S608

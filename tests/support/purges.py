@@ -37,13 +37,14 @@ assertions are rewritten.
 
 import dataclasses
 import itertools
+import json
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import pytest
 import sqlalchemy as sa
@@ -265,3 +266,45 @@ async def live(purger: Purger, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatc
     async with fake_llm.client() as http:
         client = BatchesClient(fake_llm.cfg, http_client=http)
         yield Purger(purger.engine, purger.cfg, dataclasses.replace(purger.deps, batches_client=client))
+
+
+# ---- feedback detached from its provenance before a purge (final fix C2) -----------------------------------
+
+Detached = Literal["tombstoning", "score_history"]
+# The sources a detached label's snapshot records: an Adzuna value on a revision of another source's text.
+DETACHED_SOURCES: Final = ("adzuna", "greenhouse")
+_UNTAINTED_REVISION: Final = sa.text(
+    "SELECT r.id, r.job_id FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id "
+    "WHERE NOT EXISTS (SELECT 1 FROM job_revision_sources s WHERE s.job_revision_id = r.id "
+    "AND s.source_id = 'adzuna') AND NOT EXISTS (SELECT 1 FROM postings p JOIN source_instances i "
+    "ON i.id = p.source_instance_id WHERE p.job_id = j.id AND i.source_id = 'adzuna') ORDER BY r.id LIMIT 1"
+)
+_DETACHED_FEEDBACK: Final = sa.text(
+    "INSERT INTO score_feedback (job_id, job_revision_id, profile_version_id, score_snapshot, kind, label, "
+    "comment) VALUES (:job, :revision, (SELECT profile_version_id FROM active_config WHERE id = 1), "
+    "CAST(:snapshot AS jsonb), 'label', 'ok', 'Erfundener Kommentar.') RETURNING id"
+)
+
+
+async def detached_feedback(engine: AsyncEngine, by: Detached) -> int:
+    """A label whose score snapshot records Adzuna among its sources, as `golden.record_feedback` writes it,
+    detached from its provenance as `by` leaves it; its id. Tombstoning nulls the job, its revision, the
+    result and the instance (`test_job_tombstone.py`); the score-history rule nulls the result and the
+    instance and keeps the job and its revision, here an untainted one (`test_retention_m3.py`). So no foreign
+    key names what the scores were copied from."""
+    snapshot = {
+        "L": "51.00",
+        "M": "62.00",
+        "U": "73.00",
+        "coverage": "0.80",
+        "confidence": "medium",
+        "sources": list(DETACHED_SOURCES),
+    }
+    async with engine.begin() as conn:
+        job: int | None = None
+        revision: int | None = None
+        if by == "score_history":
+            row = (await conn.execute(_UNTAINTED_REVISION)).one()
+            job, revision = int(row.job_id), int(row.id)
+        params = {"job": job, "revision": revision, "snapshot": json.dumps(snapshot)}
+        return int((await conn.execute(_DETACHED_FEEDBACK, params)).scalar_one())
