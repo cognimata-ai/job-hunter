@@ -478,6 +478,7 @@ job-hunter/
 │   ├── config.py                 # env loading + startup assertions (§16.8)
 │   ├── cli.py                    # `jobhunter` CLI: user, totp, migrate, worker, manifests, restore, startup-check, fixtures, schema-dry-run
 │   ├── cli_ops.py, cli_backup.py # `jobhunter ops …` (the V15 checks), `jobhunter backup …` and `restore …` (§19.4)
+│   ├── cli_retention.py          # `jobhunter retention run`: the retention pass on demand (§19.8)
 │   ├── crypto_rotate.py          # `jobhunter crypto rotate` (§19.8)
 │   ├── backup/ runner.py restic.py shipper.py backup_set.py prune.py scheduler.py cron.py restore.py
 │   │           restore_test.py   # the backup image's jobs (§19.5)
@@ -6355,7 +6356,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 
 ### 19.4 User bootstrap CLI
 
-`jobhunter` (run as `docker compose run --rm --no-deps <service> jobhunter <cmd>` in the service whose role the command takes: `api` for the user and session commands, `worker` for `crypto rotate` and `ops …`, `migrate` for `migrate` and `manifests replay`, `restore` for `restore …`; the `backup …` commands run in the backup container, `docker compose exec backup jobhunter backup <job>`):
+`jobhunter` (run as `docker compose run --rm --no-deps <service> jobhunter <cmd>` in the service whose role the command takes: `api` for the user and session commands, `worker` for `crypto rotate`, `ops …` and `retention run`, `migrate` for `migrate` and `manifests replay`, `restore` for `restore …`; the `backup …` commands run in the backup container, `docker compose exec backup jobhunter backup <job>`):
 
 | Command | Purpose |
 |---|---|
@@ -6372,6 +6373,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `restore run [--set <id>]` | The restore orchestration of §19.5 (the `restore` service's command), in the `restore` container |
 | `restore verify --set <id> --phase restored\|replayed [--database <db>]` | Checks on a restored database (§19.5), in the `restore` container |
 | `crypto rotate` | Resumable data-key rotation (§16.8, §19.8), as the worker |
+| `retention run` | The `retention_daily` pass (§20.1) once now, fenced by the current worker epoch as the worker's own pass is; prints its counts by rule (§19.8), as the worker |
 | `ops notify-test` / `ops deadman-sync [--show]` | The V15 checks: one test push to ntfy; the dead-man check's period applied and read back (§17.7), as the worker |
 | `schema-dry-run --live` | §10.11 |
 | `fixtures scrub <in> <out>` | §18.4 |
@@ -6522,7 +6524,7 @@ Whatever the outcome, the restore removes its staging copy of the dump (`/data/s
 
 - **Secret rotation**: replace the secret file with the same `install -o root -g 10010 -m 0440` command, then `docker compose restart` the services that receive it (§19.2): Compose compares a service's configuration, not a secret file's content, so `up -d` alone would keep the old value. A DB role's password also changes in PostgreSQL (`scripts/rotate-db-role.sh`). Rotating the session secret logs the user out. Rotating the data key: mount the old key as `data_key_previous` and the new one as `data_key`, restart `api` and `worker`, run `jobhunter crypto rotate` as the worker (resumable), and empty `data_key_previous` only after its verification pass reports no ciphertext with the old key id (§16.8). The retired key stays in the offline recovery kit while a retained backup set names it in its `data_key_ids`. `crypto rotate` re-encrypts what the mounted previous key opens and reports the other key ids left, so a set restored under several old keys takes one pass per key, before `up -d`.
 - **Restore**: on a fresh host, do the host setup first, with the offline recovery kit's data key, restic password and S3 keys; start `postgres` on an empty data directory; then `docker compose --profile restore run --rm restore` (`restore run`), which follows the restore order of §19.5 exactly: manifest stream first, then the backup set, `pg_restore --no-owner --no-acl`, `restore verify --phase restored`, the CV files, `migrate` (identity advancement and replay), the exports, `restore verify --phase replayed`. Then the data-key passes above for every key id of the set other than the current key, and only then start `api` and `worker`.
-- **Disk pressure**: check `jobhunter_table_bytes`. `retention_daily` runs nightly (03:17 UTC) and has no manual trigger: a full disk waits for its next pass; vacuum the table that grew.
+- **Disk pressure**: check `jobhunter_table_bytes`. `retention_daily` runs nightly (03:17 UTC); `jobhunter retention run`, as the worker (`docker compose run --rm --no-deps worker`), runs the same pass at once, beside a running worker: every write of it is fenced by the current worker epoch, as the worker's own pass is, each rule takes the locks it takes there, and it prints its counts only, `-1` for a rule that failed (which raises `retention.failed`); it runs only the pass, not the daily reconcilers the scheduled task runs after it. Vacuum the table that grew.
 - **Password lost**: `jobhunter user set-password`.
 
 ---

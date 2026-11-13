@@ -80,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_backup_commands(commands)
     _add_restore_commands(commands)
     _add_crypto_commands(commands)
+    _add_retention_commands(commands)
     return parser
 
 
@@ -339,6 +340,18 @@ def _add_crypto_commands(commands: "argparse._SubParsersAction[argparse.Argument
     )
 
 
+def _add_retention_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    retention = commands.add_parser(
+        "retention", help="the retention pass (§20.1), as the worker; prints counts only"
+    )
+    retention_commands = retention.add_subparsers(dest="retention_command", required=True)
+    retention_commands.add_parser(
+        "run",
+        help="run the nightly retention pass once now, fenced by the current worker epoch as the worker's "
+        'own pass is; print {"counts": {rule: count}}, -1 for a rule that failed (exit 1)',
+    )
+
+
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     fixtures = commands.add_parser("fixtures", help="source fixture tooling (§18.4)")
     fixtures_commands = fixtures.add_subparsers(dest="fixtures_command", required=True)
@@ -498,6 +511,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.crypto_rotate import run_rotate_command
 
         return run_rotate_command(args)
+    if args.command == "retention":
+        # Imported here: the pass needs the database layer, procrastinate, the checkpointer and the CV store.
+        from jobhunter.cli_retention import run_retention_command
+
+        return run_retention_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

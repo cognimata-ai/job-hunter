@@ -437,7 +437,7 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 | `dedup.ambiguous_grouping` | info | auto | A job could join more than one duplicate group, and joined the best. Information. |
 | `quota.serpapi_renewal_stale` | warn | auto | SerpApi's monthly window is still unconfirmed 48 h after its start: check the SerpApi plan and its renewal. A read that confirms the window resolves it. |
 | `reconciler.failed` | warn | auto | A reconciler raised: `$JH logs worker` names it (`reconciler_failed`, with the error class). Report it if it repeats; its next success resolves it. |
-| `retention.failed` | warn | auto | A retention rule failed: `$JH logs worker` names it (`retention_rule_failed`). The next nightly pass tries again; report it if it repeats. |
+| `retention.failed` | warn | auto | A retention rule failed: `$JH logs worker` names it (`retention_rule_failed`). The next nightly pass tries again, or `jobhunter retention run` at once (section 11); report it if it repeats. |
 | `api.unhandled_exception` | warn | manual | A request ended in a 500: a bug. `$JH logs api` gives its error class; report it; then resolve it. |
 | `auth.totp_key_mismatch` | critical | manual | No mounted data key opens the TOTP secret: a wrong `data_key`, or a key a restore did not rotate (section 9). Mount the right key (section 7); if it is lost, `$JH run --rm --no-deps api jobhunter user totp disable` and turn TOTP on again. Then resolve it. |
 | `docparse.leftover` | warn | auto | docparse could not remove a leftover on the parse tmpfs and takes no job. Recreate the worker and docparse containers, which share it: `$JH stop worker docparse`, `$JH rm -f worker docparse`, `$JH up -d --no-deps --wait worker docparse`. A clean start resolves it. |
@@ -875,8 +875,21 @@ full history, builds the release before migration 0012 for it as `jobhunter-app:
 
 1. Where the space goes: `df -h /var/lib/docker` and `docker system df`; the table sizes in System → Health
    (`table_bytes` of `GET /api/system/health`, the figures of the gauge `jobhunter_table_bytes`).
-2. The retention pass (`retention_daily`, nightly at 03:17 UTC) deletes what §20.1 lets go. This release has no
-   command that runs it on demand: a full disk waits for its next pass, or takes the steps below.
+2. The retention pass (`retention_daily`, nightly at 03:17 UTC) deletes what §20.1 lets go. When the disk
+   fills before its next pass, run it now, as the worker, while the worker runs:
+
+   ```
+   $JH run --rm --no-deps worker jobhunter retention run
+   ```
+
+   It runs the same pass once, fenced by the worker's current epoch as the worker's own pass is, each rule under
+   its usual locks, so it is safe beside the running worker and beside its nightly pass. It prints
+   `{"counts": {…}}`, what each rule deleted (rows, threads, files, the jobs it tombstoned). A count of `-1` is
+   a rule that failed or was skipped, and the command exits 1: its output's `retention_rule_failed` line and
+   the `retention.failed` alert name the rule (section 6). `{"error": "fenced_out"}`: the worker started
+   again meanwhile; run it again. `{"error": "no_worker_epoch"}`: no worker has started on this database yet.
+   It runs only the pass: the daily reconcilers stay the worker's, after its nightly pass. The space it frees
+   is reused by the table's next rows; step 3 makes it reusable sooner.
 3. Vacuum the table that grew, as its owner:
 
    ```
