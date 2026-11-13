@@ -519,7 +519,9 @@ already open keep working, and the restart ends the window.
 the prune on Sundays at 02:30 (`JOBHUNTER_BACKUP_PRUNE_CRON`), which keeps 7 daily, 4 weekly and 3 monthly
 sets; the restore test on the first Sunday of the month at 03:30 (`JOBHUNTER_RESTORE_TEST_CRON`). The manifest
 snapshots are never forgotten. One backup job runs at a time: another prints `{"error": "backup_job_busy"}`
-and changes nothing. System → Health shows the latest set, shipment and restore test, with their ages. By
+and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
+the scheduler's runs waits for it, then ships what is left, so it never prints `backup_job_busy`. A restore
+reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set, shipment and restore test, with their ages. By
 hand, each printing one JSON line:
 
 ```
@@ -601,9 +603,15 @@ worker stay stopped until the last step.
    ```
 
    postgres starts on an empty data directory, and its first start creates the roles (§19.3). The restore
-   runs §19.5's order: the latest manifest stream, the latest backup set (`$JH --profile restore run --rm
+   runs §19.5's order: the manifest stream, the latest backup set (`$JH --profile restore run --rm
    restore jobhunter restore run --set <id>` takes another), `pg_restore`, the `restored` verification, the CV
-   files, `migrate` with its replay, the exports and the `replayed` verification. It refuses a database or a CV
+   files, `migrate` with its replay, the exports and the `replayed` verification. The manifest stream is the
+   union of every `manifests` snapshot, never only the newest: a snapshot restic left incomplete hides no
+   manifest an earlier one holds. A file name two snapshots hold with different bytes stops the restore at
+   its first step (`{"error": "manifest_stream_conflict", "step": "stream"}`; the log line
+   `manifest_stream_conflict` names the file and both snapshots): a manifest file is written once, so this is
+   a damaged repository, and the restore never picks one. Stop there and keep the repository as it is: the
+   two snapshots the log line names hold the two versions. It refuses a database or a CV
    store that is not empty (`database_not_empty`, `cv_store_not_empty`). Its two verification outputs are the
    log lines `restore_verified` with `phase` `restored`, then `replayed`, each with `ok` true and no
    `failures`. Then it prints `{"restored": true, "set_id": <id>, "data_key_ids": [<key id>, …]}`: the key ids
@@ -732,7 +740,8 @@ restores the last backup set when it reports `migrate_schema_ahead_incompatible`
       ```
 
       Then section 9's steps 3 to 5. What was written after that set is lost, except the deletions: their
-      manifests are offsite, and the previous release's restore replays them, as it reads them (below).
+      manifests are offsite, in every `manifests` snapshot the restore reads (section 9), and the previous
+      release's restore replays them, as it reads them (below).
 
 **Rollbacks and the manifest format** (Ruling T31-2). A release whose migration narrows a transition edge of an
 existing table declares its revision destructive (`db/compat.py`): its rollback is a restore, never a redeploy

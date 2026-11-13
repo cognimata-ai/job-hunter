@@ -17,7 +17,10 @@ does (a subfolder the snapshot lacks fails as restic does). `failing` names the 
 `ResticError` instead (e.g. `snapshots` for an unreachable repository); `restores` records each restore.
 `whole_paths` names subfolders whose restore lands under `target` at their whole path, as a restore naming no
 subfolder would (`restic restore <id> --target`): the files one level deeper, or more, than the step expects.
-`stored(snapshot, path)` is where a snapshot holds a backed-up file, for a test to alter it.
+`stored(snapshot, path)` is where a snapshot holds a backed-up file, for a test to alter it. `unreadable`
+names listed files restic cannot read (final review C1): as restic 0.19.1 does on exit 3, `backup` still saves
+the snapshot of the files it could read, with the tags given, then raises `ResticError("backup",
+"incomplete", 3)`.
 """
 
 import shutil
@@ -168,6 +171,7 @@ class FakeRepository(Restic):
         self.root = root
         self.failing = set(failing)
         self.whole_paths: set[str] = set()
+        self.unreadable: set[Path] = set()
         self.infos: list[SnapshotInfo] = []
         self.restores: list[Restored] = []
 
@@ -190,7 +194,8 @@ class FakeRepository(Restic):
         snapshot_id = f"{len(self.infos) + 1:064x}"
         stored = self.root / snapshot_id
         stored.mkdir(parents=True)
-        listed = [Path(name) for name in lines(files_from)] if files_from is not None else []
+        named = [Path(name) for name in lines(files_from)] if files_from is not None else []
+        listed = [file for file in named if file not in self.unreadable]
         for path in paths:
             shutil.copytree(path, self._inside(stored, path))
         for file in listed:
@@ -199,6 +204,8 @@ class FakeRepository(Restic):
         time = self._EPOCH + timedelta(minutes=len(self.infos))
         names = tuple(str(path) for path in [*paths, *listed])
         self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names))
+        if len(listed) < len(named):  # exit 3: the incomplete snapshot is saved all the same
+            raise ResticError("backup", "incomplete", 3)
         return snapshot_id
 
     async def snapshots(self, *, tags: Sequence[str]) -> list[SnapshotInfo]:

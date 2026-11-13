@@ -1,6 +1,16 @@
 """The deletion-manifest shipper of the backup container (spec §19.5 step 5; plan M5 Task 10, R14, Deviation
 30): `jobhunter backup ship`, every 5 minutes in prod and on demand on the dev stack (`$DC run --rm shipper`).
 
+**One shipper at a time** (final review C1): `ship_manifests` holds the shipment lock `SHIP_LOCK_KEY`
+(7261007, a one-key session advisory lock on a dedicated autocommit connection as `jobhunter_backup`,
+`ship_lock`) from its listing of the stream through the upload and its receipt. A second shipper (the
+scheduler's while one runs by hand, say) waits for it, polling every `LOCK_POLL_S` with no snapshot held and
+logging `manifest_ship_waiting` once, then lists the stream itself: it never skips, so a `backup ship` that
+exits 0 shipped, or found shipped, every file there when it started. The snapshots are therefore made in the
+order of the lists they hold, and an older list never becomes the newest snapshot after a newer list's
+receipt. Shipping takes no backup job lock (`backup_set.BACKUP_JOB_LOCK_KEY`): restic's own repository lock
+orders it against a prune.
+
 `ship_manifests` reads the stream: the regular files of `cfg.manifests_dir` named `<manifest_uuid>.json` with
 the uuid in canonical form (`privacy.manifests.manifest_file_name`), never a `*.tmp` being written (its name
 ends in `.json.tmp`), each hashed (sha256). When the stream's `(uuid, sha256)` set equals the items of the
@@ -15,24 +25,28 @@ manifest whose file did not exist yet has no item. The worker's `manifest_shippi
 `shipped` each completed manifest an item names with its file's hash.
 
 A restic failure raises `ResticError` before any row is written. On exit 3 restic has still saved an
-incomplete snapshot tagged `manifests` (the files it could read): no row names it, but until the next run
-restic's newest `manifests` snapshot is that one. The next run ships a complete one, since the stream still
-differs from the latest shipment's items. A file of another name (a stray
+incomplete snapshot tagged `manifests` (the files it could read): no row names it, and until the next run
+restic's newest `manifests` snapshot is that one. A restore therefore reads the union of every `manifests`
+snapshot, never the newest alone (`backup.restore.restore_stream`). The next run ships a complete one, since
+the stream still differs from the latest shipment's items. A file of another name (a stray
 `notes.json`, a directory) is left out: its name is no uuid an item could hold. The log lines carry counts and
 the shipment id only.
 """
 
+import asyncio
 import hashlib
 import os
 import stat
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
+import psycopg
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.backup.restic import Restic
@@ -41,6 +55,9 @@ from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 
 MANIFESTS_TAG: Final = "manifests"
+# The shipment lock (module docstring; the project's advisory keys are listed in `db.migrate`).
+SHIP_LOCK_KEY: Final = 7261007
+LOCK_POLL_S: Final = 0.5
 _SUFFIX: Final = ".json"
 _READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -104,6 +121,36 @@ def _stream(directory: Path) -> list[_StreamFile]:
     return sorted(files)
 
 
+async def _try_ship_lock(conn: psycopg.AsyncConnection[Any]) -> bool:
+    row = await (await conn.execute("SELECT pg_try_advisory_lock(%s::bigint)", (SHIP_LOCK_KEY,))).fetchone()
+    return row is not None and bool(row[0])
+
+
+@asynccontextmanager
+async def ship_lock(cfg: AppConfig) -> AsyncIterator[None]:
+    """`SHIP_LOCK_KEY` held for the block, on a dedicated autocommit connection as `jobhunter_backup`; while
+    another shipper holds it, waited for (module docstring). Released and closed on every path; closing the
+    connection would drop it too."""
+    conn = await psycopg.AsyncConnection.connect(
+        cfg.dsn("psycopg", db_role="backup"), autocommit=True, application_name="jobhunter-backup-ship"
+    )
+    try:
+        waiting = False
+        while not await _try_ship_lock(conn):  # polls the database, so there is no event to wait for
+            if not waiting:
+                log.info("manifest_ship_waiting", lock_key=SHIP_LOCK_KEY)
+                waiting = True
+            await asyncio.sleep(LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            # A lost connection took the lock with it; do not let that hide the error that ended the shipment.
+            with suppress(psycopg.OperationalError):
+                await conn.execute("SELECT pg_advisory_unlock(%s::bigint)", (SHIP_LOCK_KEY,))
+    finally:
+        await conn.close()
+
+
 async def _latest_items(engine: AsyncEngine) -> set[tuple[uuid.UUID, bytes]]:
     async with engine.connect() as conn:
         rows = (await conn.execute(_LATEST_ITEMS)).all()
@@ -137,17 +184,22 @@ async def _backup(cfg: AppConfig, restic: Restic, files: Sequence[_StreamFile]) 
 
 
 async def ship_manifests(cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, now: datetime) -> ShipResult:
-    """Ship the manifest stream unless it is unchanged (module docstring)."""
-    files = _stream(cfg.manifests_dir)
-    current = {(file.manifest_uuid, file.sha256) for file in files}
-    if not files or current == await _latest_items(engine):
-        log.info("manifests_unchanged", files=len(files))
-        return ShipResult(shipped=False, snapshot_id=None, files=len(files))
-    snapshot_id = await _backup(cfg, restic, files)
-    async with engine.begin() as conn:
-        shipment = int((await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": now})).scalar_one())
-        await conn.execute(
-            _ITEM, [{"shipment": shipment, "uuid": file.manifest_uuid, "sha": file.sha256} for file in files]
-        )
+    """Ship the manifest stream unless it is unchanged, under the shipment lock from the listing through the
+    receipt (module docstring)."""
+    async with ship_lock(cfg):
+        files = _stream(cfg.manifests_dir)
+        current = {(file.manifest_uuid, file.sha256) for file in files}
+        if not files or current == await _latest_items(engine):
+            log.info("manifests_unchanged", files=len(files))
+            return ShipResult(shipped=False, snapshot_id=None, files=len(files))
+        snapshot_id = await _backup(cfg, restic, files)
+        async with engine.begin() as conn:
+            shipment = int(
+                (await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": now})).scalar_one()
+            )
+            await conn.execute(
+                _ITEM,
+                [{"shipment": shipment, "uuid": file.manifest_uuid, "sha": file.sha256} for file in files],
+            )
     log.info("manifests_shipped", files=len(files), shipment_id=shipment)
     return ShipResult(shipped=True, snapshot_id=snapshot_id, files=len(files))

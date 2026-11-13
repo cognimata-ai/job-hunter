@@ -8,9 +8,10 @@ backup role, then restores the latest set into a scratch database and directory,
 - `scratch`: as `jobhunter_restore` (on the `postgres` database), a leftover `jobhunter_restore_test` dropped
   and `CREATE DATABASE jobhunter_restore_test TEMPLATE jobhunter_template`; `<staging_dir>/restore_test` made
   fresh with `set/`, `manifests/`, `cv/` and `exports/` (the last empty: a set holds no export archive);
-- `stream`, `set`, `cv`: the latest manifest stream and the latest set into those directories by the same
-  subfolder restores as `restore run` (`backup.restore`), with the same empty-stream rule; the run row names
-  the set (`backup_set_id`);
+- `stream`, `set`, `cv`: the manifest stream (the union of every `manifests` snapshot, through
+  `<staging_dir>/restore_test/stream`, with the same conflict check) and the latest set into those
+  directories by the same subfolder restores as `restore run` (`backup.restore`), with the same empty-stream
+  rule; the run row names the set (`backup_set_id`), and the report the stream's snapshot and manifest counts;
 - `pg_restore` and `verify_restored` against the scratch database as `jobhunter_restore`;
 - `migrate`: `run_migrate_async(cfg, database="jobhunter_restore_test", steps={"sequences", "alembic",
   "replay"}, manifest_dir=…, cv_dir=…, exports_dir=…, db_role="restore")`, in process with the backup role's
@@ -41,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from jobhunter.backup.backup_set import SET_STAGING, BackupJobFailed, backup_job_lock
 from jobhunter.backup.restic import Restic
 from jobhunter.backup.restore import (
+    STREAM_SCRATCH,
     VERIFY_FAILED,
     RestoreFailed,
     RestoreStep,
@@ -136,8 +138,15 @@ async def _steps(
         await _scratch_database(cfg)
         dirs = _scratch_directory(cfg.staging_dir / RESTORE_TEST_STAGING)
     with restore_step("stream"):
-        stream = await restore_stream(restic, subfolder=cfg.manifests_dir, target=dirs["manifests"])
-        report["stream"] = None if stream is None else stream.id
+        stream = await restore_stream(
+            restic,
+            subfolder=cfg.manifests_dir,
+            target=dirs["manifests"],
+            scratch=cfg.staging_dir / RESTORE_TEST_STAGING / STREAM_SCRATCH,
+        )
+        report["stream"] = (
+            None if stream is None else {"snapshots": len(stream.snapshot_ids), "manifests": stream.manifests}
+        )
     with restore_step("set"):
         staged = await restore_set(
             restic, set_id=None, subfolder=cfg.staging_dir / SET_STAGING, target=dirs["set"]
@@ -154,7 +163,7 @@ async def _steps(
     scratch = null_engine(cfg, db_role="restore", database=RESTORE_TEST_DB)
     try:
         with restore_step("verify_restored"):
-            restored = await check_restored(scratch, staged, stream=stream)
+            restored = await check_restored(scratch, staged, empty_stream=stream is None)
             report["restored"] = {"ok": restored.ok, "failures": list(restored.failures)}
             if not restored.ok:
                 raise restored_failure(restored)

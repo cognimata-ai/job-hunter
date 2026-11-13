@@ -19,6 +19,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.backup import restore_test
 from jobhunter.backup.backup_set import run_backup_set
+from jobhunter.backup.restic import ResticError
 from jobhunter.backup.restore_test import RESTORE_TEST_DB, RestoreTestFailed, run_restore_test
 from jobhunter.backup.shipper import ship_manifests
 from jobhunter.clock import utcnow
@@ -142,7 +143,7 @@ async def test_it_runs_as_jobhunter_restore_into_a_template_database_and_drops_i
     pg_rows(migrated, "restore", "CREATE TABLE leftover (x int)", db=RESTORE_TEST_DB)
     manifest = a_manifest()
     write_manifest_file(backup_cfg.manifests_dir, manifest)
-    shipped = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    assert (await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())).shipped
     set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     seen: list[Any] = []
     verify = verify_replayed
@@ -165,7 +166,7 @@ async def test_it_runs_as_jobhunter_restore_into_a_template_database_and_drops_i
     row = await one(engine, _RUN, id=run_id)
     assert (row.kind, row.status, row.error, row.backup_set_id) == ("restore_test", "succeeded", None, set_id)
     assert row.report == {
-        "stream": shipped.snapshot_id,
+        "stream": {"snapshots": 1, "manifests": 1},
         "set_id": set_id,
         "restic_snapshot_id": repo.infos[-1].id,
         "cv_files": 0,
@@ -238,6 +239,41 @@ async def test_a_restore_test_before_any_manifest_succeeds(
         str(backup_cfg.staging_dir / "set"),
         str(backup_cfg.cv_store_dir),
     ]
+
+
+async def test_the_restore_test_reads_every_manifests_snapshot(
+    engine: AsyncEngine,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+) -> None:
+    """Final review C1, M2: the restore test reads the stream as `restore run` does, the union of every
+    `manifests` snapshot. The set predates M1 and M2; one shipment confirms both, then restic exits 3 on the
+    next (M1 unreadable, M3 new), leaving the newest snapshot without M1. The scratch replay inserts and
+    completes all three, and the test succeeds."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2, m3 = a_manifest(), a_manifest(), a_manifest()
+    write_manifest_file(backup_cfg.manifests_dir, m1)
+    write_manifest_file(backup_cfg.manifests_dir, m2)
+    assert (await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())).shipped
+    write_manifest_file(backup_cfg.manifests_dir, m3)
+    repo.unreadable.add(backup_cfg.manifests_dir / f"{m1['manifest_uuid']}.json")
+    with pytest.raises(ResticError):
+        await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+
+    with capture_logs() as logs:
+        run_id = await restore_tested(backup_cfg, repo, runner, backup_engine)
+
+    row = await one(engine, _RUN, id=run_id)
+    assert (row.status, row.report["stream"], row.report["replayed"]) == (
+        "succeeded",
+        {"snapshots": 2, "manifests": 3},
+        {"ok": True, "failures": []},
+    )
+    assert len(events(logs, "replay_admitted")) == 3
+    for manifest in (m1, m2, m3):  # replayed in the scratch database only
+        assert await scalar(engine, _MANIFEST_ROWS, u=manifest["manifest_uuid"]) == 0
 
 
 async def test_the_restore_test_replays_a_submitted_batch_without_worker_credentials(

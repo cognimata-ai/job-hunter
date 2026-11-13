@@ -102,6 +102,8 @@ BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments"
 #   7261005  dead-man switch (one key, session lock; `observability.deadman.DEADMAN_LOCK_KEY`, M5 Task 5)
 #   7261006  backup jobs: a set, a prune or a restore test at a time (one key, session lock;
 #            `backup.backup_set.BACKUP_JOB_LOCK_KEY`, M5 Task 26)
+#   7261007  manifest shipment: one shipper from its listing through its receipt (one key, session lock;
+#            `backup.shipper.SHIP_LOCK_KEY`, final review C1)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 

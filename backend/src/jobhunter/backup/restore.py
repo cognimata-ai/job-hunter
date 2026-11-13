@@ -21,12 +21,22 @@ exits 1):
 - `refuse` (R16): the application database must hold no `alembic_version` and `cv_store` no entry, else
   `database_not_empty` or `cv_store_not_empty`: a restore never runs over data;
 - `stream` (1): `restic snapshots --tag manifests`; a restic failure (an unreachable repository, a wrong
-  password) is `restic_failed`; none is an empty stream (`manifest_stream_empty` logged, nothing restored);
-  else the latest one's `cfg.manifests_dir` restored into `cfg.manifests_dir`. Every restic restore names its
-  subfolder (`Restic.restore(snapshot=, subfolder=, target=)`, the backup container's mount, which is the
-  restore container's too), so its files land at exact paths, which the step checks before going on: the
-  `<uuid>.json` files directly in the directory (`manifest_stream_not_restored` otherwise). The directory is
-  created first, so an empty stream is an existing empty directory (Ruling T25-2 (9));
+  password) is `restic_failed`; none is an empty stream (`manifest_stream_empty` logged, nothing restored).
+  Otherwise the stream is the **union of every `manifests` snapshot** (final review C1, M2), never the newest
+  alone: a snapshot restic saved on exit 3 (incomplete, named by no shipment) or an older list two
+  unserialised shippers uploaded last (before the shipment lock, `shipper.SHIP_LOCK_KEY`) may lack a manifest
+  an earlier snapshot holds, and `manifests` snapshots are never forgotten. Oldest first, each snapshot's
+  `cfg.manifests_dir` is restored into `<scratch>/snapshot` (made fresh) and its `<uuid>.json` files merged
+  into `<scratch>/union`: a file name already there must hold the same bytes (sha256; a manifest file is
+  written once), else `ManifestStreamConflict` (`manifest_stream_conflict`, logged with the file name and both
+  snapshot ids) stops the restore before anything of the stream is restored: it never picks one. Then the
+  union is copied into `cfg.manifests_dir`, and `<scratch>` is removed whatever the outcome. `<scratch>` is
+  `<staging_dir>/restore/stream` here (the restore test's `<staging_dir>/restore_test/stream`). Every restic
+  restore names its subfolder (`Restic.restore(snapshot=, subfolder=, target=)`, the backup container's mount,
+  which is the restore container's too), so its files land at exact paths, which the step checks for each
+  snapshot (no directory where the `<uuid>.json` files land) and for the union (at least one manifest), else
+  `manifest_stream_not_restored`. The directory is created first, so an empty stream is an existing empty
+  directory (Ruling T25-2 (9));
 - `set` (2): the snapshot tagged `set:<id>` (`--set`), else the latest tagged `set` (`backup_set_not_found`
   without one); its `<staging_dir>/set` restored into `<staging_dir>/restore` (made fresh), where
   `jobhunter.dump` and `backup_set.json` must lie (`backup_set_not_restored`); the json must parse
@@ -39,9 +49,9 @@ exits 1):
   then `pg_restore --no-owner --no-acl --exit-on-error -L <list>` as the migrator, its password in the child's
   environment only (`pg_restore_failed` for either's non-zero exit);
 - `verify_restored` (5): `privacy.restore_verify.verify_restored` in one transaction (`verify_failed`), and,
-  with an empty stream, a restored `deletion_manifests` row that is `shipped` stops it with
-  `manifest_stream_missing` (a shipped manifest must be in the stream; `executing` and `completed` rows
-  without files are §19.5's pending retries and rewrites); either rolls the transaction back;
+  with an empty stream (no `manifests` snapshot at all), a restored `deletion_manifests` row that is `shipped`
+  stops it with `manifest_stream_missing` (a shipped manifest must be in the stream; `executing` and
+  `completed` rows without files are §19.5's pending retries and rewrites); either rolls the transaction back;
 - `cv` (6): the set's `cfg.cv_store_dir` restored into `cfg.cv_store_dir`, checked to hold no directory
   (`cv_not_restored`);
 - `migrate` (7): `run_migrate_async(cfg)`, every step as the migrator on the volumes of the configuration
@@ -62,7 +72,8 @@ returns the set restored with its data key ids (`RestoreResult`), which `restore
 
 **`restore_verify`** is `jobhunter restore verify --set <id> --phase restored|replayed [--database <db>]`
 (review M4; `cli_backup` parses and prints): the `restored` phase is step 5's `check_restored` on a set an
-operator staged in `<staging_dir>/restore`, the `replayed` phase step 8.
+operator staged in `<staging_dir>/restore` (the stream empty when the repository holds no `manifests`
+snapshot, as step 1 reads it), the `replayed` phase step 8 on the restored stream, the union.
 
 Log lines carry steps, codes, ids and counts only: no row content, no path of a file's content, no secret.
 """
@@ -111,8 +122,12 @@ _ENTRY: Final = re.compile(r"\d+; \d+ \d+ (?P<what>\S.*)")
 _SUPERUSER_OWNED: Final = re.compile(r"(?:EXTENSION - \S+|COMMENT - EXTENSION \S+|SCHEMA - public)(?: .*)?")
 
 RESTORE_STAGING: Final = "restore"
+# Step 1's scratch directory inside the restore's staging (module docstring).
+STREAM_SCRATCH: Final = "stream"
 LIST_NAME: Final = "restore.list"
+LOGGED_SNAPSHOTS: Final = 20
 MANIFEST_STREAM_MISSING: Final = "manifest_stream_missing"
+MANIFEST_STREAM_CONFLICT: Final = "manifest_stream_conflict"
 VERIFY_FAILED: Final = "verify_failed"
 RESTIC_FAILED: Final = "restic_failed"
 _SET_TAG_PREFIX: Final = f"{SET_TAG}:"
@@ -165,6 +180,20 @@ class RestoreFailed(Exception):
         self.error = error
 
 
+class ManifestStreamConflict(RestoreFailed):
+    """Two `manifests` snapshots hold the file `file_name` with different bytes (module docstring, step 1):
+    the restore stops at its stream step and never picks one. `snapshot_ids` are the first snapshot that held
+    it and the one that differs."""
+
+    def __init__(self, file_name: str, snapshot_ids: tuple[str, str]) -> None:
+        super().__init__("stream", MANIFEST_STREAM_CONFLICT)
+        self.args = (
+            f"stream: {MANIFEST_STREAM_CONFLICT}: {file_name} in snapshots {', '.join(snapshot_ids)}",
+        )
+        self.file_name = file_name
+        self.snapshot_ids = snapshot_ids
+
+
 @contextmanager
 def restore_step(step: RestoreStep) -> Iterator[None]:
     """A step of a restore (module docstring): logged by name; a failure inside is `RestoreFailed(step, code)`
@@ -206,23 +235,83 @@ async def latest_snapshot(restic: Restic, tag: str) -> SnapshotInfo | None:
     return found[-1] if found else None
 
 
-async def restore_stream(restic: Restic, *, subfolder: Path, target: Path) -> SnapshotInfo | None:
-    """Step 1 (module docstring): the latest `manifests` snapshot's `subfolder` restored into `target`, which
-    is created first; that snapshot, or `None` for an empty stream. `RestoreFailed('stream', …)` when the
-    files are not where they must be."""
-    latest = await latest_snapshot(restic, MANIFESTS_TAG)
+@dataclass(frozen=True)
+class RestoredStream:
+    """Step 1's stream (module docstring): the `manifests` snapshots it is the union of, oldest first, and the
+    number of manifest files the union holds."""
+
+    snapshot_ids: tuple[str, ...]
+    manifests: int
+
+
+@dataclass(frozen=True)
+class _Merged:
+    """A file of the union: its bytes' sha256 and the first snapshot that held it."""
+
+    sha256: bytes
+    snapshot_id: str
+
+
+def _merge(landing: Path, union: Path, snapshot_id: str, merged: dict[str, _Merged]) -> None:
+    """One snapshot's files, restored into `landing`, merged into `union` (module docstring, step 1)."""
+    if _holds_a_directory(landing):
+        raise RestoreFailed("stream", "manifest_stream_not_restored")
+    for entry in _entries(landing):
+        if not (entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)):
+            continue
+        data = Path(entry.path).read_bytes()
+        digest = hashlib.sha256(data).digest()
+        known = merged.get(entry.name)
+        if known is None:
+            shutil.copy2(entry.path, union / entry.name)
+            merged[entry.name] = _Merged(digest, snapshot_id)
+        elif known.sha256 != digest:
+            log.error(
+                MANIFEST_STREAM_CONFLICT, file=entry.name, snapshot_ids=[known.snapshot_id, snapshot_id]
+            )
+            raise ManifestStreamConflict(entry.name, (known.snapshot_id, snapshot_id))
+
+
+def _copy_union(union: Path, target: Path) -> None:
+    for entry in _entries(union):
+        shutil.copy2(entry.path, target / entry.name)
+    fsync_directory(target)
+
+
+async def restore_stream(
+    restic: Restic, *, subfolder: Path, target: Path, scratch: Path
+) -> RestoredStream | None:
+    """Step 1 (module docstring): the union of every `manifests` snapshot's `subfolder` restored into
+    `target`, which is created first, through `scratch` (removed whatever the outcome); the stream, or `None`
+    for an empty one. `ManifestStreamConflict` for a file name two snapshots hold with different bytes,
+    `RestoreFailed('stream', 'manifest_stream_not_restored')` when the files are not where they must be."""
+    snapshots = await restic.snapshots(tags=[MANIFESTS_TAG])  # oldest first
     await asyncio.to_thread(target.mkdir, mode=0o700, parents=True, exist_ok=True)
-    if latest is None:
+    if not snapshots:
         log.info("manifest_stream_empty")
         return None
-    await restic.restore(snapshot=latest.id, subfolder=str(subfolder), target=target)
-    manifests = [
-        e.name for e in _entries(target) if e.name.endswith(".json") and e.is_file(follow_symlinks=False)
-    ]
-    if not manifests or _holds_a_directory(target):
-        raise RestoreFailed("stream", "manifest_stream_not_restored")
-    log.info("manifest_stream_restored", snapshot_id=latest.id, manifests=len(manifests))
-    return latest
+    union, landing = scratch / "union", scratch / "snapshot"
+    merged: dict[str, _Merged] = {}
+    try:
+        await asyncio.to_thread(_fresh, scratch)
+        await asyncio.to_thread(union.mkdir, mode=0o700)
+        for snapshot in snapshots:
+            await asyncio.to_thread(_fresh, landing)
+            await restic.restore(snapshot=snapshot.id, subfolder=str(subfolder), target=landing)
+            await asyncio.to_thread(_merge, landing, union, snapshot.id, merged)
+        if not merged:
+            raise RestoreFailed("stream", "manifest_stream_not_restored")
+        await asyncio.to_thread(_copy_union, union, target)
+    finally:
+        await asyncio.to_thread(shutil.rmtree, scratch, ignore_errors=True)
+    ids = tuple(snapshot.id for snapshot in snapshots)
+    log.info(
+        "manifest_stream_restored",
+        snapshots=len(ids),
+        snapshot_ids=list(ids[-LOGGED_SNAPSHOTS:]),
+        manifests=len(merged),
+    )
+    return RestoredStream(ids, len(merged))
 
 
 def _fresh(directory: Path) -> None:
@@ -382,15 +471,13 @@ async def load_dump(
     return len(entries)
 
 
-async def check_restored(
-    engine: AsyncEngine, staged: StagedSet, *, stream: SnapshotInfo | None
-) -> VerifyReport:
-    """Step 5 (module docstring): `verify_restored` and the empty stream's rule, in one transaction that
-    commits only a report that holds."""
+async def check_restored(engine: AsyncEngine, staged: StagedSet, *, empty_stream: bool) -> VerifyReport:
+    """Step 5 (module docstring): `verify_restored` and the empty stream's rule (`empty_stream`: no
+    `manifests` snapshot at all), in one transaction that commits only a report that holds."""
     async with engine.connect() as conn:
         async with conn.begin() as transaction:
             report = await verify_restored(conn, staged.inventory, snapshot_id=staged.snapshot.id)
-            if report.ok and stream is None and (await conn.execute(_SHIPPED)).scalar_one():
+            if report.ok and empty_stream and (await conn.execute(_SHIPPED)).scalar_one():
                 report = VerifyReport(phase="restored", ok=False, failures=[MANIFEST_STREAM_MISSING])
                 log.error(MANIFEST_STREAM_MISSING, set_id=staged.set_id)
             if not report.ok:
@@ -511,7 +598,9 @@ async def _restore(
     with restore_step("refuse"):
         await _refuse_unless_empty(cfg)
     with restore_step("stream"):
-        stream = await restore_stream(restic, subfolder=cfg.manifests_dir, target=cfg.manifests_dir)
+        stream = await restore_stream(
+            restic, subfolder=cfg.manifests_dir, target=cfg.manifests_dir, scratch=staging / STREAM_SCRATCH
+        )
     with restore_step("set"):
         staged = await restore_set(
             restic, set_id=set_id, subfolder=cfg.staging_dir / SET_STAGING, target=staging
@@ -521,7 +610,7 @@ async def _restore(
     engine = null_engine(cfg)
     try:
         with restore_step("verify_restored"):
-            report = await check_restored(engine, staged, stream=stream)
+            report = await check_restored(engine, staged, empty_stream=stream is None)
             if not report.ok:
                 raise restored_failure(report)
     finally:
@@ -540,10 +629,10 @@ async def run_restore(
     set_id: int | None,
     clock: Callable[[], datetime],
 ) -> RestoreResult:
-    """Restore the backup set `set_id` (the latest without one) and the latest manifest stream into the empty
-    application database and volumes of `cfg`, as §19.5 orders it (module docstring); the set restored and
-    its data key ids (review M3: `restore run` prints them). `RestoreFailed` names the step that stopped it;
-    `<staging_dir>/restore` is removed whatever the outcome."""
+    """Restore the backup set `set_id` (the latest without one) and the manifest stream (the union of every
+    `manifests` snapshot) into the empty application database and volumes of `cfg`, as §19.5 orders it (module
+    docstring); the set restored and its data key ids (review M3: `restore run` prints them). `RestoreFailed`
+    names the step that stopped it; `<staging_dir>/restore` is removed whatever the outcome."""
     staging = cfg.staging_dir / RESTORE_STAGING
     log.info("restore_started", set_id=set_id)
     try:
@@ -595,7 +684,7 @@ async def restore_verify(
             if restic is None:
                 raise RestoreFailed("verify_restored", "not_configured")
             staged = await _staged_by_hand(restic, set_id=set_id, directory=cfg.staging_dir / RESTORE_STAGING)
-            stream = await latest_snapshot(restic, MANIFESTS_TAG)
-            return await check_restored(engine, staged, stream=stream)
+            empty_stream = not await restic.snapshots(tags=[MANIFESTS_TAG])
+            return await check_restored(engine, staged, empty_stream=empty_stream)
     finally:
         await engine.dispose()

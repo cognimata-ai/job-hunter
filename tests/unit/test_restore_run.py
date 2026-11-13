@@ -26,7 +26,9 @@ import pytest
 import sqlalchemy as sa
 from jobhunter import cli, cli_backup, crypto
 from jobhunter.backup.backup_set import run_backup_set
+from jobhunter.backup.restic import ResticError
 from jobhunter.backup.restore import (
+    ManifestStreamConflict,
     RestoreFailed,
     RestoreResult,
     complete_restore,
@@ -299,9 +301,10 @@ async def test_each_restore_names_its_subfolder_and_target(
     target: RestoredDatabase,
 ) -> None:
     """Each restic restore names its snapshot's subfolder and its target, so every file lands at its exact
-    path: the stream's `<uuid>.json` directly in the manifests volume, the dump and `backup_set.json` directly
-    in `<staging>/restore`, the CV files directly in `cv_store`. The manifest is replayed, the CV file a row
-    names kept, and the one no row names removed."""
+    path: each `manifests` snapshot's `<uuid>.json` directly in `<staging>/restore/stream/snapshot`, merged
+    from there into the manifests volume (final review C1: the union of every snapshot), the dump and
+    `backup_set.json` directly in `<staging>/restore`, the CV files directly in `cv_store`. The manifest is
+    replayed, the CV file a row names kept, and the one no row names removed."""
     manifest = a_manifest(max_alert=50)
     write_manifest_file(site.manifests, manifest)
     await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
@@ -320,7 +323,7 @@ async def test_each_restore_names_its_subfolder_and_target(
     # Review M3: the set restored and the hex ids of the data keys its ciphertexts name (both CV files').
     assert result == RestoreResult(set_id, set_snapshot, tuple(sorted(crypto.key_id(k).hex() for k in keys)))
     assert repo.restores == [
-        Restored(stream_snapshot, str(site.manifests), site.manifests),
+        Restored(stream_snapshot, str(site.manifests), site.staging / "restore" / "stream" / "snapshot"),
         Restored(set_snapshot, str(site.staging / "set"), site.staging / "restore"),
         Restored(set_snapshot, str(site.cv), site.cv),
     ]
@@ -332,6 +335,119 @@ async def test_each_restore_names_its_subfolder_and_target(
     assert sorted(path.name for path in site.cv.iterdir()) == [named]  # the orphan removed at step 7
     assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
     assert orphan != named
+
+
+# ---- the stream: the union of every `manifests` snapshot (final review C1, M2) -----------------------------
+
+
+def stream_file(site: Site, manifest: ManifestContent) -> Path:
+    return site.manifests / manifest_file_name(manifest["manifest_uuid"])
+
+
+async def older_list_shipped_late(repo: FakeRepository, site: Site, *manifests: ManifestContent) -> str:
+    """A `manifests` snapshot of `manifests`' files alone, made after a complete one: what two shippers left
+    before the shipment lock serialised them (final review C1: shipper A listed the older stream, B shipped
+    the newer one with its receipt, and A's upload came last). No shipment row names it."""
+    listing = site.staging / "older.list"
+    listing.write_text("".join(f"{stream_file(site, m)}\n" for m in manifests), encoding="utf-8")
+    try:
+        return await repo.backup(files_from=listing, tags=["manifests"])
+    finally:
+        listing.unlink()
+
+
+@pytest.mark.parametrize("newest", ["an_older_list_shipped_late", "an_incomplete_snapshot"])
+async def test_a_manifest_only_an_older_snapshot_holds_is_restored_and_replayed(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    newest: str,
+) -> None:
+    """The set predates M1 and M2, which one shipment confirms offsite (its snapshot holds both). A newer
+    `manifests` snapshot then lacks M2: an older list shipped late, or restic's exit 3 (M2 unreadable, M3
+    new), an incomplete snapshot no shipment names. The restore reads the union of every snapshot, whatever
+    the newest holds: M2, newer than the dump and in the older snapshot only, is restored and replayed, and so
+    is M3, which only the incomplete snapshot holds."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2, m3 = a_manifest(max_alert=50), a_manifest(max_alert=51), a_manifest(max_alert=52)
+    for manifest in (m1, m2):
+        write_manifest_file(site.manifests, manifest)
+    confirmed = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    if newest == "an_older_list_shipped_late":
+        expected = [m1, m2]
+        await older_list_shipped_late(repo, site, m1)
+    else:
+        expected = [m1, m2, m3]
+        write_manifest_file(site.manifests, m3)
+        repo.unreadable.add(stream_file(site, m2))
+        with pytest.raises(ResticError):
+            await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    newest_snapshot = repo.infos[-1]
+    assert newest_snapshot.id != confirmed.snapshot_id and "manifests" in newest_snapshot.tags
+    assert str(stream_file(site, m2)) not in newest_snapshot.paths
+    site.lose()
+
+    with capture_logs() as logs:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    names = sorted(manifest_file_name(m["manifest_uuid"]) for m in expected)
+    assert sorted(path.name for path in site.manifests.iterdir()) == names
+    for manifest in expected:
+        assert stream_file(site, manifest).read_bytes() == canonical_bytes(manifest)
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+    [restored] = events(logs, "manifest_stream_restored")
+    assert (restored["snapshots"], restored["manifests"]) == (2, len(expected))
+    assert [(e["phase"], e["ok"]) for e in events(logs, "restore_verified")] == [
+        ("restored", True),
+        ("replayed", True),
+    ]
+
+
+async def test_one_file_name_with_other_bytes_in_two_snapshots_stops_the_restore(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+) -> None:
+    """A manifest file is written once, so two snapshots that hold one file name hold the same bytes. Ones
+    that do not stop the restore at its stream step with `manifest_stream_conflict`, naming the file and both
+    snapshots (logged, and on the error): it never picks one. Nothing of the stream is restored, and nothing
+    is loaded."""
+    manifest = a_manifest(max_alert=50)
+    write_manifest_file(site.manifests, manifest)
+    first = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    other: dict[str, Any] = {**manifest, "max_ids": {"alerts": 51}}
+    stream_file(site, manifest).write_bytes(canonical_bytes(other))  # type: ignore[arg-type]
+    second = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    assert first.snapshot_id is not None and second.snapshot_id is not None
+    site.lose()
+    loads = len(pg_restored(runner))
+
+    with capture_logs() as logs, pytest.raises(ManifestStreamConflict) as failed:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    name = manifest_file_name(manifest["manifest_uuid"])
+    assert (failed.value.step, failed.value.error) == ("stream", "manifest_stream_conflict")
+    assert (failed.value.file_name, failed.value.snapshot_ids) == (
+        name,
+        (first.snapshot_id, second.snapshot_id),
+    )
+    [conflict] = events(logs, "manifest_stream_conflict")
+    assert (conflict["file"], conflict["snapshot_ids"]) == (name, [first.snapshot_id, second.snapshot_id])
+    assert [(e["step"], e["error"]) for e in events(logs, "restore_failed")] == [
+        ("stream", "manifest_stream_conflict")
+    ]
+    assert list(site.manifests.iterdir()) == []
+    assert len(pg_restored(runner)) == loads and not await scalar(target.engine, _REVISION)
+    assert not (site.staging / "restore").exists()
 
 
 # ---- the refusals (review M1) ------------------------------------------------------------------------------

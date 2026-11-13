@@ -9,6 +9,7 @@ snapshot id); the database is the shared server, written as the backup role. The
 (`tests/stack/test_backup_image.py`) ships with the real binary.
 """
 
+import asyncio
 import hashlib
 import uuid
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
+from jobhunter.backup import shipper
 from jobhunter.backup.restic import ResticError
 from jobhunter.backup.shipper import ShipResult, ship_manifests
 from jobhunter.clock import utcnow
@@ -169,6 +171,66 @@ async def test_an_unchanged_stream_ships_nothing(backup_cfg: AppConfig, backup_e
     # changes the stream too.
     (backup_cfg.manifests_dir / f"{second[0]}.json").write_bytes(b"{}")
     assert (await ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=15))).shipped
+
+
+async def test_a_second_shipper_waits_for_the_first_ones_receipt(
+    backup_cfg: AppConfig, backup_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review C1, its probe's order: shipper A lists `{M1}` and pauses at its database read; meanwhile a
+    deletion's M2 is written and shipper B starts. B waits on the shipment lock (7261007) until A's receipt,
+    then lists `{M1, M2}` itself, so the snapshots are made in the streams' order and the newest one holds
+    every manifest: an older list can never become the newest snapshot after a newer one's receipt."""
+    restic = FakeRestic(backup_cfg)
+    m1 = manifest_file(backup_cfg.manifests_dir)
+    paused, resume, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    read_items = shipper._latest_items
+    reads = 0
+
+    async def latest_items(engine: AsyncEngine) -> set[tuple[uuid.UUID, bytes]]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:  # shipper A, after its listing
+            paused.set()
+            await resume.wait()
+        return await read_items(engine)
+
+    class Spy:
+        """The shipper's logger, which also tells the test when a shipper waits for the lock."""
+
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def info(self, event: str, **fields: Any) -> None:
+            if event == "manifest_ship_waiting":
+                waiting.set()
+            self.inner.info(event, **fields)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    monkeypatch.setattr(shipper, "_latest_items", latest_items)
+    monkeypatch.setattr(shipper, "log", Spy(shipper.log))
+    now = utcnow()
+    a = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, now=now))
+    await asyncio.wait_for(paused.wait(), 10)
+    m2 = manifest_file(backup_cfg.manifests_dir)
+    b = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=5)))
+    waits = asyncio.create_task(waiting.wait())
+    # B either waits on the lock or, unserialised, ships at once.
+    await asyncio.wait((b, waits), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    waits.cancel()
+    resume.set()
+    first, second = await asyncio.wait_for(asyncio.gather(a, b), 30)
+
+    path = backup_cfg.manifests_dir
+    assert [sorted(listed) for listed, _ in restic.backups] == [
+        [str(path / f"{m1[0]}.json")],
+        sorted(str(path / f"{u}.json") for u, _ in (m1, m2)),
+    ]
+    assert (first.files, second.files) == (1, 2)
+    latest = (await shipments(backup_engine))[-1]
+    assert latest.restic_snapshot_id == second.snapshot_id
+    assert await items(backup_engine, latest.id) == {m1, m2}
 
 
 async def test_a_restic_failure_writes_no_row(backup_cfg: AppConfig, backup_engine: AsyncEngine) -> None:

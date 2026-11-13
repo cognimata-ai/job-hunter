@@ -13,7 +13,8 @@ The scenarios share one sequence, in this module's order. The fixture is
 B (`PB`) comes up only after `$PT down`, since both projects pin the same subnets, and `$PT down` keeps A's
 volumes while A's data is needed again. At the end, after a failure too, `PT`, `PB` and the stand-in are
 removed with their volumes. One restic repository (`s3:http://s3stub:7070/jobhunter-test/restic`) serves both
-sites, as offsite storage outlives a lost VPS: "the latest manifest stream" is the latest any site shipped.
+sites, as offsite storage outlives a lost VPS: the manifest stream a restore reads is the union of every
+`manifests` snapshot any site shipped.
 
 The sites are driven as a user drives them: through Caddy (`https://localhost:8443`, verified against the
 site's own internal root), and by the CLI in the containers (`jobhunter backup …`, `jobhunter restore run`,
@@ -377,11 +378,11 @@ def test_v22_backup_then_a_later_manifest(stack: None) -> None:
 
 
 def test_c32_vps_loss_after_a_shipped_deletion(stack: None) -> None:
-    """A is lost (`down -v`). B restores the set, taken before the purge, and the latest stream: the manifest
-    files, the dump and the CV files land at their exact paths, both verify phases pass, and the purge's
-    postconditions hold with Adzuna disabled and `sources.purge_fence_at` set among them, re-applied from the
-    stream. B starts; the user logs in, a restored CV decrypts, and the restored export, which the Adzuna
-    manifest names, is `purged` by the replay and answers 410 `gone`."""
+    """A is lost (`down -v`). B restores the set, taken before the purge, and the stream (every `manifests`
+    snapshot): the manifest files, the dump and the CV files land at their exact paths, both verify phases
+    pass, and the purge's postconditions hold with Adzuna disabled and `sources.purge_fence_at` set among
+    them, re-applied from the stream. B starts; the user logs in, a restored CV decrypts, and the restored
+    export, which the Adzuna manifest names, is `purged` by the replay and answers 410 `gone`."""
     down_v(PT)
     printed, found = lose_and_restore(None)
     # Review M3: the set and the data key ids its ciphertexts name (the CV file's), hex ids only, on stdout.
@@ -522,8 +523,8 @@ def test_c39_pending_retry_completes_before_verify(stack: None) -> None:
 
 
 def test_the_monthly_restore_test_succeeds_as_jobhunter_restore(stack: None) -> None:
-    """The restore test in B's backup container: the latest set and stream restored into
-    `jobhunter_restore_test` as `jobhunter_restore`, replayed and verified, and dropped; the run
+    """The restore test in B's backup container: the latest set and the stream (every `manifests` snapshot)
+    restored into `jobhunter_restore_test` as `jobhunter_restore`, replayed and verified, and dropped; the run
     `succeeded`."""
     up(PB, *STACK_SERVICES, build=False)
     run_id = int(backup(PB, "restore-test")["run_id"])
