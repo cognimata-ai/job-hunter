@@ -14,8 +14,13 @@
 // recorded (a failure keeps its screenshot and page snapshot); a local run keeps a failed test's trace, which
 // holds the stack's credentials and never leaves the machine. `npm run e2e:sentinel` checks what CI keeps.
 import { defineConfig } from "@playwright/test";
+import { existsSync } from "node:fs";
 import process from "node:process";
 import { AUTH_STATE } from "./support/paths";
+
+// A dev container's pre-installed Chromium, whose revision need not be the one this Playwright version names
+// (M5 follow-ups, Ruling FU-6); a CI runner installs its own (e2e.yml), and has no such file.
+const DEV_CHROMIUM = "/opt/pw-browsers/chromium";
 
 export default defineConfig({
   testDir: ".",
@@ -29,6 +34,7 @@ export default defineConfig({
     trace: process.env.CI ? "off" : "retain-on-failure",
     screenshot: "only-on-failure",
     locale: "en-GB",
+    launchOptions: existsSync(DEV_CHROMIUM) ? { executablePath: DEV_CHROMIUM } : {},
   },
   reporter: [["list"], ["html", { open: "never", outputFolder: "../playwright-report" }]],
   globalSetup: "./global-setup.ts",
