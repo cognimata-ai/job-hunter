@@ -398,16 +398,17 @@ async def test_the_fast_path_pings_a_lower_pending_run_first(
 async def test_the_fast_path_and_the_tick_together_ping_each_run_once(
     engine: AsyncEngine, pinger: DeadmanPinger, hc: FakeCheck
 ) -> None:
-    """M7 (a): `after_run` and `ping_pending` at once take turns on the lock: each run is pinged once, in
-    order, and the watermark ends at the newest."""
+    """M7 (a): `after_run` and `ping_pending` at once take turns on the lock, run by run (final review M1:
+    each send holds it alone, reading the watermark again): each run is pinged once, in order, by whichever
+    pass reached it first, and the watermark ends at the newest."""
     failed = await scheduled_run(engine, slot=SLOT)
     assert await runs.execute_run(engine, raising_graph(), failed, 1, epoch=1) == "started"
     succeeded = await admitted(engine, await scheduled_run(engine, slot=SLOT + SIX_HOURS))
     assert await finalized(engine, succeeded, None) == "succeeded"
 
-    handled = await asyncio.gather(pinger.after_run(succeeded.run_id), pinger.ping_pending())
+    _, by_the_tick = await asyncio.gather(pinger.after_run(succeeded.run_id), pinger.ping_pending())
     assert hc.pings == ["fail", "success"]
-    assert handled[1] in (0, 2)  # the tick pinged both, or found nothing left
+    assert by_the_tick in (0, 1, 2)  # the fast path's runs are the rest: none is pinged twice
     assert await watermark(engine) == succeeded.run_id
 
 

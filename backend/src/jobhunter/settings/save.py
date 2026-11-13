@@ -50,7 +50,11 @@ r2 B7).
      lowering `change_cap` recorded earlier at its own time. The other budget fields live in the settings
      only, so a save of them leaves the row;
    - `schedule`: `schedule_state` reset in one statement (§3.4): the anchor on the save date, the interval,
-     `enabled`, the cursor at the latest slot at or before `now`, and the version;
+     `enabled`, the cursor at the latest slot at or before `now`, and the version. A save that leaves the
+     schedule disabled first takes the dead-man lock (`observability.deadman.DEADMAN_LOCK_KEY`) as a
+     transaction lock (final review M1): it waits for a dead-man ping on its way, and every send after it
+     reads the schedule again under that lock once this transaction has committed, so no ping is sent after a
+     disable commits;
    - `collection`: the instance of every `watchlist[]` board (`instance_for_company`), then the cells of the
      new version (`ensure_cells`; new cells start never covered);
    - `admission`: the flip and, when `scope.max_ad_age_days` changed, the expiry sweep of the active tuple in
@@ -107,6 +111,7 @@ from jobhunter.errors import Refusal, RefusalField
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
+from jobhunter.observability.deadman import DEADMAN_LOCK_KEY
 from jobhunter.quota.cells import ensure_cells
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import targets
@@ -130,6 +135,8 @@ _LOCK_ACTIVE: Final = q(
     "SELECT settings_version_id, profile_version_id, llm_tuple_id FROM active_config WHERE id = 1 FOR UPDATE"
 )
 _VERSION: Final = q("SELECT payload, acknowledged_warnings FROM settings_versions WHERE id = :id")
+# The dead-man lock as a transaction lock, held until the save commits (module docstring, `schedule`).
+_DEADMAN_LOCK: Final = q("SELECT pg_advisory_xact_lock(CAST(:key AS bigint))")
 _INSERT_VERSION: Final = q(
     "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
     "execution_config_id, evaluation_policy_id, base_version_id, effect_classes, acknowledged_warnings, "
@@ -359,6 +366,8 @@ async def reset_schedule(
 
 
 async def _apply_schedule(a: _Activation) -> None:
+    if not a.proposed.schedule.enabled:  # a disable: between two dead-man sends, never during one
+        await a.conn.execute(_DEADMAN_LOCK, {"key": DEADMAN_LOCK_KEY})
     await reset_schedule(a.conn, a.proposed, version_id=a.version_id, now=a.now)
 
 

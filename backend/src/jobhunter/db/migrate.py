@@ -101,7 +101,9 @@ BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments"
 #   7261003  migrate (one key, session lock)
 #   7261004  duplicate grouping's company lock: the two-key form `(7261004, hashtext(company_key))`, a
 #            transaction lock (`dedup.groups.COMPANY_LOCK_NAMESPACE`, plan Deviation 46)
-#   7261005  dead-man switch (one key, session lock; `observability.deadman.DEADMAN_LOCK_KEY`, M5 Task 5)
+#   7261005  dead-man switch (one key, session lock; `observability.deadman.DEADMAN_LOCK_KEY`, M5 Task 5); a
+#            settings save that disables the schedule takes it as a transaction lock, so the disable commits
+#            between two pings (final review M1)
 #   7261006  backup jobs: a set, a prune or a restore test at a time (one key, session lock;
 #            `backup.backup_set.BACKUP_JOB_LOCK_KEY`, M5 Task 26)
 #   7261007  manifest shipment: one shipper from its listing through its receipt (one key, session lock;

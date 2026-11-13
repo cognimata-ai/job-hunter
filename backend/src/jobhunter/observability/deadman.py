@@ -26,12 +26,18 @@ URL; no log line names the URL, the uuid or the key.
 every sync action runs holding it, on a dedicated autocommit connection of an engine without a pool, so no
 transaction is open during an HTTP call and the lock ends with that connection whatever happens. Every
 database write made under it is a short transaction of its own, which starts with the worker's epoch fence
-(`fence_epoch`) when the pinger has an epoch.
+(`fence_epoch`) when the pinger has an epoch. A settings save that disables the schedule takes the same key,
+as a transaction lock held until its commit (`settings.save`, final review M1): it waits for a ping on its
+way, and the ping after it waits for its commit.
 
-**The pings** (`DeadmanPinger`). Under the lock a ping first reads `schedule_state.enabled`,
-`deadman_state.applied_paused` and the watermark `deadman_state.last_pinged_run_id`: a disabled schedule or a
-paused check sends no ping, and the watermark still moves past the run, so a run that ends after the schedule
-was disabled can never resume a check the sync paused (Deviation 9). The watermark moves only past a run of
+**The pings** (`DeadmanPinger`). A pass takes the lock once per run (final review M1), never across its
+whole list: under it, each send first reads `schedule_state.enabled`, `deadman_state.applied_paused` and the
+watermark `deadman_state.last_pinged_run_id` again, then pings the lowest run of `runs_to_ping` above the
+watermark (one another pass already took is skipped, so the pings keep their order) and moves the watermark
+past it, and releases the lock. A disabled schedule or a paused check sends no ping, and the watermark still
+moves past the run, so a run that ends after the schedule was disabled can never resume a check the sync
+paused (Deviation 9); and since a disable commits only between two sends, no ping is sent after it commits,
+not even the rest of a pass that began before it. The watermark moves only past a run of
 `runs_to_ping` (`GREATEST`: never back), and moves whether or not healthchecks took the ping (the switch
 alarms on the missing one).
 - `after_run(run_id)`, the fast path, runs after the run-ending commit (never inside it) in
@@ -477,17 +483,21 @@ class DeadmanPinger:
 
     async def _ping_up_to(self, last_run_id: int | None) -> int:
         """Every run of `runs_to_ping` above the watermark, up to `last_run_id` (`None`: all), pinged and
-        passed in id order under the lock; how many."""
-        async with self._locked():
-            pending, may_ping = await self._pending()
-            due = [run for run in pending if last_run_id is None or run.run_id <= last_run_id]
-            for run in due:
-                await self._ping(run, may_ping=may_ping)
-        return len(due)
+        passed in id order, one run per hold of the lock, with the schedule, the pause and the watermark read
+        again for each (module docstring); how many this pass handled."""
+        handled = 0
+        while True:
+            async with self._locked():
+                pending, may_ping = await self._pending()
+                due = [run for run in pending if last_run_id is None or run.run_id <= last_run_id]
+                if not due:
+                    return handled
+                await self._ping(due[0], may_ping=may_ping)
+            handled += 1
 
     async def ping_pending(self) -> int:
         """The durable path: every run of `runs_to_ping` above the watermark pinged and passed, in id order,
-        under the lock; how many."""
+        each under the lock; how many."""
         return await self._ping_up_to(None)
 
     async def after_run(self, run_id: int) -> None:

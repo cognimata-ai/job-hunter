@@ -14,6 +14,7 @@ respx serves healthchecks (`tests.support.healthchecks`; no network); the jobs r
 worker of `aux`; the sync's clock is injected. Every setting and run is invented.
 """
 
+import asyncio
 import copy
 import dataclasses
 import time
@@ -53,6 +54,8 @@ from tests.support.deadman import (
 )
 from tests.support.fixtures import ConfigFactory
 from tests.support.healthchecks import API_KEY, API_URL, PING_URL, FakeCheck, fake_healthchecks
+from tests.support.pg import PgServer, blocked_or_done
+from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
 
@@ -244,6 +247,56 @@ async def test_a_run_finishing_after_the_schedule_was_disabled_does_not_resume_t
     await synced(engine, queue_app, pinger, monkeypatch, now=clock.now)
     assert (hc.status, hc.pauses, hc.pings) == ("paused", 2, ["success"])
     assert (await deadman_state(engine)).last_pinged_run_id == later.run_id
+
+
+class FirstPingHeld(HealthchecksClient):
+    """The stand-in's client whose first ping waits for `release` once it has begun (`sending`)."""
+
+    def __init__(self, http: httpx.AsyncClient) -> None:
+        super().__init__(http, ping_url=PING_URL, api_url=API_URL, api_key=API_KEY, sleep=no_wait)
+        self.sending, self.release = asyncio.Event(), asyncio.Event()
+        self.begun = 0
+
+    async def ping(self, kind: deadman.PingKind) -> bool:
+        self.begun += 1
+        if self.begun == 1:
+            self.sending.set()
+            await self.release.wait()
+        return await super().ping(kind)
+
+
+async def test_a_disable_during_a_two_run_pass_withholds_the_second_ping(
+    engine: AsyncEngine, migrated: PgServer, current_epoch: int, hc: FakeCheck, clock: Clock
+) -> None:
+    """Final review M1: two ended runs wait for their pings, and the tick's pass sends the first. While it is
+    on its way the user disables the schedule: the save takes the dead-man lock (7261005) the pass holds
+    around each send, so it waits for that ping and commits before the next; the next send reads the schedule
+    again under the lock and is withheld. No ping is sent after the disable commits, and the watermark moves
+    past both runs."""
+    deps = make_deps(engine, lambda instance: pytest.fail("no adapter"))  # no pinger: no fast path
+    ended = []
+    for slot in (T0, T0 + timedelta(hours=6)):
+        owner = await admitted(engine, await scheduled_run(engine, slot=slot))
+        assert (
+            await finalize_from_graph(deps, owner, initial_state(owner.run_id, owner.attempt_no))
+            == "succeeded"
+        )
+        ended.append(owner.run_id)
+    async with deadman.make_http_client(user_agent="JobHunter/test") as http:
+        client = FirstPingHeld(http)
+        pinger = DeadmanPinger(engine, client, epoch=current_epoch, clock=clock)
+        passing = asyncio.create_task(pinger.ping_pending())
+        await asyncio.wait_for(client.sending.wait(), 10)
+        disabling = asyncio.create_task(save_schedule(engine, enabled=False))
+        await await_until(lambda: blocked_or_done(migrated, disabling), 10)  # the save waits on the lock
+        client.release.set()
+        await asyncio.wait_for(asyncio.gather(passing, disabling), 30)
+
+    assert passing.result() == 2
+    assert hc.pings == ["success"]  # the first only: the second came after the disable committed
+    assert (await deadman_state(engine)).last_pinged_run_id == ended[1]
+    async with engine.connect() as conn:
+        assert await deadman.read_schedule(conn) == (SEEDED_INTERVAL_S, False)
 
 
 async def test_an_api_failure_raises_update_failed_and_backs_off_5_to_60(
