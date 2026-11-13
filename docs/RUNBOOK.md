@@ -577,10 +577,7 @@ above before any other database role's rotation, whose one-off connects with tha
 **The restic password** (`restic_password`; §19.5). restic encrypts the repository with a master key that each
 of its keys wraps, one per password, so the rotation adds a key for the new password and removes the old
 password's key: every backup set stays as it is and opens with the new password only. Put the new password
-into the offline recovery kit first, beside the old one (section 8). Run it outside the backup jobs' times
-(the nightly set from 01:15, the Sunday prune from 02:30, the monthly restore test from 03:30, section 8): a
-restic call of the running backup container between the old key's removal and its restart fails
-(`wrong_password`; a ship that does is repeated by the next, within 5 minutes).
+into the offline recovery kit first, beside the old one (section 8).
 
 ```
 umask 077
@@ -589,16 +586,33 @@ sudo scripts/rotate-restic-password.sh --dry-run <new file>
 sudo scripts/rotate-restic-password.sh <new file>
 ```
 
-In a one-off backup container, which reads the new password from its stdin, it adds a key for it
-(`restic key add`), checks that the new password opens the repository through that key, removes the old
-password's key (`restic key remove`) and checks that the old password opens nothing any more; then it installs
-`<new file>` as `restic_password` and restarts backup. Every restic call waits for a running job's repository
-lock, as the jobs' calls do. Its last line is `rotate-restic-password: done: …`. Then delete `<new file>`, and
-remove the old password from the kit: it opens nothing any more. If it stops with an error, the line before
-says where; run it again: it adds no second key, and when the old key is gone already it only installs and
-restarts. The bucket's versioning keeps the removed key as a noncurrent version for its 30 days (section 1):
-until then, someone holding both the old password and the bucket's keys could still open the repository, so a
-rotation because the password may have leaked rotates the S3 keys too (the table above).
+In this order (Ruling FU-10): a one-off backup container, which reads the new password from its stdin, adds a
+key for it (`restic key add`) and checks that the new password opens the repository through that key, and
+names the old password's key (`the old key is <id>`); the script installs `<new file>` as `restic_password`
+and restarts backup (during a backup job the restart waits up to 10 minutes, section 8); then a second one-off,
+which mounts the new password, removes the old key (`restic key remove`) and checks that it is gone. So the
+backup service's restic calls always use a password whose key is there, whenever it runs. Every restic call
+waits for a running job's repository lock, as the jobs' calls do. Its last line is
+`rotate-restic-password: done: …`. Then delete `<new file>`, and remove the old password from the kit: it
+opens nothing any more.
+
+If it stops before the install (`… is unchanged and nothing was restarted`), run it again: it adds no second
+key. If the restart fails, it says so: `$JH restart backup`, then remove the old key by hand. If the removal
+fails, it exits 1 naming the old key's id (`… the old key <id> is still in the repository …`): the new
+password is installed and backup restarted, and the old password still opens the repository. Once the cause
+is fixed (the line before it says how restic exited), remove that key by hand, as the new password, with the
+id the script named:
+
+```
+$JH run --rm --no-deps -T backup sh -c 'AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id) AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key) restic key remove --no-cache --retry-lock 30m --password-file /run/secrets/restic_password <old key id>'
+```
+
+It prints `removed key <old key id>`; the same command with `restic key list` in place of `restic key remove
+<old key id>` lists the keys left, the one the new password opens marked `current`. A run of the script again
+after its install stops with `the new password is the installed one`, naming the repository's other keys:
+remove the old one the same way. The bucket's versioning keeps a removed key as a noncurrent version for its
+30 days (section 1): until then, someone holding both the old password and the bucket's keys could still open
+the repository, so a rotation because the password may have leaked rotates the S3 keys too (the table above).
 
 ## 8. Backups and the offline recovery kit
 

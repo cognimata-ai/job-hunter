@@ -572,8 +572,8 @@ BOOTSTRAP_LOGIN: Final = (
     'exec psql -X -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "SELECT 1"'
 )
 # The repository's keys as a one-off backup container sees them with the password on its stdin (written to a
-# file on its /dev/shm): `{"opens": true, "keys": <how many>}`, or `{"opens": false, "exit": <restic's exit>}`
-# (12: no key opens with it). Only counts are printed.
+# file on its /dev/shm): `{"opens": true, "keys": <how many>, "current": <the id of the key it opens>}`, or
+# `{"opens": false, "exit": <restic's exit>}` (12: no key opens with it). Counts and key ids only.
 RESTIC_KEYS: Final = """
 set -eu
 umask 077
@@ -584,32 +584,71 @@ AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id)
 AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key)
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 if restic key list --json --no-cache --password-file "$pw" > "$pw.keys" 2>/dev/null; then
-    python -I -c 'import json, sys; print(json.dumps({"opens": True, "keys": len(json.load(sys.stdin))}))' \\
-        < "$pw.keys"
+    python -I -c 'import json, sys; keys = json.load(sys.stdin); print(json.dumps({"opens": True,
+        "keys": len(keys), "current": next(k["id"] for k in keys if k["current"])}))' < "$pw.keys"
 else
     echo "{\\"opens\\": false, \\"exit\\": $?}"
 fi
 """
 
 
+# A key added for the password on the one-off's stdin, opened with the installed restic_password: a third key
+# of the case's own, which it removes by the RUNBOOK's command for a removal by hand.
+RESTIC_ADD_KEY: Final = """
+set -eu
+umask 077
+pw=$(mktemp -p /dev/shm)
+trap 'rm -f "$pw"' EXIT
+cat > "$pw"
+AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id)
+AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key)
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+restic key add --no-cache --password-file /run/secrets/restic_password --new-password-file "$pw" > /dev/null
+"""
+# RUNBOOK section 7's removal by hand of a key the script left, by its id.
+RUNBOOK: Final = REPO / "docs/RUNBOOK.md"
+KEY_PLACEHOLDER: Final = "<old key id>"
+
+
 def bootstrap_login(*where: str) -> subprocess.CompletedProcess[str]:
     return run([*PT, *where, "-T", "postgres", "sh", "-c", BOOTSTRAP_LOGIN], check=False)
 
 
-def restic_keys(password: Path) -> Any:
-    """What `RESTIC_KEYS` reports for the password in the scratch file `password`, which reaches the one-off
-    on its stdin: this process never reads it."""
+def with_password(script: str, password: Path) -> str:
+    """`script` in a one-off backup container with the password in the scratch file `password` on its stdin
+    (this process never reads it); what it printed."""
     with password.open("rb") as stdin:
         done = subprocess.run(
-            [*PT, "run", "--rm", "--no-deps", "-T", "backup", "sh", "-c", RESTIC_KEYS],
+            [*PT, "run", "--rm", "--no-deps", "-T", "backup", "sh", "-c", script],
             stdin=stdin,
             capture_output=True,
             timeout=300,
             check=False,
         )
     if done.returncode != 0:
-        pytest.fail(f"the restic key listing exited {done.returncode}:\n{done.stderr.decode()}")
-    return last_json(done.stdout.decode())
+        pytest.fail(f"the restic one-off exited {done.returncode}:\n{done.stderr.decode()}")
+    return done.stdout.decode()
+
+
+def restic_keys(password: Path) -> Any:
+    """What `RESTIC_KEYS` reports for the password in the scratch file `password`."""
+    return last_json(with_password(RESTIC_KEYS, password))
+
+
+def opens(password: Path) -> tuple[bool, int]:
+    """Whether the password opens the repository, and how many keys it lists then (else restic's exit)."""
+    found = restic_keys(password)
+    return found["opens"], found["keys"] if found["opens"] else found["exit"]
+
+
+def removal_by_hand() -> str:
+    """The RUNBOOK's command (section 7) that removes a key the script left, as it stands there."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    [line] = [
+        line for line in text.splitlines() if line.startswith("$JH run") and "restic key remove" in line
+    ]
+    assert line.startswith("$JH run --rm --no-deps -T backup sh -c ") and KEY_PLACEHOLDER in line
+    return line
 
 
 def test_operational_commands(rotation_stack: Scratch) -> None:
@@ -619,8 +658,11 @@ def test_operational_commands(rotation_stack: Scratch) -> None:
       stays healthy);
     - (c) `pg_bootstrap` rotated by `scripts/rotate-db-role.sh`: the bootstrap role takes the new password,
       the running postgres's old mount no longer logs in, nothing restarts;
-    - (c) `restic_password` rotated by `scripts/rotate-restic-password.sh`: the repository opens with the new
-      password through one key and with the old one no more, only backup restarts, and a new backup set works;
+    - (c) `restic_password` rotated by `scripts/rotate-restic-password.sh` in Ruling FU-10's order (the key
+      added and checked, the file installed, backup restarted, then the old key removed): the repository opens
+      with the new password and with the old one no more, only backup restarts, and a new backup set works; a
+      third key of the case's own, which the rotation leaves, is then removed by the RUNBOOK's command for a
+      removal by hand;
     - a restore of the set from before both rotations, into PB, whose postgres starts from the rotated
       `pg_bootstrap`, and whose restore reads the repository with the rotated `restic_password`."""
     scratch = rotation_stack
@@ -668,24 +710,38 @@ def test_operational_commands(rotation_stack: Scratch) -> None:
         bootstrap_login("run", "--rm", "--no-deps").stdout.strip() == "1"
     )  # the installed file: the new one
 
-    # (c) restic_password: a key for the new password, the old one's removed; backup restarts.
-    new_restic = scratch.key()
-    assert restic_keys(old_restic) == {"opens": True, "keys": 1}
-    assert restic_keys(new_restic) == {"opens": False, "exit": 12}
+    # (c) restic_password: a key for the new password, the file, the restart, then the old key's removal.
+    new_restic, third = scratch.key(), scratch.key()
+    with_password(RESTIC_ADD_KEY, third)  # a key the rotation does not touch
+    old_id = restic_keys(old_restic)["current"]
+    third_id = restic_keys(third)["current"]
+    assert opens(old_restic) == (True, 2) and opens(new_restic) == (False, 12)
     running = started()
     done = as_root(ROTATE_RESTIC, "--compose", shlex.join(PT), "--secrets-dir", SECRETS, str(new_restic))
-    print("rotate-restic-password:", done.stdout)
-    assert done.stdout.splitlines()[-1] == (
-        "rotate-restic-password: done: the repository opens with the new password only; installed "
-        "restic_password and restarted backup"
+    print("rotate-restic-password:", done.stdout, done.stderr)
+    lines = done.stdout.splitlines()
+    install_at = next(i for i, line in enumerate(lines) if line.startswith("install "))
+    restart_at = next(i for i, line in enumerate(lines) if line.endswith(" restart backup"))
+    remove_at = next(i for i, line in enumerate(lines) if line.endswith(f" rotate-restic-password {old_id}"))
+    assert f"rotate-restic-password: the old key is {old_id}" in lines[:install_at]
+    assert install_at < restart_at < remove_at
+    assert lines[-1] == (
+        f"rotate-restic-password: done: installed restic_password, restarted backup and removed the old key "
+        f"{old_id[:8]}; the repository opens with the new password only"
     )
     after = started()
     moved = {key for key in running if after.get(key) != running[key]}
     assert {(project, service) for project, service, _ in moved} == {(PT_PROJECT, "backup")}
     assert after.keys() == running.keys()
-    assert restic_keys(old_restic) == {"opens": False, "exit": 12}
-    assert restic_keys(new_restic) == {"opens": True, "keys": 1}
+    assert opens(old_restic) == (False, 12)
+    assert opens(new_restic) == (True, 2) and restic_keys(new_restic)["current"] not in (old_id, third_id)
     assert int(backup(PT, "set")["set_id"]) > before  # the restarted backup's new mount
+
+    # The RUNBOOK's removal by hand of a key the script left (here the case's third), as the new password.
+    by_hand = removal_by_hand().replace(KEY_PLACEHOLDER, third_id)
+    removed = run(["bash", "-c", f"JH={shlex.quote(shlex.join(PT))}; {by_hand}"], timeout=300)
+    assert f"removed key {third_id}" in removed.stdout
+    assert opens(third) == (False, 12) and opens(new_restic) == (True, 1)
 
     # Site A lost: the set from before both rotations restored into B with the rotated secrets.
     down_v(PT)

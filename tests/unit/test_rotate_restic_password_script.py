@@ -1,19 +1,24 @@
 """`scripts/rotate-restic-password.sh`, the restic repository password's rotation (spec §19.8 "Secret
-rotation"; M5 follow-ups Task F4 (c)).
+rotation"; M5 follow-ups Task F4 (c), Ruling FU-10).
 
-Every case of the script itself is a `--dry-run`: a real run installs into the host's secrets directory as
-root and changes the keys of a repository, which no unit test touches (the rotation stack case on the compose
-test stack runs it, `tests/stack/test_prod_drills.py`). A dry run checks its arguments and the new file, then
-prints each command it would run, executing none: shims stand first on PATH for every command that would
-change something, and record any call. The new file holds a planted dummy value, which must never appear in
-what the script prints.
+Its order: (1) a key added for the new password and (2) checked, in a one-off backup container that mounts the
+installed (old) password and reads the new one from its stdin; (3) the new file installed; (4) backup
+restarted; (5) the old key removed, in a second one-off that mounts the new password. So no restic call of the
+running backup service ever meets a removed password, and a removal that fails leaves the old key, which the
+script names by its id.
 
-The one-off backup container's script (the `sh -c` text the dry run prints) is then run here against a fake
-`restic` that keeps a repository's keys in a directory (`FAKE_RESTIC`, below: restic 0.19.1's `key list
---json` fields `current` and `id`, exit 12 for a password that opens no key, and its refusal to remove the
-key in use), with its `/run/secrets` and `/dev/shm` temporary directories and the new password on its stdin,
-as the script redirects the new file there. Each restic call names its password file by a flag, so neither
-password reaches a command line or an environment; the S3 keys reach restic's environment only.
+A `--dry-run` checks its arguments and the new file, then prints each command it would run, executing none:
+shims stand first on PATH for every command that would change something, and record any call. The new file
+holds a planted dummy value, which must never appear in what the script prints.
+
+The two one-off scripts (the `sh -c` texts the dry run prints) are run here against a fake `restic` that keeps
+a repository's keys in a directory (`FAKE_RESTIC`, below: restic 0.19.1's `key list --json` fields `current`
+and `id`, exit 12 for a password that opens no key, and its refusal to remove the key in use), with their
+`/run/secrets` and `/dev/shm` temporary directories. Each restic call names its password file by a flag, so no
+password reaches a command line or an environment; the S3 keys reach restic's environment only. The whole
+script is then run, not as a dry run, with a fake `docker` that runs each one-off's script here in the same
+way and records the restart, a fake `install` that copies, and a fake `id`: it shows the five steps in their
+order, and what a removal that fails leaves and says.
 """
 
 import json
@@ -35,6 +40,7 @@ NEW: Final = "planted-new-restic-password-of-the-dry-run"
 OLD: Final = "planted-old-restic-password-of-the-dry-run"
 S3_KEY_ID: Final = "planted-s3-key-id"
 S3_SECRET: Final = "planted-s3-secret-access-key"
+SECRET_VALUES: Final = (NEW, OLD, S3_KEY_ID, S3_SECRET)
 PROD_COMPOSE: Final = shlex.split(
     "docker compose -p jobhunter --env-file deploy/images.lock --env-file deploy/release.lock "
     "--env-file /etc/jobhunter/jobhunter.env -f deploy/compose.yaml"
@@ -43,9 +49,13 @@ PROD_SECRETS: Final = "/etc/jobhunter/secrets"
 CHANGES: Final = ("install", "docker", "restic", "sudo", "chown", "chmod", "rm", "mv", "cp", "tee")
 NOTE: Final = "rotate-restic-password: "
 ONE_OFF: Final = ["run", "--rm", "--no-deps", "-T", "backup", "sh", "-c"]
+NAME: Final = "rotate-restic-password"
+NO_KEY_YET: Final = "<old-key-id>"  # the dry run's stand-in for the old key's id
+OLD_ID: Final = f"{1:064x}"  # the fake repository's first key
 
 # A restic that keeps a repository's keys as files `<FAKE_REPO>/<id>` holding their passwords, and records
 # each call (its arguments, and whether the S3 keys and the repository reached its environment) in FAKE_LOG.
+# FAKE_ADDED stores another password for an added key; FAKE_REMOVE_FAILS makes `key remove` fail.
 FAKE_RESTIC: Final = f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
@@ -54,12 +64,14 @@ args = sys.argv[1:]
 repo, log = Path(os.environ["FAKE_REPO"]), Path(os.environ["FAKE_LOG"])
 s3 = (os.environ.get("AWS_ACCESS_KEY_ID"), os.environ.get("AWS_SECRET_ACCESS_KEY")) == ({S3_KEY_ID!r},
     {S3_SECRET!r})
-with log.open("a") as out:
-    out.write(json.dumps({{"argv": args, "s3": s3, "repository": os.environ.get("RESTIC_REPOSITORY"),
-                          "password_env": "RESTIC_PASSWORD" in os.environ}}) + "\\n")
 
 def value(flag):
     return Path(args[args.index(flag) + 1]).read_text().strip()
+
+with log.open("a") as out:
+    out.write(json.dumps({{"argv": args, "s3": s3, "repository": os.environ.get("RESTIC_REPOSITORY"),
+                          "password_env": "RESTIC_PASSWORD" in os.environ,
+                          "password": value("--password-file")}}) + "\\n")
 
 def opened():
     password = value("--password-file")
@@ -76,13 +88,40 @@ elif args[:2] == ["key", "add"]:
     key.write_text(os.environ.get("FAKE_ADDED", value("--new-password-file")))
     print("saved new key with ID", key.name)
 elif args[:2] == ["key", "remove"]:
-    if args[-1] == current:
+    if args[-1] == current or os.environ.get("FAKE_REMOVE_FAILS"):
         print("Fatal: refusing to remove key currently used to access repository", file=sys.stderr)
         sys.exit(1)
     (repo / args[-1]).unlink()
     print("removed key", args[-1])
 else:
     sys.exit(1)
+"""
+
+# A docker whose `compose … run … sh -c <script> <name> <args>` runs the one-off's script here, its
+# `/run/secrets` the secrets directory the script installs into and its `/dev/shm` a temporary directory, with
+# the caller's stdin; `compose … restart …` exits FAKE_RESTART_EXIT (0 by default). Each call is recorded in
+# FAKE_CALLS after the compose prefix.
+FAKE_DOCKER: Final = f"""#!{sys.executable}
+import os, subprocess, sys
+
+args = sys.argv[1:]
+calls = os.environ["FAKE_CALLS"]
+if "run" in args:
+    at = args.index("sh")
+    script, rest = args[at + 2], args[at + 3 :]
+    with open(calls, "a") as out:
+        out.write(" ".join(["run", *rest]) + "\\n")
+    script = script.replace("/run/secrets", os.environ["FAKE_SECRETS"])
+    script = script.replace("/dev/shm", os.environ["FAKE_SHM"])
+    sys.exit(subprocess.run(["/bin/sh", "-c", script, *rest]).returncode)
+with open(calls, "a") as out:
+    out.write(" ".join(args[args.index("restart") :]) + "\\n")
+sys.exit(int(os.environ.get("FAKE_RESTART_EXIT", "0")))
+"""
+FAKE_INSTALL: Final = """#!/bin/sh
+for arg; do source=$target; target=$arg; done
+echo "install $target" >> "$FAKE_CALLS"
+cp "$source" "$target"
 """
 
 
@@ -104,6 +143,16 @@ class DryRun:
 
     def compose_commands(self, compose: list[str]) -> list[list[str]]:
         return [command[len(compose) :] for command in self.commands if command[: len(compose)] == compose]
+
+    def one_offs(self) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
+        """The two one-offs' scripts and arguments: the key's addition and check, then its removal."""
+        found = [
+            (tail[len(ONE_OFF)], tail[len(ONE_OFF) + 1 :])
+            for tail in self.compose_commands(PROD_COMPOSE)
+            if tail[: len(ONE_OFF)] == ONE_OFF
+        ]
+        add, remove = found
+        return add, remove
 
 
 def split(line: str) -> list[str]:
@@ -138,54 +187,96 @@ def dry_run(tmp_path: Path, *args: str, value: str = NEW, cwd: Path = REPO) -> D
 
 
 @dataclass(frozen=True)
-class OneOff:
-    done: subprocess.CompletedProcess[str]
-    calls: list[dict[str, Any]]  # the fake restic's calls
-    keys: dict[str, str]  # the repository's keys afterwards: id to password
+class Site:
+    """A host of the fakes: its secrets directory (the backup container's `/run/secrets`), its `/dev/shm`,
+    the repository's keys, the fakes' directory and logs."""
+
+    secrets: Path
     shm: Path
+    repo: Path
+    bin: Path
+    restic_log: Path
+    calls_log: Path
+
+    def env(self, **extra: str) -> dict[str, str]:
+        return {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "FAKE_REPO": str(self.repo),
+            "FAKE_LOG": str(self.restic_log),
+            "FAKE_CALLS": str(self.calls_log),
+            "FAKE_SECRETS": str(self.secrets),
+            "FAKE_SHM": str(self.shm),
+            "RESTIC_REPOSITORY": "s3:http://s3.test/bucket/restic",
+            **extra,
+        }
+
+    @property
+    def keys(self) -> dict[str, str]:
+        return {key.name: key.read_text() for key in sorted(self.repo.iterdir())}
+
+    @property
+    def restic_calls(self) -> list[dict[str, Any]]:
+        lines = self.restic_log.read_text().splitlines() if self.restic_log.exists() else []
+        return [json.loads(line) for line in lines]
+
+    @property
+    def calls(self) -> list[str]:
+        return self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
 
 
-def one_off(tmp_path: Path, keys: list[str], *, new: str = NEW, **env: str) -> OneOff:
-    """The dry run's one-off script, run here as the backup container runs it: its `/run/secrets` holding the
-    installed password (`OLD`) and the S3 keys, its `/dev/shm` a temporary directory, the new password on its
-    stdin, and a repository whose keys open with `keys`, in order."""
-    ran = dry_run(tmp_path, "NEW", value=new)
-    assert ran.done.returncode == 0, ran.done.stderr
-    [tail] = ran.compose_commands(PROD_COMPOSE)[:1]
-    assert tail[: len(ONE_OFF)] == ONE_OFF, tail
-    script, args = tail[len(ONE_OFF)], tail[len(ONE_OFF) + 1 :]
-    assert args == ["rotate-restic-password"]
-    secrets, shm, repo, fake = (tmp_path / name for name in ("run-secrets", "shm", "repo", "fake-bin"))
-    for directory in (secrets, shm, repo, fake):
+def a_site(tmp_path: Path, keys: list[str], *, installed: str = OLD) -> Site:
+    """The fakes, with `installed` as the installed restic_password and a repository whose keys open with
+    `keys`, in order."""
+    names = ("site-secrets", "shm", "repo", "fake-bin", "restic.log", "calls.log")
+    site = Site(*(tmp_path / name for name in names))
+    for directory in (site.secrets, site.shm, site.repo, site.bin):
         directory.mkdir()
-    (secrets / "restic_password").write_text(f"{OLD}\n")
-    (secrets / "s3_access_key_id").write_text(f"{S3_KEY_ID}\n")
-    (secrets / "s3_secret_access_key").write_text(f"{S3_SECRET}\n")
+    (site.secrets / "restic_password").write_text(f"{installed}\n")
+    (site.secrets / "s3_access_key_id").write_text(f"{S3_KEY_ID}\n")
+    (site.secrets / "s3_secret_access_key").write_text(f"{S3_SECRET}\n")
     for n, password in enumerate(keys, start=1):
-        (repo / f"{n:064x}").write_text(password)
-    (fake / "restic").write_text(FAKE_RESTIC)
-    (fake / "restic").chmod(0o755)
-    (fake / "python").symlink_to(sys.executable)  # the backup image's python
-    local = script.replace("/run/secrets", str(secrets)).replace("/dev/shm", str(shm))  # noqa: S108
-    log = tmp_path / "restic.log"
-    full_env = {
-        "PATH": f"{fake}:/usr/bin:/bin",
-        "FAKE_REPO": str(repo),
-        "FAKE_LOG": str(log),
-        "RESTIC_REPOSITORY": "s3:http://s3.test/bucket/restic",
-        **env,
-    }
-    done = subprocess.run(
+        (site.repo / f"{n:064x}").write_text(password)
+    for name, body in (("restic", FAKE_RESTIC), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL)):
+        (site.bin / name).write_text(body)
+        (site.bin / name).chmod(0o755)
+    (site.bin / "id").write_text("#!/bin/sh\necho 0\n")  # as root
+    (site.bin / "id").chmod(0o755)
+    (site.bin / "python").symlink_to(sys.executable)  # the backup image's python
+    return site
+
+
+def one_off(
+    site: Site, script: str, args: list[str], *, stdin: str = "", **env: str
+) -> subprocess.CompletedProcess[str]:
+    """A one-off's script run here as the backup container runs it, its `/run/secrets` and `/dev/shm` the
+    site's."""
+    local = script.replace("/run/secrets", str(site.secrets)).replace("/dev/shm", str(site.shm))  # noqa: S108
+    return subprocess.run(
         ["sh", "-c", local, *args],
-        input=f"{new}\n",
+        input=stdin,
         capture_output=True,
         text=True,
-        env=full_env,
+        env=site.env(**env),
         timeout=60,
         check=False,
     )
-    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-    return OneOff(done, calls, {key.name: key.read_text() for key in repo.iterdir()}, shm)
+
+
+def full_run(tmp_path: Path, site: Site, **env: str) -> subprocess.CompletedProcess[str]:
+    """The script itself, not a dry run, on the site's fakes, with the new file holding `NEW`."""
+    new_file = tmp_path / "new-password"
+    new_file.write_text(f"{NEW}\n")
+    argv = [
+        str(SCRIPT),
+        "--compose",
+        "docker compose -p fake",
+        "--secrets-dir",
+        str(site.secrets),
+        str(new_file),
+    ]
+    return subprocess.run(
+        argv, capture_output=True, text=True, env=site.env(**env), cwd=REPO, timeout=120, check=False
+    )
 
 
 def file_of(call: dict[str, Any], flag: str) -> str:
@@ -193,19 +284,34 @@ def file_of(call: dict[str, Any], flag: str) -> str:
     return Path(argv[argv.index(flag) + 1]).name
 
 
-def test_the_password_never_reaches_a_command_line(tmp_path: Path) -> None:
-    """The dry run prints the one-off backup container that changes the repository's keys, with the new file
-    on its stdin, then the install of the new file and the restart of backup, never the value, and runs
-    nothing."""
+def steps(site: Site) -> list[tuple[str, str]]:
+    """Each restic call's subcommand and the password it was made with (`OLD` or `NEW`, by name)."""
+    names = {OLD: "old", NEW: "new"}
+    return [(call["argv"][1], names.get(call["password"], "other")) for call in site.restic_calls]
+
+
+def assert_no_secret_anywhere(site: Site, done: subprocess.CompletedProcess[str]) -> None:
+    for call in site.restic_calls:
+        argv = call["argv"]
+        assert not any(secret in part for part in argv for secret in SECRET_VALUES), argv
+        assert "--no-cache" in argv and argv[argv.index("--retry-lock") + 1] == "30m", argv
+        assert call["s3"] is True and call["password_env"] is False
+        assert call["repository"] == "s3:http://s3.test/bucket/restic"
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+    assert list(site.shm.iterdir()) == []
+
+
+def test_the_dry_run_prints_the_five_steps_in_their_order(tmp_path: Path) -> None:
+    """Ruling FU-10's order: the one-off that adds and checks the new key, with the new file on its stdin; the
+    install of the new file; the restart of backup; the one-off that removes the old key, named by the id the
+    first one-off prints (`<old-key-id>` in a dry run). Never the value, and nothing runs."""
     ran = dry_run(tmp_path, "NEW")
     assert ran.done.returncode == 0, ran.done.stderr
     assert NEW not in ran.done.stdout + ran.done.stderr
     assert ran.calls == []
     assert ran.done.stdout.splitlines()[0] == f"{NOTE}dry run: the commands are printed, none is run"
     assert ran.commands[0] == ["cd", str(REPO)]
-    assert ran.lines[1].endswith(f" < {ran.new_file}")  # the one-off reads the new password from its stdin
-    tails = ran.compose_commands(PROD_COMPOSE)
-    assert [tail[: len(ONE_OFF)] for tail in tails[:1]] == [ONE_OFF]
+    assert ran.lines[1].endswith(f" < {ran.new_file}")  # the first one-off reads the new password from stdin
     target = f"{PROD_SECRETS}/restic_password"
     assert ran.commands[2] == [
         "install",
@@ -218,90 +324,165 @@ def test_the_password_never_reaches_a_command_line(tmp_path: Path) -> None:
         str(ran.new_file),
         target,
     ]
-    assert tails[1:] == [["restart", "backup"]]
-    assert len(ran.commands) == 4
+    tails = ran.compose_commands(PROD_COMPOSE)
+    assert [tail[: len(ONE_OFF)] if tail[0] == "run" else tail for tail in tails] == [
+        ONE_OFF,
+        ["restart", "backup"],
+        ONE_OFF,
+    ]
+    assert len(ran.commands) == 5
+    assert " < " not in ran.lines[4]  # the second one-off mounts the new password: no stdin
+    (_, add_args), (_, remove_args) = ran.one_offs()
+    assert (add_args, remove_args) == ([NAME], [NAME, NO_KEY_YET])
     assert all(NEW not in part for command in ran.commands for part in command)
 
 
-def test_the_one_off_adds_the_new_key_checks_it_and_removes_the_old_one(tmp_path: Path) -> None:
-    """In the one-off: the key the installed password opens is read, the new password is found to open none
-    yet, `restic key add` adds it, the new password then opens the repository through its own key, `restic
-    key remove` removes the old key (as the new key, since restic refuses to remove the key in use), and the
-    installed password opens nothing any more. Every call waits for another's repository lock as the backup
-    jobs' do and keeps no cache; its passwords are files named by flags, the new one on `/dev/shm` (removed at
-    the end), so no password is on a command line or in an environment; the S3 keys and the repository are in
-    restic's environment."""
-    done = one_off(tmp_path, [OLD])
-    assert done.done.returncode == 0, done.done.stderr
-    assert list(done.keys.values()) == [NEW]
-    [new_id] = done.keys
-    old_id = f"{1:064x}"
-    steps = [
-        (call["argv"][:2], call["argv"][-1] if call["argv"][1] == "remove" else None) for call in done.calls
-    ]
-    assert steps == [
-        (["key", "list"], None),
-        (["key", "list"], None),
-        (["key", "add"], None),
-        (["key", "list"], None),
-        (["key", "remove"], old_id),
-        (["key", "list"], None),
-    ]
-    files = [file_of(call, "--password-file") for call in done.calls]
-    assert files == ["restic_password", "new", "restic_password", "new", "new", "restic_password"]
-    assert file_of(done.calls[2], "--new-password-file") == "new"
-    for call in done.calls:
-        argv = call["argv"]
-        assert "--no-cache" in argv and argv[argv.index("--retry-lock") + 1] == "30m", argv
-        assert not any(secret in part for part in argv for secret in (NEW, OLD, S3_KEY_ID, S3_SECRET)), argv
-        assert call["s3"] is True and call["password_env"] is False
-        assert call["repository"] == "s3:http://s3.test/bucket/restic"
-    assert list(done.shm.iterdir()) == []
-    output = done.done.stdout + done.done.stderr
-    assert NEW not in output and OLD not in output
-    assert f"removed the old key {old_id[:8]}" in output and new_id[:8] in output
+def test_the_first_one_off_adds_and_checks_the_new_key_and_names_the_old_one(tmp_path: Path) -> None:
+    """The key the installed password opens is read, the new password is found to open none yet, `restic key
+    add` adds it (opened with the installed password), and the new password then opens the repository
+    through its own key. Both keys stay; the last line on stdout names the old key, for the removal. Every
+    call waits for another's repository lock as the backup jobs' do and keeps no cache; its passwords are
+    files named by flags, the new one on `/dev/shm` (removed at the end); the S3 keys are in restic's
+    environment."""
+    (add, add_args), _ = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, [OLD])
+    done = one_off(site, add, add_args, stdin=f"{NEW}\n")
+    assert done.returncode == 0, done.stderr
+    assert list(site.keys.values()) == [OLD, NEW]
+    assert steps(site) == [("list", "old"), ("list", "new"), ("add", "old"), ("list", "new")]
+    assert file_of(site.restic_calls[2], "--new-password-file") == "new"
+    assert done.stdout.splitlines() == [f"old-key {OLD_ID}"]
+    assert f"the old key is {OLD_ID[:8]}" in done.stderr
+    assert_no_secret_anywhere(site, done)
 
 
 def test_a_new_password_that_opens_a_key_already_is_not_added_again(tmp_path: Path) -> None:
-    """A run again after one that stopped between the add and the removal: the new password opens a key of
-    its own already, so no key is added; the old one is removed."""
-    done = one_off(tmp_path, [OLD, NEW])
-    assert done.done.returncode == 0, done.done.stderr
-    assert list(done.keys.values()) == [NEW]
-    assert [call["argv"][1] for call in done.calls if call["argv"][1] != "list"] == ["remove"]
-
-
-def test_an_installed_password_that_opens_nothing_goes_on_to_the_install(tmp_path: Path) -> None:
-    """A run again after one that stopped after the removal, before the install: the installed password
-    opens no key any more, the new one does, so the one-off changes nothing and ends well, and the script goes
-    on to install the new file and restart backup."""
-    done = one_off(tmp_path, [NEW])
-    assert done.done.returncode == 0, done.done.stderr
-    assert list(done.keys.values()) == [NEW]
-    assert [call["argv"][1] for call in done.calls] == ["list", "list"]
-    assert "opens no key" in done.done.stdout
+    """A run again after one that stopped after the add, before the install: no second key is added."""
+    (add, add_args), _ = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, [OLD, NEW])
+    done = one_off(site, add, add_args, stdin=f"{NEW}\n")
+    assert done.returncode == 0, done.stderr
+    assert [step for step, _ in steps(site)] == ["list", "list"]
+    assert done.stdout.splitlines() == [f"old-key {OLD_ID}"]
 
 
 @pytest.mark.parametrize(
-    ("keys", "new", "env", "message"),
+    ("keys", "installed", "env", "message"),
     [
-        ([OLD], OLD, {}, "the new password is the installed one"),
-        (["another"], NEW, {}, "neither the installed password nor the new one opens the repository"),
-        ([OLD], NEW, {"FAKE_ADDED": "not-the-new-password"}, "the new key does not open the repository"),
+        ([OLD], NEW, {}, "the installed password opens no key"),
+        ([OLD, NEW], NEW, {}, f"the new password is the installed one; nothing was changed (the repository's "
+         f"other keys: {OLD_ID[:8]})"),
+        ([OLD], OLD, {"FAKE_ADDED": "not-the-new-password"}, "the new key does not open the repository"),
+    ],
+)  # fmt: skip
+def test_the_first_one_off_stops_unless_the_new_key_opens_the_repository(
+    tmp_path: Path, keys: list[str], installed: str, env: dict[str, str], message: str
+) -> None:
+    """The first one-off names no old key, and so nothing is installed, restarted or removed, when the
+    installed password opens nothing, when it is the new password already (a run again after the install:
+    the other keys are named, for a removal by hand), or when the added key does not open with the new
+    password."""
+    (add, add_args), _ = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, keys, installed=installed)
+    done = one_off(site, add, add_args, stdin=f"{NEW}\n", **env)
+    assert done.returncode != 0
+    assert message in done.stderr
+    assert "old-key" not in done.stdout
+    assert "remove" not in [step for step, _ in steps(site)]
+    assert list(site.shm.iterdir()) == []
+
+
+def test_the_second_one_off_removes_the_old_key_with_the_new_password(tmp_path: Path) -> None:
+    """After the install and the restart, the second one-off mounts the new password: it removes the old key
+    as the new one and checks that it is gone."""
+    _, (remove, remove_args) = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, [OLD, NEW], installed=NEW)
+    done = one_off(site, remove, [NAME, OLD_ID])
+    assert remove_args == [NAME, NO_KEY_YET]
+    assert done.returncode == 0, done.stderr
+    assert list(site.keys.values()) == [NEW]
+    assert steps(site) == [("list", "new"), ("remove", "new"), ("list", "new")]
+    assert site.restic_calls[1]["argv"][-1] == OLD_ID
+    assert f"removed the old key {OLD_ID[:8]}" in done.stderr
+    assert_no_secret_anywhere(site, done)
+
+
+@pytest.mark.parametrize(
+    ("keys", "env", "message"),
+    [
+        ([OLD, NEW], {"FAKE_REMOVE_FAILS": "1"}, "restic key remove exited 1"),
+        ([NEW], {}, "the installed password opens the old key 00000000 itself"),
     ],
 )
-def test_the_old_key_stays_unless_the_new_one_opens_the_repository(
-    tmp_path: Path, keys: list[str], new: str, env: dict[str, str], message: str
+def test_the_second_one_off_fails_when_the_old_key_stays(
+    tmp_path: Path, keys: list[str], env: dict[str, str], message: str
 ) -> None:
-    """No key is removed unless the new password opens the repository through a key other than the old one:
-    the same password again, a repository neither opens, or a key added that does not open with the new
-    password each stop the one-off, which exits non-zero (so nothing is installed or restarted)."""
-    done = one_off(tmp_path, keys, new=new, **env)
-    assert done.done.returncode != 0
-    assert message in done.done.stderr
-    assert not [call for call in done.calls if call["argv"][1] == "remove"]
-    assert len(done.keys) >= len(keys)
-    assert list(done.shm.iterdir()) == []
+    """A removal restic refuses, or an id that is the installed password's own key, fails the one-off and
+    leaves every key in place."""
+    _, (remove, _) = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, keys, installed=NEW)
+    done = one_off(site, remove, [NAME, OLD_ID], **env)
+    assert done.returncode != 0
+    assert message in done.stderr
+    assert list(site.keys.values()) == keys
+
+
+def test_a_rotation_adds_installs_restarts_then_removes(tmp_path: Path) -> None:
+    """The whole script, on the fakes: the first one-off (the old password installed), the install of the new
+    file, the restart of backup, then the second one-off with the old key's id (the new password installed),
+    in that order; afterwards the repository opens with the new password only, and the script says so."""
+    site = a_site(tmp_path, [OLD])
+    done = full_run(tmp_path, site)
+    assert done.returncode == 0, done.stderr
+    assert site.calls == [
+        f"run {NAME}",
+        f"install {site.secrets}/restic_password",
+        "restart backup",
+        f"run {NAME} {OLD_ID}",
+    ]
+    assert steps(site) == [
+        ("list", "old"),
+        ("list", "new"),
+        ("add", "old"),
+        ("list", "new"),
+        ("list", "new"),  # the second one-off: the installed password is the new one now
+        ("remove", "new"),
+        ("list", "new"),
+    ]
+    assert list(site.keys.values()) == [NEW]
+    assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    assert done.stdout.splitlines()[-1] == (
+        f"{NOTE}done: installed restic_password, restarted backup and removed the old key {OLD_ID[:8]}; the "
+        "repository opens with the new password only"
+    )
+    assert_no_secret_anywhere(site, done)
+
+
+def test_a_removal_that_fails_leaves_the_old_key_and_names_it(tmp_path: Path) -> None:
+    """Step 5 fails after the install and the restart: the script exits non-zero, naming the old key's id
+    (never a password) and the RUNBOOK's removal by hand; the old key is still in the repository, the new
+    password installed, backup restarted."""
+    site = a_site(tmp_path, [OLD])
+    done = full_run(tmp_path, site, FAKE_REMOVE_FAILS="1")
+    assert done.returncode == 1
+    assert site.calls[-2:] == ["restart backup", f"run {NAME} {OLD_ID}"]
+    assert list(site.keys.values()) == [OLD, NEW]
+    assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    last = done.stderr.splitlines()[-1]
+    assert f"the old key {OLD_ID} is still in the repository" in last
+    assert "remove it by hand (docs/RUNBOOK.md, section 7)" in last
+    assert "done:" not in done.stdout
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+
+
+def test_a_key_that_does_not_open_installs_and_restarts_nothing(tmp_path: Path) -> None:
+    """Step 2 fails: nothing past the first one-off runs, and the installed password is the old one."""
+    site = a_site(tmp_path, [OLD])
+    done = full_run(tmp_path, site, FAKE_ADDED="not-the-new-password")
+    assert done.returncode == 1
+    assert site.calls == [f"run {NAME}"]
+    assert (site.secrets / "restic_password").read_text() == f"{OLD}\n"
+    assert "is unchanged and nothing was restarted" in done.stderr
 
 
 def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: Path) -> None:
@@ -310,7 +491,7 @@ def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: 
     assert ran.commands[0] == ["cd", str(REPO)]  # the prod command line's paths are the checkout's
     assert ran.commands[2][-1] == f"{PROD_SECRETS}/restic_password"
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
-    assert len(composed) == 2 and all(command[: len(PROD_COMPOSE)] == PROD_COMPOSE for command in composed)
+    assert len(composed) == 3 and all(command[: len(PROD_COMPOSE)] == PROD_COMPOSE for command in composed)
 
 
 def test_compose_and_secrets_dir_replace_both(tmp_path: Path) -> None:
@@ -320,7 +501,7 @@ def test_compose_and_secrets_dir_replace_both(tmp_path: Path) -> None:
     assert "/etc/jobhunter" not in ran.done.stdout
     assert ran.commands[2][-1] == f"{REPO}/.secrets/test/restic_password"
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
-    assert len(composed) == 2 and all(command[: len(PT)] == PT for command in composed)
+    assert len(composed) == 3 and all(command[: len(PT)] == PT for command in composed)
     assert ran.calls == []
 
 
