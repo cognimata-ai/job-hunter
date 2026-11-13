@@ -10,8 +10,8 @@ logging `manifest_ship_waiting` once, then lists the stream itself: it never ski
 exits 0 shipped, or found shipped, every file there when it started. "Found shipped" holds under the lock
 too: before it returns an unchanged (or empty) stream, it confirms that its session still holds the lock
 (`HeldShipLock.confirm`, the final re-review's M4-3), so no prune removed the receipt it compared with
-meanwhile; a session that ended stops it with `ShipLockLost`, as below. The snapshots are therefore made in the
-order of the lists they hold, and an older list never becomes the newest snapshot after a newer list's
+meanwhile; a session that ended stops it with `ShipLockLost`, as below. The snapshots are therefore made in
+the order of the lists they hold, and an older list never becomes the newest snapshot after a newer list's
 receipt. Shipping takes no backup job lock (`backup_set.BACKUP_JOB_LOCK_KEY`): restic's own repository lock
 orders its upload against a prune's. The prune takes this shipment lock too, inside its job lock, from its
 receipt read through its forget of the `manifests` snapshots (`backup.prune`, final fix D1), so a shipment
