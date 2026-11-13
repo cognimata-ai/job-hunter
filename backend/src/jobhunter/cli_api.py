@@ -17,8 +17,8 @@ WebSockets (`ws="none"`, Ruling T21-3 I1): the api serves none, and with a WebSo
 comes with langsmith) uvicorn would answer every upgrade Caddy passes through and log it on
 `uvicorn.error`, with the client address and the path with its query string, whatever `access_log` says.
 Without one, an upgrade is a plain HTTP request (a 404), and uvicorn's two warnings about it name no address.
-The sign-in and re-authentication events record the address with their outcome; nothing else of a request is
-logged with it.
+The sign-in and re-authentication events record their outcome only (final review M1): no log line holds a
+client address, which only the `login_attempts`, `login_lockouts` and `sessions` rows keep.
 """
 
 import argparse

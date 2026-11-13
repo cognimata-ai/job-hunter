@@ -24,7 +24,8 @@ records persists whatever the request does next:
    attempt (only the step it used).
 
 A missing code with TOTP on is a failure like a wrong one (the login's 401 `totp_required` is the login's
-own). Logs carry the outcome and the client address only, never the password, the code or the name.
+own). Logs carry the outcome only (final review M1): never the client address, which a failed attempt's
+`login_attempts` row holds, and never the password, the code or the name.
 """
 
 from dataclasses import dataclass, field
@@ -65,8 +66,8 @@ class _Verified:
     totp_key_mismatch: bool = False
 
 
-def _failed(ip: str) -> Problem:
-    log.warning("reauth", outcome="rejected", ip=ip)
+def _failed() -> Problem:
+    log.warning("reauth", outcome="rejected")
     return Problem(403, "reauth_failed", REAUTH_FAILED)
 
 
@@ -74,7 +75,7 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
     """Phase 0: the 429 of a lockout in force, read-only (nothing is recorded)."""
     retry_after = await lockout_in_force(engine, ip, now=now)
     if retry_after is not None:
-        log.warning("reauth", outcome="locked", ip=ip)
+        log.warning("reauth", outcome="locked")
         raise lockout_problem(retry_after)
 
 
@@ -116,7 +117,7 @@ async def _decide(
     await throttle.serialize(conn)
     retry_after = await throttle.active_lockout(conn, ip, now=now)
     if retry_after is not None:
-        log.warning("reauth", outcome="locked", ip=ip)
+        log.warning("reauth", outcome="locked")
         return lockout_problem(retry_after)
     success = await credentials_hold(
         conn,
@@ -150,7 +151,7 @@ async def verify_reauth(
             await _refuse_if_locked_out(engine, ip, now=now)  # again: the queue may have taken a while
             verified = await _verify(engine, cfg, gate, password=password, totp_code=totp_code, at=now)
     except GateFull:
-        log.warning("reauth", outcome="busy", ip=ip)
+        log.warning("reauth", outcome="busy")
         raise throttled_problem(BUSY, retry_after_s=BUSY_RETRY_AFTER_S) from None
     async with engine.begin() as conn:  # committed whatever the request does next (Ruling T18-1 (e))
         outcome = await _decide(
@@ -161,5 +162,5 @@ async def verify_reauth(
     if isinstance(outcome, Problem):
         raise outcome
     if not outcome:
-        raise _failed(ip)
-    log.info("reauth", outcome="accepted", ip=ip)
+        raise _failed()
+    log.info("reauth", outcome="accepted")

@@ -207,21 +207,21 @@ def test_the_windows_of_quiet_addresses_are_dropped() -> None:
     assert limiter.admit("10.0.1.3", 1070.0) is None and len(limiter) == 3  # no sweep before 1125
 
 
-async def test_each_refusal_is_logged_with_its_address_and_nothing_else_is(
+async def test_each_refusal_is_logged_with_its_outcome_and_nothing_else_is(
     api: EdgeMiddleware, clock: Clock, log_events: Callable[[], list[dict[str, Any]]]
 ) -> None:
-    """A refused login is a sign-in event: logged at warning as `login`, outcome `rate_limited`, with the
-    client address (as the login logs its own outcomes, ruling T16-b). An admitted one is logged by its route,
-    not here."""
+    """A refused login is a sign-in event: logged at warning as `login`, outcome `rate_limited`, without the
+    client address, as the login logs its own outcomes (final review M1: no log line holds a client address).
+    An admitted one is logged by its route, not here."""
     for _ in range(10):
         assert (await call(api, "198.51.100.7")).status == 204
     assert [e for e in log_events() if e["logger"] == "jobhunter.api.edge"] == []
     assert (await call(api, "::ffff:198.51.100.7")).status == 429
     [refusal] = [e for e in log_events() if e["logger"] == "jobhunter.api.edge"]
-    assert {k: refusal[k] for k in ("event", "outcome", "ip", "level")} == {
+    assert {k: refusal[k] for k in ("event", "outcome", "level")} == {
         "event": "login",
         "outcome": "rate_limited",
-        "ip": "198.51.100.7",  # canonical: the IPv4-mapped form as IPv4
         "level": "warning",
     }
-    assert set(refusal) <= {"event", "outcome", "ip", "level", "logger", "ts", "request_id"}
+    assert set(refusal) <= {"event", "outcome", "level", "logger", "ts", "request_id"}
+    assert "198.51.100.7" not in json.dumps(log_events())

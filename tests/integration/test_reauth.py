@@ -17,6 +17,7 @@ is that step's. Nothing runs the purges here: A0 is the route's work. Every datu
 import asyncio
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -198,6 +199,29 @@ async def test_a_reused_totp_step_is_refused(
         assert code_of(r) == (403, "reauth_failed"), r.text
     assert (await attempts(engine))[0] == failed + 2
     assert await last_step(engine) == totp_on.step
+
+
+async def test_the_log_lines_carry_the_outcome_and_no_address(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    log_events: Callable[[], list[dict[str, Any]]],
+) -> None:
+    """A re-authentication's log line carries its outcome and no client address (final review M1): the failed
+    attempt's `login_attempts` row holds the address, under its 30-day rule, and delete everything removes it;
+    a log line is neither."""
+    failed, total = await attempts(engine)
+    wrong = purge_source(password="Falsches-Passwort-42")
+    r = await post(logged_in_client, PURGE_SOURCE, wrong, fresh_key("reauth"))
+    assert code_of(r) == (403, "reauth_failed"), r.text
+    r = await post(logged_in_client, PURGE_SOURCE, purge_source(), fresh_key("reauth"))
+    assert r.status_code == 202, r.text
+    lines = [e for e in log_events() if e["event"] == "reauth"]
+    assert [(e["outcome"], e["level"]) for e in lines] == [("rejected", "warning"), ("accepted", "info")]
+    assert [sorted(set(e) - {"logger", "ts", "request_id"}) for e in lines] == [
+        ["event", "level", "outcome"]
+    ] * 2
+    assert CLIENT_IP not in json.dumps(log_events())
+    assert await attempts(engine) == (failed + 1, total + 1)  # the address is in the attempt's row
 
 
 async def test_success_records_no_attempt(

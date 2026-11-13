@@ -39,8 +39,9 @@ Every other failure is the same generic 401 `unauthenticated`. The client addres
 which uvicorn's proxy headers middleware sets from the trusted proxy's `X-Forwarded-For` only (§16.3, V20).
 The login is checked for `Origin` by the edge; it needs no `X-JH-Request` (§16.5).
 
-Logs carry the outcome and the client address only (ruling T16-b): never the username, password, TOTP code,
-token, cookie or username HMAC.
+Logs carry the outcome only (ruling T16-b; final review M1): never the client address, which the
+`login_attempts` row holds under its 30-day rule, and never the username, password, TOTP code, token, cookie
+or username HMAC.
 """
 
 import math
@@ -238,13 +239,13 @@ def lockout_problem(retry_after: timedelta) -> Problem:
     return throttled_problem("Too many failed logins", retry_after_s=retry_after_s)
 
 
-def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
-    log.warning("login", outcome=outcome, ip=ip)
+def _throttled(*, outcome: str, title: str, retry_after_s: int) -> Problem:
+    log.warning("login", outcome=outcome)
     return throttled_problem(title, retry_after_s=retry_after_s)
 
 
-def _locked(ip: str, retry_after: timedelta) -> Problem:
-    log.warning("login", outcome="locked", ip=ip)
+def _locked(retry_after: timedelta) -> Problem:
+    log.warning("login", outcome="locked")
     return lockout_problem(retry_after)
 
 
@@ -252,10 +253,10 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
     """The read-only lockout pre-check: raise the 429 of a lockout in force (nothing is recorded)."""
     retry_after = await lockout_in_force(engine, ip, now=now)
     if retry_after is not None:
-        raise _locked(ip, retry_after)
+        raise _locked(retry_after)
 
 
-async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None, ip: str) -> None:
+async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None) -> None:
     """Raise 401 `totp_required` when TOTP is on and the login sent no `code` (nothing is recorded).
 
     It is given the code only, never the username or the password, and reads the single user's flag: its
@@ -267,7 +268,7 @@ async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None, ip
     async with engine.connect() as conn:  # read-only, rolled back when the block ends
         required = await users.totp_enabled_for_any(conn)
     if required:
-        log.info("login", outcome="totp_required", ip=ip)
+        log.info("login", outcome="totp_required")
         raise Problem(401, "totp_required", TOTP_REQUIRED)
 
 
@@ -297,7 +298,7 @@ async def login(
     now = utcnow()
     ip = client_ip(request)
     await _refuse_if_locked_out(engine, ip, now=now)  # phase 0
-    await _refuse_if_totp_code_missing(engine, body.totp, ip)  # before the gate: no Argon2, nothing recorded
+    await _refuse_if_totp_code_missing(engine, body.totp)  # before the gate: no Argon2, nothing recorded
     session_secret = cfg.secret_b64("session_secret")
     try:
         async with gate.slot():
@@ -305,7 +306,7 @@ async def login(
             verified = await _verify_credentials(engine, cfg, gate, body, at=now)
     except GateFull:
         raise _throttled(
-            ip, outcome="busy", title="Too many logins at once", retry_after_s=BUSY_RETRY_AFTER_S
+            outcome="busy", title="Too many logins at once", retry_after_s=BUSY_RETRY_AFTER_S
         ) from None
     async with engine.begin() as conn:
         outcome = await decide_login(
@@ -327,12 +328,12 @@ async def login(
     # Committed: the attempt, any lockout and alert, the rehash and the session persist from here on.
     match outcome:
         case Locked(retry_after=retry_after):
-            raise _locked(ip, retry_after)
+            raise _locked(retry_after)
         case Rejected():
-            log.warning("login", outcome="rejected", ip=ip)
+            log.warning("login", outcome="rejected")
             raise Problem(401, "unauthenticated", INVALID_CREDENTIALS)
         case Accepted(token=token):
-            log.info("login", outcome="accepted", ip=ip)
+            log.info("login", outcome="accepted")
             response = Response(status_code=204)
             response.headers.append("Set-Cookie", sessions.session_cookie(token))
             return response

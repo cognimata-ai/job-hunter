@@ -13,8 +13,9 @@ itself. For each HTTP request it:
    from its client address, or beyond `LOGIN_LIMIT_GLOBAL` in all, within the windows those give, gets its own
    429 `throttled` problem with `Retry-After` (and the member `retry_after_s`, as the login's other 429s),
    before its body is read and before any database work; logged as a `login` with the outcome `rate_limited`
-   and the address, as the login logs its own outcomes (`LoginLimiter`, in memory: the api runs one replica).
-   The address is the one uvicorn's proxy headers middleware took from Caddy's `X-Forwarded-For`. §16.3's
+   and no address, as the login logs its own outcomes (final review M1: no log line holds a client address;
+   `LoginLimiter`, in memory: the api runs one replica). The address it counts is the one uvicorn's proxy
+   headers middleware took from Caddy's `X-Forwarded-For`. §16.3's
    database throttle, behind it, is unchanged. Then it refuses a state-changing `/api` request that fails the
    CSRF check (§14.1, §16.5) with its own 403 `csrf_failed` problem, before the app sees it (`csrf_failure`);
 4. stops new work while delete-everything's `global` purge fence stands (§20.2, §20.4; M5 Task 8, P3, D15):
@@ -354,7 +355,7 @@ class EdgeMiddleware:
         retry_after_s = self._logins.admit(address, monotonic())
         if retry_after_s is None:
             return None
-        log.warning("login", outcome="rate_limited", ip=address)
+        log.warning("login", outcome="rate_limited")
         return throttled_problem(LOGIN_LIMITED, retry_after_s=retry_after_s)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

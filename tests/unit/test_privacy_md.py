@@ -79,10 +79,11 @@ PROFILE_PURGE_SPARES_SHORT: Final = (
     "synthetic one"
 )
 # §2: what HEAD logs and stores of the client address (T19-2 (1), T19-3 I2): since M5 Task 21 (Ruling T21-1
-# (b)) no request log at all (uvicorn's access log off, Caddy with none and a filter on its error lines).
+# (b)) no request log at all (uvicorn's access log off, Caddy with none and a filter on its error lines), and
+# since the final review (M1) no address in the sign-in and re-authentication events either.
 LOGGED_REQUESTS: Final = (
-    "neither the api nor its reverse proxy logs requests with the client address; sign-in and "
-    "re-authentication events record the client address with their outcome"
+    "no log line holds the client address: neither the api nor its reverse proxy logs requests, and sign-in "
+    "and re-authentication events record their outcome only"
 )
 # The offsite lag of deleted data (Ruling T32-2): about 3 months of retained backup sets, plus up to 30 days
 # of the bucket's deleted object versions. §6 states it, and so does the UI's backup note in both languages.
@@ -270,7 +271,9 @@ def test_the_logged_client_addresses_and_their_retention_are_stated() -> None:
     assert f"kept {windows['login_attempts'].days} days" in categories
     rotation = LOG_ROTATION.search(COMPOSE.read_text(encoding="utf-8"))
     assert rotation is not None, "the services' log rotation"
-    assert f"rotated at {rotation.group(2)} files of {rotation.group(1)} MB per service" in categories
+    assert (
+        f"rotated by size, at {rotation.group(2)} files of {rotation.group(1)} MB per service" in categories
+    )
 
 
 def test_the_offsite_lag_of_deleted_data_is_stated() -> None:

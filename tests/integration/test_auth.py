@@ -562,9 +562,11 @@ async def test_a_login_without_origin_is_refused(api_client, make_user) -> None:
     assert r.status_code == 403 and r.json()["code"] == "csrf_failed"
 
 
-async def test_auth_logs_carry_the_outcome_and_the_address_only(
+async def test_auth_logs_carry_the_outcome_only(
     api_client, make_user, make_config, engine, log_events
 ) -> None:
+    """A sign-in's log line carries its outcome and no client address (final review M1): the address is in the
+    `login_attempts` row, under its 30-day rule, and delete everything removes it; a log line is neither."""
     from jobhunter.auth import throttle, totp, users
 
     await make_user("Ada Lovelace")
@@ -579,14 +581,17 @@ async def test_auth_logs_carry_the_outcome_and_the_address_only(
     assert required.status_code == 401 and required.json()["code"] == "totp_required"
     events = log_events()
     logins = [e for e in events if e["event"] == "login"]
-    assert [(e["outcome"], e["ip"], e["level"]) for e in logins] == [
-        ("rejected", "198.51.100.10", "warning"),
-        ("accepted", "198.51.100.10", "info"),
-        ("totp_required", "198.51.100.10", "info"),  # the first request of every sign-in with TOTP on
+    assert [(e["outcome"], e["level"]) for e in logins] == [
+        ("rejected", "warning"),
+        ("accepted", "info"),
+        ("totp_required", "info"),  # the first request of every sign-in with TOTP on
     ]
+    assert [sorted(set(e) - {"logger", "ts", "request_id"}) for e in logins] == [
+        ["event", "level", "outcome"]
+    ] * 3
     dumped = json.dumps(events, ensure_ascii=False)  # unescaped, so the password's "Ö" can be found
     username_hmac = throttle.username_hmac("Ada Lovelace", make_config("api").secret_b64("session_secret"))
-    sent = ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex())
+    sent = ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex(), "198.51.100.10")
     leaked = [n for n, value in enumerate(sent) if value in dumped]  # indices only, never the values
     assert leaked == []
 

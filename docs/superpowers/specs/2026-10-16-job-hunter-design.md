@@ -5477,7 +5477,7 @@ The cost labels (the extraction's ~$0.14 here, **Propose queries** ~$0.10 below)
 - **Global**: after 20 failures in 1 h, `login_lockouts('global')` blocks everyone for 1 h and raises the critical alert `auth.lockout`.
 - **The CLI is the escape hatch**: `jobhunter sessions unlock`.
 - A re-authentication (delete everything, the source purge) counts each failure as a failed login attempt; the api's edge refuses a client past 10 login requests a minute (100 in all) with 429 before any database work.
-- **No access log.** Neither uvicorn (`access_log` off, WebSockets off) nor Caddy (no `log` directive; a global log filter deletes the client's address, port and request headers from the lines it still writes, its errors among them) logs a request with its client address; the sign-in and re-authentication events record the address with their outcome, and `login_attempts` and `login_lockouts` hold it (§20.1).
+- **No access log.** Neither uvicorn (`access_log` off, WebSockets off) nor Caddy (no `log` directive; a global log filter deletes the client's address, port and request headers from the lines it still writes, its errors among them) logs a request with its client address, and the sign-in and re-authentication events record their outcome only, so no log line holds a client address; `login_attempts`, `login_lockouts` and `sessions` hold it (§20.1).
 - Every attempt is recorded with an HMAC of the username, never the raw value.
 - Responses take constant time: a dummy Argon2 verify runs on unknown usernames. Error messages are generic.
 - When TOTP is enabled and the request has no code, the server answers 401 `totp_required` before any password check, records no attempt and reveals nothing else.
@@ -6478,7 +6478,7 @@ Whatever the outcome, the restore removes its staging copy of the dump (`/data/s
   5. Run the host without swap, or with encrypted swap only, so the `parse_jobs` tmpfs never pages a decrypted CV to a plain disk. The script refuses any unencrypted swap device, RAM-only zram included; on a host whose image ships zram swap, it is turned off before host setup (the runbook says how).
   6. Install `deploy/firewall/docker-user.nft` (§16.9) with its systemd unit, which loads it at boot before Docker.
 - **Start / stop**: `docker compose up -d` / `docker compose stop` (graceful). Never `--scale worker=…`.
-- **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs hold ids, codes and counts, no content; the sign-in and re-authentication events also hold the client address, §20.6).
+- **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs hold ids, codes and counts: no content and no client address, §20.6).
 - **Alerts**:
 
 | Alert | Action |
@@ -6535,7 +6535,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | LangGraph checkpoints | DB | 14 days after the run or cycle ends; a cycle's row goes only after its checkpoint thread | `retention_daily` (deletes threads) |
 | procrastinate finished jobs | DB | 7 days | daily cleanup |
 | Idempotency records | `api_idempotency` | 7 days | daily |
-| Logs | Docker local driver | about 14 days (rotation) | Rotation |
+| Logs | Docker local driver (no content, no client address) | Rotated by size, 10 files of 20 MB per service: about 14 days at normal volume, longer for a service that logs little, until its container is recreated | Rotation |
 | Sessions | DB | Expiry + 1 day | daily |
 | Login attempts | DB | 30 days | daily |
 | Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
@@ -6694,6 +6694,7 @@ The user types `DELETE EVERYTHING`, re-enters the password and, with TOTP on, a 
    - the deletion manifests, their shipments and the purge fences (ids only);
    - records without content: the alerts open when the manifest is computed, this purge's operation and the request's own idempotency row (so a retried key returns the stored 202), the procrastinate jobs not finished then, and the export rows, each `purged`, `expired` or `failed` without its archive.
    - the singletons (`active_config`, `schedule_state`, `ranking_state`, `worker_heartbeat`, `deadman_state`), the default settings version and scope version the reset installs (and the scope versions step 10 does not list), the schema records (`alembic_version`, `schema_compat`, the transition matrix, `checkpoint_migrations`) and procrastinate's records of its workers and periodic defers.
+   - outside the database, the services' logs, until their rotation removes them (§20.1): they hold no content and no client address (§16.3).
 
 Delete-everything has no rebuild. In a replay after a restore, its `row_delete` operations run in phase A with those of every other replayed manifest, so a job affected by an earlier source purge that it deleted is simply skipped by the single rebuild of phase B (§19.5).
 
@@ -6720,7 +6721,7 @@ Afterwards, no Adzuna-derived text, salary or score remains in the database, in 
 ### 20.6 PRIVACY.md (contents)
 
 1. **Purpose and controller**: the user runs the app for their own job search, on a single-user deployment.
-2. **Data categories**: CV and profile (personal data), user actions and labels, job ads (public, and they may contain recruiter names and contacts), account and sign-in data (sessions, login attempts and lockouts, which hold the client address, §20.1), technical logs (no content; neither the api nor Caddy logs a request with its client address, §16.3; the sign-in and re-authentication events record the client address with their outcome).
+2. **Data categories**: CV and profile (personal data), user actions and labels, job ads (public, and they may contain recruiter names and contacts), account and sign-in data (sessions, login attempts and lockouts, which hold the client address, §20.1), technical logs (no content and no client address: neither the api nor Caddy logs a request with its client address, §16.3, and the sign-in and re-authentication events record their outcome only; rotated by size, so a service that logs little keeps its lines longer than about 14 days, until its container is recreated).
 3. **Processing and minimisation**:
    - contact stripping and a user review of the text before any LLM or embedding call;
    - the native-PDF opt-in and its disclosure;
