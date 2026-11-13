@@ -50,8 +50,9 @@ checks run in order and each prints exactly one JSON line, `{"check": <name>, "o
    shows;
 9. `manifest_shipped`: `backup ship`; within 120 s the manifest is `shipped` and the banner is gone;
 10. `restore`: `$PT down -v`; `$PB up -d postgres`; `$PB --profile restore run --rm restore` restores the set
-    of check 7 with both verify phases passing; the purge's manifest is replayed on B (an entry in its
-    `replay_log`) and no Adzuna posting is there; `$PB up -d --wait` of `SERVICES`; a login on B works;
+    of check 7 with both verify phases passing; the purge's manifest is replayed on B once, completely (its
+    `replay_log` holds `started`, `admitted` and the completion, under one restore id, `replay_phases`) and no
+    Adzuna posting is there; `$PB up -d --wait` of `SERVICES`; a login on B works;
 11. `export`: on B an export → `ready` → its zip, downloaded, names `README.txt` (only its entry count and
     size are printed);
 12. `delete_everything`: on B a wrong phrase → 422 `confirmation_mismatch`; the right one with the password →
@@ -210,11 +211,15 @@ RUN_STATUS: Final = "/* smoke_m5.run_status */ SELECT status FROM runs WHERE id 
 MANIFEST: Final = (
     "/* smoke_m5.manifest */ SELECT status, manifest_uuid FROM deletion_manifests WHERE id = {manifest_id}"
 )
-REPLAY_ENTRIES: Final = (
-    "/* smoke_m5.replayed */ SELECT count(*) FROM deletion_manifests m "
-    "CROSS JOIN LATERAL jsonb_array_elements(coalesce(m.replay_log, '[]')) e "
-    "WHERE m.manifest_uuid = '{manifest_uuid}'"
+# A manifest's `replay_log` entries, one JSON object a line, in the order they were written.
+REPLAY_LOG: Final = (
+    "/* smoke_m5.replay_log */ SELECT x.e FROM deletion_manifests m "
+    "CROSS JOIN LATERAL jsonb_array_elements(coalesce(m.replay_log, '[]')) WITH ORDINALITY AS x(e, n) "
+    "WHERE m.manifest_uuid = '{manifest_uuid}' ORDER BY x.n"
 )
+# What one complete replay of a manifest writes (`privacy.replay`): `started`, `admitted`, then the
+# completion, the entry with the counts and no phase.
+ONE_REPLAY: Final = ["started", "admitted", "completed"]
 USERS: Final = "/* smoke_m5.users */ SELECT count(*) FROM users"
 UUID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 README: Final = "README.txt"
@@ -312,6 +317,18 @@ def one(argv: list[str], sql: str, columns: int = 1) -> list[str]:
     if len(fields) != columns:
         raise CheckFailed(f"expected one row of {columns} fields, got {len(lines)} line(s)")
     return fields
+
+
+def replay_phases(argv: list[str], manifest_uuid: str) -> list[tuple[str, str]]:
+    """The manifest's `replay_log` as `(restore_id, phase)` pairs in order, the completion (its `counts`) as
+    `completed`, anything else as `?`."""
+    pairs: list[tuple[str, str]] = []
+    for line in psql(argv, REPLAY_LOG.format(manifest_uuid=manifest_uuid)).splitlines():
+        if line.strip():
+            entry = json.loads(line)
+            phase = entry.get("phase", "completed" if "counts" in entry else "?")
+            pairs.append((str(entry.get("restore_id")), str(phase)))
+    return pairs
 
 
 def count(argv: list[str], sql: str) -> int:
@@ -783,17 +800,23 @@ def check_restore(ctx: Context) -> str | None:
     ]
     if verified != [("restored", True), ("replayed", True)]:
         raise CheckFailed(f"the verify phases: {verified}")
-    replayed = count(PB, REPLAY_ENTRIES.format(manifest_uuid=STATE.purge_uuid))
+    replayed = replay_phases(PB, STATE.purge_uuid)
+    restores = len({restore_id for restore_id, _ in replayed})
+    if [phase for _, phase in replayed] != ONE_REPLAY or restores != 1:
+        raise CheckFailed(
+            "on B the purge's replay_log is not one complete replay: "
+            f"{[phase for _, phase in replayed]} under {restores} restore id(s)"
+        )
     adzuna = adzuna_postings(PB)
-    if replayed < 1 or adzuna != 0:
-        raise CheckFailed(f"on B the purge's replay_log has {replayed} entries, {adzuna} Adzuna postings")
+    if adzuna != 0:
+        raise CheckFailed(f"on B the purge was replayed, but {adzuna} Adzuna postings are there")
     up(ctx, PB, *SERVICES)
     connect(ctx, PB)
     login(ctx)
     return (
         f"PT down -v; set {STATE.set_id} restored into PB, verify phases restored and replayed passed; the "
-        f"purge's manifest replayed ({replayed} replay_log entr{'y' if replayed == 1 else 'ies'}), {adzuna} "
-        "Adzuna postings; PB up; the login on B works"
+        "purge's manifest replayed once (started, admitted, completed under one restore id), no Adzuna "
+        "postings; PB up; the login on B works"
     )
 
 

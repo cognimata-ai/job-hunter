@@ -63,6 +63,19 @@ KEY_ID: Final = "a1b2c3d4e5f60718"
 AD_TEXT: Final = "Senior Kotlin engineer for an invented logistics start-up, an ad no fixture holds"
 CV_LINES: Final = [line for line in SYNTHETIC_CV.splitlines() if len(line.strip()) > 12]
 RESTORE: Final = ["--profile", "restore", "run", "--rm", "-T", "restore"]
+RESTORE_ID: Final = "3a7f2c1e-8d4b-4e6a-9f0c-1b2d3e4f5a6b"
+# The purge manifest's `replay_log` on B as one complete replay writes it (`privacy.replay`): `started` with
+# the high-water marks, `admitted` with its turn, then the completion with its counts and no phase.
+REPLAYED: Final[list[dict[str, object]]] = [
+    {
+        "restore_id": RESTORE_ID,
+        "at": "2026-11-12T10:00:00+00:00",
+        "phase": "started",
+        "high_water": {"jobs": 40},
+    },
+    {"restore_id": RESTORE_ID, "at": "2026-11-12T10:00:01+00:00", "phase": "admitted", "turn": {"jobs": 40}},
+    {"restore_id": RESTORE_ID, "at": "2026-11-12T10:00:02+00:00", "counts": {"postings": 12}},
+]
 
 
 def load(name: str) -> ModuleType:
@@ -116,6 +129,7 @@ class Stack:
         self.stub_entries: list[dict[str, object]] = []
         self.watermark = 0
         self.purged = False
+        self.replay_log: list[dict[str, object]] = list(REPLAYED)  # the purge manifest's on B
         self.failure: tuple[Callable[[list[str]], bool], Callable[[list[str]], Any]] | None = None
 
     # ---- subprocess ----------------------------------------------------------------------------------------
@@ -241,8 +255,9 @@ class Stack:
             return f"{self.status_of(PURGE)}|{PURGE_UUID}\n"
         if sql == smoke.MANIFEST.format(manifest_id=DELETE):
             return f"{self.status_of(DELETE)}|{DELETE_UUID}\n"
-        if sql == smoke.REPLAY_ENTRIES.format(manifest_uuid=PURGE_UUID):
-            return "1\n"
+        if sql == smoke.REPLAY_LOG.format(manifest_uuid=PURGE_UUID):
+            assert project == "B"
+            return "".join(json.dumps(entry, separators=(",", ":")) + "\n" for entry in self.replay_log)
         if sql == smoke.USERS:
             return "1\n"
         raise AssertionError(f"an unexpected statement: {sql[:80]}")
@@ -414,9 +429,24 @@ def test_a_whole_run_prints_thirteen_ok_lines_and_no_secret(
     assert stack.calls[restore - 2] == TEARDOWN[0]  # PT down -v, then PB's postgres, then the restore
     assert stack.calls[restore - 1] == [*prodstack.PB, "up", "-d", "--no-build", "--wait", "postgres"]
     assert stack.calls[-3:] == TEARDOWN
-    # the backup scheduler never runs on either site: every backup command is a one-off container
-    ups = [call for call in stack.calls if call[-len(smoke.SERVICES) :] == list(smoke.SERVICES)]
-    assert len(ups) == 2 and not [call for call in stack.calls if "scheduler" in call]
+    # the backup scheduler never runs on either site: every `up` names its services, `backup` never among
+    # them (an `up` naming none starts every service, `backup` with its scheduler), and every command that
+    # names the backup service is a one-off container of it
+    sites = [
+        call[len(argv) :]
+        for call in stack.calls
+        for argv in (prodstack.PT, prodstack.PB)
+        if call[: len(argv)] == argv
+    ]
+    ups = [rest for rest in sites if rest[:1] == ["up"]]
+    assert [
+        rest[-len(smoke.SERVICES) :] == list(smoke.SERVICES) or rest[-1:] == ["postgres"] for rest in ups
+    ] == [True] * 3
+    assert not [rest for rest in ups if "backup" in rest]
+    backups = [rest for rest in sites if "backup" in rest]
+    assert backups and [rest[:5] for rest in backups] == [["run", "--rm", "--no-deps", "-T", "backup"]] * len(
+        backups
+    )
 
 
 def test_the_checks_hand_their_results_on(
@@ -434,7 +464,8 @@ def test_the_checks_hand_their_results_on(
     assert (
         f"manifest {PURGE} completed" in detail["source_purge"] and "banner shown" in detail["source_purge"]
     )
-    assert f"set {SET} restored into PB" in detail["restore"] and "1 replay_log entry" in detail["restore"]
+    assert f"set {SET} restored into PB" in detail["restore"]
+    assert "replayed once (started, admitted, completed under one restore id)" in detail["restore"]
     assert "names README.txt" in detail["export"]
     assert "the old session 401" in detail["delete_everything"]
     # B's sessions: the login after the restore, then the one after delete everything
@@ -544,6 +575,30 @@ def test_a_data_error_fails_its_check_and_still_tears_down(
     assert lines[-2] == {"check": "backup_set", "ok": False, "detail": "unexpected data (JSONDecodeError)"}
     assert lines[-1]["check"] == "teardown" and lines[-1]["ok"] is True
     assert stack.calls[-3:] == TEARDOWN
+
+
+@pytest.mark.parametrize(
+    "replay_log",
+    [
+        pytest.param(REPLAYED[:2], id="stopped after its admission"),
+        pytest.param([], id="never replayed"),
+        pytest.param(REPLAYED + REPLAYED, id="replayed twice"),
+        pytest.param(
+            [*REPLAYED[:2], {**REPLAYED[2], "restore_id": "another"}], id="completed by another restore"
+        ),
+    ],
+)
+def test_the_restore_check_wants_one_complete_replay_of_the_purge(
+    smoke: ModuleType, stack: Stack, capsys: pytest.CaptureFixture[str], replay_log: list[dict[str, object]]
+) -> None:
+    """Plan M5 Task 33, Ruling T33-15: `started`, `admitted` and the completion under one restore id, not a
+    count of entries."""
+    stack.replay_log = replay_log
+    assert smoke.main() == 1
+    lines, _ = lines_of(capsys)
+    assert (lines[-2]["check"], lines[-2]["ok"]) == ("restore", False)
+    assert lines[-2]["detail"].startswith("on B the purge's replay_log is not one complete replay")
+    assert lines[-1]["check"] == "teardown" and lines[-1]["ok"] is True
 
 
 def test_an_interrupt_still_tears_down(
