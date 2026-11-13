@@ -209,7 +209,9 @@ async def test_the_listing_pages_by_id_with_a_cursor_bound_to_its_filter(
         "source",
         "active",
         "is_canary",
+        "deletion_manifest_id",
     }
+    assert item["deletion_manifest_id"] is None  # no deletion requested
     assert (item["job_id"], item["title"], item["company"], item["source"], item["active"]) == (
         made[0].job_id,
         TITLE,
@@ -352,6 +354,60 @@ async def test_a_case_of_a_running_eval_run_cannot_be_deleted(
         )
     await deleted(logged_in_client, engine, purger, ids[2])
     await deleted(logged_in_client, engine, purger, ids[0])
+
+
+async def test_a_case_whose_deletion_is_pending_is_not_deleted_again_nor_flagged(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, purger: Purger, current_epoch: int
+) -> None:
+    """Plan M5 Task 33, Ruling T33-15 (I1): while a case's `golden_case_delete` manifest is open (`executing`:
+    its purge pending, waiting or failed), a second DELETE is 409 `conflict_state`, detail
+    `purge_in_progress`, as a second source purge or delete-everything is, and opens no manifest; activating
+    the case or making it a canary is refused the same way, deactivating it is not; the list names the open
+    manifest. Another case is untouched, and once the purge has completed the case is gone."""
+    pending, other = (case.id for case in await insert_cases(engine, 2))
+    r = await logged_in_client.delete(f"{CASES_URL}/{pending}")
+    assert r.status_code == 202, r.text
+    manifest_id = r.json()["manifest_id"]
+
+    again = await logged_in_client.delete(f"{CASES_URL}/{pending}")
+    assert (again.status_code, again.json()["code"], again.json()["detail"]) == (
+        409,
+        "conflict_state",
+        "purge_in_progress",
+    ), again.text
+    assert await count_rows(engine, "deletion_manifests", kind="golden_case_delete") == 1
+    assert await count_rows(engine, "operations", kind="purge") == 1
+    for flags in ({"active": True}, {"is_canary": True}, {"active": True, "is_canary": False}):
+        refused = await logged_in_client.patch(f"{CASES_URL}/{pending}", json=flags)
+        assert (refused.status_code, refused.json()["detail"]) == (409, "purge_in_progress"), (
+            flags,
+            refused.text,
+        )
+    r = await logged_in_client.patch(f"{CASES_URL}/{pending}", json={"active": False})
+    assert (r.status_code, r.json()["active"], r.json()["deletion_manifest_id"]) == (200, False, manifest_id)
+    listed = (await logged_in_client.get(CASES_URL)).json()["items"]
+    assert [(case["id"], case["deletion_manifest_id"]) for case in listed] == [
+        (pending, manifest_id),
+        (other, None),
+    ]
+    r = await logged_in_client.patch(f"{CASES_URL}/{other}", json={"is_canary": True})
+    assert (r.status_code, r.json()["is_canary"], r.json()["deletion_manifest_id"]) == (200, True, None)
+
+    async with engine.connect() as conn:
+        (operation_id,) = (
+            await conn.execute(
+                sa.text(
+                    "SELECT id FROM operations WHERE kind = 'purge' "
+                    "AND payload -> 'manifest_id' = to_jsonb(CAST(:m AS bigint))"
+                ),
+                {"m": manifest_id},
+            )
+        ).one()
+    await purger.run(operation_id)
+    await completed(purger, manifest_id, operation_id)
+    assert await case_ids(engine) == [other]
+    gone = await logged_in_client.delete(f"{CASES_URL}/{pending}")
+    assert (gone.status_code, gone.json()["code"]) == (404, "not_found")
 
 
 # ---- the synthetic seed ------------------------------------------------------------------------------------

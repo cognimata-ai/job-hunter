@@ -13,19 +13,22 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   keyset-paged with §14.3's signed cursor (`api.pagination`: sort `golden_cases.id`, `asc`,
   `last_key = [id]`, the filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list
   did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, title, company, label,
-  comment, profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `title` the case's
-  revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
-  list's one statement; `profile_version` the version's number).
+  comment, profile_version, scope_version, source, active, is_canary, deletion_manifest_id}`
+  (`golden.CaseRow`; `deletion_manifest_id` its open deletion manifest, null without one, M5 Task 33; `title`
+  the case's revision's, the job's for a revision without one, `company` the job's `company_display`, both
+  joined in the list's one statement; `profile_version` the version's number).
 - `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`, `active_config
   FOR SHARE` first): a third canary is 422 `validation_failed` (L4632), an unknown case 404, activating a
   case whose job is under a purge fence (M5 Task 8), or whose profile version is purged or fenced (M5 Task
-  14), 409 `conflict_state` with `detail = "purge_in_progress"`.
+  14), and activating a case or making it a canary while its deletion is pending (M5 Task 33), 409
+  `conflict_state` with `detail = "purge_in_progress"`.
 - `DELETE /api/golden-cases/{id}` → 202 `{manifest_id}` (M5 Task 18, U8, Deviation 20): A0 of the case's
   `golden_case_delete` purge (`privacy.kinds.golden_case.request_golden_case_delete`, `active_config FOR
   UPDATE` first): the api has no manifests volume, so the worker writes the manifest's file and deletes the
   case, its eval rows by cascade. 404 for no such case (`golden.CaseMissing`), 409 `conflict_state` with
-  `detail = "eval_run_running"` while a running eval run includes it, and 409 `delete_everything_in_progress`
-  under delete-everything's fence.
+  `detail = "purge_in_progress"` while its deletion is pending (an `executing` manifest names it: no second
+  manifest, M5 Task 33), 409 `conflict_state` with `detail = "eval_run_running"` while a running eval run
+  includes it, and 409 `delete_everything_in_progress` under delete-everything's fence.
 - `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
   row alone; the golden case it upserted stays (Deviation 24). 404 `not_found` for no such feedback
   (`golden.FeedbackMissing` through `api.errors.domain_problem`).
@@ -98,6 +101,10 @@ class GoldenCaseOut(BaseModel):
     source: CaseSource
     active: bool
     is_canary: bool
+    deletion_manifest_id: int | None = Field(
+        description="The case's open deletion manifest (its purge pending, waiting or failed), null without "
+        "one: the case cannot be deleted again, activated or made a canary meanwhile"
+    )
 
     @classmethod
     def of(cls, case: CaseRow) -> "GoldenCaseOut":
@@ -113,6 +120,7 @@ class GoldenCaseOut(BaseModel):
             source=case.source,
             active=case.active,
             is_canary=case.is_canary,
+            deletion_manifest_id=case.deletion_manifest_id,
         )
 
 
@@ -216,7 +224,8 @@ async def list_golden_cases(
         **_NOT_FOUND,
         409: {
             "description": "Activating a case whose job or profile version is being purged, or whose profile "
-            "version was purged (`conflict_state`, detail `purge_in_progress`)"
+            "version was purged, or activating a case or making it a canary while its deletion is pending "
+            "(`conflict_state`, detail `purge_in_progress`)"
         },
         422: {"description": "Invalid body, or a third canary (`validation_failed`)"},
         **CSRF_RESPONSES,
@@ -241,8 +250,8 @@ async def set_golden_case_flags(
     responses={
         **_NOT_FOUND,
         409: {
-            "description": "A running eval run includes the case (`conflict_state`, detail "
-            "`eval_run_running`)"
+            "description": "The case's deletion is pending (`conflict_state`, detail `purge_in_progress`), "
+            "or a running eval run includes it (`conflict_state`, detail `eval_run_running`)"
         },
         422: {"description": "Invalid path (`validation_failed`)"},
         **CSRF_RESPONSES,

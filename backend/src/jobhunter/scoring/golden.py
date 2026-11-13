@@ -28,6 +28,13 @@ its first lock. The deletion of a case a running eval run includes is refused wi
 `detail = "eval_run_running"` (`eval_run_running`, M5 Task 12): `lock_case`, `in_running_run` and `case_job`
 are shared with the golden-case purge (`privacy.kinds.golden_case`).
 
+**A pending deletion** (plan M5 Task 33, Ruling T33-15): a case whose `golden_case_delete` manifest is open
+(`executing`: its purge pending, waiting or failed; `pending_deletion`) is not deleted again (the golden-case
+purge's request refuses it) and is neither activated nor made a canary (`set_flags`), each with 409
+`conflict_state`, `detail = "purge_in_progress"`, as a second source purge or delete-everything is refused;
+deactivating it stays allowed. The listed case names that manifest (`CaseRow.deletion_manifest_id`). The
+kind has no fence that names its case (Deviation 53), so this read stands in for one.
+
 Nothing here logs content: ids, labels, sources and counts only.
 """
 
@@ -410,14 +417,25 @@ class CaseRow:
     source: CaseSource
     active: bool
     is_canary: bool
+    deletion_manifest_id: int | None  # its open `golden_case_delete` manifest (`pending_deletion`)
 
 
+# The request key of a golden-case deletion's manifest (`privacy.kinds.golden_case.REQUEST_KEY`).
+DELETION_REQUEST_KEY: Final = "golden_case_id"
+# The open deletion manifest of case `g`: `executing` (`deletion_manifests_open` serves the status), the
+# oldest when, against the rule, there were two.
+_OPEN_DELETION: Final = (
+    "(SELECT m.id FROM deletion_manifests m "  # noqa: S608 (the module's constants)
+    "WHERE m.kind = 'golden_case_delete' AND m.status = 'executing' "
+    f"AND m.request -> '{DELETION_REQUEST_KEY}' = to_jsonb(g.id) ORDER BY m.id LIMIT 1)"
+)
 # A case's revision is retention-exempt and its job is never deleted while the revision exists, so both are
 # always there; the revision's material names the title the case was labelled on (`llm_input ->> 'title'`).
 _CASE_COLUMNS: Final = (
     "g.id, r.job_id, coalesce(r.llm_input ->> 'title', j.title) AS title, j.company_display AS company, "
     "g.label, g.comment, v.version_no AS profile_version, "
-    "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary "
+    "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary, "
+    f"{_OPEN_DELETION} AS deletion_manifest_id "
     "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id JOIN jobs j ON j.id = r.job_id "
     "JOIN profile_versions v ON v.id = g.profile_version_id"
 )
@@ -427,6 +445,7 @@ _LIST: Final = q(
 )
 _ONE: Final = q(f"SELECT {_CASE_COLUMNS} WHERE g.id = :i")
 _LOCK_CASE: Final = q("SELECT active, is_canary FROM golden_cases WHERE id = :i FOR UPDATE")
+_PENDING_DELETION: Final = q(f"SELECT {_OPEN_DELETION} FROM golden_cases g WHERE g.id = :i")  # noqa: S608
 # The job of a case's revision (a plain read: the golden-case purge then takes the job's row `FOR UPDATE`).
 _CASE_JOB: Final = q(
     "SELECT r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id WHERE g.id = :i"
@@ -506,6 +525,15 @@ async def running_runs_including(conn: AsyncConnection, case_id: int, flags: Cas
     return [int(i) for i in (await conn.execute(_RUNNING_RUNS_INCLUDING, params)).scalars()]
 
 
+async def pending_deletion(conn: AsyncConnection, case_id: int) -> int | None:
+    """The id of the case's open `golden_case_delete` manifest (module docstring), `None` when it has none or
+    there is no such case. A plain read: the golden-case purge's request reads it under the case's row lock
+    and `active_config FOR UPDATE`, `set_flags` after its `active_config FOR SHARE`, so a request committing
+    meanwhile is seen."""
+    manifest_id = (await conn.execute(_PENDING_DELETION, {"i": case_id})).scalar_one_or_none()
+    return None if manifest_id is None else int(manifest_id)
+
+
 async def case_job(conn: AsyncConnection, case_id: int) -> int | None:
     """The job of the case's revision (a plain read), `None` when there is no such case."""
     job_id = (await conn.execute(_CASE_JOB, {"i": case_id})).scalar_one_or_none()
@@ -525,6 +553,7 @@ def _case(row: Row[Any]) -> CaseRow:
         source=row.source,
         active=bool(row.active),
         is_canary=bool(row.is_canary),
+        deletion_manifest_id=None if row.deletion_manifest_id is None else int(row.deletion_manifest_id),
     )
 
 
@@ -564,8 +593,18 @@ async def set_flags(
     "purge_in_progress"` (module docstring): a case whose profile version is purged or under an unreleased
     `profile` or `global` fence (`privacy.fences.version_fenced`, read after the `active_config` lock); then
     it takes its job's row `FOR SHARE` (step 4) and refuses a job under a purge fence, or one gone. A case
-    deactivated or made a canary is not activated, so neither is refused."""
+    deactivated or made a canary is not activated, so neither is refused by those. Activating a case or
+    making it a canary is refused the same way while its deletion is pending (`pending_deletion`, read after
+    the `active_config` lock; module docstring); deactivating it, or making it no canary, is not."""
     await conn.execute(_LOCK_CONFIG)  # step 2, the first lock
+    if (active or is_canary) and (manifest_id := await pending_deletion(conn, case_id)) is not None:
+        log.info(
+            "golden_case_flags_refused",
+            golden_case_id=case_id,
+            reason="deletion_pending",
+            manifest_id=manifest_id,
+        )
+        raise purge_in_progress()
     if active:
         case = (await conn.execute(_CASE_VERSION, {"i": case_id})).first()
         if case is None:

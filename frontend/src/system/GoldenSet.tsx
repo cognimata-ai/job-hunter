@@ -7,8 +7,10 @@
 // opens a deletion manifest the worker carries out (Deviation 20), so the row says "Deletion requested" instead of
 // Delete while the case is still listed, and the requested deletions below the table show each manifest's state
 // (`ManifestState`), read every 10 s until confirmed offsite; once the deletion has run, the set is read again,
-// so the deleted case leaves the table. A requested case's flags rest. A refusal shows at the row by its code
-// (`PrivacyProblem`). Every write reads the set and the golden runs' gate again.
+// so the deleted case leaves the table. A requested case's flags rest. A case whose deletion was asked for
+// before this page was read (another tab, a reload, a failed purge) is known by its `deletion_manifest_id` (plan
+// M5 Task 33): its row says "Deletion requested" too, and it is listed with the requested deletions. A refusal
+// shows at the row by its code (`PrivacyProblem`). Every write reads the set and the golden runs' gate again.
 import { useQueryClient } from "@tanstack/react-query";
 import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -146,6 +148,13 @@ export function GoldenSet() {
   const request = (golden: GoldenCaseOut) => (manifestId: number) => {
     setRequested((list) => [{ caseId: golden.id, title: golden.title, manifestId }, ...list.filter((r) => r.manifestId !== manifestId)]);
   };
+  // the deletions asked for here, then those the server names that are not among them (asked for elsewhere)
+  const pending: Requested[] = (cases.items ?? []).flatMap((golden) =>
+    golden.deletion_manifest_id === null || requested.some((r) => r.manifestId === golden.deletion_manifest_id)
+      ? []
+      : [{ caseId: golden.id, title: golden.title, manifestId: golden.deletion_manifest_id }],
+  );
+  const listed = [...requested, ...pending];
   let body;
   if (cases.items === undefined) {
     body = cases.error === null ? <Skeleton variant="line" count={3} /> : <ProblemBox error={cases.error} onRetry={cases.retry} />;
@@ -169,7 +178,8 @@ export function GoldenSet() {
             </thead>
             <tbody>
               {cases.items.map((golden) => (
-                <CaseRow key={golden.id} golden={golden} requested={requested.some((r) => r.caseId === golden.id)}
+                <CaseRow key={golden.id} golden={golden}
+                  requested={golden.deletion_manifest_id !== null || requested.some((r) => r.caseId === golden.id)}
                   onRequested={request(golden)} />
               ))}
             </tbody>
@@ -184,7 +194,7 @@ export function GoldenSet() {
     <section ref={section} id="golden-set" aria-labelledby="golden-heading" className={parts.part}>
       <h3 ref={heading} id="golden-heading" tabIndex={-1} className={parts.title}>{t("settings_system.golden")}</h3>
       {body}
-      {requested.length > 0 && <RequestedDeletions requested={requested} />}
+      {listed.length > 0 && <RequestedDeletions requested={listed} />}
     </section>
   );
 }

@@ -2821,6 +2821,11 @@ export interface components {
              * @description The job's company, as the job list shows it
              */
             company: string;
+            /**
+             * Deletion Manifest Id
+             * @description The case's open deletion manifest (its purge pending, waiting or failed), null without one: the case cannot be deleted again, activated or made a canary meanwhile
+             */
+            deletion_manifest_id: number | null;
             /** Id */
             id: number;
             /** Is Canary */
@@ -6955,7 +6960,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A running eval run includes the case (`conflict_state`, detail `eval_run_running`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            /** @description The case's deletion is pending (`conflict_state`, detail `purge_in_progress`), or a running eval run includes it (`conflict_state`, detail `eval_run_running`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7036,7 +7041,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Activating a case whose job or profile version is being purged, or whose profile version was purged (`conflict_state`, detail `purge_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            /** @description Activating a case whose job or profile version is being purged, or whose profile version was purged, or activating a case or making it a canary while its deletion is pending (`conflict_state`, detail `purge_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;

@@ -888,6 +888,7 @@ export function goldenCase(overrides: Partial<GoldenCaseOut> = {}): GoldenCaseOu
     source: "week1",
     active: true,
     is_canary: false,
+    deletion_manifest_id: null,
     ...overrides,
   };
 }

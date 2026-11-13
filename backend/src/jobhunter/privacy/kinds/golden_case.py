@@ -5,7 +5,10 @@ Carry-forward 3 in part): manifest kind `golden_case_delete`, no fence.
 transaction: `active_config FOR UPDATE` (A0's lock, held for `purge.open_purge`), then
 `fences.refuse_under_global_fence` (409 `delete_everything_in_progress` while delete-everything's fence
 stands, M5 Task 8), then the case's row `FOR UPDATE` (`golden.lock_case`): a `CaseMissing` (`LookupError`)
-when there is none, `golden.eval_run_running()` (409 `conflict_state`, detail `eval_run_running`) while a
+when there is none, `fences.purge_in_progress()` (409 `conflict_state`, detail `purge_in_progress`) while the
+case's deletion is pending (`golden.pending_deletion`: an `executing` manifest of this kind names it, so a
+second request opens no second manifest, as a second source purge or delete-everything is refused; plan M5
+Task 33, Ruling T33-15), `golden.eval_run_running()` (409 `conflict_state`, detail `eval_run_running`) while a
 running eval run includes it. Then A0 with the request `{"golden_case_id": <id>}` and no fence. The api's
 route keeps its synchronous deletion until Task 18 rewires it to answer 202 (U8, Deviation 20).
 
@@ -46,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.privacy.deletion_graph import settle_and_delete_cases
-from jobhunter.privacy.fences import refuse_under_global_fence
+from jobhunter.privacy.fences import purge_in_progress, refuse_under_global_fence
 from jobhunter.privacy.manifests import (
     ManifestContent,
     ManifestKind,
@@ -69,7 +72,7 @@ from jobhunter.worker.operations import EVAL_RUN_INTERRUPTED, fail_eval_run
 from jobhunter.worker.tasks import Deferrer
 
 KIND: Final = "golden_case_delete"
-REQUEST_KEY: Final = "golden_case_id"
+REQUEST_KEY: Final = golden.DELETION_REQUEST_KEY  # `golden_case_id`
 # How long a purge waits for a running eval run that includes its case (module docstring).
 EVAL_WAIT: Final = timedelta(minutes=5)
 LOGGED_IDS: Final = 20
@@ -88,6 +91,14 @@ async def request_golden_case_delete(
     flags = await golden.lock_case(conn, case_id)
     if flags is None:
         raise golden.CaseMissing(case_id)
+    if (pending := await golden.pending_deletion(conn, case_id)) is not None:
+        log.info(
+            "golden_case_delete_refused",
+            golden_case_id=case_id,
+            reason="purge_in_progress",
+            manifest_id=pending,
+        )
+        raise purge_in_progress()
     if await golden.in_running_run(conn, case_id, flags):
         log.info("golden_case_delete_refused", golden_case_id=case_id, reason=golden.EVAL_RUN_RUNNING)
         raise golden.eval_run_running()

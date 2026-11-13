@@ -184,6 +184,28 @@ describe("GoldenSet", () => {
     });
   });
 
+  it("a case whose deletion is pending says so after a reload, with its manifest's state, and offers no Delete", async () => {
+    // plan M5 Task 33, Ruling T33-15 (I1): the server names the open manifest, so the state outlives the page
+    const api = fakeApi({ signedIn: true });
+    api.goldenCases = [goldenCase({ deletion_manifest_id: 9 }), goldenCase({ id: 2, job_id: 32, title: "Data Engineer" })];
+    api.manifests = [manifestOut({ id: 9, kind: "golden_case_delete", status: "executing", completed_at: null, shipped_at: null })];
+    renderInProviders(<GoldenSet />);
+    await screen.findByText("Backend Engineer (Python)", { selector: "td" });
+    const pending = rowOf("Backend Engineer (Python)");
+    expect(within(pending).getByText(en["golden.deletion_requested"])).toBeTruthy();
+    expect(within(pending).queryByRole("button", { name: /^Delete/ })).toBeNull();
+    expect(within(pending).getAllByRole<HTMLInputElement>("checkbox").every((box) => box.disabled)).toBe(true);
+    const other = rowOf("Data Engineer");
+    expect(within(other).getByRole("button", { name: /^Delete/ })).toBeTruthy();
+    expect(within(other).getAllByRole<HTMLInputElement>("checkbox").some((box) => box.disabled)).toBe(false);
+    const status = await screen.findByRole("region", { name: en["golden.deletions"] });
+    const requested = within(status).getByText(/Backend Engineer \(Python\)/).closest("li");
+    await waitFor(() => {
+      expect(requested?.textContent).toContain(en["settings_privacy.status.executing"]);
+    });
+    expect(within(status).queryByText(/Data Engineer/)).toBeNull();
+  });
+
   it("a requested deletion whose read is refused is not read again", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
