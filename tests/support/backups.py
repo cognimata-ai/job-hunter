@@ -20,7 +20,11 @@ subfolder would (`restic restore <id> --target`): the files one level deeper, or
 `stored(snapshot, path)` is where a snapshot holds a backed-up file, for a test to alter it. `unreadable`
 names listed files restic cannot read (final review C1): as restic 0.19.1 does on exit 3, `backup` still saves
 the snapshot of the files it could read, with the tags given, then raises `ResticError("backup",
-"incomplete", 3)`.
+"incomplete", 3)`. `forget_last(tag=, keep_last=)` forgets the snapshots of `tag` beyond the newest
+`keep_last` (one group: every snapshot has the one host, final fix B7), their directories with them;
+`forget_prune` is recorded in `forgets` and forgets no set (the set policy is real restic's, which
+`tests/stack/test_prod_backup.py` runs). Snapshot ids and times count every snapshot made, forgotten ones
+included, so a later one never takes a forgotten one's id.
 """
 
 import shutil
@@ -174,6 +178,8 @@ class FakeRepository(Restic):
         self.unreadable: set[Path] = set()
         self.infos: list[SnapshotInfo] = []
         self.restores: list[Restored] = []
+        self.forgets: list[tuple[str, dict[str, int]]] = []
+        self._made = 0
 
     def stored(self, snapshot: str, path: Path) -> Path:
         """Where `snapshot` holds the backed-up file `path`."""
@@ -191,7 +197,8 @@ class FakeRepository(Restic):
         self, *, paths: Sequence[Path] = (), files_from: Path | None = None, tags: Sequence[str]
     ) -> str:
         self._fail("backup")
-        snapshot_id = f"{len(self.infos) + 1:064x}"
+        self._made += 1
+        snapshot_id = f"{self._made:064x}"
         stored = self.root / snapshot_id
         stored.mkdir(parents=True)
         named = [Path(name) for name in lines(files_from)] if files_from is not None else []
@@ -201,7 +208,7 @@ class FakeRepository(Restic):
         for file in listed:
             self._inside(stored, file).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file, self._inside(stored, file))
-        time = self._EPOCH + timedelta(minutes=len(self.infos))
+        time = self._EPOCH + timedelta(minutes=self._made - 1)
         names = tuple(str(path) for path in [*paths, *listed])
         self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names))
         if len(listed) < len(named):  # exit 3: the incomplete snapshot is saved all the same
@@ -211,6 +218,21 @@ class FakeRepository(Restic):
     async def snapshots(self, *, tags: Sequence[str]) -> list[SnapshotInfo]:
         self._fail("snapshots")
         return [info for info in self.infos if set(tags) <= set(info.tags)]
+
+    async def forget_last(self, *, tag: str, keep_last: int) -> None:
+        self._fail("forget")
+        self.forgets.append((tag, {"keep_last": keep_last}))
+        tagged = [info for info in self.infos if tag in info.tags]
+        forgotten = {info.id for info in tagged[: max(len(tagged) - keep_last, 0)]}
+        for snapshot_id in forgotten:
+            shutil.rmtree(self.root / snapshot_id)
+        self.infos = [info for info in self.infos if info.id not in forgotten]
+
+    async def forget_prune(self, *, tag: str, keep_daily: int, keep_weekly: int, keep_monthly: int) -> None:
+        self._fail("forget")
+        self.forgets.append(
+            (tag, {"keep_daily": keep_daily, "keep_weekly": keep_weekly, "keep_monthly": keep_monthly})
+        )
 
     async def restore(self, *, snapshot: str, subfolder: str, target: Path) -> None:
         self._fail("restore")

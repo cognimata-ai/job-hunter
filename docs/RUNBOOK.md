@@ -523,8 +523,9 @@ already open keep working, and the restart ends the window.
 **The backups** (§19.5) run in the backup container on their schedule, in UTC: a backup set nightly at 01:15
 (`JOBHUNTER_BACKUP_CRON`); the deletion manifests shipped every 5 minutes (`JOBHUNTER_MANIFEST_SHIP_CRON`);
 the prune on Sundays at 02:30 (`JOBHUNTER_BACKUP_PRUNE_CRON`), which keeps 7 daily, 4 weekly and 3 monthly
-sets; the restore test on the first Sunday of the month at 03:30 (`JOBHUNTER_RESTORE_TEST_CRON`). The manifest
-snapshots are never forgotten. One backup job runs at a time: another prints `{"error": "backup_job_busy"}`
+sets and the newest 10 `manifests` snapshots (each complete one holds every manifest shipped before it, so no
+manifest is lost, §19.5); the restore test on the first Sunday of the month at 03:30
+(`JOBHUNTER_RESTORE_TEST_CRON`). One backup job runs at a time: another prints `{"error": "backup_job_busy"}`
 and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
 the scheduler's runs waits for it, then ships what is left, so it never prints `backup_job_busy`. A restore
 reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set,

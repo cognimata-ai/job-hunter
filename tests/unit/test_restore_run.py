@@ -26,6 +26,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter import cli, cli_backup, crypto
 from jobhunter.backup.backup_set import run_backup_set
+from jobhunter.backup.prune import MANIFESTS_KEPT, run_prune
 from jobhunter.backup.restic import ResticError
 from jobhunter.backup.restore import (
     ManifestStreamConflict,
@@ -448,6 +449,46 @@ async def test_one_file_name_with_other_bytes_in_two_snapshots_stops_the_restore
     assert list(site.manifests.iterdir()) == []
     assert len(pg_restored(runner)) == loads and not await scalar(target.engine, _REVISION)
     assert not (site.staging / "restore").exists()
+
+
+async def test_a_restore_over_the_kept_manifests_snapshots_restores_every_manifest(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+) -> None:
+    """The weekly prune keeps the newest `MANIFESTS_KEPT` (10) `manifests` snapshots (final fix B7). Twelve
+    shipments of one new manifest each make twelve snapshots; after the prune the newest ten are left, and the
+    restore over them restores and replays all twelve manifests: each complete snapshot holds every manifest
+    an earlier one held, since every run ships every file of the stream, which only grows."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    manifests = [a_manifest(max_alert=50 + n) for n in range(12)]
+    for manifest in manifests:
+        write_manifest_file(site.manifests, manifest)
+        assert (await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)).shipped
+    shipped = [info.id for info in repo.infos if "manifests" in info.tags]
+    assert len(shipped) == 12
+
+    await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
+
+    assert MANIFESTS_KEPT == 10
+    assert [info.id for info in repo.infos if "manifests" in info.tags] == shipped[2:]
+    site.lose()
+    with capture_logs() as logs:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    names = sorted(manifest_file_name(m["manifest_uuid"]) for m in manifests)
+    assert sorted(path.name for path in site.manifests.iterdir()) == names
+    for manifest in manifests:
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+    [restored] = events(logs, "manifest_stream_restored")
+    assert (restored["snapshots"], restored["manifests"]) == (10, 12)
+    assert [restored.snapshot for restored in repo.restores if restored.subfolder == str(site.manifests)] == (
+        shipped[2:]
+    )
 
 
 # ---- the refusals (review M1) ------------------------------------------------------------------------------

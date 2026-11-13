@@ -25,7 +25,8 @@ exits 1):
   Otherwise the stream is the **union of every `manifests` snapshot** (final review C1, M2), never the newest
   alone: a snapshot restic saved on exit 3 (incomplete, named by no shipment) or an older list two
   unserialised shippers uploaded last (before the shipment lock, `shipper.SHIP_LOCK_KEY`) may lack a manifest
-  an earlier snapshot holds, and `manifests` snapshots are never forgotten. Oldest first, each snapshot's
+  an earlier snapshot holds; the weekly prune keeps the newest ten (`prune.MANIFESTS_KEPT`, which bounds this
+  step's work). Oldest first, each snapshot's
   `cfg.manifests_dir` is restored into `<scratch>/snapshot` (made fresh) and its `<uuid>.json` files merged
   into `<scratch>/union`: a file name already there must hold the same bytes (sha256; a manifest file is
   written once), else `ManifestStreamConflict` (`manifest_stream_conflict`, logged with the file name and both

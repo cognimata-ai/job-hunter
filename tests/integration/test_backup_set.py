@@ -485,16 +485,33 @@ async def test_two_backup_jobs_never_run_at_once(
     ).status == "succeeded"
 
 
-async def test_prune_records_a_run_and_never_forgets_manifests(
+async def test_prune_records_a_run_and_keeps_the_newest_manifests_snapshots(
     migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, engine: AsyncEngine, tmp_path: Path
 ) -> None:
+    """The prune forgets the `manifests` snapshots beyond the newest 10 first (final fix B7: each complete
+    one holds every manifest an earlier one held), then the sets beyond the counts kept, pruning what both
+    left."""
     commands = FakeCommands(migrated)
     started = utcnow()
 
     run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=lambda: started)
 
-    [forget] = commands.calls
-    # R13: the filter is the `set` tag, so restic never considers a `manifests` snapshot for forgetting.
+    manifests, forget = commands.calls
+    assert manifests.argv == [
+        RESTIC_BIN,
+        "forget",
+        "--retry-lock",
+        "30m",
+        "--host",
+        "jobhunter-backup",
+        "--tag",
+        "manifests",
+        "--group-by",
+        "host",
+        "--keep-last",
+        "10",
+    ]
+    # R13: the filter is the `set` tag, so this forget never considers a `manifests` snapshot.
     assert forget.argv == [
         RESTIC_BIN,
         "forget",
@@ -514,7 +531,7 @@ async def test_prune_records_a_run_and_never_forgets_manifests(
     ]
     row = await one(engine, _RUN, id=run_id)
     assert (row.kind, row.status, row.error, row.backup_set_id) == ("prune", "succeeded", None, None)
-    assert row.report == {"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 3}
+    assert row.report == {"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 3, "keep_manifests": 10}
     assert row.started_at == started and row.finished_at is not None
 
     # The counts are the settings'; a failure fails the run with its step and class only.
@@ -527,11 +544,15 @@ async def test_prune_records_a_run_and_never_forgets_manifests(
         JOBHUNTER_BACKUP_KEEP_WEEKLY="8",
         JOBHUNTER_BACKUP_KEEP_MONTHLY="6",
     )
+    counted = FakeCommands(migrated)
+    await run_prune(kept, Restic(kept, counted), backup_engine, clock=utcnow)
+    [_, forget] = counted.calls
+    assert forget.argv[-7:] == ["--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "6", "--prune"]
     failing = FakeCommands(migrated, fail="restic")
     with pytest.raises(PruneFailed) as failed:
         await run_prune(kept, Restic(kept, failing), backup_engine, clock=utcnow)
-    [forget] = failing.calls
-    assert forget.argv[-7:] == ["--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "6", "--prune"]
+    [forget] = failing.calls  # the first forget failed: nothing after it ran
+    assert forget.argv[-6:] == ["--tag", "manifests", "--group-by", "host", "--keep-last", "10"]
     row = await one(engine, _RUN, id=failed.value.run_id)
     assert (row.kind, row.status, row.error) == ("prune", "failed", "prune:ResticError")
     assert failed.value.error == "prune:ResticError" and row.finished_at is not None

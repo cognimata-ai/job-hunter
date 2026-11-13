@@ -104,6 +104,7 @@ async def exercise_every_call(restic: Restic, tmp_path: Path) -> None:
     await restic.backup(paths=[tmp_path / "file"], tags=["manifests"])
     await restic.restore(snapshot=SNAPSHOT_ID, subfolder="/data/manifests", target=tmp_path / "target")
     await restic.snapshots(tags=["manifests"])
+    await restic.forget_last(tag="manifests", keep_last=10)
     await restic.forget_prune(tag="set", keep_daily=7, keep_weekly=4, keep_monthly=12)
 
 
@@ -115,7 +116,7 @@ async def test_every_call_passes_host_and_retry_lock(tmp_path: Path) -> None:
     runner = FakeRunner(every_call_script())
     await exercise_every_call(Restic(backup_config(tmp_path), runner), tmp_path)
 
-    assert runner.commands() == ["snapshots", "init", "backup", "restore", "snapshots", "forget"]
+    assert runner.commands() == ["snapshots", "init", "backup", "restore", "snapshots", "forget", "forget"]
     for call in runner.calls:
         assert call.argv[0] == RESTIC_BIN == "/usr/local/bin/restic"
         assert value_of(call.argv, "--retry-lock") == RETRY_LOCK == "30m"
@@ -132,6 +133,29 @@ async def test_every_call_passes_host_and_retry_lock(tmp_path: Path) -> None:
         "12",
     ]
     assert "--prune" in forget
+
+
+async def test_forget_last_keeps_the_newest_of_a_tag_whatever_their_paths(tmp_path: Path) -> None:
+    """`forget_last` forgets the snapshots tagged `tag` beyond the newest `keep_last`, grouped by host alone:
+    a `manifests` snapshot's paths are the files it lists, so restic's default grouping by host and paths
+    would make each one a group of its own and keep them all (final fix B7). It prunes nothing itself."""
+    runner = FakeRunner()
+    await Restic(backup_config(tmp_path), runner).forget_last(tag="manifests", keep_last=10)
+    [call] = runner.calls
+    assert call.argv == (
+        RESTIC_BIN,
+        "forget",
+        "--retry-lock",
+        RETRY_LOCK,
+        "--host",
+        RESTIC_HOST,
+        "--tag",
+        "manifests",
+        "--group-by",
+        "host",
+        "--keep-last",
+        "10",
+    )
 
 
 async def test_s3_keys_reach_the_child_env_only(tmp_path: Path) -> None:

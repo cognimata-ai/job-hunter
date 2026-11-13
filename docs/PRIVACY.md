@@ -80,7 +80,7 @@ Retention is dependency-aware: a record is removed only after everything that re
 | Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
 | Alerts | DB | Resolved + 90 days | daily |
 | Exports | `exports` volume and table | 7 days; deleted by every user-requested purge and by delete-everything, not by the nightly job tombstoning, so an export can hold content tombstoned after it was made until it expires; its record, without the archive, 30 days after it expires | daily |
-| Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: indefinitely | `restic forget/prune` |
+| Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: the newest 10, which hold every manifest shipped, so the manifests are kept indefinitely | `restic forget/prune` |
 | Backup sets, backup runs | DB | 13 months after they finished, except the newest succeeded set and restore test, and a set a kept run names | daily |
 | Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
 | LangSmith traces | LangSmith EU | Per the LangSmith project retention setting (no I/O content) | LangSmith console |
