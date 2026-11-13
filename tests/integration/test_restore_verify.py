@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from tests.support.backups import FakeRepository, backup_run, backup_set
 from tests.support.collect import pending_item, queued_run
 from tests.support.fixtures import ConfigFactory
-from tests.support.pg import PgServer, config_for
+from tests.support.pg import PgServer, config_for, pg_one
 from tests.support.purges import request_source_purge, seeded
 from tests.support.restore import ContainerRunner, RestoredDatabase, restored_database
 
@@ -59,7 +59,13 @@ _MANIFEST: Final = sa.text("SELECT status, file_sha256 FROM deletion_manifests W
 _EXECUTING: Final = sa.text(
     "INSERT INTO deletion_manifests (manifest_uuid, kind, status) VALUES (:u, 'job_tombstone', 'executing')"
 )
-NAMED_ALERT: Final = 1000  # above every alert of these tests
+# The alerts' identity on the shared server: the named alert lies `ABOVE_IDENTITY` above it (final fix B12),
+# so the restored database's identity is below the manifest's bound whatever earlier files of the session
+# inserted (TRUNCATE keeps a sequence).
+_ALERTS_IDENTITY: Final = (
+    "SELECT coalesce(pg_sequence_last_value(pg_get_serial_sequence('public.alerts', 'id')::regclass), 0)"
+)
+ABOVE_IDENTITY: Final = 1000
 
 
 @dataclass(frozen=True)
@@ -246,15 +252,18 @@ async def test_the_restored_phase_closes_mid_run_backup_rows(
 
 
 async def test_the_replayed_phase_requires_completed_manifests_postconditions_and_no_fence(
-    sets: Sets, db: RestoredDatabase, make_config: ConfigFactory, tmp_path: Path
+    sets: Sets, db: RestoredDatabase, make_config: ConfigFactory, migrated: PgServer, tmp_path: Path
 ) -> None:
     """Before `migrate`, a manifest of the stream that the dump lacks is to be replayed and the alerts'
     identity lies below its bound; after it, the phase holds. Then each condition fails it on its own: a row
     the manifest deleted back (its postcondition), an active purge fence, and an identity lowered below the
-    bound."""
+    bound. The manifest's alert is named above the shared server's alerts identity, whatever it is."""
+    identity = pg_one(migrated, "migrator", _ALERTS_IDENTITY)
+    assert identity is not None
+    named = int(str(identity[0])) + ABOVE_IDENTITY
     stream = tmp_path / "stream"
     stream.mkdir(mode=0o700)
-    manifest = alert_manifest(NAMED_ALERT)
+    manifest = alert_manifest(named)
     write_manifest_file(stream, manifest)
     await loaded(sets, db)
     manifest_uuid = uuid.UUID(manifest["manifest_uuid"])
@@ -272,7 +281,7 @@ async def test_the_replayed_phase_requires_completed_manifests_postconditions_an
     assert (await one(db.engine, _MANIFEST, u=manifest_uuid)).status == "completed"
 
     async with rolled_back(db) as conn:
-        await conn.execute(_ALERT_WITH_ID, {"id": NAMED_ALERT})
+        await conn.execute(_ALERT_WITH_ID, {"id": named})
         deleted_back = await verify_replayed(conn, stream, files=db.files)
     assert deleted_back.failures == [f"manifest:{manifest_uuid}:checked"]
     async with rolled_back(db) as conn:
@@ -282,7 +291,7 @@ async def test_the_replayed_phase_requires_completed_manifests_postconditions_an
     async with rolled_back(db) as conn:
         await conn.execute(_LOWER_ALERTS)
         lowered = await verify_replayed(conn, stream, files=db.files)
-    assert lowered.failures == [f"identity:alerts:1:{NAMED_ALERT}"]
+    assert lowered.failures == [f"identity:alerts:1:{named}"]
 
 
 async def test_the_replayed_phase_refuses_a_pending_retry_until_completed(

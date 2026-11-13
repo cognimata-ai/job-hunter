@@ -4,6 +4,7 @@ crosses (`tests/stack/test_prod_drills.py`).
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Final
 
 import pytest
@@ -13,7 +14,8 @@ from jobhunter.db.alembic_runner import alembic_config
 from jobhunter.db.migrate import run_migrate_async
 from jobhunter.privacy.reconcilers import _EXECUTING
 from jobhunter.worker.operations import PURGE_KIND
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from tests.support.pg import PgServer, pg_one, pg_rows
 
@@ -27,6 +29,17 @@ INDEX_DEF: Final = (
 )
 _INDEXES: Final = "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1"
 _VERSION: Final = "SELECT version_num FROM alembic_version"
+# The fill of `filled`: `OPERATIONS` operations of another kind and `PURGES` purge operations, each of a
+# manifest of its own, every one finished (no transition: rows are inserted in a state their CHECKs allow).
+OPERATIONS: Final = 5000
+PURGES: Final = 50
+_FILL: Final = (
+    "INSERT INTO operations (kind, payload, dedup_key, status, finished_at) "
+    "SELECT 'eval_run', jsonb_build_object('eval_run_id', n), 'eval_run:' || n, 'succeeded', now() "
+    "FROM generate_series(1, %s) n "
+    "UNION ALL SELECT 'purge', jsonb_build_object('manifest_id', n), 'purge:' || n, 'succeeded', now() "
+    "FROM generate_series(1, %s) n"
+)
 
 
 async def upgrade(server: PgServer, revision: str) -> None:
@@ -63,12 +76,30 @@ async def test_the_index_exists_and_downgrades(fresh_pg_server: PgServer, make_c
     assert pg_one(server, "migrator", record, M5_INDEX) == (M5_SCHEMA, False)
 
 
-async def test_the_index_serves_the_purge_readers(engine: AsyncEngine) -> None:
-    """The purge-fences reconciler's own lookup (`_EXECUTING`, its kind bound to `purge`) can use the index:
-    with sequential scans off, its plan names it."""
-    async with engine.connect() as conn:
+@pytest.fixture
+async def filled(fresh_pg_server: PgServer) -> AsyncIterator[AsyncEngine]:
+    """A server of the test's own at 0011, its `operations` filled at a production-like size and ANALYZEd
+    (final fix B12): the planner's choice is then the data's, not that of whatever statistics earlier files
+    left on the shared server (three operations of another kind make it take `operations_dedup_newest`). An
+    engine on it as the migrator, which owns the table."""
+    server = fresh_pg_server
+    await upgrade(server, M5_INDEX)
+    pg_rows(server, "migrator", _FILL, OPERATIONS, PURGES)
+    pg_rows(server, "migrator", "ANALYZE operations")
+    filled_engine = create_async_engine(server.dsn("migrator", driver="sqlalchemy"), poolclass=NullPool)
+    try:
+        yield filled_engine
+    finally:
+        await filled_engine.dispose()
+
+
+async def test_the_index_serves_the_purge_readers(filled: AsyncEngine) -> None:
+    """The purge-fences reconciler's own lookup (`_EXECUTING`, its kind bound to `purge`) uses the index on
+    an ANALYZEd table of a production-like size: with sequential scans off, its plan names it, in both of its
+    subqueries."""
+    async with filled.connect() as conn:
         await conn.execute(sa.text("SET LOCAL enable_seqscan = off"))
         plan = (await conn.execute(sa.text(f"EXPLAIN {_EXECUTING.text}"), {"kind": PURGE_KIND})).scalars()
         lines = list(plan)
         await conn.rollback()
-    assert any(INDEX in line for line in lines), "\n".join(lines)
+    assert sum(INDEX in line for line in lines) == 2, "\n".join(lines)
