@@ -11,6 +11,8 @@ invented; nothing leaves the process (delete-everything's live run cancels throu
 restore test's replay calls nothing).
 """
 
+import errno
+import shutil
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
@@ -477,3 +479,69 @@ async def test_a_cleanup_failure_fails_a_passing_run_and_stands_beside_a_failed_
     assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (1,)
     assert await restore_test.remove_leftovers(backup_cfg, restore_staging=False) == (RESTORE_TEST_DB,)
     assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)
+
+
+def an_unremovable(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    """`shutil.rmtree` as the OS answers it for `directory` once the scratch step has made its `set/` (a file
+    under it that cannot go, say): `PermissionError`, nothing removed, which `ignore_errors` swallows as
+    `rmtree` itself does. Any other path is removed as usual."""
+    remove = shutil.rmtree
+
+    def rmtree(path: Any, ignore_errors: bool = False, onerror: Any = None, **kwargs: Any) -> None:
+        if Path(path) == directory and (directory / "set").is_dir():
+            if not ignore_errors:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return
+        remove(path, ignore_errors, onerror, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+
+
+@pytest.mark.parametrize("steps", ["a_step_fails", "every_step_passes"])
+async def test_a_staging_directory_the_cleanup_cannot_remove_fails_a_passing_run(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    queue_app: Any,
+    steps: str,
+) -> None:
+    """F3 review M1 (Ruling FU-9): the cleanup cannot remove `<staging>/restore_test`, which holds the set's
+    dump, a full copy of the data that no purge reaches. As for a scratch database it cannot drop (Ruling
+    FU-8), the error is logged (`restore_test_staging_not_removed`, the directory's name and the error's class
+    only) and recorded as `cleanup_error`: a run whose steps all passed fails `cleanup:PermissionError`, so
+    its alert opens, and a failed step keeps its own code. The scratch database is dropped all the same.
+    `remove_leftovers` never reports as removed a directory it could not remove, and removes it once it
+    can."""
+    set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    staging = backup_cfg.staging_dir / "restore_test"
+    an_unremovable(monkeypatch, staging)
+    loader = ContainerRunner(migrated, fail="pg_restore") if steps == "a_step_fails" else runner
+    expected = "pg_restore:pg_restore_failed" if steps == "a_step_fails" else "cleanup:PermissionError"
+
+    with capture_logs() as logs, pytest.raises(RestoreTestFailed) as failed:
+        await restore_tested(backup_cfg, repo, loader, backup_engine)
+
+    assert failed.value.error == expected
+    row = await one(engine, _RUN, id=failed.value.run_id)
+    assert (row.status, row.error, row.backup_set_id) == ("failed", expected, set_id)
+    assert row.report["cleanup_error"] == "PermissionError"
+    [not_removed] = events(logs, "restore_test_staging_not_removed")
+    assert (not_removed["staging"], not_removed["error_class"]) == ("restore_test", "PermissionError")
+    assert "Permission denied" not in str(logs) and str(staging) not in str(logs)
+    [logged] = events(logs, "restore_test_failed")
+    assert logged["error"] == expected
+    assert await restore_test_alert_open(engine, failed.value.run_id)
+    assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)
+    assert (staging / "set").is_dir()  # the copy stays until a removal succeeds
+
+    with capture_logs() as logs:
+        assert await restore_test.remove_leftovers(backup_cfg, restore_staging=False) == ()
+    assert [e["staging"] for e in events(logs, "restore_test_staging_not_removed")] == ["restore_test"]
+    assert events(logs, "restore_leftovers_removed") == []
+    monkeypatch.undo()
+    assert await restore_test.remove_leftovers(backup_cfg, restore_staging=False) == ("restore_test",)
+    assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []

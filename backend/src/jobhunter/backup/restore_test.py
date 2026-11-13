@@ -29,14 +29,16 @@ every step fails the run too, as `unexpected:<error class>`: a run is never left
 process. A failed run raises `backup.restore_test_failed` through the worker's `backup_health` reconciler
 (Task 7): no alert is raised here.
 
-**A cleanup that fails** (T26-5 (2), Ruling FU-8): a drop of the scratch database that raises, a refusal of
-the server's or any other error, leaves a full copy of the data that no purge reaches, so it never ends a run
-`succeeded`. It is logged (`restore_test_scratch_not_dropped`, its class only) and recorded in the report as
-`cleanup_error` (its class). When every step passed, the run is `failed` with `cleanup:<error class>`, and the
-worker raises `backup.restore_test_failed` for it as for any failed run. When a step failed, that step's
-`<step>:<code>` stays the run's error, the cleanup's beside it in the report, never in its place. The scratch
-directory is removed all the same, and the next restore test's start, or the scheduler's, drops the scratch
-database it left (`remove_leftovers`).
+**A cleanup that fails** (T26-5 (2), Rulings FU-8 and FU-9): a drop of the scratch database that raises, a
+refusal of the server's or any other error, or a scratch directory that cannot be removed (an `OSError` of
+`rmtree`; it holds the set's dump), leaves a full copy of the data that no purge reaches, so it never ends a
+run `succeeded`. Each is logged (`restore_test_scratch_not_dropped`, its class only;
+`restore_test_staging_not_removed`, the directory's name and its class only) and the first is recorded in the
+report as `cleanup_error` (its class). When every step passed, the run is `failed` with `cleanup:<error
+class>`, and the worker raises `backup.restore_test_failed` for it as for any failed run. When a step failed,
+that step's `<step>:<code>` stays the run's error, the cleanup's beside it in the report, never in its place.
+The directory is removed even when the drop failed, and the database dropped even when the directory stays;
+the next restore test's start, or the scheduler's, removes what it left (`remove_leftovers`).
 
 **`remove_leftovers`** (final review I1), at the backup scheduler's start (`scheduler.fail_interrupted`): a
 restore test killed mid-run (a restart past the backup service's stop grace, an OOM, a host reboot) leaves
@@ -45,7 +47,9 @@ a killed `restore run` leaves `<staging_dir>/restore` with its own. Each is a fu
 no purge reaches, so the start drops `jobhunter_restore_test` when it exists (as `jobhunter_restore`, `WITH
 (FORCE)`) and removes both directories, before any job runs. It is idempotent, and logs what it removed,
 names only (`restore_leftovers_removed`); a drop the server refuses is logged
-(`restore_test_scratch_not_dropped`) and left to the next restore test's start, never stopping the scheduler.
+(`restore_test_scratch_not_dropped`), and so is a directory that cannot be removed
+(`restore_test_staging_not_removed`), which is not named as removed: each is left to the next restore test's
+start, never stopping the scheduler.
 Every restore test runs it too, first, under the backup jobs' lock and before its run row (final fix C7): a
 restore test started by hand and killed hard does not restart the scheduler, so its start would not remove
 what it left. That check takes the restore test's own leftovers only, the scratch database and
@@ -239,12 +243,27 @@ async def _drop_if_exists(cfg: AppConfig) -> bool:
     return True
 
 
+def _remove_staging(directory: Path) -> str | None:
+    """`directory` removed with what it holds; the class of the error that kept it, or part of it, from being
+    removed, logged (`restore_test_staging_not_removed`: its name and the class only, never the path or the
+    message), else `None`. One that is gone already is removed."""
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        error = type(exc).__name__
+        log.warning("restore_test_staging_not_removed", staging=directory.name, error_class=error)
+        return error
+    return None
+
+
 def _remove_directory(directory: Path) -> bool:
-    """`directory` removed with what it holds; whether it existed."""
+    """`directory` removed with what it holds; whether it existed and is gone now (one that could not be
+    removed is logged by `_remove_staging`)."""
     if not directory.exists():
         return False
-    shutil.rmtree(directory, ignore_errors=True)
-    return True
+    return _remove_staging(directory) is None
 
 
 async def remove_leftovers(cfg: AppConfig, *, restore_staging: bool = True) -> tuple[str, ...]:
@@ -265,16 +284,16 @@ async def remove_leftovers(cfg: AppConfig, *, restore_staging: bool = True) -> t
 
 async def _clean_up(cfg: AppConfig) -> str | None:
     """The scratch database dropped and the scratch directory removed, after a failure too; the class of the
-    error that kept the database from being dropped, logged, else `None` (module docstring, "A cleanup that
-    fails"). It raises none: the run records it, and the next restore test's start drops what it left."""
+    first error that kept either from going, each logged, else `None` (module docstring, "A cleanup that
+    fails"). It raises none: the run records it, and the next restore test's start removes what it left."""
     error: str | None = None
     try:
         await _admin(cfg, _drop())
     except Exception as exc:  # noqa: BLE001 - reported beside the steps' outcome, never in its place (T26-5)
         error = type(exc).__name__
         log.warning("restore_test_scratch_not_dropped", error_class=error)
-    shutil.rmtree(cfg.staging_dir / RESTORE_TEST_STAGING, ignore_errors=True)
-    return error
+    not_removed = await asyncio.to_thread(_remove_staging, cfg.staging_dir / RESTORE_TEST_STAGING)
+    return error or not_removed
 
 
 async def _end(engine: AsyncEngine, run_id: int, report: dict[str, JSONValue], *, error: str | None) -> None:
