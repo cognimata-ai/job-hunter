@@ -119,7 +119,10 @@ BACKUP_UNSHIP_FUNCTION: Final = "public.unship_manifest(bigint)"
 # 7261004 (its grouping passes); it waits for 7261001 only at its start, holding none of these, so those
 # pairs form no cycle. Of the backup container's keys, `LOCK_ORDER` lists the one pair a process holds at
 # once, the outer one first: the prune takes 7261007 while it holds 7261006; a shipper takes 7261007 and
-# never 7261006, so no shipper holding 7261007 waits for 7261006, and no cycle can form.
+# never 7261006, so no shipper holding 7261007 waits for 7261006, and no cycle can form. One more pair is on
+# two databases (the final re-review's M4-4): the restore test holds 7261006 on the production database
+# while its in-process `migrate` takes 7261003 on its scratch database (`jobhunter_restore_test`); advisory
+# locks are per database, and nothing else connects to the scratch one, so that pair forms no cycle either.
 LOCK_ORDER: Final = ((7261006, 7261007),)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5

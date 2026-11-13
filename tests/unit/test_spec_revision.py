@@ -459,3 +459,17 @@ def test_the_offsite_lag_of_deleted_data_is_about_4_months() -> None:
     assert VERSIONS_EXPIRY in targets[0]
     assert f"the offsite lag of deleted data to {OFFSITE_LAG}" in targets[0]
     assert "the monthly restore test within about a month" in targets[0]
+
+
+def test_the_backup_roles_forgery_sentence_covers_an_inserted_receipt() -> None:
+    """The final re-review's M4-5: the backup role holds INSERT on the receipt tables, as the shipper must,
+    so §7.1's row states what a forged receipt could hide, beside what a forged removal does, and why the
+    restore's union of the `manifests` snapshots still holds: a restore reads the snapshots, never a
+    receipt."""
+    [row] = [line for line in _spec_lines() if line.startswith("  | `jobhunter_backup` |")]
+    assert "A removal forged by a compromised backup container" in row
+    assert "an insertion forged there" in row
+    assert "can hide a deletion that was never shipped" in row
+    assert "`privacy.manifest_unshipped` stays silent" in row
+    assert "a restore reads the `manifests` snapshots themselves, never a receipt" in row
+    assert "trusted for its receipts as for its snapshots" in row
