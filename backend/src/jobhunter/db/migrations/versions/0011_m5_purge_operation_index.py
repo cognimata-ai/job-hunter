@@ -11,10 +11,11 @@ static SQL, one `op.execute` per statement:
        two subqueries, the newest operation of each executing manifest and its check for a live or failed one
        (`privacy/reconcilers.py`, `_EXECUTING`), and delete-everything's lookup of its own manifest's
        operations (`privacy/kinds/delete_everything.py`, `_OWN_OPERATIONS`, the `id <= :bound` query).
-       Without it those lookups read every operation of the kind. The readers bind `kind` (`kind = :kind`),
-       so only a custom plan, which sees the value, uses this partial index; a generic plan, which PostgreSQL
-       may choose once psycopg prepares a statement after its threshold, may not, at a small cost on a small
-       table. The table is small (operations are pruned by retention), so the build takes no `CONCURRENTLY`.
+       Without it those lookups read every operation of the kind. The readers write the index's predicate,
+       `kind = 'purge'`, as a literal (final review, Codex's parked item 4), so a generic plan, which
+       PostgreSQL may choose once psycopg prepares a statement after its threshold, uses this partial index as
+       a custom plan does; a bound `kind = :kind` would hide it from a generic plan. The table is small
+       (operations are pruned by retention), so the build takes no `CONCURRENTLY`.
 
 An expand migration, the one the upgrade-then-rollback drill crosses (`tests/stack/test_prod_drills.py`): it
 adds an index and nothing else, so M5's first schema's code (0010's) runs on it, and its floor is 0010; it is

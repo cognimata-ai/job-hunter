@@ -300,8 +300,10 @@ _EXECUTING: Final = q(
 
 # ---- A2 ----------------------------------------------------------------------------------------------------
 
+# The kind is the literal `'purge'` (`PURGE_KIND`), never a parameter, so even a generic plan can use the
+# partial index of migration 0011, whose predicate it is (final review, Codex's parked item 4).
 _OWN_OPERATIONS: Final = q(
-    "SELECT id FROM operations WHERE kind = :kind "
+    "SELECT id FROM operations WHERE kind = 'purge' "
     "AND payload -> 'manifest_id' = to_jsonb(CAST(:m AS bigint)) AND id <= :bound ORDER BY id"
 )
 _DEFAULT_INSTANCES: Final = q(
@@ -453,9 +455,7 @@ async def _operations(
 ) -> tuple[list[Operation], dict[str, list[int]]]:
     """The content's operations, in §20.4's order (module docstring), and its `retained` ids."""
     idempotency_row_id = get_int(dict(manifest.request), REQUEST_KEY)
-    own = await select_ids(
-        conn, _OWN_OPERATIONS, {"kind": PURGE_KIND, "m": manifest.id, "bound": max_ids["operations"]}
-    )
+    own = await select_ids(conn, _OWN_OPERATIONS, {"m": manifest.id, "bound": max_ids["operations"]})
     defaults = await select_ids(
         conn, _DEFAULT_INSTANCES, {"sources": list(DEFAULT_INSTANCES), "bound": max_ids["source_instances"]}
     )

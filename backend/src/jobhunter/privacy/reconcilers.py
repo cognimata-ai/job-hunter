@@ -66,14 +66,17 @@ _OVERDUE: Final = q(
 )
 # Each executing manifest with its newest purge operation, whether any of them is pending, running or failed,
 # and whether another manifest's global fence stands (the D5 gate); a manifest's operations are its payload's.
+# The kind is the literal `'purge'` (`PURGE_KIND`), never a parameter, so even a generic plan can use the
+# partial index of migration 0011, whose predicate it is (final review, Codex's parked item 4).
 _EXECUTING: Final = q(
     "SELECT m.id, m.manifest_uuid, n.id AS operation_id, n.status, n.heartbeat_at, "
-    "EXISTS (SELECT 1 FROM operations o WHERE o.kind = :kind AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
+    "EXISTS (SELECT 1 FROM operations o WHERE o.kind = 'purge' "
+    "AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
     "AND o.status IN ('pending', 'running', 'failed')) AS blocks_requeue, "
     "EXISTS (SELECT 1 FROM purge_fences f WHERE f.kind = 'global' AND f.released_at IS NULL "
     "AND f.manifest_id <> m.id) AS under_global_fence "
     "FROM deletion_manifests m LEFT JOIN LATERAL (SELECT o.id, o.status, o.heartbeat_at FROM operations o "
-    "WHERE o.kind = :kind AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
+    "WHERE o.kind = 'purge' AND o.payload -> 'manifest_id' = to_jsonb(m.id) "
     "ORDER BY o.id DESC LIMIT 1) n ON true "
     "WHERE m.status = 'executing' ORDER BY m.id"
 )
@@ -164,7 +167,7 @@ async def purge_fences(ctx: ReconcileContext) -> int:
     changed = 0
     async with ctx.engine.begin() as conn:
         await fence_epoch(conn, ctx.epoch)
-        executing = (await conn.execute(_EXECUTING, {"kind": PURGE_KIND})).all()
+        executing = (await conn.execute(_EXECUTING)).all()
         for manifest in executing:
             if not manifest.blocks_requeue:
                 if (
