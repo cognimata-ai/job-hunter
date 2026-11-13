@@ -246,7 +246,11 @@ Once, after host setup, in this order (section 13, items 5 and 6):
    ```
 
    It prints `{"created": true}`, or `{"created": false}` for a repository that exists, which it leaves as it
-   is.
+   is. A database that was not restored from a repository gets a new, empty one: never point
+   `RESTIC_REPOSITORY` at the bucket path of an earlier lifetime of the deployment, whose `manifests` snapshots
+   a later restore would replay into the new database (its deletions by id). On a first deployment, and on a
+   deployment started again from nothing, `backup init` must print `{"created": true}`; on the fresh host of a
+   restore (section 9) it is the existing repository the restore reads.
 2. Caddy against Let's Encrypt's staging CA first, so that a mistake does not spend the production rate limit:
    add the line `acme_ca https://acme-staging-v02.api.letsencrypt.org/directory` to the global options block of
    `deploy/Caddyfile` (its first `{ … }`), then start the stack and read Caddy's log:
