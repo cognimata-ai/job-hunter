@@ -6476,7 +6476,7 @@ Whatever the outcome, the restore removes its staging copy of the dump (`/data/s
   3. For each name of §19.2: `install -o root -g 10010 -m 0440 <file> /etc/jobhunter/secrets/<name>`, then delete the source file. Never `chmod 0400`: the app services run as uid 10001 and could not read it.
   4. Check with `docker compose run --rm --no-deps <service> jobhunter startup-check --role <service>` for `api`, `worker`, `migrate`, `backup` and `restore` (the assertions of §16.8 for that role, without starting the service).
   5. Run the host without swap, or with encrypted swap only, so the `parse_jobs` tmpfs never pages a decrypted CV to a plain disk. The script refuses any unencrypted swap device, RAM-only zram included; on a host whose image ships zram swap, it is turned off before host setup (the runbook says how).
-  6. Install `deploy/firewall/docker-user.nft` (§16.9) with its systemd unit, which loads it at boot before Docker.
+  6. Install `deploy/firewall/docker-user.nft` (§16.9) with its systemd unit, which loads it at boot before Docker with `nft` (the package `nftables`: the preflight refuses a host without it). After every boot and after any firewall change, `nft list table inet jobhunter_egress` must list the table: the unit stays active after a flush has deleted it.
 - **Start / stop**: `docker compose up -d` / `docker compose stop` (graceful). Never `--scale worker=…`.
 - **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs hold ids, codes and counts: no content and no client address, §20.6).
 - **Alerts**:

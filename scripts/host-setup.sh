@@ -8,6 +8,8 @@
 # anything:
 # - a real run only: it runs as root, from the checkout at /opt/jobhunter, and deploy/release.lock and
 #   /etc/jobhunter/jobhunter.env exist (step 5 needs them);
+# - nft is installed (`command -v nft`; the package nftables): step 4's unit loads the egress rule with it, so
+#   a host without it would stop at step 4, after the secrets were installed;
 # - every secret file of deploy/secrets.example is in <dir>, except the two optional ones (step 3);
 # - gid 10010 is absent, or is the group jobhunter-secrets with no members, and no host user has gid 10010 as
 #   its primary group: no host user may read the secrets (§19.2);
@@ -161,6 +163,9 @@ if [ "$dry_run" -eq 0 ]; then
         [ -f "$file" ] || die "$file is missing; the startup checks (step 5) need it; nothing was changed"
     done
 fi
+command -v nft >/dev/null ||
+    die "nft is not installed: install the package nftables (apt-get install nftables); step 4's egress rule" \
+        "needs it; nothing was changed"
 for name in $names; do
     if [ ! -f "$source_dir/$name" ] && [[ $OPTIONAL != *" $name "* ]]; then
         die "$name is not in $source_dir (deploy/secrets.example lists it); nothing was changed"

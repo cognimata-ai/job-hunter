@@ -12,6 +12,7 @@ consulted. Each source file holds a planted dummy value, which must never appear
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,10 +85,22 @@ def probe_stub(command: str, answers: dict[str, tuple[str, int]], log: Path) -> 
     )
 
 
-def dry_run(tmp_path: Path, present: tuple[str, ...], *flags: str, answers: Answers | None = None) -> DryRun:
+def without_nft(path: str) -> str:
+    """`path` without its directories that hold an `nft`: a host without nftables."""
+    return os.pathsep.join(d for d in path.split(os.pathsep) if d and not os.access(Path(d, "nft"), os.X_OK))
+
+
+def dry_run(
+    tmp_path: Path,
+    present: tuple[str, ...],
+    *flags: str,
+    answers: Answers | None = None,
+    nft: bool = True,
+) -> DryRun:
     """The script's dry run on a new source directory holding `present`, each file a planted value, the probes
-    answering from `answers` over `DEFAULTS`, answer by answer; it fails the test when the run executed any
-    command of `CHANGES`."""
+    answering from `answers` over `DEFAULTS`, answer by answer, and `nft` on PATH (a shim) unless `nft` is
+    false (then no directory of PATH holds one); it fails the test when the run executed any command of
+    `CHANGES`."""
     source = tmp_path / "secrets-src"
     source.mkdir()
     for name in present:
@@ -96,13 +109,16 @@ def dry_run(tmp_path: Path, present: tuple[str, ...], *flags: str, answers: Answ
     shims.mkdir()
     record, log = tmp_path / "changed", tmp_path / "probed"
     for command in CHANGES:
-        (shims / command).write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{record}"\nexit 97\n')
+        if command != "nft" or nft:
+            (shims / command).write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{record}"\nexit 97\n')
     given = {command: {**DEFAULTS.get(command, {}), **(answers or {}).get(command, {})} for command in PROBES}
     for command in PROBES:
         (shims / command).write_text(probe_stub(command, given.get(command, {}), log))
     for shim in shims.iterdir():
         shim.chmod(0o755)
-    env = {"PATH": f"{shims}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path), "LC_ALL": "C.UTF-8"}
+    path = f"{shims}{os.pathsep}{os.environ['PATH'] if nft else without_nft(os.environ['PATH'])}"
+    assert (shutil.which("nft", path=path) is None) is not nft, "nft on PATH as the case says"
+    env = {"PATH": path, "HOME": str(tmp_path), "LC_ALL": "C.UTF-8"}
     done = subprocess.run(
         [str(SCRIPT), "--secrets-from", str(source), *flags, "--dry-run"],
         env=env,
@@ -193,6 +209,19 @@ def test_it_never_uses_chmod_0400(tmp_path: Path) -> None:
     secret_installs = [line for line in printed if line.startswith("install ") and f"{SECRETS_DIR}/" in line]
     assert len(secret_installs) == len(NAMES)
     assert all(" -o root -g 10010 -m 0440 " in line for line in secret_installs)
+
+
+def test_a_host_without_nft_stops_it(tmp_path: Path) -> None:
+    """Step 4's unit loads the egress rule with `nft` (§16.9; final review M4): a host without it stops in the
+    preflight, a dry run too, naming the package, before any step and before reading the group or the swap,
+    so the secrets are never installed on a host whose rule cannot load."""
+    run = dry_run(tmp_path, NAMES, "--delete-sources", nft=False)
+    assert run.done.returncode == 1
+    assert (commands(run.done.stdout), run.probed) == ([], [])
+    assert run.done.stderr == (
+        "host-setup: nft is not installed: install the package nftables (apt-get install nftables); step 4's "
+        "egress rule needs it; nothing was changed\n"
+    )
 
 
 @pytest.mark.parametrize("missing", [name for name in NAMES if name not in OPTIONAL])

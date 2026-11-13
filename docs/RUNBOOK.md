@@ -148,10 +148,11 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    zram included. On a host whose image ships zram swap, turn it off before host setup: `swapoff` its device
    (`swapoff /dev/zram0`) and disable the provider's zram service (`systemctl disable --now <zram service>`) so
    that it does not come back at boot; `swapon --show` after a reboot lists nothing.
-2. **The checkout and the registry.** Install Docker Engine at its pinned version (section 1). Clone the
-   repository to `/opt/jobhunter`, check out the release tag (section 10), and log in to GHCR with the
-   read-only token, read from a file that is deleted afterwards (Docker keeps the login in root's
-   `~/.docker/config.json`):
+2. **The checkout and the registry.** Install Docker Engine at its pinned version (section 1), and the
+   package `nftables` (`apt-get install nftables`): its `nft` loads the egress rule at every boot, and host
+   setup refuses to start without it. Clone the repository to `/opt/jobhunter`, check out the release tag
+   (section 10), and log in to GHCR with the read-only token, read from a file that is deleted afterwards
+   (Docker keeps the login in root's `~/.docker/config.json`):
 
    ```
    git clone <repository URL> /opt/jobhunter
@@ -196,7 +197,8 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    ```
 
    Its preflight changes nothing and stops at the first failure: it runs as root from `/opt/jobhunter`;
-   `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; `<dir>` holds every name of
+   `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; `nft` is installed (the package
+   `nftables`, item 2); `<dir>` holds every name of
    `deploy/secrets.example` but the optional `data_key_previous` and `ntfy_token`; gid 10010 is free or the
    group `jobhunter-secrets` without members, and no host user has it as its primary group; the swap check
    passes. Then it runs the steps below, each command printed first: the group, the directory, the files, the
@@ -230,7 +232,8 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
       systemctl enable --now jobhunter-egress.service
       ```
 
-7. **After every boot**, `systemctl status jobhunter-egress` (section 5).
+7. **After every boot, and after any firewall change**, `nft list table inet jobhunter_egress` lists the egress
+   rule's table (section 5).
 
 ## 3. First start
 
@@ -314,10 +317,12 @@ Once, after host setup, in this order (section 13, items 5 and 6):
 3. On the VPS: `$JH ps -a` (each service running, those with a healthcheck `healthy`, `migrate` exited 0;
    without `-a`, `ps` lists the running containers only) and
    `$JH logs worker --since 1h` (the logs hold ids, codes and counts, never personal data).
-4. After every boot: `systemctl status jobhunter-egress` shows the egress rule `active (exited)`, and
-   `nft list table inet jobhunter_egress` lists it. The unit is ordered before Docker and fails open, so a rule
-   file that does not load stops nothing, and only this check shows it: fix the file, then
-   `systemctl restart jobhunter-egress`.
+4. After every boot, and after any change to the host's firewall (a rule file installed, an `nft flush
+   ruleset`, a firewall front end's reload or restart): `nft list table inet jobhunter_egress` lists the egress
+   rule's table. That is the check. `systemctl status jobhunter-egress` is no evidence: the unit stays `active
+   (exited)` after a flush has deleted the table. The unit is ordered before Docker and fails open, so a rule
+   file that does not load, or a flush, stops nothing, and only this check shows it: fix the file, or load the
+   rule again after a flush, with `systemctl restart jobhunter-egress`, then check again.
 
 ## 6. Alerts
 
@@ -701,6 +706,8 @@ git diff --stat <previous release tag> <release tag> -- deploy/Caddyfile deploy/
 - `deploy/firewall/docker-user.nft`: `systemctl restart jobhunter-egress`.
 - `deploy/firewall/jobhunter-egress.service`: install it again (section 2, step 6 of the manual equivalent),
   then `systemctl daemon-reload` and `systemctl restart jobhunter-egress`.
+- After either, `nft list table inet jobhunter_egress` lists the table (section 5's check after any firewall
+  change).
 
 A change of `/etc/jobhunter/jobhunter.env` is section 4's.
 
