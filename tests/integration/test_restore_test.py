@@ -255,6 +255,8 @@ async def test_a_killed_restore_tests_leftovers_are_removed_before_the_next_one(
     jobs' lock and before its run row, logging the names. A set an operator staged in `<staging>/restore` (for
     `restore verify --phase restored`) is no restore test's, and stays."""
     await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    # a scratch database of the test's own, whatever an earlier file of the session left
+    pg_rows(migrated, "restore", f"DROP DATABASE IF EXISTS {RESTORE_TEST_DB} WITH (FORCE)", db="postgres")
     pg_rows(
         migrated, "restore", f"CREATE DATABASE {RESTORE_TEST_DB} TEMPLATE jobhunter_template", db="postgres"
     )
