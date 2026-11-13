@@ -3,7 +3,8 @@
 `root:10010` secret files, the stack comes up healthy, Caddy serves TLS with §16.6's headers and the `__Host-`
 session cookie, readiness answers through it and the metrics do not, its logs hold no client address, and the
 api's edge limits logins per client address, which it reads from Caddy's X-Forwarded-For. The api serves the
-test stack's fictional operator file, mounted read-only into it alone (M5 follow-ups Task F1).
+test stack's fictional operator file, mounted read-only into it alone (M5 follow-ups Task F1). No image that
+runs a Python service holds the base image's pip (M5 follow-ups Task F2).
 
 Run explicitly with `-m stack`, with no other stack on 172.30.0.0/24 (the dev stack: `$DC down` first):
 
@@ -157,6 +158,24 @@ def test_the_stack_comes_up_healthy(stack: None) -> None:
         by_target = {fields[1]: fields for fields in (line.split() for line in mounts)}
         assert by_target[TMP][2] == "tmpfs", service
         assert by_target["/data/exports"][3].split(",")[0] == mode, service
+
+
+# Run by the base image's interpreter, which (unlike a venv's) has the base image's site-packages on its path:
+# fails, naming what it found, while pip's package, its dist-info or its scripts are there, or pip imports.
+NO_PIP: Final = (
+    "import glob, importlib.util, sys\n"
+    "found = glob.glob('/usr/local/bin/pip*') + glob.glob('/usr/local/lib/python3*/site-packages/pip*')\n"
+    "sys.exit(f'pip left: {found}' if found or importlib.util.find_spec('pip') else 0)"
+)
+
+
+def test_no_python_image_holds_pip(stack: None) -> None:
+    """The base image's pip is gone from every image that runs a Python service (M5 Task 29, Ruling T29-3;
+    follow-ups Task F2): the app and backup images, docparse, and the embedder's `fake` target, the real
+    image without the model (tests/unit/test_image_stages_no_pip.py checks every shipped Dockerfile stage)."""
+    for service in ("api", "worker", "backup", "docparse", "embedder"):
+        done = run([*PT, "exec", "-T", service, "/usr/local/bin/python3", "-c", NO_PIP], check=False)
+        assert done.returncode == 0, (service, done.stderr)
 
 
 def test_tls_headers_and_the_session_cookie_through_caddy(tls: ssl.SSLContext, user: None) -> None:
