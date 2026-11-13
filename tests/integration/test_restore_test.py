@@ -241,6 +241,41 @@ async def test_a_restore_test_before_any_manifest_succeeds(
     ]
 
 
+async def test_a_killed_restore_tests_leftovers_are_removed_before_the_next_one(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    backup_cfg: AppConfig,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    backup_engine: AsyncEngine,
+) -> None:
+    """Final re-review N5 (final fix C7): a restore test started by hand and killed hard leaves the scratch
+    database and `<staging>/restore_test`, and the scheduler does not restart, so its start does not run.
+    Every restore test, the scheduled one included, first removes what an earlier one left, under the backup
+    jobs' lock and before its run row, logging the names. A set an operator staged in `<staging>/restore` (for
+    `restore verify --phase restored`) is no restore test's, and stays."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    pg_rows(
+        migrated, "restore", f"CREATE DATABASE {RESTORE_TEST_DB} TEMPLATE jobhunter_template", db="postgres"
+    )
+    pg_rows(migrated, "restore", "CREATE TABLE copied (x int)", db=RESTORE_TEST_DB)
+    staging = backup_cfg.staging_dir
+    for leftover in ("restore_test/set", "restore"):
+        (staging / leftover).mkdir(mode=0o700, parents=True)
+        (staging / leftover / "jobhunter.dump").write_bytes(b"a full copy of the database")
+
+    with capture_logs() as logs:
+        run_id = await restore_tested(backup_cfg, repo, runner, backup_engine)
+
+    order = [e["event"] for e in logs if e["event"] in ("restore_leftovers_removed", "restore_test_started")]
+    assert order == ["restore_leftovers_removed", "restore_test_started"]
+    [removed] = events(logs, "restore_leftovers_removed")
+    assert (removed["database"], removed["staging"]) == (["jobhunter_restore_test"], ["restore_test"])
+    assert (await one(engine, _RUN, id=run_id)).status == "succeeded"
+    assert (staging / "restore" / "jobhunter.dump").read_bytes() == b"a full copy of the database"
+    assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)
+
+
 async def test_the_restore_test_reads_every_manifests_snapshot(
     engine: AsyncEngine,
     backup_cfg: AppConfig,

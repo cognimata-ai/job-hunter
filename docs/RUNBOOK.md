@@ -541,6 +541,12 @@ $JH exec backup jobhunter backup ship
 $JH exec backup jobhunter backup restore-test
 ```
 
+A restore test started by hand restores the latest set into a scratch database and `/data/staging/restore_test`
+and removes both when it ends. If that process is killed hard (an OOM, a `kill -9`), nothing removes that full
+copy of the database until another restore test or a restart of the backup service: so run
+`$JH exec backup jobhunter backup restore-test` again, or `$JH restart backup`. Every restore test, the monthly
+one included, first removes what an earlier one left.
+
 **A restart of the backup service waits for its job.** `$JH restart backup`, `$JH stop` and an `up` that
 recreates the service let a running job finish: the service has a stop grace of 10 minutes (§19.5). Between
 jobs it stops at once. During a job it can take up to those 10 minutes: expect that during the nightly set
@@ -665,8 +671,10 @@ worker stay stopped until the last step.
 
 **`restore verify` by hand.** `restore run` runs both verification phases itself. `jobhunter restore verify
 --set <id> --phase restored` alone is for a restore staged by hand, before `migrate`: both `backup_set.json`
-and `jobhunter.dump` of the set must be in `/data/staging/restore` (the `backup_staging` volume).
-`--phase replayed` may be run again at any time:
+and `jobhunter.dump` of the set must be in `/data/staging/restore` (the `backup_staging` volume). The backup
+service's start removes `/data/staging/restore`, a full copy of the database that no purge reaches, so stage a
+set for this only while `backup` stays up, or stage it again after a restart of `backup` (a restore test
+leaves it as it is). `--phase replayed` may be run again at any time:
 
 ```
 $JH --profile restore run --rm restore jobhunter restore verify --set <id> --phase replayed

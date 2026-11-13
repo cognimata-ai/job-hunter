@@ -37,6 +37,11 @@ no purge reaches, so the start drops `jobhunter_restore_test` when it exists (as
 (FORCE)`) and removes both directories, before any job runs. It is idempotent, and logs what it removed,
 names only (`restore_leftovers_removed`); a drop the server refuses is logged
 (`restore_test_scratch_not_dropped`) and left to the next restore test's start, never stopping the scheduler.
+Every restore test runs it too, first, under the backup jobs' lock and before its run row (final fix C7): a
+restore test started by hand and killed hard does not restart the scheduler, so its start would not remove
+what it left. That check takes the restore test's own leftovers only, the scratch database and
+`<staging_dir>/restore_test`: `<staging_dir>/restore` is `restore run`'s, or a set an operator staged for
+`restore verify --phase restored`, which only the scheduler's start removes.
 """
 
 import asyncio
@@ -231,19 +236,17 @@ def _remove_directory(directory: Path) -> bool:
     return True
 
 
-async def remove_leftovers(cfg: AppConfig) -> tuple[str, ...]:
-    """What a killed restore test or restore left (module docstring), removed; the names removed."""
+async def remove_leftovers(cfg: AppConfig, *, restore_staging: bool = True) -> tuple[str, ...]:
+    """What a killed restore test or restore left (module docstring), removed; the names removed. Without
+    `restore_staging`, the restore test's own leftovers only: `<staging_dir>/restore` stays."""
     databases: list[str] = []
     try:
         if await _drop_if_exists(cfg):
             databases.append(RESTORE_TEST_DB)
     except psycopg.Error as exc:
         log.warning("restore_test_scratch_not_dropped", error_class=type(exc).__name__)
-    staging = [
-        name
-        for name in (RESTORE_TEST_STAGING, RESTORE_STAGING)
-        if await asyncio.to_thread(_remove_directory, cfg.staging_dir / name)
-    ]
+    names = (RESTORE_TEST_STAGING, RESTORE_STAGING) if restore_staging else (RESTORE_TEST_STAGING,)
+    staging = [name for name in names if await asyncio.to_thread(_remove_directory, cfg.staging_dir / name)]
     if databases or staging:
         log.warning("restore_leftovers_removed", database=databases, staging=staging)
     return (*databases, *staging)
@@ -281,6 +284,7 @@ async def run_restore_test(
     run's id. `RestoreTestFailed` once the run is `failed`, `BackupJobBusy` (nothing written) while another
     backup job runs."""
     async with backup_job_lock(cfg, "restore_test"):
+        await remove_leftovers(cfg, restore_staging=False)  # what a killed earlier test left (final fix C7)
         async with engine.begin() as conn:
             run_id = int((await conn.execute(_START, {"at": clock()})).scalar_one())
         log.info("restore_test_started", run_id=run_id)
