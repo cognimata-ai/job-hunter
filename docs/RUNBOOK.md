@@ -215,13 +215,13 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    Its preflight changes nothing and stops at the first failure: it runs as root from `/opt/jobhunter`;
    `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; the operator file
    `/etc/jobhunter/operator.json` exists (item 3; a dry run only names it when it is missing); `nft` is
-   installed (the package `nftables`, item 2), and so is `swapon` (the package `mount`); `<dir>` holds every name of `deploy/secrets.example` but the
-   optional `data_key_previous` and `ntfy_token`; gid 10010 is free or the
-   group `jobhunter-secrets` without members, and no host user has it as its primary group; the swap check
-   passes. Then it runs the steps below, each command printed first: the group, the directory, the files, the
-   egress rule's unit, the startup assertions of api, worker, migrate, backup and restore, and, with
-   `--delete-sources`, the deletion of the source files once every step has passed. Remove the empty `<dir>`
-   afterwards (`rmdir <dir>`).
+   installed (the package `nftables`, item 2), and so is `swapon` (the package `mount`); `<dir>` holds every
+   name of `deploy/secrets.example` but the optional `data_key_previous` and `ntfy_token`; gid 10010 is free
+   or the group `jobhunter-secrets` without members, and no host user has it as its primary group; the swap
+   check passes. Then it runs the steps below, each command printed first: the group, the directory, the
+   files, the egress rule's unit, the startup assertions of api, worker, migrate, backup and restore, and,
+   with `--delete-sources`, the deletion of the source files once every step has passed. Remove the empty
+   `<dir>` afterwards (`rmdir <dir>`).
 6. **The manual equivalent**, §19.8's steps 1 to 6, for a host where the script cannot run:
    1. `groupadd --gid 10010 jobhunter-secrets`; no user is added to it.
    2. `install -d -o root -g 10010 -m 0750 /etc/jobhunter/secrets`.
@@ -698,9 +698,9 @@ back. So, before a `docker volume rm` or a `down` that removes volumes, whatever
 
    Only exit 0 lets the procedure go on: `{"shipped": true, …}`, or `{"shipped": false, …}` when the stream was
    shipped already. On `{"error": "locked"}` (restic's repository lock, which a prune can hold longer than a
-   ship waits) or `{"error": "ship_lock_lost"}` (a lost lock, above), run it again; a ship never prints `backup_job_busy`, since it waits for a ship already
-   running. On any other error, stop and remove no volume: fix the cause as the `privacy.manifest_unshipped`
-   row says (section 6), then ship again.
+   ship waits) or `{"error": "ship_lock_lost"}` (a lost lock, above), run it again; a ship never prints
+   `backup_job_busy`, since it waits for a ship already running. On any other error, stop and remove no
+   volume: fix the cause as the `privacy.manifest_unshipped` row says (section 6), then ship again.
 3. Check that the latest shipment holds every manifest file, as the application role. api and worker are
    stopped, so a manifest's `status` can lag behind its shipment; this query reads the shipment itself:
 
