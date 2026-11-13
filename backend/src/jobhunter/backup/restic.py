@@ -24,10 +24,9 @@ newest snapshot of those tags may be that incomplete one. `restore` runs `restic
 restic printed them in), each with the number of files it holds (`files`): its summary's
 `total_files_processed`, which restic >= 0.17 stores in every snapshot it makes (0 for one saved on exit 3
 with no file readable), `None` for a snapshot without a summary. `forget_prune` forgets the snapshots tagged
-`tag` beyond the daily, weekly and monthly counts and prunes the data they alone held. `forget_last` forgets
-the snapshots tagged `tag` beyond the newest `keep_last`, grouped by host alone (`--group-by host`: restic's
-default groups by host and paths, and a `manifests` snapshot's paths are the files it lists, so each would be
-a group of its own and every one kept), and prunes nothing itself: the `forget_prune` that follows it does.
+`tag` beyond the daily, weekly and monthly counts and prunes the data they alone held. `forget_snapshots`
+forgets exactly the snapshots it names by id (`restic forget -- <id>…`; restic ignores the `--host` filter for
+explicit ids), and prunes nothing itself: the `forget_prune` that follows it does.
 
 Every failure raises `ResticError(command, code)`: the code is `incomplete` (exit 3: a source file could not
 be read), `repository_absent` (10), `locked` (11), `wrong_password` (12), `failed` (any other exit status),
@@ -219,10 +218,11 @@ class Restic:
             args += ["--tag", ",".join(_tag(tag) for tag in tags)]
         return _snapshot_infos((await self._run("snapshots", *args)).stdout)
 
-    async def forget_last(self, *, tag: str, keep_last: int) -> None:
-        """Forget the snapshots tagged `tag` beyond the newest `keep_last`, all of one group (module
-        docstring); no prune."""
-        await self._run("forget", "--tag", _tag(tag), "--group-by", "host", "--keep-last", str(keep_last))
+    async def forget_snapshots(self, ids: Sequence[str]) -> None:
+        """Forget exactly the snapshots `ids` names, at least one (module docstring); no prune."""
+        if not ids or not all(_SNAPSHOT_ID.fullmatch(snapshot_id) for snapshot_id in ids):
+            raise ValueError("forget_snapshots takes one or more snapshot ids")
+        await self._run("forget", "--", *ids)
 
     async def forget_prune(self, *, tag: str, keep_daily: int, keep_weekly: int, keep_monthly: int) -> None:
         """Forget the snapshots tagged `tag` beyond the counts kept, and prune what they alone held."""

@@ -49,7 +49,7 @@ describe("PrivacySection", () => {
     expect(kept("Raw provider response bodies")).toBe("30 days, longer while a newer response refers to the same body");
     expect(kept("Raw provider response records (metadata, body already removed)")).toBe("With their fetch request: 13 months");
     expect(kept("Backups")).toBe(
-      "Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: the newest 10, which hold every manifest shipped, so the manifests are kept indefinitely",
+      "Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: the latest one a shipment confirmed, which holds every manifest shipped up to it, and every newer one, so the manifests are kept indefinitely",
     );
     expect(kept("Backup set and backup run records")).toBe(
       "13 months after they finished, except the newest successful backup set and restore test, and a set a kept run refers to",

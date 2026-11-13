@@ -104,7 +104,7 @@ async def exercise_every_call(restic: Restic, tmp_path: Path) -> None:
     await restic.backup(paths=[tmp_path / "file"], tags=["manifests"])
     await restic.restore(snapshot=SNAPSHOT_ID, subfolder="/data/manifests", target=tmp_path / "target")
     await restic.snapshots(tags=["manifests"])
-    await restic.forget_last(tag="manifests", keep_last=10)
+    await restic.forget_snapshots([SNAPSHOT_ID])
     await restic.forget_prune(tag="set", keep_daily=7, keep_weekly=4, keep_monthly=12)
 
 
@@ -135,27 +135,19 @@ async def test_every_call_passes_host_and_retry_lock(tmp_path: Path) -> None:
     assert "--prune" in forget
 
 
-async def test_forget_last_keeps_the_newest_of_a_tag_whatever_their_paths(tmp_path: Path) -> None:
-    """`forget_last` forgets the snapshots tagged `tag` beyond the newest `keep_last`, grouped by host alone:
-    a `manifests` snapshot's paths are the files it lists, so restic's default grouping by host and paths
-    would make each one a group of its own and keep them all (final fix B7). It prunes nothing itself."""
+async def test_forget_snapshots_names_them_by_id(tmp_path: Path) -> None:
+    """`forget_snapshots` forgets exactly the snapshots it names, by id (final fix C1; restic ignores the host
+    filter for explicit ids), and prunes nothing itself. It names at least one, and only snapshot ids."""
+    ids = ["a1" * 32, "b2" * 32]
     runner = FakeRunner()
-    await Restic(backup_config(tmp_path), runner).forget_last(tag="manifests", keep_last=10)
+    restic = Restic(backup_config(tmp_path), runner)
+    await restic.forget_snapshots(ids)
     [call] = runner.calls
-    assert call.argv == (
-        RESTIC_BIN,
-        "forget",
-        "--retry-lock",
-        RETRY_LOCK,
-        "--host",
-        RESTIC_HOST,
-        "--tag",
-        "manifests",
-        "--group-by",
-        "host",
-        "--keep-last",
-        "10",
-    )
+    assert call.argv == (RESTIC_BIN, "forget", "--retry-lock", RETRY_LOCK, "--host", RESTIC_HOST, "--", *ids)
+    for wrong in ([], ["--prune"], ["a1" * 31]):
+        with pytest.raises(ValueError):
+            await restic.forget_snapshots(wrong)
+    assert len(runner.calls) == 1
 
 
 async def test_s3_keys_reach_the_child_env_only(tmp_path: Path) -> None:

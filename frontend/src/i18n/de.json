@@ -1757,7 +1757,7 @@
   "settings_privacy.row.exports": "Exporte",
   "settings_privacy.kept.exports": "7 Tage; jede Löschung entfernt sie sofort, nur nicht das nächtliche Führen alter Stellen als Grabstein: Ein Export kann eine danach als Grabstein geführte Stelle enthalten, bis er abläuft; der Datensatz ohne Datei 30 Tage nach Ablauf",
   "settings_privacy.row.backups": "Sicherungen",
-  "settings_privacy.kept.backups": "Sicherungssätze: 7 tägliche, 4 wöchentliche und 3 monatliche. Manifest-Snapshots: die neuesten 10, die jedes übertragene Manifest enthalten; die Manifeste werden also unbegrenzt aufbewahrt",
+  "settings_privacy.kept.backups": "Sicherungssätze: 7 tägliche, 4 wöchentliche und 3 monatliche. Manifest-Snapshots: der zuletzt durch eine Übertragung bestätigte, der jedes bis dahin übertragene Manifest enthält, und jeder neuere; die Manifeste werden also unbegrenzt aufbewahrt",
   "settings_privacy.row.backup_records": "Datensätze der Sicherungssätze und Sicherungsläufe",
   "settings_privacy.kept.backup_records": "13 Monate nach ihrem Ende, außer dem neuesten erfolgreichen Sicherungssatz und Wiederherstellungstest und einem Satz, auf den ein aufbewahrter Lauf verweist",
   "settings_privacy.row.manifests": "Löschprotokolle, ihre Auslieferungen und Löschsperren (nur IDs und Hashes)",

@@ -1757,7 +1757,7 @@
   "settings_privacy.row.exports": "Exports",
   "settings_privacy.kept.exports": "7 days; every purge deletes them at once except the nightly tombstoning of old job ads, so an export can hold an ad tombstoned after it was made until it expires; the record without its file 30 days after it expires",
   "settings_privacy.row.backups": "Backups",
-  "settings_privacy.kept.backups": "Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: the newest 10, which hold every manifest shipped, so the manifests are kept indefinitely",
+  "settings_privacy.kept.backups": "Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: the latest one a shipment confirmed, which holds every manifest shipped up to it, and every newer one, so the manifests are kept indefinitely",
   "settings_privacy.row.backup_records": "Backup set and backup run records",
   "settings_privacy.kept.backup_records": "13 months after they finished, except the newest successful backup set and restore test, and a set a kept run refers to",
   "settings_privacy.row.manifests": "Deletion manifests, shipments and purge fences (ids and hashes only)",

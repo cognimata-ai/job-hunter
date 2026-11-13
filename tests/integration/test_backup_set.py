@@ -121,7 +121,7 @@ def write_dump(path: Path) -> None:
 class FakeCommands:
     """`CommandRunner` for `pg_dump`, `pg_restore` and restic (module docstring). `fail` names the program
     that fails: `pg_dump` and `pg_restore` exit 1, restic exits 3 (a backup) or 11 (a forget). `during_dump`
-    runs while the dump runs, before it reads the snapshot."""
+    runs while the dump runs, before it reads the snapshot. restic's `snapshots` answers `listing`."""
 
     def __init__(
         self,
@@ -129,10 +129,12 @@ class FakeCommands:
         *,
         fail: str | None = None,
         during_dump: Callable[[], Awaitable[None]] | None = None,
+        listing: bytes = b"[]",
     ) -> None:
         self.server = server
         self.fail = fail
         self.during_dump = during_dump
+        self.listing = listing
         self.calls: list[Call] = []
         self.snapshot_id: str | None = None
         self.dump_saw: dict[str, int] = {}
@@ -152,6 +154,8 @@ class FakeCommands:
         assert program == "restic", argv
         if argv[1] == "forget":
             return CommandResult(11 if self.fail == "restic" else 0, b"", FAILURE_DETAIL)
+        if argv[1] == "snapshots":
+            return CommandResult(0, self.listing, "")
         assert argv[1] == "backup", argv
         self.staged, self.inventory = read_staged(Path(argv[argv.index("--") + 1]))
         if self.fail == "restic":
@@ -485,18 +489,73 @@ async def test_two_backup_jobs_never_run_at_once(
     ).status == "succeeded"
 
 
-async def test_prune_records_a_run_and_keeps_the_newest_manifests_snapshots(
-    migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, engine: AsyncEngine, tmp_path: Path
+# Restic's listing of four `manifests` snapshots, oldest first: two older than the latest receipt's (one an
+# earlier receipt's, one incomplete), the latest receipt's, and an incomplete one newer than it.
+OLDER_RECEIPTED, OLDER_PARTIAL, RECEIPTED, NEWER_PARTIAL = ("a1" * 32, "b2" * 32, "c3" * 32, "d4" * 32)
+_RECEIPT: Final = sa.text(
+    "INSERT INTO manifest_shipments (restic_snapshot_id, shipped_at) VALUES (:snapshot, now())"
+)
+
+
+def manifests_listing() -> bytes:
+    snapshots = (OLDER_RECEIPTED, OLDER_PARTIAL, RECEIPTED, NEWER_PARTIAL)
+    return json.dumps(
+        [
+            {"id": snapshot, "time": f"2026-11-1{n}T03:00:00Z", "tags": ["manifests"], "paths": ["/data/m"]}
+            for n, snapshot in enumerate(snapshots)
+        ]
+    ).encode()
+
+
+SET_FORGET: Final = [
+    RESTIC_BIN,
+    "forget",
+    "--retry-lock",
+    "30m",
+    "--host",
+    "jobhunter-backup",
+    "--tag",
+    "set",
+    "--keep-daily",
+    "7",
+    "--keep-weekly",
+    "4",
+    "--keep-monthly",
+    "3",
+    "--prune",
+]
+
+
+async def test_prune_forgets_the_manifests_snapshots_older_than_the_latest_receipt(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
 ) -> None:
-    """The prune forgets the `manifests` snapshots beyond the newest 10 first (final fix B7: each complete
-    one holds every manifest an earlier one held), then the sets beyond the counts kept, pruning what both
-    left."""
-    commands = FakeCommands(migrated)
+    """The prune reads the latest receipt's snapshot and forgets, by id, only the `manifests` snapshots
+    strictly older than it (final fix C1): the receipted one is complete and covers every manifest shipped up
+    to it, and a newer one, incomplete or not, can only add to the restore's union. Then it forgets the sets
+    beyond the counts kept, pruning what both forgets left."""
+    async with backup_engine.begin() as conn:
+        for snapshot in (OLDER_RECEIPTED, RECEIPTED):  # the latest receipt is the newest shipment row
+            await conn.execute(_RECEIPT, {"snapshot": snapshot})
+    commands = FakeCommands(migrated, listing=manifests_listing())
     started = utcnow()
 
     run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=lambda: started)
 
-    manifests, forget = commands.calls
+    listing, manifests, forget = commands.calls
+    assert listing.argv[1:] == [
+        "snapshots",
+        "--retry-lock",
+        "30m",
+        "--host",
+        "jobhunter-backup",
+        "--json",
+        "--tag",
+        "manifests",
+    ]
     assert manifests.argv == [
         RESTIC_BIN,
         "forget",
@@ -504,37 +563,54 @@ async def test_prune_records_a_run_and_keeps_the_newest_manifests_snapshots(
         "30m",
         "--host",
         "jobhunter-backup",
-        "--tag",
-        "manifests",
-        "--group-by",
-        "host",
-        "--keep-last",
-        "10",
+        "--",
+        OLDER_RECEIPTED,
+        OLDER_PARTIAL,
     ]
     # R13: the filter is the `set` tag, so this forget never considers a `manifests` snapshot.
-    assert forget.argv == [
-        RESTIC_BIN,
-        "forget",
-        "--retry-lock",
-        "30m",
-        "--host",
-        "jobhunter-backup",
-        "--tag",
-        "set",
-        "--keep-daily",
-        "7",
-        "--keep-weekly",
-        "4",
-        "--keep-monthly",
-        "3",
-        "--prune",
-    ]
+    assert forget.argv == SET_FORGET
     row = await one(engine, _RUN, id=run_id)
     assert (row.kind, row.status, row.error, row.backup_set_id) == ("prune", "succeeded", None, None)
-    assert row.report == {"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 3, "keep_manifests": 10}
+    assert row.report == {"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 3, "manifests_forgotten": 2}
     assert row.started_at == started and row.finished_at is not None
 
-    # The counts are the settings'; a failure fails the run with its step and class only.
+
+@pytest.mark.parametrize("receipt", [None, "e5" * 32], ids=["no_receipt", "a_receipt_restic_does_not_list"])
+async def test_prune_without_a_listed_receipt_forgets_no_manifests_snapshot(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+    receipt: str | None,
+) -> None:
+    """With no receipt, nothing proves a `manifests` snapshot complete, so the prune forgets none (final fix
+    C1), and neither does it when restic does not list the receipted snapshot: it cannot tell which are older.
+    The sets' forget runs as always."""
+    if receipt is not None:
+        async with backup_engine.begin() as conn:
+            await conn.execute(_RECEIPT, {"snapshot": receipt})
+    commands = FakeCommands(migrated, listing=manifests_listing())
+
+    run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
+
+    assert [call.argv[1] for call in commands.calls] == ([] if receipt is None else ["snapshots"]) + [
+        "forget"
+    ]
+    assert commands.calls[-1].argv == SET_FORGET
+    row = await one(engine, _RUN, id=run_id)
+    assert (row.status, row.report["manifests_forgotten"]) == ("succeeded", 0)
+
+
+async def test_prune_takes_its_counts_from_the_settings_and_records_a_failure(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """The counts are the settings'; a failure fails the run with its step and class only."""
     kept = config_for(
         migrated,
         "backup",
@@ -546,13 +622,11 @@ async def test_prune_records_a_run_and_keeps_the_newest_manifests_snapshots(
     )
     counted = FakeCommands(migrated)
     await run_prune(kept, Restic(kept, counted), backup_engine, clock=utcnow)
-    [_, forget] = counted.calls
+    [forget] = counted.calls  # no receipt: no `manifests` snapshot is considered
     assert forget.argv[-7:] == ["--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "6", "--prune"]
     failing = FakeCommands(migrated, fail="restic")
     with pytest.raises(PruneFailed) as failed:
         await run_prune(kept, Restic(kept, failing), backup_engine, clock=utcnow)
-    [forget] = failing.calls  # the first forget failed: nothing after it ran
-    assert forget.argv[-6:] == ["--tag", "manifests", "--group-by", "host", "--keep-last", "10"]
     row = await one(engine, _RUN, id=failed.value.run_id)
     assert (row.kind, row.status, row.error) == ("prune", "failed", "prune:ResticError")
     assert failed.value.error == "prune:ResticError" and row.finished_at is not None

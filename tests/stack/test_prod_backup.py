@@ -1,8 +1,9 @@
 """The backup service on the compose test stack against the S3 stand-in (plan M5 Task 24; spec §19.5;
 Deviation 29, R13, Ruling T24-1 (f)): `jobhunter backup init` against versitygw, a backup set with the real
 `pg_dump`, `pg_restore` and restic, the service's scheduler shipping a new manifest within 90 seconds, and the
-prune, which forgets the set snapshots beyond its counts and the `manifests` snapshots beyond the newest
-`MANIFESTS_KEPT` (final fix B7), each kept one holding every file a forgotten one held.
+prune, which forgets the set snapshots beyond its counts and the `manifests` snapshots strictly older than
+the latest receipt's (final fix C1), by id on the real restic, the receipted one holding every file a
+forgotten one held.
 
 Run explicitly with `-m stack`, with no other stack on 172.30.0.0/24 (the dev stack: `$DC down` first):
 
@@ -25,7 +26,6 @@ from collections.abc import Iterator
 from typing import Any, Final
 
 import pytest
-from jobhunter.backup.prune import MANIFESTS_KEPT
 
 from tests.support.manifest_file import WRITE_MANIFEST, written_manifest
 from tests.support.prodstack import PT, logs_tail, other_stack_up, prod_session, psql, run, s3_down
@@ -130,12 +130,17 @@ def test_the_scheduler_ships_within_90_seconds(initialised: list[Any]) -> None:
 
 
 def test_prune_runs(initialised: list[Any]) -> None:
-    # More `manifests` snapshots than the prune keeps: one new manifest a shipment, whether this ships it or
-    # the scheduler already did (a second shipper finds the stream shipped and makes no snapshot).
-    while len(snapshots("manifests")) <= MANIFESTS_KEPT:
+    # Two more receipted `manifests` snapshots: one new manifest a shipment, whether this ships it or the
+    # scheduler already did (a second shipper finds the stream shipped and makes no snapshot).
+    for _ in range(2):
         new_manifest()
         backup("ship")
     manifests = snapshots("manifests")  # oldest first
+    latest = "SELECT restic_snapshot_id FROM manifest_shipments ORDER BY id DESC LIMIT 1"
+    receipted = psql(PT, latest).strip()
+    at = [snapshot["id"] for snapshot in manifests].index(receipted)
+    older = manifests[:at]
+    assert older, manifests
     for _ in range(2):
         backup("set")
     sets = snapshots("set")
@@ -148,14 +153,12 @@ def test_prune_runs(initialised: list[Any]) -> None:
     row = psql(PT, f"SELECT kind, status, report FROM backup_runs WHERE id = {run_id}")  # noqa: S608 - an int
     kind, status, report = row.strip().split("|")
     assert (kind, status) == ("prune", "succeeded"), row
-    assert json.loads(report) == {"keep_daily": 1, "keep_weekly": 1, "keep_monthly": 1, "keep_manifests": 10}
+    keeps = {"keep_daily": 1, "keep_weekly": 1, "keep_monthly": 1}
+    assert json.loads(report) == {**keeps, "manifests_forgotten": len(older)}
     # One of each period kept: the newest set; every older one forgotten.
     assert [snapshot["id"] for snapshot in snapshots("set")] == [sets[-1]["id"]]
-    # The newest `MANIFESTS_KEPT` `manifests` snapshots kept, though each lists other paths (restic groups
-    # them by host alone), and the newest holds every file a forgotten one held.
+    # The latest receipt's `manifests` snapshot and every newer one kept, every older one forgotten by id, and
+    # the receipted one holds every file a forgotten one held.
     kept = snapshots("manifests")
-    assert [snapshot["id"] for snapshot in kept] == [
-        snapshot["id"] for snapshot in manifests[-MANIFESTS_KEPT:]
-    ]
-    forgotten = manifests[:-MANIFESTS_KEPT]
-    assert forgotten and all(set(old["paths"]) <= set(kept[-1]["paths"]) for old in forgotten)
+    assert [snapshot["id"] for snapshot in kept] == [snapshot["id"] for snapshot in manifests[at:]]
+    assert all(set(old["paths"]) <= set(kept[0]["paths"]) for old in older)

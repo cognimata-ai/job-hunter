@@ -26,7 +26,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter import cli, cli_backup, crypto
 from jobhunter.backup.backup_set import run_backup_set
-from jobhunter.backup.prune import MANIFESTS_KEPT, run_prune
+from jobhunter.backup.prune import run_prune
 from jobhunter.backup.restic import ResticError
 from jobhunter.backup.restore import (
     ManifestStreamConflict,
@@ -511,10 +511,10 @@ async def test_a_restore_over_the_kept_manifests_snapshots_restores_every_manife
     runner: ContainerRunner,
     target: RestoredDatabase,
 ) -> None:
-    """The weekly prune keeps the newest `MANIFESTS_KEPT` (10) `manifests` snapshots (final fix B7). Twelve
-    shipments of one new manifest each make twelve snapshots; after the prune the newest ten are left, and the
-    restore over them restores and replays all twelve manifests: each complete snapshot holds every manifest
-    an earlier one held, since every run ships every file of the stream, which only grows."""
+    """The weekly prune forgets the `manifests` snapshots strictly older than the latest receipted one (final
+    fix C1). Twelve shipments of one new manifest each make twelve receipted snapshots; after the prune only
+    the newest is left, and the restore over it restores and replays all twelve manifests: a receipted
+    snapshot is complete, and every run ships every file of the stream, which only grows."""
     await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     manifests = [a_manifest(max_alert=50 + n) for n in range(12)]
     for manifest in manifests:
@@ -525,8 +525,8 @@ async def test_a_restore_over_the_kept_manifests_snapshots_restores_every_manife
 
     await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
 
-    assert MANIFESTS_KEPT == 10
-    assert [info.id for info in repo.infos if "manifests" in info.tags] == shipped[2:]
+    assert [info.id for info in repo.infos if "manifests" in info.tags] == shipped[-1:]
+    assert repo.forgets[0] == ("ids", shipped[:-1])
     site.lose()
     with capture_logs() as logs:
         await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
@@ -536,10 +536,53 @@ async def test_a_restore_over_the_kept_manifests_snapshots_restores_every_manife
     for manifest in manifests:
         assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
     [restored] = events(logs, "manifest_stream_restored")
-    assert (restored["snapshots"], restored["manifests"]) == (10, 12)
-    assert [restored.snapshot for restored in repo.restores if restored.subfolder == str(site.manifests)] == (
-        shipped[2:]
-    )
+    assert (restored["snapshots"], restored["manifests"]) == (1, 12)
+
+
+async def test_incomplete_snapshots_after_a_receipt_never_evict_the_receipted_one(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+) -> None:
+    """The final re-review's sequence (R-C1). A set predates M2's deletion. `{M1}` ships with its receipt,
+    then `{M1, M2}` with its receipt: M2 is confirmed offsite. Then M3 is written, and ten runs find M2
+    unreadable at restic's read: ten incomplete `{M1, M3}` snapshots, no receipt. The prune forgets only what
+    is strictly older than the latest receipted snapshot, `{M1}`'s; the receipted one and the ten newer are
+    kept. The site is lost and the older set restored: M2 is restored and replayed, with M1 and M3."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2, m3 = a_manifest(max_alert=50), a_manifest(max_alert=51), a_manifest(max_alert=52)
+    write_manifest_file(site.manifests, m1)
+    first = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    write_manifest_file(site.manifests, m2)
+    confirmed = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    assert first.snapshot_id is not None and confirmed.snapshot_id is not None
+    write_manifest_file(site.manifests, m3)
+    repo.unreadable.add(stream_file(site, m2))
+    for _ in range(10):
+        with pytest.raises(ResticError):
+            await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    partial = [info.id for info in repo.infos if "manifests" in info.tags][2:]
+    assert len(partial) == 10
+
+    await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
+    site.lose()
+    with capture_logs() as logs:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    names = {m["manifest_uuid"]: manifest_file_name(m["manifest_uuid"]) for m in (m1, m2, m3)}
+    restored_names = {path.name for path in site.manifests.iterdir()}
+    assert [name for name in names.values() if name not in restored_names] == []
+    for manifest in (m1, m2, m3):
+        assert stream_file(site, manifest).read_bytes() == canonical_bytes(manifest)
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+    assert repo.forgets[0] == ("ids", [first.snapshot_id])
+    assert [info.id for info in repo.infos if "manifests" in info.tags] == [confirmed.snapshot_id, *partial]
+    [restored] = events(logs, "manifest_stream_restored")
+    assert (restored["snapshots"], restored["manifests"]) == (11, 3)
 
 
 # ---- the refusals (review M1) ------------------------------------------------------------------------------

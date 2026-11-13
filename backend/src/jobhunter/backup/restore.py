@@ -25,12 +25,12 @@ exits 1):
   exit 3 with no listed file readable, final fix B8) holds no manifest, so it can hide none: it contributes
   nothing, is never restored (its manifests folder may not exist, which would fail the restore) and is logged
   `manifest_snapshot_empty` with its id. A snapshot without a count (no summary) is restored as any other. No
-  snapshot left is an empty stream (`manifest_stream_empty` logged, nothing restored).
-  Otherwise the stream is the **union of every `manifests` snapshot** (final review C1, M2), never the newest
-  alone: a snapshot restic saved on exit 3 (incomplete, named by no shipment) or an older list two
-  unserialised shippers uploaded last (before the shipment lock, `shipper.SHIP_LOCK_KEY`) may lack a manifest
-  an earlier snapshot holds; the weekly prune keeps the newest ten (`prune.MANIFESTS_KEPT`, which bounds this
-  step's work). Oldest first, each snapshot's
+  snapshot left is an empty stream (`manifest_stream_empty` logged, nothing restored). Otherwise the stream is
+  the **union of every `manifests` snapshot** (final review C1, M2), never the newest alone: a snapshot restic
+  saved on exit 3 (incomplete, named by no shipment) or an older list two unserialised shippers uploaded last
+  (before the shipment lock, `shipper.SHIP_LOCK_KEY`) may lack a manifest an earlier snapshot holds; the
+  weekly prune forgets only the snapshots older than the latest receipted one, which holds every manifest
+  shipped up to it (`backup.prune`, which bounds this step's work). Oldest first, each snapshot's
   `cfg.manifests_dir` is restored into `<scratch>/snapshot` (made fresh) and its `<uuid>.json` files merged
   into `<scratch>/union`: a file name already there must hold the same bytes (sha256; a manifest file is
   written once), else `ManifestStreamConflict` (`manifest_stream_conflict`, logged with the file name and both
