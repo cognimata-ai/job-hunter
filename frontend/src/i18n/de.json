@@ -1753,7 +1753,7 @@
   "settings_privacy.row.logs": "Protokolle",
   "settings_privacy.kept.logs": "Rotation nach Größe; etwa 14 Tage bei normalem Aufkommen",
   "settings_privacy.row.sessions": "Sitzungen, Anmeldeversuche und Anmeldesperren",
-  "settings_privacy.kept.sessions": "Sitzungen bis 1 Tag nach Ablauf; Anmeldeversuche 30 Tage; eine Sperre bis zur nächsten Anmeldung von ihrer Adresse nach ihrem Ende, bis zur Entsperrung oder bis zum Löschen aller Daten",
+  "settings_privacy.kept.sessions": "Sitzungen bis 1 Tag nach Ablauf; Anmeldeversuche 30 Tage; eine Sperre bis zur nächsten Anmeldung von ihrer Adresse nach ihrem Ende, bis zur Entsperrung, bis zum Löschen aller Daten oder bis 30 Tage nach ihrem Ende, je nachdem, was zuerst eintritt",
   "settings_privacy.row.alerts": "Meldungen",
   "settings_privacy.kept.alerts": "90 Tage nach ihrer Behebung",
   "settings_privacy.row.exports": "Exporte",

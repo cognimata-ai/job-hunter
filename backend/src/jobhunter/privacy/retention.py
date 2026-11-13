@@ -17,6 +17,14 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+`login_lockouts` (T19-4) deletes a login lockout that ended (`locked_until`) longer ago than the login
+attempts are kept, the `login_attempts` rule's window (`LOGIN_ATTEMPTS_KEPT`): a lockout row holds the client
+address, and an expired one otherwise goes only at the next sign-in or re-authentication from that address
+(`auth.throttle.active_lockout`). A global lockout it deletes resolves the open `auth.lockout` alert, as that
+sign-in would. It takes no throttle lock: an expired lockout decides no sign-in (`peek_lockout` and
+`active_lockout` read only live ones), and a new lock of the same scope waits for the row it deletes, then
+inserts one of its own.
+
 `operations` deletes an operation 30 days after it finished, except a purge operation whose deletion manifest
 is still `executing` (M5 Task 9, D7): a failed purge keeps its fence until it is retried, and the
 `purge_fences` reconciler re-queues a manifest only when it has no pending, running or failed operation.
@@ -208,6 +216,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
+from jobhunter.auth import throttle
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
@@ -240,12 +249,15 @@ class RetentionRule:
 
 # 13 calendar months last 393 to 397 days; the longest bound keeps every row for at least 13 months.
 THIRTEEN_MONTHS: Final = timedelta(days=397)
+# How long a login attempt is kept, and an ended lockout of its address (T19-4).
+LOGIN_ATTEMPTS_KEPT: Final = timedelta(days=30)
 
 # In the order they run, which is also the order of the report.
 RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("api_idempotency", timedelta(0)),  # once expired (created + 7 days)
     RetentionRule("sessions", timedelta(days=1)),  # expiry + 1 day
-    RetentionRule("login_attempts", timedelta(days=30)),
+    RetentionRule("login_attempts", LOGIN_ATTEMPTS_KEPT),
+    RetentionRule("login_lockouts", LOGIN_ATTEMPTS_KEPT),  # once the lockout ended that long ago (T19-4)
     RetentionRule("alerts", timedelta(days=90)),  # after resolution
     RetentionRule("operations", timedelta(days=30)),  # after they finished
     RetentionRule("raw_items", timedelta(days=90)),
@@ -374,6 +386,9 @@ _DELETES: Final[dict[str, TextClause]] = {
         "AND NOT EXISTS (SELECT 1 FROM batch_submissions s WHERE s.bulk_operation_id = b.id)"
     ),
 }
+
+# `login_lockouts` (T19-4): the lockouts that ended before the cutoff, by scope.
+_ENDED_LOCKOUTS: Final = q("DELETE FROM login_lockouts WHERE locked_until < :cutoff RETURNING scope")
 
 # `backup_records` (M5 Task 24): the finished runs first, except the newest succeeded restore test (Task 26),
 # then the finished sets that no run left names (a restore test's `backup_set_id`), except the newest
@@ -542,6 +557,17 @@ async def _delete_rows(
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         return (await conn.execute(statement, dict(params))).rowcount
+
+
+async def _delete_lockouts(engine: AsyncEngine, cutoff: datetime, epoch: int) -> int:
+    """`login_lockouts` (module docstring), in one fenced transaction: the lockouts that ended before `cutoff`
+    deleted, and the `auth.lockout` alert resolved when the global one is among them; how many."""
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        scopes = list((await conn.execute(_ENDED_LOCKOUTS, {"cutoff": cutoff})).scalars())
+        if throttle.GLOBAL_SCOPE in scopes:
+            await resolve_alert(conn, code=throttle.LOCKOUT_ALERT_CODE, subject=throttle.GLOBAL_SCOPE)
+    return len(scopes)
 
 
 async def _delete_backup_records(engine: AsyncEngine, cutoff: datetime, epoch: int) -> int:
@@ -810,6 +836,8 @@ async def _apply(
     epoch: int,
 ) -> int:
     cutoff = now - rule.window
+    if rule.name == "login_lockouts":
+        return await _delete_lockouts(engine, cutoff, epoch)
     if rule.name == "checkpoints":
         return await _purge_threads(engine, saver, cutoff, epoch)
     if rule.name == "profile_checkpoints":

@@ -285,6 +285,9 @@ def test_the_logged_client_addresses_and_their_retention_are_stated() -> None:
     windows = {rule.name: rule.window for rule in retention.RULES}
     assert f"kept until {windows['sessions'].days} day after they expire" in categories
     assert f"kept {windows['login_attempts'].days} days" in categories
+    # T19-4: an ended lockout goes at the latest once it ended as long ago as the login attempts are kept
+    assert windows["login_lockouts"] == windows["login_attempts"]
+    assert f"or {windows['login_lockouts'].days} days after it ended, whichever comes first" in categories
     rotation = LOG_ROTATION.search(COMPOSE.read_text(encoding="utf-8"))
     assert rotation is not None, "the services' log rotation"
     assert (

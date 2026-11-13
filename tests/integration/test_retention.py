@@ -1,4 +1,5 @@
 from datetime import timedelta
+from typing import Final
 
 import pytest
 import sqlalchemy as sa
@@ -7,6 +8,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.graph import build_noop_collect_graph
 from jobhunter.graphs.collect.state import initial_state
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.privacy.retention import RULES, run_retention_daily
 from jobhunter.profile.storage import CvStore
 from jobhunter.worker.tasks import defer_in_tx
@@ -111,6 +113,8 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "api_idempotency": timedelta(0),
         "sessions": timedelta(days=1),
         "login_attempts": timedelta(days=30),
+        # T19-4: a lockout once it ended as long ago as the login attempts are kept
+        "login_lockouts": timedelta(days=30),
         "alerts": timedelta(days=90),
         "operations": timedelta(days=30),
         # Task 24: the M1 rules (their own tests are in test_retention_m1.py)
@@ -219,6 +223,48 @@ async def test_sessions_and_operations_go_one_day_after_expiry_and_30_days_after
         assert kept == [b"\x03"]
         left = (await c.execute(sa.text("SELECT dedup_key FROM operations ORDER BY dedup_key"))).scalars()
         assert list(left) == ["old-pending", "recent-failed"]
+
+
+_LOCKOUT: Final = sa.text(
+    "INSERT INTO login_lockouts (scope, locked_until, reason) VALUES (:scope, :until, 'ip_failures')"
+)
+_OPEN_LOCKOUT_ALERT: Final = sa.text(
+    "SELECT count(*) FROM alerts WHERE dedup_key = 'auth.lockout:global' AND resolved_at IS NULL"
+)
+
+
+@pytest.mark.parametrize("global_ended", [31, 29], ids=["global_31_days_ago", "global_29_days_ago"])
+async def test_lockouts_go_once_they_ended_as_long_ago_as_login_attempts_are_kept(
+    engine, current_epoch, queue_app, cv_store, migrated, global_ended: int
+) -> None:
+    """T19-4: a lockout row holds the client address, and an expired one went only at the next sign-in from
+    that address. `login_lockouts` deletes every lockout that ended longer ago than the login attempts are
+    kept (the `login_attempts` rule's window, 30 days, from the caller's `now`), never a live or a recent one;
+    a global lockout it deletes resolves the open `auth.lockout` alert, as a sign-in that finds it expired
+    does."""
+    now = utcnow() + SHIFT
+    lockouts = {
+        "ip:198.51.100.1": now - timedelta(days=31),  # ended 31 days ago: goes
+        "ip:198.51.100.2": now - timedelta(days=29),  # ended 29 days ago: kept
+        "ip:198.51.100.3": now + timedelta(minutes=10),  # still locked: kept
+        "global": now - timedelta(days=global_ended),
+    }
+    async with engine.begin() as c:
+        for scope, until in lockouts.items():
+            await c.execute(_LOCKOUT, {"scope": scope, "until": until})
+        await raise_alert(
+            c, code="auth.lockout", severity="critical", subject="global", message="global login lockout"
+        )
+
+    report = await retention_at(engine, queue_app, migrated, now, cv_store=cv_store)
+
+    gone = {"ip:198.51.100.1"} | ({"global"} if global_ended > 30 else set())
+    assert report["login_lockouts"] == len(gone)
+    async with engine.connect() as c:
+        kept = set((await c.execute(sa.text("SELECT scope FROM login_lockouts"))).scalars())
+        open_alerts = (await c.execute(_OPEN_LOCKOUT_ALERT)).scalar_one()
+    assert kept == set(lockouts) - gone
+    assert open_alerts == (0 if "global" in gone else 1)
 
 
 async def test_runs_go_with_their_attempts_after_13_months_and_a_live_run_never_goes(

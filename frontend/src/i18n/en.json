@@ -1753,7 +1753,7 @@
   "settings_privacy.row.logs": "Logs",
   "settings_privacy.kept.logs": "Rotated by size; about 14 days at normal volume",
   "settings_privacy.row.sessions": "Sessions, login attempts and login lockouts",
-  "settings_privacy.kept.sessions": "Sessions until 1 day after they expire; login attempts 30 days; a lockout until the next sign-in from its address after it ended, an unlock, or deleting everything",
+  "settings_privacy.kept.sessions": "Sessions until 1 day after they expire; login attempts 30 days; a lockout until the next sign-in from its address after it ended, an unlock, deleting everything, or 30 days after it ended, whichever comes first",
   "settings_privacy.row.alerts": "Alerts",
   "settings_privacy.kept.alerts": "90 days after they are resolved",
   "settings_privacy.row.exports": "Exports",

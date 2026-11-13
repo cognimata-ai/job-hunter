@@ -6564,7 +6564,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Logs | Docker local driver (no content, no client address) | Rotated by size, 10 files of 20 MB per service: about 14 days at normal volume, longer for a service that logs little, until its container is recreated | Rotation |
 | Sessions | DB | Expiry + 1 day | daily |
 | Login attempts | DB | 30 days | daily |
-| Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, or delete-everything; no scheduled clean-up | Sign-in, CLI, delete-everything |
+| Login lockouts | DB (`login_lockouts`; an address's lockout is keyed by the address) | Until the next sign-in or re-authentication from that address after the lockout ended (the global one: from any address), `jobhunter sessions unlock`, delete-everything, or 30 days after it ended, whichever comes first | Sign-in, CLI, delete-everything, daily |
 | Alerts | DB | Resolved + 90 days | daily |
 | Exports | `exports` volume and table | 7 days; deleted by every purge but the nightly job tombstoning; rows 30 days after expiry | daily |
 | Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: the latest one a shipment confirmed, which holds every manifest shipped up to it, and every newer one, so the manifests are kept indefinitely | `restic forget/prune` |
