@@ -43,7 +43,12 @@ revision `destructive`, so its rollback is a restore: with a compatible floor th
 instead (spec §19.6): release N teaches the parser the new format while it still writes the old one, and
 release N+1 writes the new format. A rollback from N+1 therefore lands on N, whose restore reads both, so no
 release ever needs a restore its own parser cannot replay (one that skipped release N would stop its restore
-at a `ManifestInvalid`).
+at a `ManifestInvalid`). Beside it, the `max_ids` rule (final fix C3, spec §19.6): a release that makes a kind
+read a `max_ids` key its older manifests lack (a table it creates) declares the key added
+(`KindProcedure.max_ids_keys_added`), never required. A table created after a manifest was written has no row
+within its bound, so the key's absence reads as 0 and `migrate`'s bound check requires it of no manifest;
+declared required, it would stop every `migrate` that meets an older manifest of the kind, so that release
+counts as a manifest-format change and ships expand/contract.
 """
 
 import functools

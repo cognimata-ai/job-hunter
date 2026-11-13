@@ -18,9 +18,14 @@ registers one): `compute` (A2, after the quiesce, under the fence: the content o
 re-application of A0's effects beyond the manifest, its fences and its operation, at the manifest's place in
 the stream; `high_water` is each table's greatest id when the replay began, so a row above it is the replay's
 own: a no-op for every kind but the source purge), `deletes_exports` (true for every kind but
-`job_tombstone`: M5-R3, Deviation 18) and `max_ids_keys`, the `max_ids` keys the procedure reads (its
+`job_tombstone`: M5-R3, Deviation 18), `max_ids_keys`, the `max_ids` keys the procedure reads (its
 `execute`, its `postconditions` and, for the source purge, the rebuild), which a replay checks every manifest
-of the kind for before it starts (`replay.required_bounds`, final review M3).
+of the kind for before it starts (`replay.required_bounds`, final review M3), and `max_ids_keys_added`, the
+keys a release added after manifests of the kind were written (final fix C3). A table created after a
+manifest was written has no row within that manifest's bound, so an added key's absence reads as 0: the
+procedure reads it only as `max_ids.get(key, 0)`, and no replay requires it. A release that starts reading a
+key declares it added, never required (or the change counts as a manifest-format change, `db.compat`); no key
+is both (`register_kind` refuses one).
 `compute_content` runs `compute` and completes what the kind cannot know: `fenced_at` (and a watermark's)
 becomes the fence's commit cutoff the quiesce waited from (`fences.fence_committed_at`), and a kind that
 deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["exports"]`.
@@ -380,6 +385,7 @@ class KindProcedure(Protocol):
     kind: ManifestKind
     deletes_exports: bool
     max_ids_keys: frozenset[str]
+    max_ids_keys_added: frozenset[str]
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime
@@ -420,7 +426,10 @@ KINDS: dict[ManifestKind, KindProcedure] = {}
 
 
 def register_kind(proc: KindProcedure) -> KindProcedure:
-    """Register `proc` for its kind; `ValueError` when another procedure has the kind already."""
+    """Register `proc` for its kind; `ValueError` when another procedure has the kind already, or when it
+    declares a `max_ids` key both required and added (module docstring)."""
+    if both := sorted(proc.max_ids_keys & proc.max_ids_keys_added):
+        raise ValueError(f"manifest kind {proc.kind!r} declares {both[0]!r} both required and added")
     registered = KINDS.get(proc.kind)
     if registered is not None and registered is not proc:
         raise ValueError(f"another procedure is already registered for manifest kind {proc.kind!r}")

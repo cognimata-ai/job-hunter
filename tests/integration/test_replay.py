@@ -419,6 +419,61 @@ async def test_a_manifest_whose_max_ids_lacks_a_key_its_kind_reads_stops_migrate
     assert await scalar(engine, sa.text("SELECT count(*) FROM purge_fences")) == 0
 
 
+class LaterBound:
+    """The golden-case deletion as a later release might write it (final fix C3): it also reads the bound of a
+    table that release created, `later_table`, declared added (or, for the refusal, required), and records
+    what each execution read. Everything else is the real procedure's."""
+
+    def __init__(self, inner: Any, *, added: bool) -> None:
+        self.inner = inner
+        self.kind = inner.kind
+        self.deletes_exports = inner.deletes_exports
+        self.max_ids_keys = inner.max_ids_keys | (frozenset() if added else frozenset({"later_table"}))
+        self.max_ids_keys_added = frozenset({"later_table"}) if added else frozenset()
+        self.read: list[int] = []
+
+    async def compute(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.inner.compute(*args, **kwargs)
+
+    async def execute(self, run: Any, content: Any) -> None:
+        self.read.append(content["max_ids"].get("later_table", 0))
+        await self.inner.execute(run, content)
+
+    async def postconditions(self, conn: Any, content: Any) -> Any:
+        return await self.inner.postconditions(conn, content)
+
+    async def reapply_admission(self, *args: Any, **kwargs: Any) -> None:
+        await self.inner.reapply_admission(*args, **kwargs)
+
+
+@pytest.mark.parametrize("added", [True, False], ids=["declared_added", "declared_required"])
+async def test_a_bound_a_later_release_added_reads_as_0_where_an_older_manifest_lacks_it(
+    engine: AsyncEngine,
+    make_config: ConfigFactory,
+    purger: Purger,
+    monkeypatch: pytest.MonkeyPatch,
+    added: bool,
+) -> None:
+    """Final fix C3 (final re-review N3): a manifest written before a release created a table has no row of it
+    within its bound. So a kind may declare the table's key added (`max_ids_keys_added`): the bound check
+    requires it of no manifest, and an older manifest that lacks it replays with the bound read as 0. The same
+    key declared required stops `migrate` with `ManifestBoundMissing` before any replay step."""
+    later = LaterBound(purge.KINDS["golden_case_delete"], added=added)
+    monkeypatch.setitem(purge.KINDS, "golden_case_delete", later)
+    built = content(kind="golden_case_delete", operations=bounded_by("golden_case_delete"), max_ids={})
+    write_manifest_file(purger.cfg.manifests_dir, built)
+
+    if added:
+        await migrate(make_config, purger, steps=frozenset({"replay"}))
+        assert await scalar(engine, _MANIFEST_ROWS) == 1
+        assert later.read == [0]
+        return
+    with pytest.raises(ManifestBoundMissing) as stopped:
+        await migrate(make_config, purger, steps=frozenset({"replay"}))
+    assert (stopped.value.kind, stopped.value.key) == ("golden_case_delete", "later_table")
+    assert (await scalar(engine, _MANIFEST_ROWS), later.read) == (0, [])
+
+
 @pytest.mark.parametrize("defect", ["another_kind", "another_hash", "completed_without_content"])
 async def test_a_file_or_row_that_is_not_its_manifest_stops_migrate(
     engine: AsyncEngine,

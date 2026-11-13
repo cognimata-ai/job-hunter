@@ -146,6 +146,7 @@ class GoldenCaseDelete:
     kind: ManifestKind = KIND
     deletes_exports: bool = True
     max_ids_keys: frozenset[str] = frozenset()  # its operation names its case by id: no bound is read
+    max_ids_keys_added: frozenset[str] = frozenset()  # no key a later release added (final fix C3)
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime

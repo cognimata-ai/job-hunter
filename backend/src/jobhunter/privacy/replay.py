@@ -26,11 +26,14 @@ reads it (`parse_manifest` of its canonical bytes, then that hash).
 every manifest of the stream and of every recorded row is checked for the `max_ids` keys its replay reads
 (`required_bounds`): those its kind's procedure reads (`KindProcedure.max_ids_keys`, which each kind declares
 beside the code that reads them) and those its typed operations' selectors read (`manifests.bound_keys`). A
-manifest that lacks one (a release whose procedure reads a table an older release's manifest never bounded)
-raises `ManifestBoundMissing`, a `ManifestInvalid` naming the manifest's uuid, its kind and the first missing
-key, logged `replay_bound_missing` with the three, and `migrate` stops as for any refused file
-(`migrate_failed`, the step and the error's class), every manifest unreplayed. A pending retry without a hash
-has no content yet: it is computed under the restored schema, every key present.
+key a later release added (`KindProcedure.max_ids_keys_added`, final fix C3) is required of no manifest: a
+table created after a manifest was written has no row within its bound, so the procedure reads its absence as
+0. A manifest that lacks a required one (a damaged or hand-made file, or a release that declared a new key
+required, which only a manifest-format change may) raises `ManifestBoundMissing`, a `ManifestInvalid` naming
+the manifest's uuid, its kind and the first missing key, logged `replay_bound_missing` with the three, and
+`migrate` stops as for any refused file (`migrate_failed`, the step and the error's class), every manifest
+unreplayed. A pending retry without a hash has no content yet: it is computed under the restored schema, every
+key present.
 
 **The replay** (`replay_stream`) ends at once when every manifest is `satisfied`. Otherwise:
 - **phase A** (Ruling T25-3: each manifest's effects at its place in the stream). One transaction under
@@ -310,9 +313,9 @@ async def _holds(
 
 
 def required_bounds(content: ManifestContent) -> frozenset[str]:
-    """The `max_ids` keys a replay of `content` reads (module docstring, "The bounds"): its kind's
-    (`KindProcedure.max_ids_keys`) and its typed operations' (`manifests.bound_keys`); none of a kind no
-    procedure replays, which is refused by its own name."""
+    """The `max_ids` keys a replay of `content` requires (module docstring, "The bounds"): its kind's
+    (`KindProcedure.max_ids_keys`, never its added ones) and its typed operations' (`manifests.bound_keys`);
+    none of a kind no procedure replays, which is refused by its own name."""
     proc = KINDS.get(content["kind"])
     return frozenset() if proc is None else proc.max_ids_keys | bound_keys(content)
 

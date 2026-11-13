@@ -228,6 +228,7 @@ class JobTombstone:
     kind: ManifestKind = KIND
     deletes_exports: bool = False
     max_ids_keys: frozenset[str] = frozenset({TARGETS_BOUND})
+    max_ids_keys_added: frozenset[str] = frozenset()  # no key a later release added (final fix C3)
 
     async def compute(
         self, conn: AsyncConnection, manifest: ManifestRow, *, now: datetime

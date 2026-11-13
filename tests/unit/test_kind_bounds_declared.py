@@ -15,9 +15,15 @@ parameter through every argument from its position on). A read whose key cannot 
 well, by function and line, and so does a manifest's bounds passed whole to a function outside the module,
 unless `PASSED_OUT` names it: a pure function, whose reads are found by calling it.
 
+A kind declares the keys it requires (`max_ids_keys`) and those a later release added
+(`max_ids_keys_added`, final fix C3): a table created after a manifest was written has no row within that
+manifest's bound, so an added key's absence reads as 0, and the check requires every read of one to be
+`.get(key, 0)`.
+
 The check is shown to fail on reads planted in a kind's syntax tree: a key it does not declare, read in
 `execute`, through `.get`, or in a helper its `postconditions` call; a key no rule resolves; the bounds passed
-whole to another module. A read planted in `compute` alone is left out, as the check says.
+whole to another module; an added key read by subscript or with another default. A read planted in `compute`
+alone is left out, and an added key read as `.get(key, 0)` passes, as the check says.
 """
 
 import ast
@@ -31,7 +37,7 @@ from typing import Any, Final
 import pytest
 from jobhunter.privacy import manifests
 from jobhunter.privacy.kinds import delete_everything, golden_case, job_tombstone, profile_purge, source_purge
-from jobhunter.privacy.purge import KINDS
+from jobhunter.privacy.purge import KINDS, register_kind
 
 MODULES: Final = (golden_case, job_tombstone, profile_purge, source_purge, delete_everything)
 BOUNDS_NAMES: Final = frozenset({"max_ids", "bounds"})
@@ -54,6 +60,8 @@ class Reads:
 
     keys: set[str] = field(default_factory=set)
     unresolved: list[str] = field(default_factory=list)
+    # each key's read forms: `subscript`, `get_or_0` (`.get(key, 0)`) or `get` (another `.get`)
+    forms: dict[str, set[str]] = field(default_factory=dict)
 
 
 def functions(tree: ast.Module) -> dict[str, Function]:
@@ -379,15 +387,15 @@ def escapes_in(
             yield node.lineno, callee
 
 
-def reads_in(function: Function, holders: set[str]) -> Iterator[tuple[ast.expr, int]]:
-    """The key of every bound read in `function`, with its line."""
+def reads_in(function: Function, holders: set[str]) -> Iterator[tuple[ast.expr, int, str]]:
+    """The key of every bound read in `function`, with its line and its form (`Reads.forms`)."""
     for node in ast.walk(function.node):
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.ctx, ast.Load)
             and holding(node.value, holders)
         ):
-            yield node.slice, node.lineno
+            yield node.slice, node.lineno, "subscript"
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -395,7 +403,9 @@ def reads_in(function: Function, holders: set[str]) -> Iterator[tuple[ast.expr, 
             and holding(node.func.value, holders)
             and node.args
         ):
-            yield node.args[0], node.lineno
+            default = node.args[1] if len(node.args) > 1 else None
+            zero = isinstance(default, ast.Constant) and default.value == 0 and not node.keywords
+            yield node.args[0], node.lineno, "get_or_0" if zero else "get"
 
 
 def bound_reads(tree: ast.Module, namespace: Mapping[str, Any], procedure: str) -> Reads:
@@ -411,13 +421,25 @@ def bound_reads(tree: ast.Module, namespace: Mapping[str, Any], procedure: str) 
                 reads.keys |= read_by(PASSED_OUT[callee])
             else:
                 reads.unresolved.append(f"{name}:{line} (passed out to {callee})")
-        for key, line in reads_in(known[name], holders):
+        for key, line, form in reads_in(known[name], holders):
             resolved = resolver.key(key, known[name])
             if resolved is None:
                 reads.unresolved.append(f"{name}:{line}")
-            else:
-                reads.keys |= resolved
+                continue
+            reads.keys |= resolved
+            for one in resolved:
+                reads.forms.setdefault(one, set()).add(form)
     return reads
+
+
+def violations(reads: Reads, required: AbstractSet[str], added: AbstractSet[str]) -> list[str]:
+    """What fails the check (module docstring): each unresolved read; each key the kind declares neither
+    required nor added (`undeclared:<key>`); each added key read other than as `.get(key, 0)`
+    (`added_read:<key>`), which an older manifest that lacks it would fail."""
+    found = list(reads.unresolved)
+    found += [f"undeclared:{key}" for key in sorted(reads.keys - required - added)]
+    found += [f"added_read:{key}" for key in sorted(added & reads.keys) if reads.forms[key] != {"get_or_0"}]
+    return found
 
 
 def parsed(module: ModuleType) -> ast.Module:
@@ -433,10 +455,29 @@ def procedure_of(module: ModuleType) -> Any:
 def test_every_bound_a_kind_reads_is_one_it_declares(module: ModuleType) -> None:
     procedure = procedure_of(module)
     reads = bound_reads(parsed(module), vars(module), type(procedure).__name__)
-    assert reads.unresolved == []
-    assert sorted(reads.keys - procedure.max_ids_keys) == []
+    assert violations(reads, procedure.max_ids_keys, procedure.max_ids_keys_added) == []
     # and the check sees the reads it is about: every key a kind declares is one it reads
-    assert reads.keys == procedure.max_ids_keys
+    assert reads.keys == procedure.max_ids_keys | procedure.max_ids_keys_added
+
+
+def test_every_kind_declares_its_added_keys_apart_from_its_required_ones() -> None:
+    """Final fix C3: a key a release adds to what a kind reads is declared added (`max_ids_keys_added`, its
+    absence read as 0: a table created after a manifest has no row within its bound), never required, or the
+    release counts as a manifest-format change; no key is both, and registering a kind that declares one
+    both is refused."""
+    for kind, procedure in KINDS.items():
+        assert isinstance(procedure.max_ids_keys_added, frozenset), kind
+        assert procedure.max_ids_keys.isdisjoint(procedure.max_ids_keys_added), kind
+
+    class Both:
+        kind = "golden_case_delete"
+        deletes_exports = True
+        max_ids_keys = frozenset({"jobs"})
+        max_ids_keys_added = frozenset({"jobs"})
+
+    with pytest.raises(ValueError, match="both required and added"):
+        register_kind(Both())  # type: ignore[arg-type]  # a partial procedure: refused before it is used
+    assert KINDS["golden_case_delete"] is procedure_of(golden_case)
 
 
 def planted(module: ModuleType, method: str, code: str, *, helper: str = "") -> ast.Module:
@@ -459,55 +500,75 @@ def planted(module: ModuleType, method: str, code: str, *, helper: str = "") -> 
 
 
 PLANTS: Final = {
-    "a_subscript_in_execute": ("execute", 'content["max_ids"]["planted"]', "", {"planted"}, []),
+    "a_subscript_in_execute": ("execute", 'content["max_ids"]["planted"]', "", (), ["undeclared:planted"]),
     "a_get_of_a_bound_name": (
         "execute",
         'planted_bounds = content["max_ids"]\nplanted_bounds.get("planted")',
         "",
-        {"planted"},
-        [],
+        (),
+        ["undeclared:planted"],
     ),
     "a_helper_the_postconditions_call": (
         "postconditions",
         '_planted(content["max_ids"])',
         "def _planted(bounds):\n    return bounds[PLANTED_KEY]",
-        {"planted"},
-        [],
+        (),
+        ["undeclared:planted"],
     ),
     "a_helper_whose_parameter_has_another_name": (
         "execute",
         '_planted(run, content["max_ids"])',
         "def _planted(run, limits):\n    return limits.get(PLANTED_KEY)",
-        {"planted"},
-        [],
+        (),
+        ["undeclared:planted"],
     ),
-    "a_key_no_rule_resolves": ("execute", 'content["max_ids"][str(len(content))]', "", set(), ["execute:1"]),
+    "a_key_no_rule_resolves": ("execute", 'content["max_ids"][str(len(content))]', "", (), ["execute:1"]),
     "the_bounds_passed_out": (
         "execute",
         'elsewhere.read(content["max_ids"])',
         "",
-        set(),
+        (),
         ["execute:1 (passed out to read)"],
     ),
-    "a_read_in_compute_alone": ("compute", 'max_ids = {}\nmax_ids["planted"]', "", set(), []),
+    "an_added_key_read_by_subscript": (
+        "execute",
+        'content["max_ids"]["planted"]',
+        "",
+        ("planted",),
+        ["added_read:planted"],
+    ),
+    "an_added_key_read_with_another_default": (
+        "execute",
+        'content["max_ids"].get("planted")',
+        "",
+        ("planted",),
+        ["added_read:planted"],
+    ),
+    # accepted: an added key read as 0 where an older manifest lacks it (final fix C3)
+    "an_added_key_read_as_0_when_absent": (
+        "execute",
+        'content["max_ids"].get("planted", 0)',
+        "",
+        ("planted",),
+        [],
+    ),
+    "a_read_in_compute_alone": ("compute", 'max_ids = {}\nmax_ids["planted"]', "", (), []),
 }
 
 
-@pytest.mark.parametrize(
-    ("method", "code", "helper", "new", "unresolved"), PLANTS.values(), ids=PLANTS.keys()
-)
+@pytest.mark.parametrize(("method", "code", "helper", "added", "found"), PLANTS.values(), ids=PLANTS.keys())
 def test_the_check_fails_on_a_planted_read(
-    method: str, code: str, helper: str, new: set[str], unresolved: list[str]
+    method: str, code: str, helper: str, added: tuple[str, ...], found: list[str]
 ) -> None:
     module = job_tombstone
     procedure = procedure_of(module)
     namespace = {**vars(module), "PLANTED_KEY": "planted"}
     name = type(procedure).__name__
     reads = bound_reads(planted(module, method, code, helper=helper), namespace, name)
-    assert sorted(reads.keys - procedure.max_ids_keys) == sorted(new)
-    assert [entry.removeprefix(f"{name}.") for entry in reads.unresolved] == unresolved
-    failed = bool(reads.unresolved) or bool(reads.keys - procedure.max_ids_keys)
-    assert failed is (method != "compute")
+    declared_added = procedure.max_ids_keys_added | frozenset(added)
+    assert [
+        v.removeprefix(f"{name}.") for v in violations(reads, procedure.max_ids_keys, declared_added)
+    ] == found
 
 
 def test_a_function_given_the_bounds_whole_reads_the_thread_owners() -> None:
