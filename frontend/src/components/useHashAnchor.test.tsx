@@ -93,6 +93,30 @@ describe("useHashAnchor", () => {
     expect(scrolledIds(scrolled)).toEqual(["target", "target"]);
   });
 
+  it("pins again at a scroll that comes with the page's growth, as the browser's scroll anchoring makes", () => {
+    // the sections above fill in and the browser keeps what was in view: not the user's scroll
+    const setHeight = (value: number): void => {
+      Object.defineProperty(document.documentElement, "scrollHeight", { value, configurable: true });
+    };
+    setHeight(20_000);
+    scrolled.mockImplementation(() => {
+      setScrollY(1_000);
+    });
+    try {
+      render(<Page hash="target" />);
+      setHeight(23_000);
+      setScrollY(4_000); // anchored
+      window.dispatchEvent(new Event("scroll"));
+      expect(scrolledIds(scrolled)).toEqual(["target", "target"]); // pinned again, not let go
+      setScrollY(400); // the user's, the page's height unchanged
+      window.dispatchEvent(new Event("scroll"));
+      FakeObserver.made[0].fire();
+      expect(scrolledIds(scrolled)).toEqual(["target", "target"]);
+    } finally {
+      Reflect.deleteProperty(document.documentElement, "scrollHeight");
+    }
+  });
+
   it(`lets go after ${String(PIN_MS)} ms`, () => {
     vi.useFakeTimers();
     render(<Page hash="target" />);
