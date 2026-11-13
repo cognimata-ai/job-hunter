@@ -351,7 +351,7 @@ def test_prodstack_runs_the_stack_modules_then_the_drills() -> None:
     found = steps_of(load(PRODSTACK)["jobs"]["prodstack"])
     ci = steps_of(load(CI)["jobs"]["unit"])
     # the checkout as ci.yml pins it, with the whole history: build-prev-image.sh reads the parent of the
-    # commit that added 0011, which a shallow clone lacks
+    # commit that added 0012, which a shallow clone lacks
     assert found[0]["uses"] == ci[0]["uses"]
     assert found[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
     assert (found[1]["uses"], found[1]["with"]) == (ci[1]["uses"], ci[1]["with"])

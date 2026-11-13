@@ -30,13 +30,14 @@ took the lock with it, so the run fails `prune:ShipLockLost`, with nothing forgo
 proves nothing, and the shipper's unchanged-stream check would trust it for ever. So, in the same locked step
 and one transaction, the prune removes it: the receipt row locked (`FOR UPDATE`, so the `manifest_shipping`
 reconciler cannot mark a manifest with it meanwhile), each manifest it shipped returned `shipped ->
-completed` (`shipped_at` and `shipment_id` cleared, `completed_at` kept), its items deleted, then the row;
-then the receipt below it, while restic does not list that one's snapshot either, until one is listed or
-none remains. Each is logged `manifest_receipt_removed` with its shipment id, snapshot id, item count and the
-number of manifests returned (ids and counts only). It forgets no `manifests` snapshot in that run. The
-reconciler then raises `privacy.manifest_unshipped` for a returned manifest completed more than 1 h ago, the
-UI reports it not confirmed offsite again, and the next ship finds the stream unlike the latest receipt's
-items and uploads all of it.
+completed` by `unship_manifest` (`shipped_at` and `shipment_id` cleared, `completed_at` kept; migration
+0012, final fix E2: the backup role's one way to change a manifest, as it holds no UPDATE on them), its
+items deleted, then the row; then the receipt below it, while restic does not list that one's snapshot
+either, until one is listed or none remains. Each is logged `manifest_receipt_removed` with its shipment
+id, snapshot id, item count and the number of manifests returned (ids and counts only). It forgets no
+`manifests` snapshot in that run. The reconciler then raises `privacy.manifest_unshipped` for a returned
+manifest completed more than 1 h ago, the UI reports it not confirmed offsite again, and the next ship finds
+the stream unlike the latest receipt's items and uploads all of it.
 
 **Why the receipt anchors it.** A restore reads the union of every `manifests` snapshot
 (`restore.restore_stream`), so forgetting the older ones bounds its work, which would otherwise grow with
@@ -62,7 +63,7 @@ from jobhunter.backup.restic import Restic
 from jobhunter.backup.shipper import MANIFESTS_TAG, ship_lock
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import transition, transition_where
+from jobhunter.db.transitions import transition
 from jobhunter.observability.logging import get_logger
 
 _START: Final = q(
@@ -76,6 +77,13 @@ _LATEST_RECEIPT_LOCKED: Final = q(
     "SELECT id, restic_snapshot_id FROM manifest_shipments ORDER BY id DESC LIMIT 1 FOR UPDATE"
 )
 _ITEM_COUNT: Final = q("SELECT count(*) FROM manifest_shipment_items WHERE shipment_id = :shipment")
+# Each manifest the receipt shipped, returned to `completed` by `unship_manifest` (migration 0012, the backup
+# role's one way to change a manifest, final fix E2): the ids first, then the function on each.
+_UNSHIP: Final = q(
+    "WITH shipped AS MATERIALIZED (SELECT id FROM deletion_manifests "
+    "WHERE shipment_id = :shipment AND status = 'shipped') "
+    "SELECT count(*) FILTER (WHERE unship_manifest(id)) FROM shipped"
+)
 _REMOVE_ITEMS: Final = q("DELETE FROM manifest_shipment_items WHERE shipment_id = :shipment")
 _REMOVE_RECEIPT: Final = q("DELETE FROM manifest_shipments WHERE id = :shipment")
 
@@ -132,17 +140,10 @@ async def _remove_false_receipts(engine: AsyncEngine, listed: Collection[str]) -
                 break
             params = {"shipment": int(receipt.id)}
             items = int((await conn.execute(_ITEM_COUNT, params)).scalar_one())
-            returned = await transition_where(
-                conn,
-                "deletion_manifests",
-                ["shipped"],
-                "completed",
-                where="t.shipment_id = :shipment",
-                params=params,
-            )
+            returned = int((await conn.execute(_UNSHIP, params)).scalar_one())
             await conn.execute(_REMOVE_ITEMS, params)
             await conn.execute(_REMOVE_RECEIPT, params)
-            removed.append(_FalseReceipt(int(receipt.id), receipt.restic_snapshot_id, items, len(returned)))
+            removed.append(_FalseReceipt(int(receipt.id), receipt.restic_snapshot_id, items, returned))
     return removed
 
 

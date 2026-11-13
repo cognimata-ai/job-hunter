@@ -1,6 +1,6 @@
 """Migration 0011 (M5 Task 27, Ruling T27-2): the partial index of the purge operations by their payload's
 manifest id, an expand migration (floor 0010, not destructive), the one the upgrade-then-rollback drill
-crosses (`tests/stack/test_prod_drills.py`).
+crossed until 0012 (`tests/stack/test_prod_drills.py`).
 """
 
 import asyncio

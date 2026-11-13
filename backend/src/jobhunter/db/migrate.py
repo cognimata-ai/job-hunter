@@ -93,9 +93,10 @@ STEP_GROUPS: Final[Mapping[StepGroup, tuple[MigrateStep, ...]]] = MappingProxyTy
 # Tables of later milestones that the backup role writes (the backup role has no default privileges).
 BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")
 # What the prune's removal of a false receipt needs besides (final fix D1 (b), `backup.prune`): DELETE on the
-# receipt tables, and UPDATE of exactly the columns that return a shipped manifest to `completed`.
+# receipt tables, and the function that returns a shipped manifest to `completed`, the backup role's one way
+# to change a manifest (migration 0012, final fix E2): it holds no UPDATE on `deletion_manifests`.
 BACKUP_DELETE_TABLES: Final = ("manifest_shipments", "manifest_shipment_items")
-BACKUP_UNSHIP_COLUMNS: Final = ("status", "completed_at", "shipped_at", "shipment_id")
+BACKUP_UNSHIP_FUNCTION: Final = "public.unship_manifest(bigint)"
 # Session-level advisory lock that serialises `migrate` runs. The project's advisory keys: a session lock and
 # a transaction lock on the same key conflict, so each use has a key of its own. PostgreSQL keeps the one-key
 # form (one bigint; `objsubid = 1` in `pg_locks`) and the two-key form (two integers; `objsubid = 2`) apart,
@@ -126,6 +127,9 @@ class SchemaAheadIncompatible(Exception):
     `ahead_incompatible`); `migrate` refuses it before any step, and the RUNBOOK rolls back by restore."""
 
 
+_HAS_FUNCTION: Final = q("SELECT to_regprocedure(:signature) IS NOT NULL")
+
+
 async def _exists(conn: AsyncConnection, table: str) -> bool:
     return bool(
         (
@@ -136,11 +140,16 @@ async def _exists(conn: AsyncConnection, table: str) -> bool:
 
 async def apply_explicit_grants(conn: AsyncConnection) -> list[str]:
     """Grant `INSERT, UPDATE` to the backup role on each table of `BACKUP_GRANT_TABLES` that exists; and, for
-    the prune's removal of a false receipt, `DELETE` on each of `BACKUP_DELETE_TABLES` and `UPDATE` of
-    `BACKUP_UNSHIP_COLUMNS` on `deletion_manifests`.
+    the prune's removal of a false receipt, `DELETE` on each of `BACKUP_DELETE_TABLES` and `EXECUTE` on
+    `BACKUP_UNSHIP_FUNCTION`, which PUBLIC may not execute (a restore's `--no-acl` leaves a function
+    executable by PUBLIC, migration 0012). It revokes every `UPDATE` of the backup role on
+    `deletion_manifests` (its columns' too): the release before 0012 granted four columns (final fix D1), and
+    a rollback to it grants them again, with which a compromised backup container could complete an executing
+    manifest (final fix E2).
 
     Idempotent. Returns the tables of `BACKUP_GRANT_TABLES` it granted on, in that order; a table that does
-    not exist yet (the M0 schema has none of them) is skipped, and a later `migrate` grants on it.
+    not exist yet (the M0 schema has none of them) is skipped, and a later `migrate` grants on it, as for the
+    function before 0012.
     """
     quote = conn.dialect.identifier_preparer.quote
     granted: list[str] = []
@@ -152,8 +161,11 @@ async def apply_explicit_grants(conn: AsyncConnection) -> list[str]:
         if await _exists(conn, table):
             await conn.execute(q(f"GRANT DELETE ON public.{quote(table)} TO jobhunter_backup"))
     if await _exists(conn, "deletion_manifests"):
-        columns = ", ".join(quote(column) for column in BACKUP_UNSHIP_COLUMNS)
-        await conn.execute(q(f"GRANT UPDATE ({columns}) ON public.deletion_manifests TO jobhunter_backup"))
+        # a table-level REVOKE revokes the same privilege on every column too
+        await conn.execute(q("REVOKE UPDATE ON public.deletion_manifests FROM jobhunter_backup"))
+    if (await conn.execute(_HAS_FUNCTION, {"signature": BACKUP_UNSHIP_FUNCTION})).scalar_one():
+        await conn.execute(q(f"REVOKE ALL ON FUNCTION {BACKUP_UNSHIP_FUNCTION} FROM PUBLIC"))
+        await conn.execute(q(f"GRANT EXECUTE ON FUNCTION {BACKUP_UNSHIP_FUNCTION} TO jobhunter_backup"))
     return granted
 
 

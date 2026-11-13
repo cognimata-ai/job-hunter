@@ -157,11 +157,15 @@ def allocated_at_or_below(
 
 
 def backup_grants(server: PgServer, role: PgRole = "migrator", db: str = APP_DB) -> bool:
+    """Whether the backup role holds what `migrate`'s grants step gives it (§19.3 step 4): INSERT and UPDATE
+    on its four tables, and `unship_manifest`, which the application role may not execute (final fix E2)."""
     row = pg_one(
         server,
         role,
         "SELECT bool_and(has_table_privilege('jobhunter_backup', 'public.' || t, 'INSERT') "
         "AND has_table_privilege('jobhunter_backup', 'public.' || t, 'UPDATE')) "
+        "AND has_function_privilege('jobhunter_backup', 'public.unship_manifest(bigint)', 'EXECUTE') "
+        "AND NOT has_function_privilege('jobhunter_app', 'public.unship_manifest(bigint)', 'EXECUTE') "
         "FROM unnest(CAST(%s AS text[])) AS t",
         list(BACKUP_GRANT_TABLES),
         db=db,
@@ -388,6 +392,10 @@ async def test_a_restored_database_with_a_newer_stream_advances_above_it(
             "migrator",
             f"REVOKE INSERT, UPDATE ON {', '.join(BACKUP_GRANT_TABLES)} FROM jobhunter_backup",
         )
+        # and a function's privileges are its default: PUBLIC may execute it, no role is granted it
+        unship = "unship_manifest(bigint)"
+        pg_rows(server, "migrator", f"REVOKE EXECUTE ON FUNCTION {unship} FROM jobhunter_backup")
+        pg_rows(server, "migrator", f"GRANT EXECUTE ON FUNCTION {unship} TO PUBLIC")
         assert not backup_grants(server)
 
     # The latest manifest stream, newer than the dump: what its manifests deleted had ids the dump never saw.

@@ -36,7 +36,7 @@ from jobhunter.backup.restore_test import run_restore_test
 from jobhunter.backup.runner import CommandResult
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.db.migrate import BACKUP_DELETE_TABLES, BACKUP_GRANT_TABLES, BACKUP_UNSHIP_COLUMNS
+from jobhunter.db.migrate import BACKUP_DELETE_TABLES, BACKUP_GRANT_TABLES
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import pg_error
 from jobhunter.graphs.checkpointer import open_saver
@@ -74,6 +74,11 @@ _MANIFEST_COLUMNS_UPDATED: Final = (
     "SELECT attname FROM pg_attribute WHERE attrelid = 'public.deletion_manifests'::regclass AND attnum > 0 "
     "AND NOT attisdropped AND has_column_privilege('jobhunter_backup', attrelid, attnum, 'UPDATE') "
     "ORDER BY attname"
+)
+# The functions of the application schema that run as their owner and that a role may execute.
+_DEFINER_FUNCTIONS: Final = (
+    "SELECT proname FROM pg_proc WHERE pronamespace = CAST('public' AS regnamespace) AND prosecdef "
+    "AND has_function_privilege(%s, oid, 'EXECUTE') ORDER BY 1"
 )
 _IDLE_IN_TRANSACTION: Final = (
     "SELECT usename FROM pg_stat_activity WHERE state = 'idle in transaction' AND pid <> pg_backend_pid()"
@@ -442,15 +447,19 @@ async def test_the_backup_role_writes_only_the_backup_tables(
         async with backup_engine.begin() as conn:
             await conn.execute(sa.text("DELETE FROM backup_sets"))
     assert pg_error(denied.value).sqlstate == "42501"  # insufficient privilege
-    # On `deletion_manifests`, the UPDATE of the four columns that return a manifest to `completed`, no other.
-    assert [row[0] for row in pg_rows(migrated, "superuser", _MANIFEST_COLUMNS_UPDATED)] == sorted(
-        BACKUP_UNSHIP_COLUMNS
-    )
+    # No UPDATE of any column of `deletion_manifests`: the backup role returns a shipped manifest to
+    # `completed` only through `unship_manifest` (final fix E2), the one function it may execute that runs as
+    # its owner; the application role may execute none.
+    assert pg_rows(migrated, "superuser", _MANIFEST_COLUMNS_UPDATED) == []
+    assert pg_rows(migrated, "superuser", _DEFINER_FUNCTIONS, "jobhunter_backup") == [("unship_manifest",)]
+    assert pg_rows(migrated, "superuser", _DEFINER_FUNCTIONS, "jobhunter_app") == []
     # Ruling T26-1 (a) T24-4 M3: no INSERT and no UPDATE on a table of the application either, nor of a
-    # manifest's content.
+    # manifest's status, times or content.
     for statement in (
         "INSERT INTO alerts (code, severity, dedup_key, message) VALUES ('t', 'info', 'backup-role', 'x')",
         "UPDATE settings_versions SET version_no = version_no",
+        "UPDATE deletion_manifests SET status = status",
+        "UPDATE deletion_manifests SET completed_at = completed_at",
         "UPDATE deletion_manifests SET scope = scope",
         "DELETE FROM deletion_manifests",
     ):

@@ -7,7 +7,7 @@
 # (JOBHUNTER_STACK_PREBUILT=embedder: the stack modules use it as it is and never build it); the stack modules
 # (C32, C37, C39, V20, V22, and N1 with the outside reach, JOBHUNTER_N1_OUTSIDE=1: a hosted runner has a
 # direct route out); the preceding release's app image, `jobhunter-app:prev` (scripts/build-prev-image.sh
-# reads the parent of the commit that added migration 0011, so the checkout fetches the whole history); the
+# reads the parent of the commit that added migration 0012, so the checkout fetches the whole history); the
 # upgrade-then-rollback and rotation drills as one module (each drill's fixture is function-scoped); and
 # the M5 acceptance smoke (scripts/smoke_m5.py, Task 33), which builds nothing and runs on the images the
 # stack modules and the drills built, from fresh projects it removes again at its end.
@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0 # build-prev-image.sh reads the parent of the commit that added 0011
+          fetch-depth: 0 # build-prev-image.sh reads the parent of the commit that added 0012
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:

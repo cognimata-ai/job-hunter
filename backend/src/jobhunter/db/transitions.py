@@ -719,7 +719,9 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
         # with its columns. No owner columns: the purge holds its operation's claim. `shipped -> completed`
         # is the prune's alone, when the receipt that shipped it names a snapshot restic no longer lists
         # (§19.5 Retention, final fix D1): the shipment is cleared and the completion keeps its time, so
-        # `privacy.manifest_unshipped` judges it from its completion.
+        # `privacy.manifest_unshipped` judges it from its completion. The prune takes it through
+        # `unship_manifest` (migration 0012, final fix E2), which makes these assignments in SQL: the
+        # backup role holds no UPDATE on the table.
         "deletion_manifests": TransitionSpec(
             table="deletion_manifests",
             state_col="status",

@@ -699,7 +699,13 @@ def test_the_backup_role_writes_its_four_tables_and_nothing_else(migrated: PgSer
         "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
         "VALUES (gen_random_uuid(), 'source_purge', 'executing')",
         "DELETE FROM backup_sets",
-        "UPDATE deletion_manifests SET scope = scope",  # only the columns that un-ship a manifest (fix D1)
+        # no UPDATE of a manifest at all: it un-ships one through `unship_manifest` alone (final fix E2), so
+        # it can neither complete an executing one (the final re-review's R3-I1), nor move a completion time,
+        # nor edit its content
+        "UPDATE deletion_manifests SET status = 'completed', completed_at = now() "
+        "WHERE status = 'executing' AND file_sha256 IS NOT NULL",
+        "UPDATE deletion_manifests SET completed_at = completed_at",
+        "UPDATE deletion_manifests SET scope = scope",
         "DELETE FROM deletion_manifests",
     ):
         with pytest.raises(psycopg.Error) as refusal:
@@ -833,8 +839,9 @@ async def test_the_downgrade_is_refused_while_any_record_table_holds_a_row(
             )
     finally:
         await engine.dispose()
-    # `migrate` went to the head; 0011 (Task 27) only adds an index, and its downgrade has no guard. Alembic
-    # commits each migration's downgrade on its own, so the refusals below are 0010's, at 0010.
+    # `migrate` went to the head; 0011 (Task 27) only adds an index and 0012 (final fix E2) a function, and
+    # their downgrades have no guard. Alembic commits each migration's downgrade on its own, so the refusals
+    # below are 0010's, at 0010.
     await downgrade(server, M5_SCHEMA)
     at_0010 = catalogue(server)
     assert at_0010[0] == (M5_SCHEMA,)

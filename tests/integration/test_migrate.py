@@ -46,7 +46,7 @@ async def test_first_install_order_and_artifacts(fresh_pg_server, make_config) -
         "replay",
     ]
     assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
-    assert code_head() == "0011_m5_purge_operation_index"
+    assert code_head() == "0012_m5_unship_manifest"
     for t in ("procrastinate_jobs", "checkpoints", "checkpoint_writes", "checkpoint_blobs"):
         assert one(fresh_pg_server, f"SELECT to_regclass('{t}') IS NOT NULL") == (True,)
     assert one(fresh_pg_server, "SELECT count(*) FROM procrastinate_jobs", role="app") == (0,)
@@ -478,6 +478,50 @@ async def test_grants_step_skips_absent_tables_and_grants_on_the_tables_that_exi
     finally:
         await engine.dispose()
     assert one(fresh_pg_server, backup_privileges) == (True, True, False, True)
+
+
+# The columns of `deletion_manifests` the backup role may update, and whether each of the backup and the
+# application role may execute `unship_manifest`.
+_UNSHIP_PRIVILEGES = (
+    "SELECT ARRAY(SELECT attname::text FROM pg_attribute "
+    "WHERE attrelid = 'public.deletion_manifests'::regclass AND attnum > 0 AND NOT attisdropped "
+    "AND has_column_privilege('jobhunter_backup', attrelid, attnum, 'UPDATE') ORDER BY 1), "
+    "has_function_privilege('jobhunter_backup', 'public.unship_manifest(bigint)', 'EXECUTE'), "
+    "has_function_privilege('jobhunter_app', 'public.unship_manifest(bigint)', 'EXECUTE')"
+)
+
+
+async def test_grants_step_takes_the_backup_roles_update_of_the_manifests_back(
+    fresh_pg_server, make_config
+) -> None:
+    """The release before 0012 granted the backup role UPDATE of four columns of `deletion_manifests` (final
+    fix D1), and a rollback to it grants them again; a restore (`--no-acl`) leaves `unship_manifest`
+    executable by PUBLIC. Every `migrate` of this code revokes that UPDATE and leaves the function executable
+    by the backup role alone (final fix E2), idempotently."""
+    from jobhunter.db.session import make_null_engine
+
+    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
+    assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == ([], True, False)
+    for statement in (
+        "GRANT UPDATE (status, completed_at, shipped_at, shipment_id) ON deletion_manifests "
+        "TO jobhunter_backup",
+        "REVOKE EXECUTE ON FUNCTION unship_manifest(bigint) FROM jobhunter_backup",
+        "GRANT EXECUTE ON FUNCTION unship_manifest(bigint) TO PUBLIC",
+    ):
+        one(fresh_pg_server, statement)
+    assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == (
+        ["completed_at", "shipment_id", "shipped_at", "status"],
+        True,
+        True,
+    )
+    engine = make_null_engine(fresh_pg_server.dsn("migrator", driver="sqlalchemy"))
+    try:
+        for _ in range(2):  # idempotent
+            async with engine.begin() as conn:
+                assert await apply_explicit_grants(conn) == list(BACKUP_GRANT_TABLES)
+            assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == ([], True, False)
+    finally:
+        await engine.dispose()
 
 
 # The ten revisions up to M5's first, base first.

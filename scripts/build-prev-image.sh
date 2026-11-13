@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Builds the app image of the release before migration 0011 and tags it `jobhunter-app:prev` (plan M5 Task 27),
-# for the upgrade-then-rollback drill (tests/stack/test_prod_drills.py).
+# Builds the app image of the release before migration 0012 and tags it `jobhunter-app:prev` (plan M5 Task 27),
+# for the upgrade-then-rollback drill (tests/stack/test_prod_drills.py), which crosses the newest expand
+# migration: 0012 (the M5 final review's fix E2) since it was added, 0011 before.
 #
 #   scripts/build-prev-image.sh      from any directory, in a clone with the full history
 #
-# The preceding release is the parent of the commit that added 0011, found with `git log --diff-filter=A` on
-# 0011's path; a shallow clone cannot answer that, so it is refused (CI checks out with `fetch-depth: 0`).
+# The preceding release is the parent of the commit that added 0012, found with `git log --diff-filter=A` on
+# 0012's path; a shallow clone cannot answer that, so it is refused (CI checks out with `fetch-depth: 0`).
 # That tree is checked out in a `git worktree` under a new `mktemp -d` directory, which a trap removes on every
 # exit (`git worktree remove --force`, the directory, then `git worktree prune`). The build passes what
 # compose's `x-app-build` passes: `target: runtime`, the five base images of that tree's deploy/images.lock as
@@ -20,7 +21,7 @@ if [ "$#" -ne 0 ]; then
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-readonly MIGRATION=backend/src/jobhunter/db/migrations/versions/0011_m5_purge_operation_index.py
+readonly MIGRATION=backend/src/jobhunter/db/migrations/versions/0012_m5_unship_manifest.py
 readonly TAG=jobhunter-app:prev
 
 if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
@@ -68,7 +69,7 @@ node_image=$(image_of node)
 restic_image=$(image_of restic)
 pgvector_image=$(image_of pgvector)
 
-echo "build-prev-image: building $TAG from $prev, the parent of $added (which adds 0011)" >&2
+echo "build-prev-image: building $TAG from $prev, the parent of $added (which adds 0012)" >&2
 docker build \
     --file "$tree/Dockerfile" \
     --target runtime \

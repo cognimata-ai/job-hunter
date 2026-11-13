@@ -809,7 +809,7 @@ remove no volume, stay on the newer release, and roll forward with a fix.
 
 **The drill.** `tests/stack/test_prod_drills.py` rehearses an upgrade and its rollback on the compose test
 stack, never on the VPS. `scripts/build-prev-image.sh`, which takes no arguments and needs a clone with the
-full history, builds the release before migration 0011 for it as `jobhunter-app:prev`; it removes no image.
+full history, builds the release before migration 0012 for it as `jobhunter-app:prev`; it removes no image.
 
 ## 11. Disk pressure and a lost password
 

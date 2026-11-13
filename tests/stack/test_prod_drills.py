@@ -10,7 +10,7 @@ Run explicitly with `-m stack`, with no other stack on 172.30.0.0/24 (the dev st
       tests/stack/test_prod_drills.py -k upgrade_then_rollback
 
 The fixture is `tests.support.prodstack.prod_session("postgres")`: it builds the current images (the deploy
-of 0011 runs them) and starts postgres alone on an empty `pgdata`. Every step of the preceding release sets
+of 0012 runs them) and starts postgres alone on an empty `pgdata`. Every step of the preceding release sets
 `app_image=jobhunter-app:prev` in the environment, which takes precedence over deploy/compose.test.env, and
 starts without building (`up(PT, build=False)`): the test overlay's `build:` would otherwise rebuild the
 current code under that tag. The backup image stays the current one throughout (`backup_image`); it is not
@@ -83,9 +83,9 @@ from tests.support.prodstack import (
 pytestmark = pytest.mark.stack
 
 PREV_IMAGE: Final = "jobhunter-app:prev"
-PREV_HEAD: Final = "0010_m5_operations"
-HEAD: Final = "0011_m5_purge_operation_index"
-MIGRATION: Final = "backend/src/jobhunter/db/migrations/versions/0011_m5_purge_operation_index.py"
+PREV_HEAD: Final = "0011_m5_purge_operation_index"
+HEAD: Final = "0012_m5_unship_manifest"
+MIGRATION: Final = "backend/src/jobhunter/db/migrations/versions/0012_m5_unship_manifest.py"
 REVISION_LABEL: Final = "org.opencontainers.image.revision"
 # The tables whose rows the drill keeps across the upgrade and the rollback.
 KEPT: Final = (
@@ -108,7 +108,7 @@ def one(sql: str) -> str:
 
 
 def preceding_commit() -> str:
-    """The parent of the commit that added 0011, as `build-prev-image.sh` finds it."""
+    """The parent of the commit that added 0012, as `build-prev-image.sh` finds it."""
     log = ["git", "-C", str(REPO), "log", "--diff-filter=A", "--format=%H", "--", MIGRATION]
     added = run(log).stdout.split()[-1]
     return run(["git", "-C", str(REPO), "rev-parse", f"{added}^"]).stdout.strip()
@@ -176,12 +176,12 @@ def stack() -> Iterator[None]:
 
 
 def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The preceding release (0010) with data; §19.6's deploy of the 0011 image (`run --rm migrate`, then
-    `up -d --wait`); the rollback to the preceding release, whose `migrate` accepts 0011 as
-    `ahead_compatible` and whose site is ready and serves the same data; then 0011's record made
+    """The preceding release (0011) with data; §19.6's deploy of the 0012 image (`run --rm migrate`, then
+    `up -d --wait`); the rollback to the preceding release, whose `migrate` accepts 0012 as
+    `ahead_compatible` and whose site is ready and serves the same data; then 0012's record made
     destructive: the preceding release's `migrate` refuses it (`migrate_schema_ahead_incompatible`) and its
     `/readyz` answers 503 `migrations`."""
-    # the image is the preceding release's: built from the parent of 0011's commit
+    # the image is the preceding release's: built from the parent of 0012's commit
     label = f'{{{{index .Config.Labels "{REVISION_LABEL}"}}}}'
     built_from = run(["docker", "image", "inspect", "--format", label, PREV_IMAGE]).stdout.strip()
     assert built_from == preceding_commit()
@@ -200,7 +200,7 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
     assert before["ids"]["jobs"] and before["ids"]["users"] and before["profile"] == str(version)
     assert jobs_list(site)
 
-    # §19.6's deploy of the 0011 image, built from the current code at the session's start
+    # §19.6's deploy of the 0012 image, built from the current code at the session's start
     monkeypatch.delenv("app_image")
     done, found = migrate()
     assert done.returncode == 0, done.stdout + done.stderr
@@ -212,14 +212,14 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
     assert one(f"SELECT compat_floor || ' ' || destructive FROM schema_compat WHERE revision = '{HEAD}'") == (  # noqa: S608
         f"{PREV_HEAD} false"
     )
-    assert one("SELECT to_regclass('operations_purge_manifest') IS NOT NULL") == "t"
+    assert one("SELECT to_regprocedure('unship_manifest(bigint)') IS NOT NULL") == "t"
     site = Site(PT)
     ready(site)
     assert missing(before) == NONE_MISSING
     assert active_profile() == before["profile"]
     assert jobs_list(site)
 
-    # The rollback: the preceding release's images again, on the 0011 schema
+    # The rollback: the preceding release's images again, on the 0012 schema
     monkeypatch.setenv("app_image", PREV_IMAGE)
     done, found = migrate()
     assert done.returncode == 0, done.stdout + done.stderr
@@ -236,7 +236,7 @@ def test_upgrade_then_rollback(stack: None, monkeypatch: pytest.MonkeyPatch) -> 
     assert active_profile() == before["profile"]
     assert jobs_list(site)
 
-    # 0011 made destructive in the database: the preceding release refuses it
+    # 0012 made destructive in the database: the preceding release refuses it
     psql(PT, f"UPDATE schema_compat SET destructive = true WHERE revision = '{HEAD}'")  # noqa: S608
     done, found = migrate()
     assert done.returncode == 1, done.stdout + done.stderr

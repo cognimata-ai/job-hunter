@@ -10,6 +10,7 @@ from jobhunter.db.compat import CompatInfo, chain_compat, classify_schema, compa
 M4_SCHEMA = "0009_m4_ui"
 M5_SCHEMA = "0010_m5_operations"
 M5_INDEX = "0011_m5_purge_operation_index"
+M5_UNSHIP = "0012_m5_unship_manifest"
 # The revisions before M5, base first: none declares a floor, so each is its own.
 BEFORE_M5 = (
     "0001_m0_baseline",
@@ -55,14 +56,24 @@ def test_0010_floor_is_0009() -> None:
 
 
 def test_0011_floor_is_0010() -> None:
-    """0011, the rollback drill's expand migration (Task 27), is the head; M5's first schema's code runs on
-    it."""
+    """0011, an expand migration (Task 27): M5's first schema's code runs on it."""
     module = migration(M5_INDEX)
     assert (module.revision, module.down_revision) == (M5_INDEX, M5_SCHEMA)
     assert (module.compat_floor, module.destructive) == (M5_SCHEMA, False)
-    assert code_head() == M5_INDEX
     assert {info.revision: info for info in chain_compat()}[M5_INDEX] == CompatInfo(
         M5_INDEX, M5_SCHEMA, False
+    )
+
+
+def test_0012_floor_is_0011() -> None:
+    """0012, the backup role's `unship_manifest` (final fix E2), is the head and the rollback drill's expand
+    migration: it adds a function and nothing else, so 0011's code runs on it."""
+    module = migration(M5_UNSHIP)
+    assert (module.revision, module.down_revision) == (M5_UNSHIP, M5_INDEX)
+    assert (module.compat_floor, module.destructive) == (M5_INDEX, False)
+    assert code_head() == M5_UNSHIP
+    assert {info.revision: info for info in chain_compat()}[M5_UNSHIP] == CompatInfo(
+        M5_UNSHIP, M5_INDEX, False
     )
 
 
