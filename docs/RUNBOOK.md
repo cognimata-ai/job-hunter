@@ -424,7 +424,7 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 | `auth.lockout` | critical | auto | The global login lockout: failed logins from many addresses. It ends by itself; `$JH run --rm --no-deps api jobhunter sessions unlock` lifts it at once. |
 | `backup.failed` | critical | auto | `$JH logs backup --since 24h` and the set's error (System → Health) name the step; check the bucket, its keys and `RESTIC_REPOSITORY`, then `$JH exec backup jobhunter backup set` (section 8). The next succeeded set resolves it. |
 | `backup.stale` | warn / critical | auto | No succeeded set for 36 h (warn) or 72 h (critical): check that the backup container runs (`$JH ps backup`), then as `backup.failed`. |
-| `backup.restore_test_failed` | critical | auto | The monthly restore test failed: `$JH logs backup` names its step. Fix it, then `$JH exec backup jobhunter backup restore-test`; its success resolves it. |
+| `backup.restore_test_failed` | critical | auto | The monthly restore test failed: `$JH logs backup` names its step. Fix it, then `$JH exec backup jobhunter backup restore-test`; its success resolves it. A run that failed `cleanup:<error class>` passed every step but could not drop its scratch database, a full copy of the data (section 8): the next restore test drops it first, and so does `$JH restart backup`. |
 | `system.disk_pressure` | warn / critical | auto | The data volumes' disk is 80 % full (critical from 90 %): section 11. |
 | `system.table_growth` | info | auto | `procrastinate_jobs` holds more than a million rows, or a table more than 10 GB: section 11. |
 | `deadman.update_failed` | warn | auto | The healthchecks Management API missed the period's update. Check `healthchecks_api_key` (read-write) and `HEALTHCHECKS_API_URL` with `$JH run --rm --no-deps worker jobhunter ops deadman-sync --show`; a renewed key takes `$JH restart worker` (section 7). The sync tries again with a backoff; a success resolves it. |
@@ -585,9 +585,11 @@ and removes both when it ends. If that process is killed hard (an OOM, a `kill -
 copy of the database until another restore test or a restart of the backup service: so run
 `$JH exec backup jobhunter backup restore-test` again, or `$JH restart backup`. Every restore test, the monthly
 one included, first removes what an earlier one left. A restore test that could not drop its scratch database
-says so in its run's report, `cleanup_error` (the error's class), beside its outcome, which stays its steps'
-(a failed step keeps its code): the same applies, and `$JH logs backup` names it
-(`restore_test_scratch_not_dropped`).
+never ends `succeeded`: when every step passed, its run fails `cleanup:<error class>` and
+`backup.restore_test_failed` pages (section 6); when a step failed, the run keeps that step's code and its
+report names the cleanup's error beside it (`cleanup_error`, the error's class). `$JH logs backup` names it
+too (`restore_test_scratch_not_dropped`). Either way the copy stays until the next restore test or
+`$JH restart backup`, so run one of them.
 
 **The prune's report.** A prune records what it did in its run's report, read with:
 

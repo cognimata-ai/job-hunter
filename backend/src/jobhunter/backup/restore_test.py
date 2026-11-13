@@ -29,12 +29,14 @@ every step fails the run too, as `unexpected:<error class>`: a run is never left
 process. A failed run raises `backup.restore_test_failed` through the worker's `backup_health` reconciler
 (Task 7): no alert is raised here.
 
-**A cleanup that fails** (T26-5 (2)): a drop of the scratch database that raises, a refusal of the server's
-or any other error, is logged (`restore_test_scratch_not_dropped`, its class) and recorded in the report
-beside the outcome, as `cleanup_error` (its class), never in its place: a failed step keeps its
-`<step>:<code>`, and a run whose steps all passed still succeeds. The scratch directory is removed all the
-same, and the next restore test's start, or the scheduler's, drops the scratch database it left
-(`remove_leftovers`).
+**A cleanup that fails** (T26-5 (2), Ruling FU-8): a drop of the scratch database that raises, a refusal of
+the server's or any other error, leaves a full copy of the data that no purge reaches, so it never ends a run
+`succeeded`. It is logged (`restore_test_scratch_not_dropped`, its class only) and recorded in the report as
+`cleanup_error` (its class). When every step passed, the run is `failed` with `cleanup:<error class>`, and the
+worker raises `backup.restore_test_failed` for it as for any failed run. When a step failed, that step's
+`<step>:<code>` stays the run's error, the cleanup's beside it in the report, never in its place. The scratch
+directory is removed all the same, and the next restore test's start, or the scheduler's, drops the scratch
+database it left (`remove_leftovers`).
 
 **`remove_leftovers`** (final review I1), at the backup scheduler's start (`scheduler.fail_interrupted`): a
 restore test killed mid-run (a restart past the backup service's stop grace, an OOM, a host reboot) leaves
@@ -56,7 +58,7 @@ import shutil
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import psycopg
 from psycopg import sql
@@ -92,8 +94,10 @@ from jobhunter.types import JSONValue
 RESTORE_TEST_DB: Final = "jobhunter_restore_test"
 RESTORE_TEST_STAGING: Final = "restore_test"
 TEMPLATE_DB: Final = "jobhunter_template"
-# The error's step for a failure outside every step (`unexpected:<error class>`, review M7).
+# The error's step for a failure outside every step (`unexpected:<error class>`, review M7), and for a
+# cleanup that failed after every step passed (`cleanup:<error class>`, Ruling FU-8).
 UNEXPECTED: Final = "unexpected"
+CLEANUP: Final = "cleanup"
 SCRATCH_DIRS: Final = ("set", "manifests", "cv", "exports")
 
 _START: Final = q(
@@ -262,7 +266,7 @@ async def remove_leftovers(cfg: AppConfig, *, restore_staging: bool = True) -> t
 async def _clean_up(cfg: AppConfig) -> str | None:
     """The scratch database dropped and the scratch directory removed, after a failure too; the class of the
     error that kept the database from being dropped, logged, else `None` (module docstring, "A cleanup that
-    fails"). It raises none: the next restore test's start drops what it left."""
+    fails"). It raises none: the run records it, and the next restore test's start drops what it left."""
     error: str | None = None
     try:
         await _admin(cfg, _drop())
@@ -301,20 +305,22 @@ async def run_restore_test(
         log.info("restore_test_started", run_id=run_id)
         report: dict[str, JSONValue] = {}
         error: str | None = None
-        failed_at: RestoreStep | None = None
+        failed_at: RestoreStep | Literal["cleanup"] | None = None
         cause: Exception | None = None
         cleanup_error: str | None = None
         try:
             try:
                 await _steps(cfg, restic, runner, engine, run_id, report, now=clock())
             finally:
-                cleanup_error = await _clean_up(cfg)  # raises none: the steps' outcome stands
+                cleanup_error = await _clean_up(cfg)  # raises none: a failed step's error stands
         except RestoreFailed as failed:
             error, failed_at, cause = f"{failed.step}:{failed.error}", failed.step, failed
         except Exception as exc:  # noqa: BLE001 - outside every step: recorded `unexpected:<class>`, re-raised
             error, cause = f"{UNEXPECTED}:{type(exc).__name__}", exc
         if cleanup_error is not None:
-            report["cleanup_error"] = cleanup_error  # beside the outcome, never in its place (T26-5 (2))
+            report["cleanup_error"] = cleanup_error  # beside a failed step's code, never in its place (T26-5)
+            if error is None:  # a copy no purge reaches is left: the run fails, so its alert fires (FU-8)
+                error, failed_at = f"{CLEANUP}:{cleanup_error}", CLEANUP
         await _end(engine, run_id, report, error=error)
         if error is not None:
             log.error("restore_test_failed", run_id=run_id, step=failed_at, error=error)

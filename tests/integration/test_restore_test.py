@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter.backup import restore_test
@@ -27,10 +28,13 @@ from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.ids import uuid7
 from jobhunter.llm.batches import BatchesClient
+from jobhunter.observability.backup_health import backup_health
 from jobhunter.observability.deadman import DeadmanPinger
 from jobhunter.privacy.manifests import FileRoots, ManifestContent, write_manifest_file
 from jobhunter.privacy.restore_verify import VerifyReport, verify_replayed
 from jobhunter.scoring import batch_results
+from jobhunter.worker.reconcilers import ReconcileContext
+from jobhunter.worker.tasks import defer_in_tx, task_app
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from structlog.testing import capture_logs
 
@@ -389,8 +393,25 @@ async def test_an_error_outside_a_step_still_fails_the_run(
     assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []
 
 
+# The restore-test alert the worker's `backup_health` reconciler opens for a failed run (spec §17.6).
+_RESTORE_TEST_ALERT: Final = sa.text(
+    "SELECT count(*) FROM alerts WHERE dedup_key = 'backup.restore_test_failed:restore_test:' || :run "
+    "AND resolved_at IS NULL"
+)
+
+
+async def restore_test_alert_open(engine: AsyncEngine, run_id: int) -> bool:
+    """One pass of the worker's `backup_health` reconciler; whether `run_id`'s alert is open after it."""
+    await backup_health(
+        ReconcileContext(engine=engine, queue=task_app(), defer=defer_in_tx, now=utcnow(), epoch=1)
+    )
+    async with engine.connect() as conn:
+        return bool((await conn.execute(_RESTORE_TEST_ALERT, {"run": str(run_id)})).scalar_one())
+
+
+@pytest.mark.parametrize("cleanup", ["raises", "refused"])
 @pytest.mark.parametrize("steps", ["a_step_fails", "every_step_passes"])
-async def test_a_cleanup_error_is_reported_beside_the_steps_outcome_never_in_its_place(
+async def test_a_cleanup_failure_fails_a_passing_run_and_stands_beside_a_failed_step(
     migrated: PgServer,
     engine: AsyncEngine,
     backup_cfg: AppConfig,
@@ -398,47 +419,60 @@ async def test_a_cleanup_error_is_reported_beside_the_steps_outcome_never_in_its
     repo: FakeRepository,
     runner: ContainerRunner,
     monkeypatch: pytest.MonkeyPatch,
+    queue_app: Any,
     steps: str,
+    cleanup: str,
 ) -> None:
-    """T26-5 (2): the cleanup's drop of the scratch database fails, with an error that is no database error.
-    It is logged (`restore_test_scratch_not_dropped`, its class) and recorded in the report beside the
-    outcome (`cleanup_error`), never in its place: a run whose load failed is still `failed` with
-    `pg_restore:pg_restore_failed`, and one whose steps all passed still `succeeded`. The scratch directory is
-    removed all the same; the scratch database stays until the next restore test's start drops it."""
+    """T26-5 (2) and Ruling FU-8: the cleanup cannot drop the scratch database, a full copy of the data that
+    no purge reaches. Its drop either raises an error that is no database error, or the server refuses it (a
+    superuser's session on the scratch database, which `jobhunter_restore` may not terminate:
+    `InsufficientPrivilege`). Either way the error is logged (`restore_test_scratch_not_dropped`, its class
+    only) and recorded in the report (`cleanup_error`).
+    - Every step passed: the run is `failed` with `cleanup:<class>`, so the restore-test alert opens; it
+      never ends `succeeded` silently.
+    - A step failed: the run keeps that step's `pg_restore:pg_restore_failed`, the cleanup's error beside it.
+    The scratch directory is removed all the same; the next restore test's start drops the database."""
     set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     admin = restore_test._admin
     drops: list[int] = []
+    held: list[psycopg.AsyncConnection[Any]] = []
 
-    async def the_cleanup_breaks(cfg: AppConfig, *statements: Any) -> None:
+    async def the_cleanup_fails(cfg: AppConfig, *statements: Any) -> None:
         drops.append(len(statements))
         if len(drops) > 1:  # the scratch step's call (drop, create) is the first; the cleanup's drop next
-            raise RuntimeError("the cleanup broke")
+            if cleanup == "raises":
+                raise RuntimeError("the cleanup broke")
+            held.append(await psycopg.AsyncConnection.connect(migrated.dsn("superuser", RESTORE_TEST_DB)))
         await admin(cfg, *statements)
 
-    monkeypatch.setattr(restore_test, "_admin", the_cleanup_breaks)
+    monkeypatch.setattr(restore_test, "_admin", the_cleanup_fails)
     loader = ContainerRunner(migrated, fail="pg_restore") if steps == "a_step_fails" else runner
+    error_class = "RuntimeError" if cleanup == "raises" else "InsufficientPrivilege"
+    expected = "pg_restore:pg_restore_failed" if steps == "a_step_fails" else f"cleanup:{error_class}"
 
-    with capture_logs() as logs:
-        if steps == "a_step_fails":
-            with pytest.raises(RestoreTestFailed) as failed:
-                await restore_tested(backup_cfg, repo, loader, backup_engine)
-            assert failed.value.error == "pg_restore:pg_restore_failed"
-            run_id = failed.value.run_id
-        else:
-            run_id = await restore_tested(backup_cfg, repo, loader, backup_engine)
+    try:
+        with capture_logs() as logs, pytest.raises(RestoreTestFailed) as failed:
+            await restore_tested(backup_cfg, repo, loader, backup_engine)
+    finally:
+        for conn in held:
+            await conn.close()
 
     assert drops == [2, 1]
-    row = await one(engine, _RUN, id=run_id)
-    if steps == "a_step_fails":
-        assert (row.status, row.error) == ("failed", "pg_restore:pg_restore_failed")
-        assert [e["step"] for e in events(logs, "restore_test_failed")] == ["pg_restore"]
-    else:
-        assert (row.status, row.error) == ("succeeded", None)
+    assert failed.value.error == expected
+    row = await one(engine, _RUN, id=failed.value.run_id)
+    assert (row.status, row.error, row.backup_set_id) == ("failed", expected, set_id)
+    assert row.report["cleanup_error"] == error_class
+    if steps == "every_step_passes":
         assert row.report["replayed"] == {"ok": True, "failures": []}
-    assert (row.backup_set_id, row.report["cleanup_error"]) == (set_id, "RuntimeError")
     [not_dropped] = events(logs, "restore_test_scratch_not_dropped")
-    assert not_dropped["error_class"] == "RuntimeError"
+    assert not_dropped["error_class"] == error_class
+    [logged] = events(logs, "restore_test_failed")
+    assert (logged["error"], logged["step"]) == (
+        expected,
+        "pg_restore" if steps == "a_step_fails" else "cleanup",
+    )
     assert "the cleanup broke" not in str(logs)
+    assert await restore_test_alert_open(engine, failed.value.run_id)
     assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []
     assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (1,)
     assert await restore_test.remove_leftovers(backup_cfg, restore_staging=False) == (RESTORE_TEST_DB,)
