@@ -6,7 +6,8 @@
 // disabled until the exact phrase (a wrong one is marked), and a wrong password is refused with the
 // `reauth_failed` text. (c) The phrase and the password: 202, "Deleting…" and the executing state, checked with
 // the worker paused (`docker compose pause worker`, from before the request until after those checks), so a fast
-// purge cannot end the session first (final review M2); the cleanup unpauses it whatever ends the spec. Then the
+// purge cannot end the session first (final review M2); it is paused only outside every transaction, so it never
+// holds a lock the request waits for (final fix C8), and the cleanup unpauses it whatever ends the spec. Then the
 // completion ends the session and the next read leads to the login; the same user and password sign in again (M5-U3), the Jobs page is the
 // first-use empty state, and the deletion shows "Completed — not yet confirmed offsite" with the offsite banner,
 // never "Confirmed offsite", until the shipper has run (`runShipper`, the shipper service of the dev stack, whose
@@ -23,7 +24,7 @@ import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
 import { answerTo, apiContext, getJson, ORIGIN } from "../support/api";
 import { en, expect, fillPassword, filled, signInThroughUi, templateMatch, test } from "../support/fixtures";
-import { compose, initResticRepo, runShipper, smokeUser } from "../support/stack";
+import { compose, initResticRepo, pauseWorkerOutsideTransactions, runShipper, smokeUser } from "../support/stack";
 
 type ManifestOut = components["schemas"]["ManifestOut"];
 type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
@@ -51,9 +52,11 @@ test.describe.configure({ retries: 0 });
 /** Whether the spec paused the worker and has not unpaused it yet (part c). */
 let workerPaused = false;
 
-/** The worker paused: the purge it would run waits until `unpauseWorker`. */
+/** The worker paused outside every transaction (the harness's `pauseWorkerOutsideTransactions`, final fix C8:
+ * frozen inside one, it could hold a lock the request waits for): the purge it would run waits until
+ * `unpauseWorker`. */
 async function pauseWorker(): Promise<void> {
-  await compose(["pause", "worker"]);
+  await pauseWorkerOutsideTransactions(); // a pause that fails leaves the worker running
   workerPaused = true;
 }
 

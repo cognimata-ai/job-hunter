@@ -195,6 +195,48 @@ export async function runShipper(): Promise<void> {
   await compose(["run", "--rm", "-T", "shipper"]);
 }
 
+/** The worker container's addresses on its networks: what PostgreSQL shows as its sessions' `client_addr`
+ * (the worker shares the api's role, so its sessions are told apart by address). */
+async function workerAddresses(): Promise<string[]> {
+  const id = (await compose(["ps", "-q", "worker"])).trim();
+  const ran = await run(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", id]);
+  const addresses = ran.stdout.trim().split(/\s+/).filter((address) => /^[\d.]+$/.test(address));
+  if (ran.code !== 0 || addresses.length === 0) {
+    throw new Error(`the worker's addresses were not found (docker inspect exited ${String(ran.code)})`);
+  }
+  return addresses;
+}
+
+/** How many of the worker's sessions (by `addresses`) hold a transaction open. */
+async function workerTransactions(addresses: readonly string[]): Promise<number> {
+  const listed = addresses.map((address) => `'${address}'`).join(", ");
+  return Number(await psql(`SELECT count(*) FROM pg_stat_activity WHERE client_addr IN (${listed}) AND xact_start IS NOT NULL`));
+}
+
+/** The worker paused (`$DC pause worker`) outside every transaction (final fix C8): paused, then checked in
+ * `pg_stat_activity`; while one of its sessions holds a transaction open (the `active_config` lock a request
+ * would wait for, say), it is unpaused, given a moment and paused again, at most `attempts` times. A frozen
+ * worker so never holds a lock the api's next request needs. */
+export async function pauseWorkerOutsideTransactions(attempts = 30): Promise<void> {
+  const addresses = await workerAddresses();
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await compose(["pause", "worker"]);
+    let open: number;
+    try {
+      open = await workerTransactions(addresses);
+    } catch (error) {
+      await compose(["unpause", "worker"]); // never left paused by a check that failed
+      throw error;
+    }
+    if (open === 0) {
+      return;
+    }
+    await compose(["unpause", "worker"]);
+    await sleep(POLL_MS);
+  }
+  throw new Error(`the worker held a transaction at each of ${String(attempts)} pauses`);
+}
+
 /** The score lane's bucket refilled (`smoke_m3.ADVANCE_BUCKET`, Ruling T28-f): the month row's clock a month
  * back, so the next accrual fills it to its capacity. */
 export async function advanceBucket(): Promise<void> {
