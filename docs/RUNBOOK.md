@@ -480,12 +480,14 @@ content, so it would keep the running containers with the old value (R6); a rest
 | `anthropic_key`, `rapidapi_key`, `serpapi_key`, `adzuna_app_id`, `adzuna_app_key`, `langsmith_key`, `ntfy_token`, `healthchecks_ping_url`, `healthchecks_api_key` | `$JH restart worker` |
 | `s3_access_key_id`, `s3_secret_access_key` | `$JH restart backup` (the restore container is one-off; during a backup job the restart waits up to 10 minutes, section 8); the offline recovery kit takes the new keys |
 | `data_key` | the data key's procedure (below) |
-| `db_app`, `db_migrator`, `db_backup`, `db_restore` | `scripts/rotate-db-role.sh` (below) |
+| `db_app`, `db_migrator`, `db_backup`, `db_restore`, `pg_bootstrap` | `scripts/rotate-db-role.sh` (below) |
+| `restic_password` | `scripts/rotate-restic-password.sh` (below) |
 
-Two are not rotated by a new file. `restic_password` is the repository's own key: a new file alone locks the
-backups out of the repository, and this release has no command that changes it. `pg_bootstrap` is read by
-postgres's first start and by `scripts/rotate-db-role.sh`'s one-off container, and must stay the bootstrap
-role's password.
+Two are never rotated by a new file alone. `restic_password` opens the repository: a new file alone locks the
+backups out of it, so its script changes the repository's keys before it installs the file. `pg_bootstrap` is
+the bootstrap role's password, read by postgres's first start and by `scripts/rotate-db-role.sh`'s one-off
+container, which connects with it: its rotation sets the role's password while the old file is installed, then
+installs the new one.
 
 **The data key** (§16.8; R1, Deviation 31). One rotation at a time: two `crypto rotate` runs at once are safe
 but pointless.
@@ -551,6 +553,48 @@ sudo scripts/rotate-db-role.sh db_app <new file>
 Then delete `<new file>`. For `db_app`, new connections of api and worker fail for a few seconds between the
 role's new password and their restart, which follows from the order install, alter, restart; connections
 already open keep working, and the restart ends the window.
+
+**The bootstrap role** (`pg_bootstrap`). The same script, with `pg_bootstrap`, goes the other way round: its
+one-off connects with the installed password and sets the bootstrap role's to the new one, which it reads from
+its stdin (the script feeds it `<new file>`), never from a command line; then it installs `<new file>`. Nothing
+restarts: postgres reads the file at its first start only.
+
+```
+umask 077
+openssl rand -hex 24 > <new file>
+sudo scripts/rotate-db-role.sh --dry-run pg_bootstrap <new file>
+sudo scripts/rotate-db-role.sh pg_bootstrap <new file>
+```
+
+Then delete `<new file>`. If it stops before the install, the role keeps its old password: run it again. If
+the install itself fails, the script says so: install `<new file>` as `pg_bootstrap` with the `install` command
+above before any other database role's rotation, whose one-off connects with that file.
+
+**The restic password** (`restic_password`; §19.5). restic encrypts the repository with a master key that each
+of its keys wraps, one per password, so the rotation adds a key for the new password and removes the old
+password's key: every backup set stays as it is and opens with the new password only. Put the new password
+into the offline recovery kit first, beside the old one (section 8). Run it outside the backup jobs' times
+(the nightly set from 01:15, the Sunday prune from 02:30, the monthly restore test from 03:30, section 8): a
+restic call of the running backup container between the old key's removal and its restart fails
+(`wrong_password`; a ship that does is repeated by the next, within 5 minutes).
+
+```
+umask 077
+openssl rand -base64 32 > <new file>
+sudo scripts/rotate-restic-password.sh --dry-run <new file>
+sudo scripts/rotate-restic-password.sh <new file>
+```
+
+In a one-off backup container, which reads the new password from its stdin, it adds a key for it
+(`restic key add`), checks that the new password opens the repository through that key, removes the old
+password's key (`restic key remove`) and checks that the old password opens nothing any more; then it installs
+`<new file>` as `restic_password` and restarts backup. Every restic call waits for a running job's repository
+lock, as the jobs' calls do. Its last line is `rotate-restic-password: done: …`. Then delete `<new file>`, and
+remove the old password from the kit: it opens nothing any more. If it stops with an error, the line before
+says where; run it again: it adds no second key, and when the old key is gone already it only installs and
+restarts. The bucket's versioning keeps the removed key as a noncurrent version for its 30 days (section 1):
+until then, someone holding both the old password and the bucket's keys could still open the repository, so a
+rotation because the password may have leaked rotates the S3 keys too (the table above).
 
 ## 8. Backups and the offline recovery kit
 
@@ -679,9 +723,11 @@ key. The kit holds:
 
 It is kept offline, at the place the deploy checklist names (section 1): never on the VPS alone, in the bucket
 or in this repository. It changes before the stack does: a new data key goes into it before it is installed
-(section 7), and new S3 keys, a changed environment file or a changed operator file when they change. A key id is the first 8 bytes of
-the key's sha256, in hex, as `crypto rotate` and `restore run` print it: `base64 -d <key file> | sha256sum |
-cut -c1-16`.
+(section 7), and so does a new `restic_password` before its rotation, which then replaces the kit's old copy
+(the old password opens nothing once the rotation is done, and every set opens with the new one, section 7);
+new S3 keys, a changed environment file or a changed operator file go in when they change. A key id is the
+first 8 bytes of the key's sha256, in hex, as `crypto rotate` and `restore run` print it:
+`base64 -d <key file> | sha256sum | cut -c1-16`.
 
 A key retired by a rotation stays in the kit until no retained set names it in its `data_key_ids`, the key ids
 each set's `backup_set.json` records (Deviation 31). restic keeps sets for about 3 months (7 daily, 4 weekly,

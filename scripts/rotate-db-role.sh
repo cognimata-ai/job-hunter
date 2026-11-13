@@ -5,13 +5,13 @@
 #   sudo scripts/rotate-db-role.sh [--compose '<command line>'] [--secrets-dir DIR] [--dry-run] \
 #     <secret-name> <new-file>
 #
-# <secret-name> is one of db_app, db_migrator, db_backup and db_restore. --compose defaults to the production
-# command line of deploy/compose.yaml's header (run from the checkout this script is in) and --secrets-dir to
-# /etc/jobhunter/secrets, so the RUNBOOK calls it without either; the rotation drill passes the compose test
-# stack's command line and .secrets/test, its secrets directory. The command line is split on whitespace (no
-# quoting); a relative --secrets-dir or <new-file> is taken from the directory it is called from.
+# <secret-name> is one of db_app, db_migrator, db_backup, db_restore and pg_bootstrap. --compose defaults to the
+# production command line of deploy/compose.yaml's header (run from the checkout this script is in) and
+# --secrets-dir to /etc/jobhunter/secrets, so the RUNBOOK calls it without either; the rotation drill passes the
+# compose test stack's command line and .secrets/test, its secrets directory. The command line is split on
+# whitespace (no quoting); a relative --secrets-dir or <new-file> is taken from the directory it is called from.
 #
-# The steps, in order:
+# The steps of an application role's secret (db_*), in order:
 # 1. the new file installed as the secret, as production installs one: root:10010, mode 0440. Compose
 #    bind-mounts a secret file when a container starts, so every running container keeps the old one.
 # 2. the role's password set to it in PostgreSQL, by a one-off postgres container (its fresh mount sees the new
@@ -23,9 +23,22 @@
 # 3. a restart of the services that hold the secret: api and worker for db_app, backup for db_backup and
 #    db_restore; db_migrator is held by none (migrate and restore are one-off).
 #
-# Each command is printed before it runs. --dry-run runs none of them: it checks the arguments and that the new
-# file holds a password (`grep -q`, which prints nothing; an empty password would leave the role without one),
-# then prints the commands. Only role and service names, paths and the commands are printed, never a value.
+# pg_bootstrap (M5 follow-ups Task F4 (c)) is the bootstrap superuser's own password, the one the one-off
+# connects with, so its steps go the other way round:
+# 1. the bootstrap role's password set to the new one first, by the one-off postgres container, connecting with
+#    the old one (its fresh mount of the installed pg_bootstrap): the script feeds the new file to the
+#    one-off's stdin (`< <new-file>`), which writes it to a file of its own on /dev/shm (a RAM filesystem, mode
+#    0600, removed when it ends), and psql reads it from there into `pw` as above;
+# 2. the new file installed as the secret;
+# 3. no restart: postgres reads pg_bootstrap at its first start only, and every one-off of this script mounts
+#    it afresh.
+# Never install a new pg_bootstrap without this script: the role would keep the old password, and the next
+# rotation's one-off could not connect.
+#
+# Each command is printed before it runs (with its `< <file>` when it reads one). --dry-run runs none of them:
+# it checks the arguments and that the new file holds a password (`grep -q`, which prints nothing; an empty
+# password would leave the role without one), then prints the commands. Only role and service names, paths and
+# the commands are printed, never a value.
 set -euo pipefail
 
 readonly DEFAULT_COMPOSE="docker compose -p jobhunter --env-file deploy/images.lock --env-file deploy/release.lock \
@@ -43,6 +56,25 @@ secret="/run/secrets/$1"
 PGPASSWORD=$(cat /run/secrets/pg_bootstrap)
 export PGPASSWORD
 psql -X -q -v ON_ERROR_STOP=1 -h postgres -U "$POSTGRES_USER" -d postgres -v role="$2" -v secret="$secret" <<'EOSQL'
+\set pw `cat :'secret'`
+ALTER ROLE :"role" PASSWORD :'pw';
+EOSQL
+SCRIPT
+)
+
+# The one-off postgres container's script for pg_bootstrap, no arguments: connected with the installed (old)
+# password, it sets the bootstrap role's to the new one, which it reads from its stdin into a file on /dev/shm.
+readonly ALTER_BOOTSTRAP=$(
+    cat <<'SCRIPT'
+set -eu
+umask 077
+new=$(mktemp -p /dev/shm)
+trap 'rm -f "$new"' EXIT
+cat >"$new"
+grep -q '[^[:space:]]' "$new" || { echo "rotate-db-role: no new password on stdin" >&2; exit 1; }
+PGPASSWORD=$(cat /run/secrets/pg_bootstrap)
+export PGPASSWORD
+psql -X -q -v ON_ERROR_STOP=1 -h postgres -U "$POSTGRES_USER" -d postgres -v role="$POSTGRES_USER" -v secret="$new" <<'EOSQL'
 \set pw `cat :'secret'`
 ALTER ROLE :"role" PASSWORD :'pw';
 EOSQL
@@ -70,6 +102,18 @@ step() {
     echo "${shown% }"
     if [ "$dry_run" -eq 0 ]; then
         "$@"
+    fi
+}
+
+# step_from FILE COMMAND...: print it with its input (`< FILE`), then run it with FILE on its stdin unless this is
+# a dry run. The value goes from the file to the command's stdin, never onto a command line.
+step_from() {
+    local input=$1 shown
+    shift
+    shown=$(printf '%q ' "$@")
+    echo "${shown% } < $(printf '%q' "$input")"
+    if [ "$dry_run" -eq 0 ]; then
+        "$@" <"$input"
     fi
 }
 
@@ -102,7 +146,8 @@ db_app) role=jobhunter_app holders="api worker" ;;
 db_migrator) role=jobhunter_migrator holders="" ;;
 db_backup) role=jobhunter_backup holders="backup" ;;
 db_restore) role=jobhunter_restore holders="backup" ;;
-*) die "unknown secret $name: one of db_app, db_migrator, db_backup, db_restore; nothing was changed" ;;
+pg_bootstrap) role="the bootstrap superuser" holders="" ;; # its name is POSTGRES_USER, in the container
+*) die "unknown secret $name: one of db_app, db_migrator, db_backup, db_restore, pg_bootstrap; nothing was changed" ;;
 esac
 read -r -a compose <<<"$compose_line"
 [ "${#compose[@]}" -gt 0 ] || usage
@@ -119,14 +164,28 @@ else
     note "dry run: the commands are printed, none is run"
 fi
 
-# 1. The new file.
-step install -o root -g "$GID" -m 0440 "$new_file" "$secrets_dir/$name"
+if [ "$name" = pg_bootstrap ]; then
+    # 1. The bootstrap role's password, set by a one-off postgres container that connects with the old one.
+    step cd "$root"
+    if ! step_from "$new_file" "${compose[@]}" run --rm --no-deps -T postgres sh -c "$ALTER_BOOTSTRAP" \
+        rotate-db-role; then
+        die "$role still has its old password and nothing was installed: run it again"
+    fi
+    # 2. The new file.
+    if ! step install -o root -g "$GID" -m 0440 "$new_file" "$secrets_dir/$name"; then
+        die "$role has the new password, but $secrets_dir/$name still holds the old one: install" \
+            "$new_file there as this script does"
+    fi
+else
+    # 1. The new file.
+    step install -o root -g "$GID" -m 0440 "$new_file" "$secrets_dir/$name"
 
-# 2. The role's password, set by a one-off postgres container that mounts the new file.
-step cd "$root"
-if ! step "${compose[@]}" run --rm --no-deps -T postgres sh -c "$ALTER_ROLE" rotate-db-role "$name" "$role"; then
-    die "$secrets_dir/$name holds the new password, but $role still has the old one and nothing was" \
-        "restarted: run it again"
+    # 2. The role's password, set by a one-off postgres container that mounts the new file.
+    step cd "$root"
+    if ! step "${compose[@]}" run --rm --no-deps -T postgres sh -c "$ALTER_ROLE" rotate-db-role "$name" "$role"; then
+        die "$secrets_dir/$name holds the new password, but $role still has the old one and nothing was" \
+            "restarted: run it again"
+    fi
 fi
 
 # 3. The services that hold the secret.

@@ -27,6 +27,14 @@ The rotation drill (Task 28) needs no preceding image:
     JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q -p no:cacheprovider \
       tests/stack/test_prod_drills.py -k rotation_drill
 
+Nor does the operational commands' case (M5 follow-ups Task F4, `-k operational_commands`): the retention
+pass run by hand beside the running worker, then `pg_bootstrap` and `restic_password` rotated by their scripts
+as the RUNBOOK runs them, and a backup set and a restore of the set from before both rotations, with the new
+secrets. Its two root commands are the drill's two shapes (`install`, and a rotation script with PT's command
+line and `.secrets/test`), and it installs its own old restic password before the repository exists, so that
+it can show the old password opens nothing afterwards; both new values reach the containers from scratch files
+on their stdin or as installed secrets, never through this process.
+
 Both drills run in one session too (CI's and the acceptance run's whole module): each drill's fixture is
 function-scoped, so the upgrade drill's projects are removed (`down -v`) before the rotation drill's
 `prod_session` starts, which would otherwise find PT up and skip.
@@ -54,6 +62,7 @@ from typing import Any, Final
 
 import pytest
 from jobhunter.db.migrate import MIGRATE_ORDER
+from jobhunter.privacy.retention import RULES
 
 from tests.support.prodsite import (
     PASSWORD,
@@ -550,3 +559,139 @@ def test_rotation_drill(rotation_stack: Scratch) -> None:
         "texts": 1,
         "texts_opened": 1,
     }
+
+
+# ---- the operational commands (M5 follow-ups Task F4) ------------------------------------------------------
+
+ROTATE_RESTIC: Final = "scripts/rotate-restic-password.sh"
+# The bootstrap role's login with `pg_bootstrap` as the running postgres container mounts it (the file from
+# its start: the old one after a rotation) or as a one-off mounts it (the installed one): `1` when PT's
+# postgres accepts it, else psql's refusal. The password goes from the file into psql's environment only.
+BOOTSTRAP_LOGIN: Final = (
+    "PGPASSWORD=$(cat /run/secrets/pg_bootstrap) && export PGPASSWORD && "
+    'exec psql -X -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "SELECT 1"'
+)
+# The repository's keys as a one-off backup container sees them with the password on its stdin (written to a
+# file on its /dev/shm): `{"opens": true, "keys": <how many>}`, or `{"opens": false, "exit": <restic's exit>}`
+# (12: no key opens with it). Only counts are printed.
+RESTIC_KEYS: Final = """
+set -eu
+umask 077
+pw=$(mktemp -p /dev/shm)
+trap 'rm -f "$pw" "$pw.keys"' EXIT
+cat > "$pw"
+AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id)
+AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key)
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+if restic key list --json --no-cache --password-file "$pw" > "$pw.keys" 2>/dev/null; then
+    python -I -c 'import json, sys; print(json.dumps({"opens": True, "keys": len(json.load(sys.stdin))}))' \\
+        < "$pw.keys"
+else
+    echo "{\\"opens\\": false, \\"exit\\": $?}"
+fi
+"""
+
+
+def bootstrap_login(*where: str) -> subprocess.CompletedProcess[str]:
+    return run([*PT, *where, "-T", "postgres", "sh", "-c", BOOTSTRAP_LOGIN], check=False)
+
+
+def restic_keys(password: Path) -> Any:
+    """What `RESTIC_KEYS` reports for the password in the scratch file `password`, which reaches the one-off
+    on its stdin: this process never reads it."""
+    with password.open("rb") as stdin:
+        done = subprocess.run(
+            [*PT, "run", "--rm", "--no-deps", "-T", "backup", "sh", "-c", RESTIC_KEYS],
+            stdin=stdin,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+    if done.returncode != 0:
+        pytest.fail(f"the restic key listing exited {done.returncode}:\n{done.stderr.decode()}")
+    return last_json(done.stdout.decode())
+
+
+def test_operational_commands(rotation_stack: Scratch) -> None:
+    """M5 follow-ups Task F4 on PT, the RUNBOOK's commands with PT's command line:
+    - (a) `jobhunter retention run` in a one-off worker beside the running one: every rule's count, none
+      failed, under the running worker's epoch (no takeover: the epoch is the same after it, and the worker
+      stays healthy);
+    - (c) `pg_bootstrap` rotated by `scripts/rotate-db-role.sh`: the bootstrap role takes the new password,
+      the running postgres's old mount no longer logs in, nothing restarts;
+    - (c) `restic_password` rotated by `scripts/rotate-restic-password.sh`: the repository opens with the new
+      password through one key and with the old one no more, only backup restarts, and a new backup set works;
+    - a restore of the set from before both rotations, into PB, whose postgres starts from the rotated
+      `pg_bootstrap`, and whose restore reads the repository with the rotated `restic_password`."""
+    scratch = rotation_stack
+    old_restic = scratch.key()
+    install(old_restic, "restic_password")  # the case's own old password, before the repository exists
+    up(PT, build=False)
+    backup(PT, "init")
+    create_user(PT, USERNAME, PASSWORD)
+    Site(PT).confirmed_profile()  # a CV file and its extracted text, in the set
+    before = int(backup(PT, "set")["set_id"])
+
+    # (a) The retention pass now, beside the running worker, fenced by its epoch.
+    epoch = one("SELECT worker_epoch FROM worker_heartbeat WHERE id = 1")
+    passed = run(
+        [*PT, "run", "--rm", "--no-deps", "-T", "worker", "jobhunter", "retention", "run"], timeout=600
+    )
+    printed = last_json(passed.stdout)
+    print("retention run on PT:", printed)
+    assert list(printed) == ["counts"]
+    assert list(printed["counts"]) == [rule.name for rule in RULES]
+    assert all(isinstance(n, int) and n >= 0 for n in printed["counts"].values()), printed
+    assert one("SELECT worker_epoch FROM worker_heartbeat WHERE id = 1") == epoch
+    healthy(PT, "worker")
+
+    # (c) pg_bootstrap: the role's new password, set with the old one; nothing restarts.
+    assert bootstrap_login("exec").stdout.strip() == "1"
+    running = started()
+    done = as_root(
+        ROTATE_DB_ROLE,
+        "--compose",
+        shlex.join(PT),
+        "--secrets-dir",
+        SECRETS,
+        "pg_bootstrap",
+        str(scratch.password()),
+    )
+    print("rotate-db-role pg_bootstrap:", done.stdout)
+    assert done.stdout.splitlines()[-1] == (
+        "rotate-db-role: done: the bootstrap superuser has its new password; restarted nothing"
+    )
+    assert started() == running
+    refused = bootstrap_login("exec")  # the running postgres still mounts the old file
+    assert refused.returncode != 0 and "password authentication failed" in refused.stderr, refused.stderr
+    assert (
+        bootstrap_login("run", "--rm", "--no-deps").stdout.strip() == "1"
+    )  # the installed file: the new one
+
+    # (c) restic_password: a key for the new password, the old one's removed; backup restarts.
+    new_restic = scratch.key()
+    assert restic_keys(old_restic) == {"opens": True, "keys": 1}
+    assert restic_keys(new_restic) == {"opens": False, "exit": 12}
+    running = started()
+    done = as_root(ROTATE_RESTIC, "--compose", shlex.join(PT), "--secrets-dir", SECRETS, str(new_restic))
+    print("rotate-restic-password:", done.stdout)
+    assert done.stdout.splitlines()[-1] == (
+        "rotate-restic-password: done: the repository opens with the new password only; installed "
+        "restic_password and restarted backup"
+    )
+    after = started()
+    moved = {key for key in running if after.get(key) != running[key]}
+    assert {(project, service) for project, service, _ in moved} == {(PT_PROJECT, "backup")}
+    assert after.keys() == running.keys()
+    assert restic_keys(old_restic) == {"opens": False, "exit": 12}
+    assert restic_keys(new_restic) == {"opens": True, "keys": 1}
+    assert int(backup(PT, "set")["set_id"]) > before  # the restarted backup's new mount
+
+    # Site A lost: the set from before both rotations restored into B with the rotated secrets.
+    down_v(PT)
+    up(PB, "postgres", build=False)  # an empty pgdata: its init takes the rotated pg_bootstrap
+    command = [*PB, "--profile", "restore", "run", "--rm", "-T", "restore", "jobhunter", "restore", "run"]
+    restored = last_json(run([*command, "--set", str(before)], timeout=RESTORE_TIMEOUT_S).stdout)
+    print("restore run on PB:", restored)
+    assert (restored["restored"], restored["set_id"]) == (True, before)
+    assert len(restored["data_key_ids"]) == 1

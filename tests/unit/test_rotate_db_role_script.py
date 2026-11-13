@@ -41,6 +41,7 @@ HOLDERS: Final = {
     "db_migrator": [],
     "db_backup": ["backup"],
     "db_restore": ["backup"],
+    "pg_bootstrap": [],  # postgres reads it at its init only (M5 follow-ups Task F4 (c))
 }
 PROD_COMPOSE: Final = shlex.split(
     "docker compose -p jobhunter --env-file deploy/images.lock --env-file deploy/release.lock "
@@ -156,11 +157,12 @@ def test_the_password_never_reaches_a_command_line(tmp_path: Path, name: str) ->
     assert PLANTED not in stdin and PLANTED not in done.stdout + done.stderr
 
 
-@pytest.mark.parametrize("name", list(ROLES))
+@pytest.mark.parametrize("name", list(HOLDERS))
 def test_it_restarts_the_holders_of_each_secret(tmp_path: Path, name: str) -> None:
     """After the role's password, the services that hold the secret are restarted: api and worker for
     `db_app`, backup for `db_backup` and `db_restore`; `db_migrator` is held by none (migrate and restore are
-    one-off), so nothing is restarted and the script says so."""
+    one-off), nor is `pg_bootstrap` (postgres reads it at its init only), so nothing is restarted and the
+    script says so."""
     services = yaml.safe_load((REPO / "deploy/compose.yaml").read_text(encoding="utf-8"))["services"]
     holding = [
         service
@@ -178,6 +180,80 @@ def test_it_restarts_the_holders_of_each_secret(tmp_path: Path, name: str) -> No
         assert tails[1:] == []
         assert f"{NOTE}no running service holds {name}: nothing to restart" in ran.done.stdout.splitlines()
     assert ran.done.stdout.splitlines()[0] == f"{NOTE}dry run: the commands are printed, none is run"
+
+
+def test_the_bootstrap_password_is_set_with_the_old_one_then_installed(tmp_path: Path) -> None:
+    """M5 follow-ups Task F4 (c): `pg_bootstrap` is the password the one-off itself connects with, so its
+    order is the other way round. The dry run prints the one-off postgres container first, with the new file
+    on its stdin, then the install of the new file, and restarts nothing; never the value. The one-off's
+    script, run against a recording psql with its `/run/secrets` holding the installed (old) password and its
+    `/dev/shm` a temporary directory, connects as the bootstrap role with the old password in psql's
+    environment, reads the new one from its stdin into a file on `/dev/shm`, and gives psql that file's path
+    and the role as variables: psql reads the new password itself (`\\set pw `cat :'secret'``) and sets it
+    (`:'pw'`), so neither password is on a command line. The file is removed at the end."""
+    ran = dry_run(tmp_path, "pg_bootstrap", "NEW")
+    assert ran.done.returncode == 0, ran.done.stderr
+    assert PLANTED not in ran.done.stdout + ran.done.stderr
+    assert ran.calls == []
+    printed = [line for line in ran.done.stdout.splitlines() if not line.startswith(NOTE)]
+    assert ran.commands[0] == ["cd", str(REPO)]
+    assert printed[1].endswith(f" < {ran.new_file}")  # the one-off reads the new password from its stdin
+    target = f"{PROD_SECRETS}/pg_bootstrap"
+    assert ran.commands[2] == [
+        "install",
+        "-o",
+        "root",
+        "-g",
+        "10010",
+        "-m",
+        "0440",
+        str(ran.new_file),
+        target,
+    ]
+    assert len(ran.commands) == 3
+    [one_off] = ran.compose_commands(PROD_COMPOSE)
+    script, args = one_off_script(one_off)
+    assert args == ["rotate-db-role"]
+    assert f"{NOTE}no running service holds pg_bootstrap: nothing to restart" in ran.done.stdout.splitlines()
+
+    mounted, shm, fake = tmp_path / "run-secrets", tmp_path / "shm", tmp_path / "fake-bin"
+    for directory in (mounted, shm, fake):
+        directory.mkdir()
+    (mounted / "pg_bootstrap").write_text(f"{BOOTSTRAP}\n")
+    expected = tmp_path / "expected"
+    expected.write_text(f"{PLANTED}\n")
+    recorded = tmp_path / "psql.log"
+    (fake / "psql").write_text(
+        "#!/bin/sh\n"
+        f'{{ printf "argv:"; printf " [%s]" "$@"; echo; '
+        f'[ "$PGPASSWORD" = {shlex.quote(BOOTSTRAP)} ] && echo "PGPASSWORD:old"; '
+        'for arg in "$@"; do case $arg in secret=*) '
+        f'cmp -s "${{arg#secret=}}" {shlex.quote(str(expected))} && echo "secret:new";; esac; done; '
+        f"echo stdin:; cat; }} > {shlex.quote(str(recorded))}\n"
+    )
+    (fake / "psql").chmod(0o755)
+    local = script.replace("/run/secrets", str(mounted)).replace("/dev/shm", str(shm))  # noqa: S108
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "POSTGRES_USER": "jobhunter_bootstrap"}
+    done = subprocess.run(
+        ["sh", "-c", local, *args],
+        input=f"{PLANTED}\n",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    record = recorded.read_text()
+    argv_line = record.splitlines()[0]
+    assert PLANTED not in argv_line and BOOTSTRAP not in argv_line
+    assert "[-h] [postgres] [-U] [jobhunter_bootstrap]" in argv_line
+    assert "[role=jobhunter_bootstrap]" in argv_line and f"[secret={shm}/" in argv_line
+    assert "PGPASSWORD:old" in record and "secret:new" in record
+    stdin = record.split("stdin:\n", 1)[1]
+    assert "\\set pw `cat :'secret'`" in stdin and "ALTER ROLE :\"role\" PASSWORD :'pw';" in stdin
+    assert PLANTED not in stdin and PLANTED not in done.stdout + done.stderr
+    assert list(shm.iterdir()) == []
 
 
 def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: Path) -> None:
