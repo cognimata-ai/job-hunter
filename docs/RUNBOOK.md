@@ -215,7 +215,7 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    Its preflight changes nothing and stops at the first failure: it runs as root from `/opt/jobhunter`;
    `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; the operator file
    `/etc/jobhunter/operator.json` exists (item 3; a dry run only names it when it is missing); `nft` is
-   installed (the package `nftables`, item 2); `<dir>` holds every name of `deploy/secrets.example` but the
+   installed (the package `nftables`, item 2), and so is `swapon` (the package `mount`); `<dir>` holds every name of `deploy/secrets.example` but the
    optional `data_key_previous` and `ntfy_token`; gid 10010 is free or the
    group `jobhunter-secrets` without members, and no host user has it as its primary group; the swap check
    passes. Then it runs the steps below, each command printed first: the group, the directory, the files, the

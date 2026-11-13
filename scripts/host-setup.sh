@@ -13,6 +13,8 @@
 #   here; a dry run names it and goes on. Its content is step 5's to check;
 # - nft is installed (`command -v nft`; the package nftables): step 4's unit loads the egress rule with it, so
 #   a host without it would stop at step 4, after the secrets were installed;
+# - swapon is installed (`command -v swapon`; the package mount): the swap check lists the swap areas with it,
+#   so a host without it stops here with a message, not with the shell's `command not found` (T22);
 # - every secret file of deploy/secrets.example is in <dir>, except the two optional ones (step 3);
 # - gid 10010 is absent, or is the group jobhunter-secrets with no members, and no host user has gid 10010 as
 #   its primary group: no host user may read the secrets (§19.2);
@@ -176,6 +178,9 @@ fi
 command -v nft >/dev/null ||
     die "nft is not installed: install the package nftables (apt-get install nftables); step 4's egress rule" \
         "needs it; nothing was changed"
+command -v swapon >/dev/null ||
+    die "swapon is not installed: install the package mount (apt-get install mount); the swap check needs it;" \
+        "nothing was changed"
 for name in $names; do
     if [ ! -f "$source_dir/$name" ] && [[ $OPTIONAL != *" $name "* ]]; then
         die "$name is not in $source_dir (deploy/secrets.example lists it); nothing was changed"

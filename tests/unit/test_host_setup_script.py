@@ -100,9 +100,11 @@ def probe_stub(command: str, answers: dict[str, tuple[str, int]], log: Path) -> 
     )
 
 
-def without_nft(path: str) -> str:
-    """`path` without its directories that hold an `nft`: a host without nftables."""
-    return os.pathsep.join(d for d in path.split(os.pathsep) if d and not os.access(Path(d, "nft"), os.X_OK))
+def without(path: str, *commands: str) -> str:
+    """`path` without its directories that hold one of `commands`: a host without them."""
+    return os.pathsep.join(
+        d for d in path.split(os.pathsep) if d and not any(os.access(Path(d, c), os.X_OK) for c in commands)
+    )
 
 
 def dry_run(
@@ -111,12 +113,13 @@ def dry_run(
     *flags: str,
     answers: Answers | None = None,
     nft: bool = True,
+    swapon: bool = True,
     script: Path = SCRIPT,
 ) -> DryRun:
     """The script's dry run on a new source directory holding `present`, each file a planted value, the probes
-    answering from `answers` over `DEFAULTS`, answer by answer, and `nft` on PATH (a shim) unless `nft` is
-    false (then no directory of PATH holds one); it fails the test when the run executed any command of
-    `CHANGES`."""
+    answering from `answers` over `DEFAULTS`, answer by answer, and `nft` and `swapon` on PATH (shims) unless
+    `nft` or `swapon` is false (then no directory of PATH holds one); it fails the test when the run executed
+    any command of `CHANGES`."""
     source = tmp_path / "secrets-src"
     source.mkdir()
     for name in present:
@@ -129,11 +132,14 @@ def dry_run(
             (shims / command).write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{record}"\nexit 97\n')
     given = {command: {**DEFAULTS.get(command, {}), **(answers or {}).get(command, {})} for command in PROBES}
     for command in PROBES:
-        (shims / command).write_text(probe_stub(command, given.get(command, {}), log))
+        if command != "swapon" or swapon:
+            (shims / command).write_text(probe_stub(command, given.get(command, {}), log))
     for shim in shims.iterdir():
         shim.chmod(0o755)
-    path = f"{shims}{os.pathsep}{os.environ['PATH'] if nft else without_nft(os.environ['PATH'])}"
+    absent = [command for command, there in (("nft", nft), ("swapon", swapon)) if not there]
+    path = f"{shims}{os.pathsep}{without(os.environ['PATH'], *absent)}"
     assert (shutil.which("nft", path=path) is None) is not nft, "nft on PATH as the case says"
+    assert (shutil.which("swapon", path=path) is None) is not swapon, "swapon on PATH as the case says"
     env = {"PATH": path, "HOME": str(tmp_path), "LC_ALL": "C.UTF-8"}
     done = subprocess.run(
         [str(script), "--secrets-from", str(source), *flags, "--dry-run"],
@@ -237,6 +243,19 @@ def test_a_host_without_nft_stops_it(tmp_path: Path) -> None:
     assert run.done.stderr == (
         "host-setup: nft is not installed: install the package nftables (apt-get install nftables); step 4's "
         "egress rule needs it; nothing was changed\n"
+    )
+
+
+def test_a_host_without_swapon_stops_it(tmp_path: Path) -> None:
+    """T22: the swap check lists the swap areas with `swapon` (the package mount): a host without it stops in
+    the preflight, a dry run too, with a message that names the command and its package, before any step and
+    before reading the group or the swap, never as a shell's `command not found`."""
+    run = dry_run(tmp_path, NAMES, "--delete-sources", swapon=False)
+    assert run.done.returncode == 1
+    assert (commands(run.done.stdout), run.probed) == ([], [])
+    assert run.done.stderr == (
+        "host-setup: swapon is not installed: install the package mount (apt-get install mount); the swap "
+        "check needs it; nothing was changed\n"
     )
 
 
@@ -480,7 +499,7 @@ def real_run(tmp_path: Path, operator_file: Path) -> tuple[subprocess.CompletedP
     for shim in shims.iterdir():
         shim.chmod(0o755)
     env = {
-        "PATH": f"{shims}{os.pathsep}{without_nft(os.environ['PATH'])}",
+        "PATH": f"{shims}{os.pathsep}{without(os.environ['PATH'], 'nft')}",
         "HOME": str(tmp_path),
         "LC_ALL": "C.UTF-8",
     }
