@@ -9,7 +9,10 @@
 // So the hook remembers the element last focused inside `root`, also while the focus is in a dialog opened from
 // it (`aria-modal`, which portals out of `root`). When `root` changes and that element has left the document
 // with the focus on the body, the focus goes to `fallback` (the list's heading, with `tabIndex={-1}`). A focus
-// the user moved anywhere else, or dropped while its control stays, is left alone.
+// the user moved anywhere else, or dropped while its control stays, is left alone, and so is a control the
+// user clicked away from (a `focusout` with no next element, the control still there and no longer the active
+// element; plan M5 Task 33, Ruling T33-15), whose removal by a later background read is not theirs to follow.
+// A window switch keeps the control the active element, so it is still followed.
 import { type RefObject, useEffect } from "react";
 
 const MODAL = "[aria-modal='true']";
@@ -27,9 +30,19 @@ export function useFocusFallback(root: RefObject<HTMLElement | null>, fallback: 
     };
     const onFocusOut = (event: FocusEvent): void => {
       const next = event.relatedTarget;
-      if (next instanceof Element && !container.contains(next) && next.closest(MODAL) === null) {
-        last = null; // the user moved on
+      if (next instanceof Element) {
+        if (!container.contains(next) && next.closest(MODAL) === null) {
+          last = null; // the user moved on
+        }
+        return;
       }
+      // no next element: a click on content that takes no focus, the control's removal, or the window's blur
+      const left = event.target;
+      queueMicrotask(() => {
+        if (left === last && left instanceof Element && left.isConnected && document.activeElement !== left) {
+          last = null; // the user clicked away
+        }
+      });
     };
     const observer = new MutationObserver(() => {
       const active = document.activeElement;

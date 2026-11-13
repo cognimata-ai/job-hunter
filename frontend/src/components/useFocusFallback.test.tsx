@@ -87,4 +87,38 @@ describe("useFocusFallback", () => {
     });
     expect(document.activeElement).toBe(document.body);
   });
+
+  it("forgets a control the user clicked away from, so its later removal moves no focus", async () => {
+    // plan M5 Task 33, Ruling T33-15: a click on content that takes no focus blurs it with no next element
+    const { rerender } = render(<List items={["One", "Two"]} />);
+    focus("One");
+    act(() => {
+      (document.activeElement as HTMLElement).blur();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    rerender(<List items={["Two"]} />); // a background read removes it later
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("keeps following a control while the window is away, its focus kept", async () => {
+    const { rerender } = render(<List items={["One", "Two"]} />);
+    focus("One");
+    act(() => {
+      // the window loses the focus: no next element, and the control stays the document's active element
+      screen.getByRole("button", { name: "One" }).dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: null }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    rerender(<List items={["Two"]} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "List" }));
+  });
 });
