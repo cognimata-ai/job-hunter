@@ -150,6 +150,8 @@ _SESSION_COUNT: Final = sa.text("SELECT count(*) FROM sessions")
 _ACTIVE_CASE: Final = sa.text("SELECT id FROM golden_cases WHERE active ORDER BY id LIMIT 1")
 _EVAL_RUN: Final = sa.text("SELECT status, metrics FROM eval_runs WHERE id = :r")
 _ROW_EXISTS: Final = "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = :i)"
+_FEEDBACK: Final = sa.text("SELECT score_snapshot, kind, label, comment FROM score_feedback WHERE id = :f")
+_FEEDBACK_OF_JOB: Final = sa.text("SELECT id FROM score_feedback WHERE job_id = :j")
 _CONFIGURATION: Final = sa.text(
     "SELECT 'version' AS kind, id, version_no, NULL::timestamptz AS at FROM settings_versions "
     "UNION ALL SELECT 'active', settings_version_id, scope_version_id, updated_at FROM active_config "
@@ -443,6 +445,38 @@ async def test_profile_source_and_golden_purges_replay_after_a_restore(
     # marker (`test_profile_purge.py::test_no_call_of_the_version_is_reserved_after_admission`).
     assert await scalar(restored.engine, _OPERATION_STATUS, o=seed.running_operation_id) == "pending"
     assert await scalar(restored.engine, _PROPOSAL_STATUS, p=seed.running_proposal_id) == "purged"
+
+
+async def test_a_source_purge_replay_redacts_the_feedback_snapshots_it_froze(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    purger: Purger,
+    restored: Restored,
+    make_config: ConfigFactory,
+) -> None:
+    """Final review I1: a backup set taken before the Adzuna purge holds the seed's label of the mixed job's
+    tainted revision with its Adzuna-derived score snapshot. The manifest froze that feedback's id before any
+    provenance was detached, so the replay redacts it as the live purge did: `score_snapshot` NULL, the kind,
+    label and comment kept, the `field_redact` postcondition holding."""
+    seed = await seeded(engine)
+    feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    await backup_set(migrated, restored)
+    before = await one(restored.engine, _FEEDBACK, f=feedback)
+    assert before.score_snapshot is not None
+    source = await finished(purger, await request_source_purge(engine))
+    assert source.scope is not None
+    assert [
+        op["ids"]
+        for op in source.scope["operations"]
+        if op["op"] == "field_redact" and op["table"] == "score_feedback"
+    ] == [[feedback]]
+
+    assert await migrate_restored(make_config, restored, purger.cfg.manifests_dir) == list(MIGRATE_ORDER)
+
+    await assert_replayed(restored.engine, restored.files, source)
+    after = await one(restored.engine, _FEEDBACK, f=feedback)
+    assert after.score_snapshot is None
+    assert (after.kind, after.label, after.comment) == (before.kind, before.label, before.comment)
 
 
 async def test_an_injected_rebuild_failure_keeps_the_fence_and_fails_migrate(

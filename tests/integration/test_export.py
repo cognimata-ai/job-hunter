@@ -47,6 +47,7 @@ from jobhunter.privacy.export import (
     write_archive,
 )
 from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
+from jobhunter.privacy.kinds.source_purge import request_source_purge
 from jobhunter.privacy.purge import OpenedPurge
 from jobhunter.privacy.retention import run_retention_daily
 from jobhunter.worker import operations as ops
@@ -81,6 +82,7 @@ _OPERATION: Final = sa.text(
     "SELECT status, attempts, last_error_code, not_before FROM operations WHERE id = :i"
 )
 _COUNT_EXPORTS: Final = sa.text("SELECT count(*) FROM exports")
+_FEEDBACK_OF_JOB: Final = sa.text("SELECT id FROM score_feedback WHERE job_id = :j")
 _COUNT_EXPORT_OPERATIONS: Final = sa.text("SELECT count(*) FROM operations WHERE kind = 'export'")
 _MAX_MANIFEST: Final = sa.text("SELECT coalesce(max(id), 0) FROM deletion_manifests")
 _FAILED_ALERT: Final = sa.text(
@@ -336,6 +338,38 @@ async def test_a_fenced_job_is_absent_from_the_export(engine: AsyncEngine, expor
     after = naming(await snapshot_archive())
     assert after == {name: jobs - {fenced} for name, jobs in before.items()}
     assert after["jobs.json"]  # the other jobs stay
+
+
+async def test_after_an_adzuna_purge_the_exported_feedback_holds_no_adzuna_score(
+    engine: AsyncEngine, exporter: Exporter, purger: Purger
+) -> None:
+    """Final review I1, §20.5: no Adzuna-derived score remains in an export. The seed's label of the mixed
+    job's tainted revision is exported after the Adzuna purge with its kind, label and comment, and its
+    `score_snapshot` null; before the purge it held the copied score."""
+    async with engine.begin() as conn:
+        seed = await seed_two_year_old_graph(conn, now=utcnow())
+    feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    keys = crypto.data_keys(exporter.deps.cfg)
+
+    async def exported() -> dict[str, Any]:
+        sink = io.BytesIO()
+        async with read_snapshot(engine) as snap:
+            await write_archive(snap, sink, export_id=1, cv_store=exporter.deps.cv_store, keys=keys)
+        archive = zipfile.ZipFile(io.BytesIO(sink.getvalue()))
+        [item] = [item for item in listed(archive, "feedback.json") if item["id"] == feedback]
+        return item
+
+    before = await exported()
+    assert before["score_snapshot"] is not None
+    async with engine.begin() as conn:
+        opened = await request_source_purge(conn, source_id="adzuna", now=utcnow(), defer=None)
+    await purger.run(opened.operation_id)
+    await completed(purger, opened.manifest_id, opened.operation_id)
+
+    after = await exported()
+    assert after["score_snapshot"] is None
+    kept = ("id", "job_id", "kind", "label", "comment", "created_at")
+    assert {key: after[key] for key in kept} == {key: before[key] for key in kept}
 
 
 async def test_the_stored_file_is_never_plaintext(engine: AsyncEngine, exporter: Exporter) -> None:

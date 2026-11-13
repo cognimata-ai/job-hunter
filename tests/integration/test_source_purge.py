@@ -13,6 +13,7 @@ selection (`dedup.revisions.recompute_job`) over its postings. Every row is inve
 
 import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta
@@ -198,6 +199,17 @@ _ALERT_RESOLVED: Final = sa.text("SELECT resolved_at IS NOT NULL FROM alerts WHE
 _POINT_SETTINGS: Final = sa.text("UPDATE active_config SET settings_version_id = :v WHERE id = 1")
 _UNFENCE_SOURCE: Final = sa.text("UPDATE sources SET purge_fence_at = NULL WHERE id = 'adzuna'")
 _TOUCH: Final = sa.text("UPDATE jobs SET updated_at = now() WHERE id = :j")
+_FEEDBACK: Final = sa.text("SELECT score_snapshot, kind, label, comment FROM score_feedback WHERE id = :f")
+_FEEDBACK_OF_JOB: Final = sa.text("SELECT id FROM score_feedback WHERE job_id = :j")
+_ADD_FEEDBACK: Final = sa.text(
+    "INSERT INTO score_feedback (job_id, job_revision_id, llm_result_id, det_result_id, score_snapshot, "
+    "kind, label, comment) VALUES (:job, :revision, :result, :det, CAST(:snapshot AS jsonb), 'label', "
+    ":label, 'Erfunden.') RETURNING id"
+)
+_SNAPSHOT_AGAIN: Final = sa.text(
+    """UPDATE score_feedback SET score_snapshot = '{"M": "70.00"}' WHERE id = :f"""
+)
+_SNAPSHOT_GONE: Final = sa.text("UPDATE score_feedback SET score_snapshot = NULL WHERE id = :f")
 
 
 # ---- helpers -----------------------------------------------------------------------------------------------
@@ -510,6 +522,96 @@ async def test_a_mixed_source_job_is_rebuilt_without_the_adzuna_salary(
     assert int(instance.id) not in {int(r.id) for r in instances}
     current = [r for r in instances if r.is_current]
     assert current and all(r.det_inputs["job"]["salary"] == {"value": None, "sources": []} for r in current)
+
+
+async def add_feedback(
+    conn: AsyncConnection,
+    job: Job,
+    *,
+    result_id: int | None = None,
+    det_result_id: int | None = None,
+    label: str = "ok",
+) -> int:
+    """A label of `job`'s revision with a score snapshot as `golden.record_feedback` writes it (invented
+    scores); its id."""
+    snapshot = json.dumps(
+        {"L": "51.00", "M": "62.00", "U": "73.00", "coverage": "0.80", "confidence": "medium"}
+    )
+    return int(
+        (
+            await conn.execute(
+                _ADD_FEEDBACK,
+                {
+                    "job": job.job_id,
+                    "revision": job.revision_id,
+                    "result": result_id,
+                    "det": det_result_id,
+                    "snapshot": snapshot,
+                    "label": label,
+                },
+            )
+        ).scalar_one()
+    )
+
+
+async def test_feedback_score_snapshots_drawn_from_adzuna_are_redacted_keeping_the_labels(
+    engine: AsyncEngine, purger: Purger, job_with_postings: JobWithPostings
+) -> None:
+    """Final review I1: `score_feedback` copies a scored result's L, M, U, coverage and confidence. The purge
+    freezes, before anything is detached, the feedback whose snapshot draws on Adzuna: the seed's label of
+    the mixed job's tainted revision, and a label whose det instance names Adzuna (an Adzuna salary on an
+    untainted revision). Their `score_snapshot` is NULL afterwards (manifest operation `field_redact`), their
+    kind, label and comment kept; a label drawing on no Adzuna value keeps its snapshot."""
+    seed = await seeded(engine)
+    tuple_id = int(await scalar(engine, _ACTIVE_TUPLE))
+    seeded_feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    salaried = await mixed_job(job_with_postings, engine, salary=stated(60_000, 70_000))
+    async with engine.begin() as conn:
+        result = (await published_result(conn, salaried, tuple_id)).result_id
+    await recomputed(engine, salaried.job_id)
+    async with engine.connect() as conn:
+        (instance,) = [r for r in (await conn.execute(_INSTANCES, {"r": result})).all() if r.is_current]
+    assert instance.det_inputs["job"]["salary"]["sources"] == [ADZUNA]
+    clean = await job_with_postings({"greenhouse": {}})
+    async with engine.begin() as conn:
+        adzuna_salary = await add_feedback(conn, salaried, result_id=result, det_result_id=int(instance.id))
+        kept = await add_feedback(
+            conn, Job(clean.job_id, await recomputed(engine, clean.job_id)), label="poor"
+        )
+    before = {f: await one(engine, _FEEDBACK, f=f) for f in (seeded_feedback, adzuna_salary, kept)}
+    assert all(row.score_snapshot is not None for row in before.values())
+
+    manifest = await purged(engine, purger, await request(engine))
+
+    assert operations(manifest, "field_redact", "score_feedback") == sorted([seeded_feedback, adzuna_salary])
+    for feedback in (seeded_feedback, adzuna_salary):
+        after = await one(engine, _FEEDBACK, f=feedback)
+        assert after.score_snapshot is None
+        assert (after.kind, after.label, after.comment) == tuple(before[feedback])[1:]
+    assert tuple(await one(engine, _FEEDBACK, f=kept)) == tuple(before[kept])
+
+
+async def test_a_feedback_snapshot_written_again_fails_the_postcondition(
+    engine: AsyncEngine, purger: Purger
+) -> None:
+    """The redaction's postcondition (the `field_redact`'s, checked in phase C with the kind's and by every
+    replay's classification): a redacted feedback row that holds a snapshot again violates it; once NULL
+    again, it holds."""
+    seed = await seeded(engine)
+    feedback = int(await scalar(engine, _FEEDBACK_OF_JOB, j=seed.closed_job_id))
+    manifest = await purged(engine, purger, await request(engine))
+    assert manifest.scope is not None
+    async with engine.begin() as conn:
+        await conn.execute(_SNAPSHOT_AGAIN, {"f": feedback})
+    async with engine.connect() as conn:
+        found = await check_postconditions(conn, manifest.scope, files=purger.file_roots)
+    assert [(v.op, v.table, v.detail) for v in found] == [
+        ("field_redact", "score_feedback", "1 row not redacted")
+    ]
+    async with engine.begin() as conn:
+        await conn.execute(_SNAPSHOT_GONE, {"f": feedback})
+    async with engine.connect() as conn:
+        assert await check_postconditions(conn, manifest.scope, files=purger.file_roots) == []
 
 
 async def test_a_tainted_current_revision_is_nulled_before_its_delete(

@@ -38,7 +38,11 @@ within `max_ids`:
   `job_revisions`); `row_delete det_results` (the instances naming the source whose result is on an untainted
   revision: a tainted revision's go with its targets); `row_delete golden_cases` (active or not: the agreement
   overrides the exemption); `row_delete llm_calls` (the other eval calls whose `input_refs` name a tainted
-  revision, no case's deletion taking them); `row_delete postings`, `ad_keys` and `fetch_requests` with the
+  revision, no case's deletion taking them); `field_redact score_feedback score_snapshot` (final review I1:
+  the feedback rows within the bound whose snapshot of L, M, U, coverage and confidence draws on the source,
+  their scored revision tainted, their result on a tainted revision or their det instance naming the source,
+  frozen here by id while those keys still name them; their kind, label and comment stay);
+  `row_delete postings`, `ad_keys` and `fetch_requests` with the
   selector `source:<source>` (bounded by id, by `created_at <= fenced_at` for the keys); `field_redact jobs
   current_revision_id` of the affected jobs whose current revision is tainted; `row_delete job_revisions` of
   the tainted ones; `row_delete embeddings` of the embeddings only tainted revisions reference (D22, frozen
@@ -54,7 +58,9 @@ the content names or selects within its bound:
    instances, `ROW_CHUNK` a chunk over their jobs; the golden cases in one chunk over their jobs
    (`deletion_graph.settle_and_delete_cases(check=None)`: active or not, before any `delete_job_graph`, whose
    active-case refusal must never fire here); the eval calls, `ROW_CHUNK` a chunk
-   (`deletion_graph.settle_and_delete_calls`: their entries settled first, G04);
+   (`deletion_graph.settle_and_delete_calls`: their entries settled first, G04); the frozen feedback rows'
+   `score_snapshot` set NULL, `ROW_CHUNK` a chunk (live and in a replay alike; the deletions after it null
+   their keys, never their snapshots);
 2. (4) the source data, `ROW_CHUNK` a page by selector within the bound: the postings over their jobs
    (observations, key sources and the conflicts on them cascade; each deleted conflict's
    `dedup.identity_conflict` alert resolved), then the keys over their owners, then the fetch requests (raw
@@ -224,6 +230,14 @@ _EVAL_CALLS: Final = q(
     "AND (c.golden_case_id IS NULL OR NOT (c.golden_case_id = ANY(CAST(:cases AS bigint[])))) "
     "ORDER BY c.id"
 )
+# The feedback within the bound whose score snapshot draws on the source (module docstring, final review I1).
+_FEEDBACK: Final = q(
+    "SELECT f.id FROM score_feedback f WHERE f.id <= :bound AND f.score_snapshot IS NOT NULL AND ("  # noqa: S608
+    f"f.job_revision_id = ANY({_TAINTED_IDS}) "
+    "OR EXISTS (SELECT 1 FROM llm_results r WHERE r.id = f.llm_result_id "
+    f"AND r.job_revision_id = ANY({_TAINTED_IDS})) "
+    f"OR EXISTS (SELECT 1 FROM det_results d WHERE d.id = f.det_result_id AND {_NAMES_SOURCE})) ORDER BY f.id"
+)
 _CURRENT_TAINTED: Final = q(
     "SELECT id FROM jobs WHERE id = ANY(CAST(:jobs AS bigint[])) "  # noqa: S608
     f"AND current_revision_id = ANY({_TAINTED_IDS}) ORDER BY id"
@@ -245,6 +259,10 @@ _TARGET_PAGE: Final = q(
 _TARGETS_AGAIN: Final = q(f"SELECT id, job_id FROM score_targets WHERE id = ANY({_IDS}) ORDER BY id")  # noqa: S608
 _JOBS_OF_INSTANCES: Final = q(f"SELECT DISTINCT job_id FROM det_results WHERE id = ANY({_IDS})")  # noqa: S608
 _DELETE_INSTANCES: Final = q(f"DELETE FROM det_results WHERE id = ANY({_IDS})")  # noqa: S608
+_REDACT_FEEDBACK: Final = q(
+    f"UPDATE score_feedback SET score_snapshot = NULL WHERE id = ANY({_IDS}) "  # noqa: S608
+    "AND score_snapshot IS NOT NULL"
+)
 _JOBS_OF_CASES: Final = q(
     "SELECT DISTINCT r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "  # noqa: S608
     f"WHERE g.id = ANY({_IDS})"
@@ -525,6 +543,9 @@ async def _operations(
         _EVAL_CALLS,
         {"bound": max_ids["llm_calls"], "tainted_keys": [str(r) for r in tainted], "cases": cases},
     )
+    feedback = await _ids(
+        conn, _FEEDBACK, {"source": source, "tainted": tainted, "bound": max_ids["score_feedback"]}
+    )
     unpointed = await _ids(conn, _CURRENT_TAINTED, {"jobs": jobs, "tainted": tainted})
     frozen = await _ids(conn, _FROZEN_EMBEDDINGS, {"tainted": tainted, "bound": max_ids["embeddings"]})
     operations: list[Operation] = []
@@ -540,6 +561,10 @@ async def _operations(
     operations += _by_ids("det_results", instances)
     operations += _by_ids("golden_cases", cases)
     operations += _by_ids("llm_calls", calls)
+    if feedback:
+        operations.append(
+            {"op": "field_redact", "table": "score_feedback", "ids": feedback, "columns": ["score_snapshot"]}
+        )
     operations += [
         _by_source("postings", source),
         _by_source("ad_keys", source, by="created_at"),
@@ -615,6 +640,16 @@ async def _delete_cases(run: PurgeRun, cases: Sequence[int]) -> int:
                 await deletion_graph.settle_and_delete_cases(chunk.conn, ids, now=run.now, check=None)
             )
     return deleted
+
+
+async def _redact_feedback(run: PurgeRun, feedback: Sequence[int]) -> int:
+    """Step 3's feedback snapshots drawing on the source, `ROW_CHUNK` per chunk: `score_snapshot` NULL, the
+    row with its kind, label and comment kept; how many were redacted."""
+    redacted = 0
+    for ids in _slices(feedback):
+        async with run.chunk() as chunk:
+            redacted += (await chunk.conn.execute(_REDACT_FEEDBACK, {"ids": ids})).rowcount
+    return redacted
 
 
 async def _delete_calls(run: PurgeRun, calls: Sequence[int]) -> int:
@@ -891,6 +926,9 @@ class SourcePurge:
             "instances": await _delete_instances(run, _named(content, "row_delete", "det_results")),
             "golden_cases": await _delete_cases(run, _named(content, "row_delete", "golden_cases")),
             "calls": await _delete_calls(run, _named(content, "row_delete", "llm_calls")),
+            "feedback_redacted": await _redact_feedback(
+                run, _named(content, "field_redact", "score_feedback")
+            ),
             "postings": await _delete_postings(run, source, bounds["postings"]),
             "keys": await _delete_keys(run, source, datetime.fromisoformat(content["fenced_at"])),
             "fetch_requests": await _delete_requests(run, source, bounds["fetch_requests"]),
