@@ -143,7 +143,7 @@ async def test_it_runs_as_jobhunter_restore_into_a_template_database_and_drops_i
     pg_rows(migrated, "restore", "CREATE TABLE leftover (x int)", db=RESTORE_TEST_DB)
     manifest = a_manifest()
     write_manifest_file(backup_cfg.manifests_dir, manifest)
-    assert (await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())).shipped
+    assert (await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)).shipped
     set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     seen: list[Any] = []
     verify = verify_replayed
@@ -256,11 +256,11 @@ async def test_the_restore_test_reads_every_manifests_snapshot(
     m1, m2, m3 = a_manifest(), a_manifest(), a_manifest()
     write_manifest_file(backup_cfg.manifests_dir, m1)
     write_manifest_file(backup_cfg.manifests_dir, m2)
-    assert (await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())).shipped
+    assert (await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)).shipped
     write_manifest_file(backup_cfg.manifests_dir, m3)
     repo.unreadable.add(backup_cfg.manifests_dir / f"{m1['manifest_uuid']}.json")
     with pytest.raises(ResticError):
-        await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+        await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
 
     with capture_logs() as logs:
         run_id = await restore_tested(backup_cfg, repo, runner, backup_engine)
@@ -293,7 +293,7 @@ async def test_the_restore_test_replays_a_submitted_batch_without_worker_credent
     opened = await request_delete_everything(engine)
     await live.run(opened.operation_id)
     await completed(live, opened.manifest_id, opened.operation_id)
-    await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
 
     def no_call(*args: object, **kwargs: object) -> Any:
         raise AssertionError("the restore test made an external call")

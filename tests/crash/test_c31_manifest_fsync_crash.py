@@ -233,7 +233,7 @@ async def test_c31_a_crash_after_the_rename_adopts_the_file_and_is_done_once_shi
 
     # completed is not done: only a shipment covering the file makes the deletion `shipped`
     async with backup_engine(migrated, volumes) as (cfg, backup):
-        result = await ship_manifests(cfg, FakeRestic(cfg), backup, now=utcnow())
+        result = await ship_manifests(cfg, FakeRestic(cfg), backup, clock=utcnow)
     assert result.shipped and manifest(migrated, opened.manifest_id)[0] == "completed"
     current = int(one(migrated, "SELECT worker_epoch FROM worker_heartbeat")[0])
     await run_reconciler("manifest_shipping", engine, now=utcnow(), epoch=current)

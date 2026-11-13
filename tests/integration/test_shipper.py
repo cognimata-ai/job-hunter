@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import uuid
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
@@ -118,7 +118,7 @@ async def test_ship_lists_json_files_only_never_tmp(
     (directory / f"{uuid.uuid4()}.json").mkdir()  # not a regular file
     restic = FakeRestic(backup_cfg)
 
-    result = await ship_manifests(backup_cfg, restic, backup_engine, now=utcnow())
+    result = await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
 
     assert backup_cfg.staging_dir == directory.parent / "staging"  # this test's own
     listed, tags = restic.backups[0]
@@ -138,7 +138,7 @@ async def test_one_item_per_file_the_snapshot_contains(
         )
     now = utcnow()
 
-    result = await ship_manifests(backup_cfg, FakeRestic(backup_cfg), backup_engine, now=now)
+    result = await ship_manifests(backup_cfg, FakeRestic(backup_cfg), backup_engine, clock=lambda: now)
 
     [shipment] = await shipments(backup_engine)
     assert (shipment.restic_snapshot_id, shipment.shipped_at) == (result.snapshot_id, now)
@@ -151,17 +151,21 @@ async def test_an_unchanged_stream_ships_nothing(backup_cfg: AppConfig, backup_e
     restic = FakeRestic(backup_cfg)
     now = utcnow()
     # An empty stream (no purge yet) ships nothing: restic has no empty snapshot to make.
-    assert await ship_manifests(backup_cfg, restic, backup_engine, now=now) == ShipResult(False, None, 0)
+    assert await ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now) == ShipResult(
+        False, None, 0
+    )
 
     first = manifest_file(backup_cfg.manifests_dir)
-    assert (await ship_manifests(backup_cfg, restic, backup_engine, now=now)).shipped
-    unchanged = await ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=5))
+    assert (await ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now)).shipped
+    unchanged = await ship_manifests(
+        backup_cfg, restic, backup_engine, clock=lambda: now + timedelta(minutes=5)
+    )
     assert unchanged == ShipResult(shipped=False, snapshot_id=None, files=1)
     assert len(restic.backups) == 1 and len(await shipments(backup_engine)) == 1
 
     # A new file: every file ships again, so the latest snapshot is the complete stream.
     second = manifest_file(backup_cfg.manifests_dir)
-    again = await ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=10))
+    again = await ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now + timedelta(minutes=10))
     assert again == ShipResult(shipped=True, snapshot_id=f"{2:064x}", files=2)
     latest = (await shipments(backup_engine))[-1]
     assert await items(backup_engine, latest.id) == {first, second}
@@ -170,7 +174,9 @@ async def test_an_unchanged_stream_ships_nothing(backup_cfg: AppConfig, backup_e
     # A shipped file whose bytes are not the shipped ones (migrate rewrote a lost file differently, say)
     # changes the stream too.
     (backup_cfg.manifests_dir / f"{second[0]}.json").write_bytes(b"{}")
-    assert (await ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=15))).shipped
+    assert (
+        await ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now + timedelta(minutes=15))
+    ).shipped
 
 
 async def test_a_second_shipper_waits_for_the_first_ones_receipt(
@@ -211,10 +217,12 @@ async def test_a_second_shipper_waits_for_the_first_ones_receipt(
     monkeypatch.setattr(shipper, "_latest_items", latest_items)
     monkeypatch.setattr(shipper, "log", Spy(shipper.log))
     now = utcnow()
-    a = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, now=now))
+    a = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now))
     await asyncio.wait_for(paused.wait(), 10)
     m2 = manifest_file(backup_cfg.manifests_dir)
-    b = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, now=now + timedelta(minutes=5)))
+    b = asyncio.create_task(
+        ship_manifests(backup_cfg, restic, backup_engine, clock=lambda: now + timedelta(minutes=5))
+    )
     waits = asyncio.create_task(waiting.wait())
     # B either waits on the lock or, unserialised, ships at once.
     await asyncio.wait((b, waits), timeout=10, return_when=asyncio.FIRST_COMPLETED)
@@ -233,12 +241,71 @@ async def test_a_second_shipper_waits_for_the_first_ones_receipt(
     assert await items(backup_engine, latest.id) == {m1, m2}
 
 
+async def test_a_waiting_shipper_reads_its_time_once_it_holds_the_lock(
+    backup_cfg: AppConfig, backup_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shipment's `shipped_at` is read from the clock once the shipper holds the shipment lock, at its
+    receipt (final fix B10): shipper B, which waited for A's receipt, ships after A in time as in id order,
+    and neither carries the time it started at. The clock moves on while B waits, and ticks a second at each
+    read."""
+    restic = FakeRestic(backup_cfg)
+    m1 = manifest_file(backup_cfg.manifests_dir)
+    started = utcnow()
+    now = [started]
+
+    def clock() -> datetime:
+        read, now[0] = now[0], now[0] + timedelta(seconds=1)
+        return read
+
+    paused, resume, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    read_items = shipper._latest_items
+    reads = 0
+
+    async def latest_items(engine: AsyncEngine) -> set[tuple[uuid.UUID, bytes]]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:  # shipper A, holding the lock
+            paused.set()
+            await resume.wait()
+        return await read_items(engine)
+
+    class Spy:
+        """The shipper's logger, which also tells the test when a shipper waits for the lock."""
+
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def info(self, event: str, **fields: Any) -> None:
+            if event == "manifest_ship_waiting":
+                waiting.set()
+            self.inner.info(event, **fields)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    monkeypatch.setattr(shipper, "_latest_items", latest_items)
+    monkeypatch.setattr(shipper, "log", Spy(shipper.log))
+    a = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, clock=clock))
+    await asyncio.wait_for(paused.wait(), 10)
+    m2 = manifest_file(backup_cfg.manifests_dir)
+    b = asyncio.create_task(ship_manifests(backup_cfg, restic, backup_engine, clock=clock))
+    await asyncio.wait_for(waiting.wait(), 10)
+    after_wait = started + timedelta(minutes=5)
+    now[0] = after_wait  # A's upload took its time, and B waited for it
+    resume.set()
+    await asyncio.wait_for(asyncio.gather(a, b), 30)
+
+    first, second = await shipments(backup_engine)
+    assert (await items(backup_engine, first.id), await items(backup_engine, second.id)) == ({m1}, {m1, m2})
+    assert after_wait <= first.shipped_at < second.shipped_at
+
+
 async def test_a_restic_failure_writes_no_row(backup_cfg: AppConfig, backup_engine: AsyncEngine) -> None:
     manifest_file(backup_cfg.manifests_dir)
     restic = FakeRestic(backup_cfg, failure=ResticError("backup", "incomplete", 3))
 
     with pytest.raises(ResticError) as failed:
-        await ship_manifests(backup_cfg, restic, backup_engine, now=utcnow())
+        await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
 
     assert failed.value.code == "incomplete"
     assert await shipments(backup_engine) == []
@@ -263,7 +330,7 @@ async def test_the_reconciler_then_marks_the_manifest_shipped(
         await record_manifest(conn, manifest, written, sha)
         await complete_manifest(conn, manifest.id)
 
-    result = await ship_manifests(backup_cfg, FakeRestic(backup_cfg), backup_engine, now=utcnow())
+    result = await ship_manifests(backup_cfg, FakeRestic(backup_cfg), backup_engine, clock=utcnow)
     [shipment] = await shipments(backup_engine)
     assert result.snapshot_id == shipment.restic_snapshot_id
 

@@ -18,11 +18,13 @@ latest shipment, or the stream is empty (no purge yet: restic makes no snapshot 
 shipped. Otherwise it lists every file of the stream, one absolute path per line, in a file of
 `cfg.staging_dir` (removed afterwards), runs one `restic backup --files-from-verbatim <list> --tag
 manifests`, and then, in one transaction as `jobhunter_backup`, inserts a `manifest_shipments` row (the
-snapshot id, `shipped_at` = `now`) with one `manifest_shipment_items` row per file: exactly the files the
-snapshot holds, since a listed file that cannot be read makes restic exit 3 and no row is written then. Every
-run ships every file, so the latest shipment's snapshot is the complete stream, and coverage is exact: a
-manifest whose file did not exist yet has no item. The worker's `manifest_shipping` reconciler then marks
-`shipped` each completed manifest an item names with its file's hash.
+snapshot id, and `shipped_at` read from the clock then, under the lock, so a shipper that waited never
+records the time it started at and shipments agree in time with their order, final fix B10) with one
+`manifest_shipment_items` row per file: exactly the files the snapshot holds, since a listed file that cannot
+be read makes restic exit 3 and no row is written then. Every run ships every file, so the latest shipment's
+snapshot is the complete stream, and coverage is exact: a manifest whose file did not exist yet has no item.
+The worker's `manifest_shipping` reconciler then marks `shipped` each completed manifest an item names with
+its file's hash.
 
 A restic failure raises `ResticError` before any row is written. On exit 3 restic has still saved an
 incomplete snapshot tagged `manifests` (the files it could read): no row names it, and until the next run
@@ -39,7 +41,7 @@ import os
 import stat
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -183,9 +185,11 @@ async def _backup(cfg: AppConfig, restic: Restic, files: Sequence[_StreamFile]) 
         _remove(listing)
 
 
-async def ship_manifests(cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, now: datetime) -> ShipResult:
+async def ship_manifests(
+    cfg: AppConfig, restic: Restic, engine: AsyncEngine, *, clock: Callable[[], datetime]
+) -> ShipResult:
     """Ship the manifest stream unless it is unchanged, under the shipment lock from the listing through the
-    receipt (module docstring)."""
+    receipt (module docstring); the receipt's `shipped_at` is read from `clock` under the lock."""
     async with ship_lock(cfg):
         files = _stream(cfg.manifests_dir)
         current = {(file.manifest_uuid, file.sha256) for file in files}
@@ -195,7 +199,7 @@ async def ship_manifests(cfg: AppConfig, restic: Restic, engine: AsyncEngine, *,
         snapshot_id = await _backup(cfg, restic, files)
         async with engine.begin() as conn:
             shipment = int(
-                (await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": now})).scalar_one()
+                (await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": clock()})).scalar_one()
             )
             await conn.execute(
                 _ITEM,

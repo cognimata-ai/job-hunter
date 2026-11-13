@@ -307,7 +307,7 @@ async def test_each_restore_names_its_subfolder_and_target(
     replayed, the CV file a row names kept, and the one no row names removed."""
     manifest = a_manifest(max_alert=50)
     write_manifest_file(site.manifests, manifest)
-    await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     store = CvStore(site.cv)
     keys = [os.urandom(32) for _ in range(2)]
     named = store.write(b"%PDF-1.7 an invented CV", [keys[0]]).storage_path
@@ -376,7 +376,7 @@ async def test_a_manifest_only_an_older_snapshot_holds_is_restored_and_replayed(
     m1, m2, m3 = a_manifest(max_alert=50), a_manifest(max_alert=51), a_manifest(max_alert=52)
     for manifest in (m1, m2):
         write_manifest_file(site.manifests, manifest)
-    confirmed = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    confirmed = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     if newest == "an_older_list_shipped_late":
         expected = [m1, m2]
         await older_list_shipped_late(repo, site, m1)
@@ -385,7 +385,7 @@ async def test_a_manifest_only_an_older_snapshot_holds_is_restored_and_replayed(
         write_manifest_file(site.manifests, m3)
         repo.unreadable.add(stream_file(site, m2))
         with pytest.raises(ResticError):
-            await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+            await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     newest_snapshot = repo.infos[-1]
     assert newest_snapshot.id != confirmed.snapshot_id and "manifests" in newest_snapshot.tags
     assert str(stream_file(site, m2)) not in newest_snapshot.paths
@@ -422,11 +422,11 @@ async def test_one_file_name_with_other_bytes_in_two_snapshots_stops_the_restore
     is loaded."""
     manifest = a_manifest(max_alert=50)
     write_manifest_file(site.manifests, manifest)
-    first = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    first = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     other: dict[str, Any] = {**manifest, "max_ids": {"alerts": 51}}
     stream_file(site, manifest).write_bytes(canonical_bytes(other))  # type: ignore[arg-type]
-    second = await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    second = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     assert first.snapshot_id is not None and second.snapshot_id is not None
     site.lose()
     loads = len(pg_restored(runner))
@@ -524,7 +524,7 @@ async def test_files_restored_off_their_exact_paths_stop_the_restore(
     """A restore whose files land one level deeper than the step expects (as a restore naming no subfolder
     would) is checked before the restore goes on, and stops it at that step with its code."""
     write_manifest_file(site.manifests, a_manifest(max_alert=50))
-    await ship_manifests(backup_cfg, repo, backup_engine, now=utcnow())
+    await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
     await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
     site.lose()
     subfolder = {"manifests": site.manifests, "set": site.staging / "set", "cv": site.cv}[deeper]

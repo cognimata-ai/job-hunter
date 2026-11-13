@@ -75,7 +75,7 @@ async def _set_job(cfg: AppConfig, restic: Restic, runner: CommandRunner, engine
 
 
 async def _ship_job(cfg: AppConfig, restic: Restic, runner: CommandRunner, engine: AsyncEngine) -> object:
-    return await ship_manifests(cfg, restic, engine, now=utcnow())
+    return await ship_manifests(cfg, restic, engine, clock=utcnow)
 
 
 async def _prune_job(cfg: AppConfig, restic: Restic, runner: CommandRunner, engine: AsyncEngine) -> int:
@@ -98,7 +98,7 @@ SCHEDULED_JOBS: Final[Mapping[JobName, _Job]] = MappingProxyType(
 async def _ship(cfg: AppConfig, restic: Restic) -> Printed:
     engine = _engine(cfg)
     try:
-        result = await ship_manifests(cfg, restic, engine, now=utcnow())
+        result = await ship_manifests(cfg, restic, engine, clock=utcnow)
     finally:
         await engine.dispose()
     return dict(asdict(result))
