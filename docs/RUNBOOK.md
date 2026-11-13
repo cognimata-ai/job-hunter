@@ -557,8 +557,9 @@ $JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT id, status, repo
 
 `manifests_forgotten` counts the `manifests` snapshots it forgot. When it forgot none on purpose,
 `manifests_skipped` says why: `no_receipt` (no shipment has written a receipt yet) or `receipt_not_listed` (it
-removed a false receipt, below); it is `null` otherwise. Either clears by itself: the next shipment writes a
-receipt, and the next prune forgets again.
+removed a false receipt, below); it is `null` otherwise. `no_receipt` stays until the first deletion has
+shipped: a shipment of an empty stream writes no receipt, so a new installation reports it every week until
+then, which is harmless. `receipt_not_listed` clears at the next shipment, and the next prune forgets again.
 
 **A false receipt.** A shipment's receipt (a `manifest_shipments` row) names the snapshot that confirmed its
 manifests offsite. If the prune finds the latest receipt's snapshot missing from the repository (deleted by
@@ -569,6 +570,16 @@ forgets no `manifests` snapshot that week, and lists the removed receipts in its
 `privacy.manifest_unshipped` opens for them. Nothing else is needed: the next shipment (within 5 minutes)
 uploads the whole stream, and the alert resolves. If it does not, the shipment fails: treat it as that alert
 says (section 6). Find out how the snapshot went missing before the next prune.
+
+**After a restore of an older set.** A backup set taken before a prune removed a false receipt still holds
+that receipt, and the receipts below it, which name snapshots earlier prunes forgot on purpose. After a restore
+of that set (section 9), every shipment finds the stream equal to that receipt's items and ships nothing, until
+the next weekly prune finds the receipt's snapshot missing. That prune then removes the stale receipts
+(usually all of them), so expect, up to a week after the restore: `receipts_removed` listing them in its
+report, a `manifest_receipt_removed` line for each in `$JH logs backup`, and one critical
+`privacy.manifest_unshipped` alert, paged, for every deletion they confirmed, each shown not confirmed
+offsite. Nothing is lost: a `manifests` snapshot in the repository holds every manifest throughout. The next
+shipment, within about 5 minutes, uploads the whole stream, and the alerts resolve by themselves.
 
 **A restart of the backup service waits for its job.** `$JH restart backup`, `$JH stop` and an `up` that
 recreates the service let a running job finish: the service has a stop grace of 10 minutes (§19.5). Between
@@ -691,7 +702,9 @@ worker stay stopped until the last step.
    $JH up -d --wait
    ```
 
-5. The health check (section 5). The next nightly set is the new host's first.
+5. The health check (section 5). The next nightly set is the new host's first. If the set restored is older
+   than a false receipt a prune removed, the next weekly prune pages once for every deletion, which resolves
+   by itself within about 5 minutes and loses nothing: section 8, **After a restore of an older set**.
 
 **`restore verify` by hand.** `restore run` runs both verification phases itself. `jobhunter restore verify
 --set <id> --phase restored` alone is for a restore staged by hand, before `migrate`: both `backup_set.json`

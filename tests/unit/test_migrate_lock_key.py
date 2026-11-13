@@ -35,7 +35,8 @@ def test_every_one_key_advisory_lock_has_a_key_of_its_own() -> None:
 
 
 def test_a_shipper_never_takes_the_job_lock_the_prune_holds_around_the_shipment_lock() -> None:
-    """The one pair of these locks a process holds at once: the prune takes the shipment lock (7261007)
+    """The one pair of the backup container's locks a process holds at once (the worker holds 7261001 with
+    7261005 and 7261004, `db.migrate`'s note, final fix E3): the prune takes the shipment lock (7261007)
     inside its backup job lock (7261006) (final fix D1 (a); `tests/integration/test_backup_set.py` watches it
     hold both). `db.migrate` registers that order, and the shipper names no job lock, so a shipper holding
     7261007 never waits for 7261006: no cycle can form."""
