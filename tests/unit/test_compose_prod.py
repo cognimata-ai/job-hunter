@@ -474,6 +474,14 @@ def test_no_image_is_a_floating_tag(tmp_path: Path) -> None:
         assert pt_config()["services"][name]["image"] == lock["python"], name
 
 
+def test_the_backup_service_has_ten_minutes_to_stop() -> None:
+    """Final review I1, M3: on SIGTERM the backup scheduler lets a running job finish (and a restore test drop
+    its scratch database and directory) before it stops, so Docker waits 10 minutes, not its default 10 s,
+    before it kills the service; the scheduler's next start removes what a killed one left."""
+    assert prod_config()["services"]["backup"]["stop_grace_period"] == "10m0s"
+    assert pt_config()["services"]["backup"]["stop_grace_period"] == "10m0s"
+
+
 def test_restore_has_its_profile_and_waits_for_postgres() -> None:
     services = prod_config()["services"]
     restore, backup = services["restore"], services["backup"]

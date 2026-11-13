@@ -258,6 +258,11 @@ services:
     image: "${backup_image:?}"
     hostname: jobhunter-backup
     command: ["jobhunter", "backup", "scheduler"]
+    # On SIGTERM the scheduler lets a running job finish before it stops, and a restore test drops its scratch
+    # database and directory as it ends. Docker's default 10 s would kill most of them first; 10 minutes covers
+    # a set's upload and the end of a restore test at §19.7's scale. A job killed all the same is cleaned up by
+    # the scheduler's next start (`fail_interrupted`), which stays the guarantee (final review I1, M3).
+    stop_grace_period: 10m
     environment:
       <<: *restic-env
       JOBHUNTER_BACKUP_CRON: ${JOBHUNTER_BACKUP_CRON:-}

@@ -26,7 +26,12 @@ fires first after `now`, the table's order breaking a tie.
 **The start** (`fail_interrupted`): one backup container runs one job at a time, so a `backup_sets` or
 `backup_runs` row still `running` when the scheduler starts was left by a container that died; nothing else
 would ever end it (the health page would show it running for good). Each becomes `failed` with `error` =
-`interrupted`, and the set's staging is cleared (restic's cache is kept). The backup service starts with the
+`interrupted`, and the set's staging is cleared (restic's cache is kept). Then what a killed restore test or
+restore left is removed (`restore_test.remove_leftovers`, final review I1): the scratch database
+`jobhunter_restore_test` and the staging directories `restore_test/` and `restore/`, each a full copy of the
+database that no purge reaches; their names are logged. Docker gives the service `stop_grace_period` (10 min,
+`deploy/compose.yaml`) between SIGTERM and its kill, for a running job to end and clean up; this start is
+what removes the copies of one killed all the same. The backup service starts with the
 stack, not after `migrate`, so `wait_for_database` tries that again every `DATABASE_RETRY_S` while the
 database refuses it (not up, not migrated, not granted yet), for up to `DATABASE_WAIT_S`.
 """
@@ -42,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.backup.backup_set import BackupJobFailed, clear_staging
 from jobhunter.backup.cron import cron_refusal, next_tick
+from jobhunter.backup.restore_test import remove_leftovers
 from jobhunter.config import AppConfig
 from jobhunter.db.transitions import transition_where
 from jobhunter.observability.logging import get_logger
@@ -64,10 +70,12 @@ class BackupJob:
 
 @dataclass(frozen=True)
 class Interrupted:
-    """The rows a dead container left `running`, now `failed` (`interrupted`), by id."""
+    """The rows a dead container left `running`, now `failed` (`interrupted`), by id, and the names of what a
+    killed restore test or restore left that the start removed."""
 
     sets: tuple[int, ...]
     runs: tuple[int, ...]
+    removed: tuple[str, ...] = ()
 
 
 def backup_jobs(cfg: AppConfig, names: Sequence[JobName] = JOB_NAMES) -> tuple[BackupJob, ...]:
@@ -180,7 +188,8 @@ async def run_scheduler(
 
 async def fail_interrupted(cfg: AppConfig, engine: AsyncEngine) -> Interrupted:
     """The start's cleanup (module docstring): every `running` set and run `failed` (`interrupted`), in one
-    transaction as the backup role, then the set's staging cleared."""
+    transaction as the backup role, then the set's staging cleared and a killed restore test's or restore's
+    copies of the database removed."""
     async with engine.begin() as conn:
         sets = await transition_where(
             conn, "backup_sets", ["running"], "failed", where="true", params={}, reason=INTERRUPTED
@@ -189,8 +198,11 @@ async def fail_interrupted(cfg: AppConfig, engine: AsyncEngine) -> Interrupted:
             conn, "backup_runs", ["running"], "failed", where="true", params={}, reason=INTERRUPTED
         )
     clear_staging(cfg)
+    removed = await remove_leftovers(cfg)
     interrupted = Interrupted(
-        sets=tuple(sorted(int(row["id"]) for row in sets)), runs=tuple(sorted(int(row["id"]) for row in runs))
+        sets=tuple(sorted(int(row["id"]) for row in sets)),
+        runs=tuple(sorted(int(row["id"]) for row in runs)),
+        removed=removed,
     )
     if interrupted.sets or interrupted.runs:
         log.warning("backup_rows_interrupted", sets=list(interrupted.sets), runs=list(interrupted.runs))

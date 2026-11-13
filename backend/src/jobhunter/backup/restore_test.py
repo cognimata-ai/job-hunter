@@ -20,15 +20,26 @@ backup role, then restores the latest set into a scratch database and directory,
 - `exports`: `restore run`'s step 7b against the scratch database and directory;
 - `verify_replayed` on the scratch stream and directories.
 Then, after a failure too, the scratch database is dropped (as `jobhunter_restore`, `WITH (FORCE)`) and the
-scratch directory removed, and the run becomes `succeeded` with its report (the set and snapshot, the stream,
-both verification reports, the migrate steps and the exports ended: ids, codes and counts only), or `failed`
-with `error` = `<step>:<code>` (the step's `RestoreFailed` code, or an unforeseen error's class) and the
-report so far, and `RestoreTestFailed` is raised. An exception outside every step (the cleanup's included)
-fails the run too, as `unexpected:<error class>`: a run is never left `running` by its own process. A failed
-run raises `backup.restore_test_failed` through the worker's `backup_health` reconciler (Task 7): no alert is
-raised here.
+scratch directory removed (a `finally`, so only while the process lives: what a killed test leaves, the
+scheduler's next start removes with `remove_leftovers`, below), and the run becomes `succeeded` with its
+report (the set and snapshot, the stream, both verification reports, the migrate steps and the exports ended:
+ids, codes and counts only), or `failed` with `error` = `<step>:<code>` (the step's `RestoreFailed` code, or
+an unforeseen error's class) and the report so far, and `RestoreTestFailed` is raised. An exception outside
+every step (the cleanup's included) fails the run too, as `unexpected:<error class>`: a run is never left
+`running` by its own process. A failed run raises `backup.restore_test_failed` through the worker's
+`backup_health` reconciler (Task 7): no alert is raised here.
+
+**`remove_leftovers`** (final review I1), at the backup scheduler's start (`scheduler.fail_interrupted`): a
+restore test killed mid-run (a restart past the backup service's stop grace, an OOM, a host reboot) leaves
+the scratch database, with every row of the set, and `<staging_dir>/restore_test` with its `jobhunter.dump`;
+a killed `restore run` leaves `<staging_dir>/restore` with its own. Each is a full copy of the database that
+no purge reaches, so the start drops `jobhunter_restore_test` when it exists (as `jobhunter_restore`, `WITH
+(FORCE)`) and removes both directories, before any job runs. It is idempotent, and logs what it removed,
+names only (`restore_leftovers_removed`); a drop the server refuses is logged
+(`restore_test_scratch_not_dropped`) and left to the next restore test's start, never stopping the scheduler.
 """
 
+import asyncio
 import shutil
 from collections.abc import Callable
 from datetime import datetime
@@ -42,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from jobhunter.backup.backup_set import SET_STAGING, BackupJobFailed, backup_job_lock
 from jobhunter.backup.restic import Restic
 from jobhunter.backup.restore import (
+    RESTORE_STAGING,
     STREAM_SCRATCH,
     VERIFY_FAILED,
     RestoreFailed,
@@ -195,6 +207,46 @@ async def _steps(
                 raise RestoreFailed("verify_replayed", VERIFY_FAILED)
     finally:
         await scratch.dispose()
+
+
+_SCRATCH_EXISTS: Final = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = %s)"
+
+
+async def _drop_if_exists(cfg: AppConfig) -> bool:
+    """The scratch database dropped, as `jobhunter_restore`, when it exists; whether it existed."""
+    dsn = cfg.dsn("psycopg", db_role="restore", database="postgres")
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+        row = await (await conn.execute(_SCRATCH_EXISTS, (RESTORE_TEST_DB,))).fetchone()
+        if row is None or not row[0]:
+            return False
+        await conn.execute(_drop())
+    return True
+
+
+def _remove_directory(directory: Path) -> bool:
+    """`directory` removed with what it holds; whether it existed."""
+    if not directory.exists():
+        return False
+    shutil.rmtree(directory, ignore_errors=True)
+    return True
+
+
+async def remove_leftovers(cfg: AppConfig) -> tuple[str, ...]:
+    """What a killed restore test or restore left (module docstring), removed; the names removed."""
+    databases: list[str] = []
+    try:
+        if await _drop_if_exists(cfg):
+            databases.append(RESTORE_TEST_DB)
+    except psycopg.Error as exc:
+        log.warning("restore_test_scratch_not_dropped", error_class=type(exc).__name__)
+    staging = [
+        name
+        for name in (RESTORE_TEST_STAGING, RESTORE_STAGING)
+        if await asyncio.to_thread(_remove_directory, cfg.staging_dir / name)
+    ]
+    if databases or staging:
+        log.warning("restore_leftovers_removed", database=databases, staging=staging)
+    return (*databases, *staging)
 
 
 async def _clean_up(cfg: AppConfig) -> None:

@@ -16,6 +16,7 @@ from typing import Final
 import pytest
 import sqlalchemy as sa
 from jobhunter.backup.backup_set import BackupSetFailed
+from jobhunter.backup.restore_test import RESTORE_TEST_DB
 from jobhunter.backup.scheduler import (
     JOB_NAMES,
     BackupJob,
@@ -32,10 +33,11 @@ from jobhunter.config import AppConfig, BackupSettings, StartupCheckFailed, load
 from jobhunter.db.session import make_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from tests.support.backups import backup_run, backup_set
 from tests.support.logs import logged
-from tests.support.pg import PgServer, config_for
+from tests.support.pg import PgServer, config_for, pg_one, pg_rows
 
 ENV: Final = {
     "JOBHUNTER_ENV": "test",
@@ -214,6 +216,51 @@ async def test_rows_left_running_by_a_dead_container_fail_at_start(
     }
     assert sorted(path.name for path in staging.iterdir()) == [".restic-cache"]  # the set's staging cleared
     assert (cache / "index").read_bytes() == b"restic's cache"  # the cache kept
+
+
+_SCRATCH_DB: Final = f"SELECT count(*) FROM pg_database WHERE datname = '{RESTORE_TEST_DB}'"  # noqa: S608
+
+
+async def test_an_interrupted_restore_tests_leftovers_are_removed_at_the_next_start(
+    migrated: PgServer, clean_db: None, engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Final review I1: a restore test killed mid-run (a restart past the stop grace, an OOM) leaves the
+    scratch database `jobhunter_restore_test`, with every row, and `<staging>/restore_test` with its
+    `jobhunter.dump`; a killed `restore run` leaves `<staging>/restore` with its own. The next start drops the
+    database and removes both directories, logging their names only; restic's cache stays, and a second start
+    finds and logs nothing."""
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    cfg = config_for(migrated, "backup", JOBHUNTER_STAGING_DIR=str(staging))
+    pg_rows(
+        migrated, "restore", f"CREATE DATABASE {RESTORE_TEST_DB} TEMPLATE jobhunter_template", db="postgres"
+    )
+    pg_rows(migrated, "restore", "CREATE TABLE copied (x int)", db=RESTORE_TEST_DB)
+    for leftover in ("restore_test/set", "restore"):
+        (staging / leftover).mkdir(mode=0o700, parents=True)
+        (staging / leftover / "jobhunter.dump").write_bytes(b"a full copy of the database")
+    (staging / "restore_test" / "manifests").mkdir(mode=0o700)
+    cache = staging / ".restic-cache"
+    cache.mkdir(mode=0o700)
+    (cache / "index").write_bytes(b"restic's cache")
+    run = await backup_run(engine, "running")
+
+    backup_engine = make_engine(cfg, pool_size=1)
+    try:
+        with capture_logs() as events:
+            interrupted = await fail_interrupted(cfg, backup_engine)
+            again = await fail_interrupted(cfg, backup_engine)
+    finally:
+        await backup_engine.dispose()
+
+    assert interrupted.runs == (run,) and again == Interrupted(sets=(), runs=())
+    assert pg_one(migrated, "superuser", _SCRATCH_DB, db="postgres") == (0,)
+    assert sorted(path.name for path in staging.iterdir()) == [".restic-cache"]
+    assert (cache / "index").read_bytes() == b"restic's cache"
+    removed = [e for e in events if e["event"] == "restore_leftovers_removed"]
+    assert [(e["database"], e["staging"]) for e in removed] == [
+        (["jobhunter_restore_test"], ["restore_test", "restore"])
+    ]
 
 
 async def test_the_start_waits_for_the_database() -> None:
