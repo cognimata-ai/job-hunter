@@ -25,6 +25,7 @@ from typing import Any, Final
 
 import pytest
 
+from tests.support.manifest_file import WRITE_MANIFEST, written_manifest
 from tests.support.prodstack import PT, logs_tail, other_stack_up, prod_session, psql, run, s3_down
 
 pytestmark = pytest.mark.stack
@@ -38,21 +39,6 @@ from jobhunter.backup.runner import SubprocessRunner
 from jobhunter.config import load_config
 infos = asyncio.run(Restic(load_config("backup"), SubprocessRunner()).snapshots(tags=sys.argv[1:]))
 print(json.dumps([{"id": i.id, "tags": list(i.tags), "paths": list(i.paths)} for i in infos]))
-"""
-# A deletion manifest's file written by the worker as a purge writes it (`write_manifest_file`); its uuid.
-WRITE_MANIFEST: Final = """
-import json, uuid
-from jobhunter.config import load_config
-from jobhunter.privacy.manifests import write_manifest_file
-manifest_uuid = str(uuid.uuid4())
-stamp = "2026-11-10T08:00:00+00:00"
-content = {
-    "format": 1, "manifest_uuid": manifest_uuid, "kind": "job_tombstone", "admitted_at": stamp,
-    "fenced_at": stamp, "max_ids": {"jobs": 1},
-    "operations": [{"op": "row_delete", "table": "jobs", "ids": [1], "bound": {"by": "id"}}],
-}
-write_manifest_file(load_config("worker").manifests_dir, content)
-print(json.dumps({"manifest_uuid": manifest_uuid}))
 """
 
 
@@ -77,9 +63,11 @@ def snapshots(*tags: str) -> list[dict[str, Any]]:
 
 
 def new_manifest() -> str:
-    """A manifest's file in the `manifests` volume, written by the worker; its uuid."""
-    written = last_json(run([*PT, "exec", "-T", "worker", "python", "-I", "-c", WRITE_MANIFEST]).stdout)
-    return str(written["manifest_uuid"])
+    """A manifest's file in the `manifests` volume, written by the worker as a purge writes it
+    (`tests.support.manifest_file`); its uuid."""
+    writer = run([*PT, "exec", "-T", "worker", "python", "-I", "-c", WRITE_MANIFEST, "worker"])
+    manifest_uuid, _, _ = written_manifest(writer.stdout)
+    return manifest_uuid
 
 
 @pytest.fixture(scope="module")
@@ -126,7 +114,7 @@ def test_the_scheduler_ships_within_90_seconds(initialised: list[Any]) -> None:
     manifest_uuid = new_manifest()
     deadline = time.monotonic() + SHIP_WITHIN_S
     query = (
-        "SELECT s.restic_snapshot_id FROM manifest_shipment_items i "  # noqa: S608 - a uuid4 made here
+        "SELECT s.restic_snapshot_id FROM manifest_shipment_items i "  # noqa: S608 - a uuid in canonical form
         "JOIN manifest_shipments s ON s.id = i.shipment_id "
         f"WHERE i.manifest_uuid = '{manifest_uuid}' ORDER BY s.id LIMIT 1"
     )

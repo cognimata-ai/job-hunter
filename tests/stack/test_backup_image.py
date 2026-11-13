@@ -24,6 +24,8 @@ from typing import Final
 
 import pytest
 
+from tests.support.manifest_file import WRITE_MANIFEST, written_manifest
+
 pytestmark = pytest.mark.stack
 REPO: Final = Path(__file__).resolve().parents[2]
 DEV_PROJECT: Final = "jobhunter-dev"  # `name:` of compose.dev.yaml
@@ -263,45 +265,6 @@ def test_fresh_volumes_mount_10001_0700(images: None, fresh_volumes: list[str]) 
         assert (directory, mounted.stdout.strip()) == (directory, "10001:10001 700")
 
 
-# Writes one manifest file as a purge writes it, on the manifests volume (the migrate service mounts it
-# writable): a `job_tombstone` of job 1, its content computed by the kind's own A2 (`purge.compute_content`
-# over `JobTombstone.compute`, with `max_identity_ids` read on the dev database as the migrator), and written
-# by `write_manifest_file`. The fresh database has no job 1, so the content tombstones nothing (its fence op
-# names no job), and the replay of it by the `migrate` the shipper depends on deletes nothing. Prints it and
-# every file of the stream as {uuid: sha256 hex}.
-WRITE_MANIFEST: Final = """
-import asyncio, hashlib, json
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import NullPool
-from jobhunter.clock import utcnow
-from jobhunter.config import load_config
-from jobhunter.ids import uuid7
-from jobhunter.privacy.kinds.job_tombstone import KIND, REQUEST_KEY, JobTombstone
-from jobhunter.privacy.manifests import ManifestRow, write_manifest_file
-from jobhunter.privacy.purge import compute_content
-
-async def main():
-    cfg = load_config("migrate")
-    now = utcnow()
-    row = ManifestRow(
-        id=1, manifest_uuid=uuid7(), kind=KIND, status="executing", request={REQUEST_KEY: [1]},
-        file_sha256=None, scope=None, created_at=now, completed_at=None, shipped_at=None,
-    )
-    engine = create_async_engine(cfg.dsn("sqlalchemy"), poolclass=NullPool)
-    try:
-        async with engine.connect() as conn:
-            content = await compute_content(conn, JobTombstone(), row, fenced_at=now, now=now)
-    finally:
-        await engine.dispose()
-    sha = write_manifest_file(cfg.manifests_dir, content)
-    files = cfg.manifests_dir.glob("*.json")
-    stream = {p.stem: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
-    print(json.dumps({"written": [content["manifest_uuid"], sha.hex()], "stream": stream}))
-
-asyncio.run(main())
-"""
-
-
 def test_ship_into_a_local_repository(dev_project: set[str]) -> None:
     init = run(*DC, "run", "--rm", "-T", "shipper", "jobhunter", "backup", "init", timeout=600)
     assert last_json(init.stdout) == {"created": True}
@@ -309,11 +272,11 @@ def test_ship_into_a_local_repository(dev_project: set[str]) -> None:
     whoami = run(*DC, "run", "--rm", "-T", "--no-deps", "shipper", "sh", "-c", probe)
     assert whoami.stdout.splitlines() == ["10001", "10001", "10001:10001 700", "10001:10001 700"]
 
-    writer = run(*DC, "run", "--rm", "-T", "--no-deps", "migrate", "python", "-c", WRITE_MANIFEST)
-    written = last_json(writer.stdout)
-    assert isinstance(written, dict)
-    manifest_uuid, sha = written["written"]
-    stream: dict[str, str] = written["stream"]
+    # One manifest file as a purge writes it (`tests.support.manifest_file`), in the one-off `migrate`, which
+    # mounts the manifests volume writable; the replay of it by the `migrate` the shipper depends on deletes
+    # nothing.
+    writer = run(*DC, "run", "--rm", "-T", "--no-deps", "migrate", "python", "-c", WRITE_MANIFEST, "migrate")
+    manifest_uuid, sha, stream = written_manifest(writer.stdout)
     assert stream[manifest_uuid] == sha
     if f"{DEV_PROJECT}_manifests" not in dev_project:
         assert list(stream) == [manifest_uuid]  # a new volume: its one manifest is this test's
