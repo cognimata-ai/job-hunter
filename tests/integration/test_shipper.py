@@ -330,6 +330,44 @@ async def test_a_shipper_whose_lock_session_ended_uploads_nothing(
     assert not list(backup_cfg.staging_dir.iterdir())
 
 
+@pytest.mark.parametrize("stream", ["unchanged", "empty"])
+async def test_a_shipper_whose_lock_session_ended_never_reports_the_stream_shipped(
+    migrated: PgServer,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: str,
+) -> None:
+    """The final re-review's M4-3: the unchanged-stream return confirms the lock too. A session that ended
+    after the listing took the lock with it, and a prune may hold it now and be about to remove the receipt
+    the shipper compares with; so the shipper stops with `ShipLockLost` rather than exit 0 "unchanged" on a
+    receipt that may be gone a moment later. It uploads nothing and writes nothing; the next ship, on a live
+    session, finds the stream unchanged."""
+    restic = FakeRestic(backup_cfg)
+    if stream == "unchanged":
+        manifest_file(backup_cfg.manifests_dir)
+        assert (await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)).shipped
+    listed = shipper._stream
+
+    def end_the_session_after_the_listing(directory: Path) -> list[Any]:
+        files = listed(directory)
+        assert pg_rows(migrated, "superuser", _END_SESSION) == [(True,)]
+        return files
+
+    monkeypatch.setattr(shipper, "_stream", end_the_session_after_the_listing)
+    with pytest.raises(Exception) as stopped:  # the class is checked below
+        await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
+
+    assert type(stopped.value).__name__ == "ShipLockLost"
+    receipts = len(await shipments(backup_engine))
+    assert (len(restic.backups), receipts) == ((1, 1) if stream == "unchanged" else (0, 0))
+    monkeypatch.setattr(shipper, "_stream", listed)
+    files = 1 if stream == "unchanged" else 0
+    assert await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow) == ShipResult(
+        shipped=False, snapshot_id=None, files=files
+    )
+
+
 @pytest.mark.parametrize("meanwhile", ["nothing", "another_shipper_ships"])
 async def test_a_shipper_whose_lock_session_ends_during_its_upload_writes_no_receipt(
     migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, meanwhile: str

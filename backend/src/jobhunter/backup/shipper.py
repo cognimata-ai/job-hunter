@@ -7,7 +7,10 @@
 connection (`HeldShipLock.transaction`, final fix E1). A second shipper (the
 scheduler's while one runs by hand, say) waits for it, polling every `LOCK_POLL_S` with no snapshot held and
 logging `manifest_ship_waiting` once, then lists the stream itself: it never skips, so a `backup ship` that
-exits 0 shipped, or found shipped, every file there when it started. The snapshots are therefore made in the
+exits 0 shipped, or found shipped, every file there when it started. "Found shipped" holds under the lock
+too: before it returns an unchanged (or empty) stream, it confirms that its session still holds the lock
+(`HeldShipLock.confirm`, the final re-review's M4-3), so no prune removed the receipt it compared with
+meanwhile; a session that ended stops it with `ShipLockLost`, as below. The snapshots are therefore made in the
 order of the lists they hold, and an older list never becomes the newest snapshot after a newer list's
 receipt. Shipping takes no backup job lock (`backup_set.BACKUP_JOB_LOCK_KEY`): restic's own repository lock
 orders its upload against a prune's. The prune takes this shipment lock too, inside its job lock, from its
@@ -26,7 +29,8 @@ it holds the lock, so a receipt that commits did so under it; a session that end
 transaction with it, and the shipper stops with `ShipLockLost`, writing nothing. Its snapshot then has no
 receipt, which claims nothing, and the next ship uploads the stream again. The read of the latest receipt's
 items, before the upload, may run on another connection: only a live lock session writes a receipt, so none
-changes while this one lives, and once it has ended this shipper writes none.
+changes while this one lives, and once it has ended this shipper writes none, nor reports the stream
+unchanged (the confirmation above).
 
 `ship_manifests` reads the stream: the regular files of `cfg.manifests_dir` named `<manifest_uuid>.json` with
 the uuid in canonical form (`privacy.manifests.manifest_file_name`), never a `*.tmp` being written (its name
@@ -279,6 +283,7 @@ async def ship_manifests(
         files = _stream(cfg.manifests_dir)
         current = {(file.manifest_uuid, file.sha256) for file in files}
         if not files or current == await _latest_items(engine):
+            await held.confirm()  # the lock still held, so the receipt compared with is still there
             log.info("manifests_unchanged", files=len(files))
             return ShipResult(shipped=False, snapshot_id=None, files=len(files))
         snapshot_id = await _backup(cfg, restic, files, held)
