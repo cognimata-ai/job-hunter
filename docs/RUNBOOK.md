@@ -775,16 +775,20 @@ that PR's head commit, by its release tag (below).
 - GHCR packages start private: the VPS logs in to `ghcr.io` with a read-only token (`read:packages`; section 2).
 - The digest PR is opened with the workflow's `GITHUB_TOKEN`, so it starts no CI: run CI on it by hand, by
   dispatching the workflows that offer it or by pushing a commit to its branch.
-- An attempt that fails after its push leaves its branch `release/<sha>-<run id>-<attempt>`: delete it.
+- An attempt that fails after its push leaves its branch `release/<sha>-<run id>-<attempt>` and its tag: delete
+  both (`git push origin --delete <branch> <tag>`), as for a digest PR closed without merging.
 - The runner's disk for the real embedder build is checked at its first run.
-- Once the digest PR is merged, tag its head commit, not the merge commit: the head's tree is the tree the
-  images were built from plus `deploy/release.lock`, while a merge commit can carry other commits that landed
-  meanwhile (`git tag <release tag> <head commit>`, then `git push origin <release tag>`). The release tag is
-  what the VPS checks out.
+- The workflow tags the digest PR's head commit `release-<YYYYMMDD>-<12 hex digits>`, the run's date in UTC and
+  the start of that commit's hash, and pushes the tag with the PR's branch; the PR's description names it. It
+  tags the head commit, not a merge commit: the head's tree is the tree the images were built from plus
+  `deploy/release.lock`, while a merge commit can carry other commits that landed meanwhile. Every attempt
+  makes a commit and a tag of its own. Merge the PR, then deploy its tag: the release tag is what the VPS
+  checks out.
 
 **An upgrade** (§19.6):
 
-0. Check out the release tag (R24): `git fetch --tags`, then `git checkout <release tag>`, in `/opt/jobhunter`.
+0. Check out the release tag (R24), the `release-<YYYYMMDD>-<12 hex digits>` the merged digest PR names:
+   `git fetch --tags`, then `git checkout <release tag>`, in `/opt/jobhunter`.
 1. `$JH pull`.
 2. A backup set and a shipment just before the change, which a rollback by restore starts from:
    `$JH exec backup jobhunter backup set` (note the `set_id` it prints), then

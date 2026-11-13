@@ -6042,7 +6042,7 @@ E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) aga
 | `e2e` | runs on pull requests to `main` and on demand: the E2E stack (§18.7) + the Playwright suite E1–E20 |
 | `prodstack` (`prodstack.yml`) | runs on pull requests to `main` and on demand: the compose test stack (§18.7) with N1 (no egress from `api` and `docparse`, the worker's reach included), N2 (real client IP through Caddy, spoofed `X-Forwarded-For` ignored), C32, C37, C39, V20, V22 and the upgrade-then-rollback and rotation drills |
 | `audit` | pip-audit, npm audit |
-| Manual workflows | `eval-manual.yml`, `schema-dry-run-manual.yml`, `smoke-free-sources.yml` (weekly live smoke of free sources only, never paid), `release.yml` (dispatched by hand at a release: builds and pushes the app, backup, docparse and embedder images to GHCR, then opens the digest PR that writes `deploy/release.lock`, §19.6) |
+| Manual workflows | `eval-manual.yml`, `schema-dry-run-manual.yml`, `smoke-free-sources.yml` (weekly live smoke of free sources only, never paid), `release.yml` (dispatched by hand at a release: builds and pushes the app, backup, docparse and embedder images to GHCR, then opens the digest PR that writes `deploy/release.lock` and tags its head commit as the release, §19.6) |
 
 **No CI job makes live paid calls.**
 
@@ -6462,7 +6462,7 @@ Whatever the outcome, the restore removes its staging copy of the dump (`/data/s
 
 ### 19.6 Upgrades
 
-- **The release workflow** (`release.yml`, dispatched by hand) builds the app, backup, docparse and embedder images, pushes them to GHCR tagged with the commit, and opens the digest PR, which writes their digests into `deploy/release.lock`; the release tag names that PR's head commit. The embedder image's build downloads the model files of `embedder/model.lock`, so it needs the route to `huggingface.co`; the VPS pulls the release's images and never builds one.
+- **The release workflow** (`release.yml`, dispatched by hand) builds the app, backup, docparse and embedder images, pushes them to GHCR tagged with the commit, and opens the digest PR, which writes their digests into `deploy/release.lock`; it tags that PR's head commit `release-<YYYYMMDD>-<short sha>` (the run's UTC date and the first 12 hex digits of that commit) and pushes the tag with the PR's branch in one atomic push, so each attempt has a tag of its own. That tag, once the PR is merged, is the release. The embedder image's build downloads the model files of `embedder/model.lock`, so it needs the route to `huggingface.co`; the VPS pulls the release's images and never builds one.
 - **Deploy steps**:
   0. check out the release tag;
   1. `docker compose pull`;

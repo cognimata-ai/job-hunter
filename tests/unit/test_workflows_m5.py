@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -85,9 +86,11 @@ MODULES_RUN: Final = (
 DRILLS_RUN: Final = (
     "JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q tests/stack/test_prod_drills.py"
 )
-# A `git` and a `gh` that record their arguments, after their own name, in the same file.
+# A `git` and a `gh` that record their arguments, after their own name, in the same file; `git rev-parse`
+# answers FAKE_HEAD, the commit the step has just made.
 FAKE_RECORDER: Final = """#!/bin/sh
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_DIR/calls"
+if [ "$(basename "$0")" = git ] && [ "$1" = rev-parse ]; then echo "$FAKE_HEAD"; fi
 """
 # A `docker` that records its arguments and answers from FAKE_* variables (the container's state, its health
 # from the FAKE_HEALTHY_AFTER-th `exec` on, `image inspect`'s status), and a `sleep` that returns at once.
@@ -495,30 +498,70 @@ def test_release_is_dispatch_only_and_writes_release_lock(tmp_path: Path) -> Non
     for missing in ("GHCR", *(f"{kind.upper()}_DIGEST" for kind in expected)):
         done = run_script(str(write["run"]), tmp_path, {**env, missing: ""})
         assert done.returncode != 0 and missing in done.stderr, missing
-    # then the digest PR, last, with the job's token, from a branch of this run's own attempt
+    # then the digest PR, last, with the job's token, from a branch of this run's own attempt, its head commit
+    # tagged as the release
     pr_step = later[-1]
     assert later.index(write) == len(later) - 2
     assert pr_step["env"] == {"GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}
-    sha = "a" * 40
-    env = {
-        "GITHUB_SHA": sha,
-        "GITHUB_RUN_ID": "1234",
-        "GITHUB_RUN_ATTEMPT": "2",
-        "GITHUB_REF_NAME": "develop",  # the branch it was run on, whichever it is
-        "GITHUB_SERVER_URL": "https://github.com",
-        "GITHUB_REPOSITORY": "owner/job-hunter",
-    }
+    sha, head = "a" * 40, "b" * 40
     (tmp_path / "calls").unlink(missing_ok=True)
-    assert run_script(str(pr_step["run"]), tmp_path, env).returncode == 0
-    calls = docker_calls(tmp_path)
+    calls, tag = digest_pr(str(pr_step["run"]), tmp_path, sha=sha, head=head, run_id="1234", attempt="2")
     branch = (
         f"release/{sha}-1234-2"  # a re-run (attempt 3) or another dispatch (another run id) never meets it
     )
     assert calls[:2] == [f"git switch --create {branch}", "git add deploy/release.lock"]
     assert calls[2].startswith("git -c user.name=github-actions[bot] ") and " commit --message " in calls[2]
-    assert calls[3:5] == ["gh auth setup-git", f"git push origin {branch}"]  # the token reaches git first
-    assert calls[5].startswith(f"gh pr create --base develop --head {branch} --title ")
-    assert len(calls) == 6 and not any("--force" in call for call in calls)
+    assert calls[3:5] == ["git rev-parse HEAD", f"git tag {tag} {head}"]
+    # the token reaches git first; the branch and its tag go in one atomic push
+    assert calls[5:7] == ["gh auth setup-git", f"git push --atomic origin {branch} refs/tags/{tag}"]
+    assert calls[7].startswith(f"gh pr create --base develop --head {branch} --title ")
+    assert len(calls) == 8 and not any("--force" in call for call in calls)
+
+
+def digest_pr(
+    script: str, tmp_path: Path, *, sha: str, head: str, run_id: str, attempt: str
+) -> tuple[list[str], str]:
+    """The digest PR step of `release.yml` for commit `sha`, whose own commit is `head`: the calls it made and
+    the tag it made; the tag is `release-<the run's UTC date>-<head's first 12 hex digits>`."""
+    env = {
+        "GITHUB_SHA": sha,
+        "GITHUB_RUN_ID": run_id,
+        "GITHUB_RUN_ATTEMPT": attempt,
+        "GITHUB_REF_NAME": "develop",  # the branch it was run on, whichever it is
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "owner/job-hunter",
+        "FAKE_HEAD": head,
+    }
+    days = {datetime.now(UTC).strftime("%Y%m%d")}
+    done = run_script(script, tmp_path, env)
+    days.add(datetime.now(UTC).strftime("%Y%m%d"))
+    assert done.returncode == 0, done.stderr
+    calls = docker_calls(tmp_path)
+    tags = [call.split()[2] for call in calls if call.startswith("git tag ")]
+    assert len(tags) == 1 and tags[0] in {f"release-{day}-{head[:12]}" for day in days}, calls
+    return calls, tags[0]
+
+
+def test_the_digest_prs_head_commit_is_tagged_and_pushed_once_per_attempt(tmp_path: Path) -> None:
+    """M5 follow-ups Task F4 (b): the `pr` job tags the digest PR's head commit, the commit it has just made
+    (its tree: the built tree plus `deploy/release.lock`), `release-<YYYYMMDD>-<12 hex digits of it>`, and
+    pushes the tag with the PR's branch, atomically, with `contents: write` and no other new permission. The
+    PR names the tag. Every attempt makes a commit of its own, so a re-run or another dispatch on the same
+    commit and day makes another tag and never meets an earlier one; nothing is forced."""
+    pr = load(RELEASE)["jobs"]["pr"]
+    assert pr["permissions"] == {"contents": "write", "pull-requests": "write"}
+    script = str(steps_of(pr)[-1]["run"])
+    sha = "c" * 40
+    tags = []
+    for n, (head, attempt) in enumerate((("1" * 40, "1"), ("2" * 40, "2"), ("3" * 12 + "4" * 28, "1"))):
+        (tmp_path / "calls").unlink(missing_ok=True)
+        calls, tag = digest_pr(script, tmp_path, sha=sha, head=head, run_id=str(500 + n), attempt=attempt)
+        push = [call for call in calls if call.startswith("git push")]
+        assert push == [f"git push --atomic origin release/{sha}-{500 + n}-{attempt} refs/tags/{tag}"]
+        [created] = [call for call in calls if call.startswith("gh pr create")]
+        assert tag in created  # the PR names the tag the deploy checks out
+        tags.append(tag)
+    assert len(set(tags)) == 3
 
 
 def test_the_embedder_build_runs_only_on_embedder_changes_or_dispatch(tmp_path: Path) -> None:

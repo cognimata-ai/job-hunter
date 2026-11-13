@@ -8,17 +8,20 @@
 #   `<name>_image=ghcr.io/<owner>/jobhunter-<name>@sha256:<digest>` lines deploy/compose.yaml reads (each digest
 #   required: an empty one fails the step), and opens the digest PR into the branch the workflow was run on,
 #   from a branch of its own attempt, `release/<sha>-<run id>-<run attempt>`, so a re-run or another dispatch on
-#   the same commit never meets an earlier branch. The deploy runs what that PR merges.
+#   the same commit never meets an earlier branch. It tags the PR's head commit, the one it made (the built
+#   tree plus release.lock), `release-<YYYYMMDD>-<its first 12 hex digits>`, the run's UTC date, and pushes
+#   the tag with the branch in one atomic push: each attempt's commit is its own, so its tag is too. The deploy
+#   checks out that tag once the PR is merged (docs/RUNBOOK.md, section 10).
 #
 # Every build takes its base images from the digests of deploy/images.lock, and the optional `build_ca` secret
 # as compose's x-app-build passes it (SSL_CERT_FILE, /dev/null when unset; a hosted runner has none). The PR
-# needs the repository setting that lets GitHub Actions create pull requests; a PR the GITHUB_TOKEN opens
-# starts no workflow of its own. Every value a script uses comes from its environment, never from a `${{ }}`
-# inside the script.
+# needs the repository setting that lets GitHub Actions create pull requests; a PR or tag the GITHUB_TOKEN
+# pushes starts no workflow of its own. Every value a script uses comes from its environment, never from a
+# `${{ }}` inside the script.
 #
 # Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment),
 # the base images to digests. No secret but the GITHUB_TOKEN: the checkouts do not keep it, and the PR step
-# hands it to git through gh for its one push.
+# hands it to git through gh for its one push, of the branch and the tag.
 name: Release
 
 on:
@@ -157,9 +160,13 @@ jobs:
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit --message "chore(release): the image digests of $GITHUB_SHA"
+          head=$(git rev-parse HEAD)
+          tag="release-$(date -u +%Y%m%d)-${head:0:12}"
+          git tag "$tag" "$head"
           gh auth setup-git
-          git push origin "$branch"
+          git push --atomic origin "$branch" "refs/tags/$tag"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="deploy/release.lock: the four images built from $GITHUB_SHA by $run_url."
+          body="$body The release tag is $tag, this PR's head commit: the deploy checks it out once merged."
           gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
-            --title "chore(release): the image digests of ${GITHUB_SHA:0:12}" \
-            --body "deploy/release.lock: the four images built from $GITHUB_SHA by $run_url"
+            --title "chore(release): the image digests of ${GITHUB_SHA:0:12}" --body "$body"
