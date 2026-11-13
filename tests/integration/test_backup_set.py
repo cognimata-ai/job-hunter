@@ -720,6 +720,41 @@ async def test_the_prune_holds_the_shipment_lock_inside_its_job_lock_through_its
     ]
 
 
+async def test_a_prune_whose_shipment_lock_session_ended_forgets_no_manifests_snapshot(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+) -> None:
+    """The prune confirms it still holds the shipment lock just before it forgets or removes anything (final
+    fix D2, as the shipper does before restic starts): a lock session that ended after the listing took the
+    lock with it, and a shipment may have landed since. The run fails `prune:ShipLockLost`, having forgotten
+    no snapshot."""
+    async with backup_engine.begin() as conn:
+        for snapshot in (OLDER_RECEIPTED, RECEIPTED):
+            await conn.execute(_RECEIPT, {"snapshot": snapshot})
+
+    async def the_session_ends(argv: list[str]) -> None:
+        if argv[1] == "snapshots":
+            ended = pg_rows(
+                migrated,
+                "superuser",
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE application_name = 'jobhunter-backup-prune'",
+            )
+            assert ended == [(True,)]
+
+    commands = FakeCommands(migrated, listing=manifests_listing(), during_restic=the_session_ends)
+
+    with pytest.raises(PruneFailed) as failed:
+        await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
+
+    assert [call.argv[1] for call in commands.calls] == ["snapshots"]
+    row = await one(engine, _RUN, id=failed.value.run_id)
+    assert (row.status, row.error) == ("failed", "prune:ShipLockLost")
+
+
 async def test_prune_takes_its_counts_from_the_settings_and_records_a_failure(
     migrated: PgServer,
     clean_db: None,

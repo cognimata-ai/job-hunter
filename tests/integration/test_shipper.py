@@ -38,7 +38,7 @@ from jobhunter.worker.tasks import defer_in_tx, task_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.backups import FakeRestic
-from tests.support.pg import PgServer, config_for
+from tests.support.pg import PgServer, config_for, pg_rows
 
 pytestmark = pytest.mark.integration
 
@@ -298,6 +298,36 @@ async def test_a_waiting_shipper_reads_its_time_once_it_holds_the_lock(
     first, second = await shipments(backup_engine)
     assert (await items(backup_engine, first.id), await items(backup_engine, second.id)) == ({m1}, {m1, m2})
     assert after_wait <= first.shipped_at < second.shipped_at
+
+
+_END_SESSION: Final = (
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'jobhunter-backup-ship'"
+)
+
+
+async def test_a_shipper_whose_lock_session_ended_uploads_nothing(
+    migrated: PgServer, backup_cfg: AppConfig, backup_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Just before restic starts, the shipper confirms on its lock's connection that the session is alive
+    and still holds the shipment lock (final fix D2): a session that ended after the listing (PostgreSQL
+    restarted, the connection cut) took the lock with it, and another shipper may hold it now. It stops with
+    `ShipLockLost`: no upload, no receipt, and its list file removed."""
+    restic = FakeRestic(backup_cfg)
+    manifest_file(backup_cfg.manifests_dir)
+    read_items = shipper._latest_items
+
+    async def latest_items(engine: AsyncEngine) -> set[tuple[uuid.UUID, bytes]]:
+        assert pg_rows(migrated, "superuser", _END_SESSION) == [(True,)]  # after the listing, under the lock
+        return await read_items(engine)
+
+    monkeypatch.setattr(shipper, "_latest_items", latest_items)
+    with pytest.raises(Exception) as stopped:  # the class is checked below
+        await ship_manifests(backup_cfg, restic, backup_engine, clock=utcnow)
+
+    assert type(stopped.value).__name__ == "ShipLockLost"
+    assert restic.backups == []
+    assert await shipments(backup_engine) == []
+    assert not list(backup_cfg.staging_dir.iterdir())
 
 
 async def test_a_restic_failure_writes_no_row(backup_cfg: AppConfig, backup_engine: AsyncEngine) -> None:

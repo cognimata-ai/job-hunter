@@ -21,7 +21,9 @@ lock (7261006), the order `db.migrate` registers (`LOCK_ORDER`; a shipper never 
 it from its receipt read through its listing and its forget of the `manifests` snapshots; it releases it
 before the sets' forget. No shipment lands in between: one would otherwise be receipted after the read and,
 timestamped before the anchor by a clock stepped back, forgotten as older (the final re-review's R2-C1). A
-shipment meanwhile waits for the prune, then ships.
+shipment meanwhile waits for the prune, then ships. Just before it forgets or removes anything, the prune
+confirms it still holds the lock (`shipper.HeldShipLock.confirm`, final fix D2): a lock session that ended
+took the lock with it, so the run fails `prune:ShipLockLost`, with nothing forgotten or removed.
 
 **A false receipt is removed** (final fix D1 (b)). A latest receipt whose snapshot restic does not list
 proves nothing, and the shipper's unchanged-stream check would trust it for ever. So, in the same locked step
@@ -143,7 +145,7 @@ async def _prune_manifests(
 ) -> _ManifestsPruned:
     """Under the shipment lock: forget the `manifests` snapshots strictly older than the latest receipt's, or
     remove the false receipts when restic does not list its snapshot (module docstring)."""
-    async with ship_lock(cfg, holder="prune"):
+    async with ship_lock(cfg, holder="prune") as held:
         async with engine.connect() as conn:
             latest = (await conn.execute(_LATEST_RECEIPT)).first()
         if latest is None:
@@ -152,6 +154,7 @@ async def _prune_manifests(
         snapshots = await restic.snapshots(tags=[MANIFESTS_TAG])
         anchor = next((snapshot for snapshot in snapshots if snapshot.id == latest.restic_snapshot_id), None)
         if anchor is None:
+            await held.confirm()
             removed = await _remove_false_receipts(engine, {snapshot.id for snapshot in snapshots})
             for receipt in removed:
                 log.warning(
@@ -166,6 +169,7 @@ async def _prune_manifests(
             return _ManifestsPruned(0, tuple(receipt.shipment_id for receipt in removed))
         older = [snapshot.id for snapshot in snapshots if snapshot.time < anchor.time]
         if older:
+            await held.confirm()
             await restic.forget_snapshots(older)
         return _ManifestsPruned(len(older), ())
 

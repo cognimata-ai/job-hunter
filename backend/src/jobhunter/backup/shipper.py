@@ -12,7 +12,10 @@ receipt. Shipping takes no backup job lock (`backup_set.BACKUP_JOB_LOCK_KEY`): r
 orders its upload against a prune's. The prune takes this shipment lock too, inside its job lock, from its
 receipt read through its forget of the `manifests` snapshots (`backup.prune`, final fix D1), so a shipment
 never lands between the prune's choice of the latest receipt and its forget; a shipper meanwhile waits for it
-as for another shipper. That is the lock order `db.migrate` registers (`LOCK_ORDER`).
+as for another shipper. That is the lock order `db.migrate` registers (`LOCK_ORDER`). Just before restic
+starts, the shipper confirms on the lock's connection that its session is alive and still holds the lock
+(`HeldShipLock.confirm`, final fix D2): a session that ended (a PostgreSQL restart, a cut connection) took
+the lock with it, and another shipper may hold it now, so it stops with `ShipLockLost`, uploading nothing.
 
 `ship_manifests` reads the stream: the regular files of `cfg.manifests_dir` named `<manifest_uuid>.json` with
 the uuid in canonical form (`privacy.manifests.manifest_file_name`), never a `*.tmp` being written (its name
@@ -64,6 +67,14 @@ MANIFESTS_TAG: Final = "manifests"
 SHIP_LOCK_KEY: Final = 7261007
 LOCK_POLL_S: Final = 0.5
 _SUFFIX: Final = ".json"
+# Whether this session holds the shipment lock: a one-key advisory lock's bigint is `classid` (its high 32
+# bits) and `objid` (its low 32 bits), with `objsubid = 1`.
+_HOLDS_SHIP_LOCK: Final = (
+    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1 "
+    "AND pid = pg_backend_pid() "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+    "AND ((classid::bigint << 32) | objid::bigint) = %s::bigint)"
+)
 _READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 _LATEST_ITEMS: Final = q(
@@ -79,6 +90,31 @@ _ITEM: Final = q(
 )
 
 log = get_logger("jobhunter.backup.shipper")
+
+
+class ShipLockLost(Exception):
+    """The shipment lock's session ended, or no longer holds the lock, before an irreversible step: the step
+    was not taken (no upload, no forget, no receipt removed)."""
+
+
+@dataclass(frozen=True)
+class HeldShipLock:
+    """The shipment lock as `ship_lock` holds it, on its own connection."""
+
+    conn: psycopg.AsyncConnection[Any]
+    holder: str
+
+    async def confirm(self) -> None:
+        """Check, on the lock's connection, that the session is alive and still holds the lock; `ShipLockLost`
+        otherwise (final fix D2). A session that ended took the lock with it, and another may hold it now."""
+        try:
+            row = await (await self.conn.execute(_HOLDS_SHIP_LOCK, (SHIP_LOCK_KEY,))).fetchone()
+        except psycopg.OperationalError as exc:
+            log.warning("ship_lock_lost", lock_key=SHIP_LOCK_KEY, holder=self.holder)
+            raise ShipLockLost from exc
+        if row is None or not row[0]:
+            log.warning("ship_lock_lost", lock_key=SHIP_LOCK_KEY, holder=self.holder)
+            raise ShipLockLost
 
 
 @dataclass(frozen=True)
@@ -132,10 +168,11 @@ async def _try_ship_lock(conn: psycopg.AsyncConnection[Any]) -> bool:
 
 
 @asynccontextmanager
-async def ship_lock(cfg: AppConfig, *, holder: str = "ship") -> AsyncIterator[None]:
+async def ship_lock(cfg: AppConfig, *, holder: str = "ship") -> AsyncIterator[HeldShipLock]:
     """`SHIP_LOCK_KEY` held for the block, on a dedicated autocommit connection as `jobhunter_backup`
     (`jobhunter-backup-<holder>`: a shipper, or the prune); while another holds it, waited for (module
-    docstring). Released and closed on every path; closing the connection would drop it too."""
+    docstring). The block confirms it still holds it before each irreversible step (`HeldShipLock.confirm`).
+    Released and closed on every path; closing the connection would drop it too."""
     conn = await psycopg.AsyncConnection.connect(
         cfg.dsn("psycopg", db_role="backup"), autocommit=True, application_name=f"jobhunter-backup-{holder}"
     )
@@ -147,7 +184,7 @@ async def ship_lock(cfg: AppConfig, *, holder: str = "ship") -> AsyncIterator[No
                 waiting = True
             await asyncio.sleep(LOCK_POLL_S)
         try:
-            yield
+            yield HeldShipLock(conn, holder)
         finally:
             # A lost connection took the lock with it; do not let that hide the error that ended the shipment.
             with suppress(psycopg.OperationalError):
@@ -179,10 +216,12 @@ def _remove(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-async def _backup(cfg: AppConfig, restic: Restic, files: Sequence[_StreamFile]) -> str:
-    """One `manifests` snapshot of exactly `files`, through a list file in the staging directory."""
+async def _backup(cfg: AppConfig, restic: Restic, files: Sequence[_StreamFile], held: HeldShipLock) -> str:
+    """One `manifests` snapshot of exactly `files`, through a list file in the staging directory, once the
+    shipment lock is confirmed held just before restic starts."""
     listing = _write_list(cfg.staging_dir, files)
     try:
+        await held.confirm()
         return await restic.backup(files_from=listing, tags=[MANIFESTS_TAG])
     finally:
         _remove(listing)
@@ -193,13 +232,13 @@ async def ship_manifests(
 ) -> ShipResult:
     """Ship the manifest stream unless it is unchanged, under the shipment lock from the listing through the
     receipt (module docstring); the receipt's `shipped_at` is read from `clock` under the lock."""
-    async with ship_lock(cfg):
+    async with ship_lock(cfg) as held:
         files = _stream(cfg.manifests_dir)
         current = {(file.manifest_uuid, file.sha256) for file in files}
         if not files or current == await _latest_items(engine):
             log.info("manifests_unchanged", files=len(files))
             return ShipResult(shipped=False, snapshot_id=None, files=len(files))
-        snapshot_id = await _backup(cfg, restic, files)
+        snapshot_id = await _backup(cfg, restic, files, held)
         async with engine.begin() as conn:
             shipment = int(
                 (await conn.execute(_SHIPMENT, {"snapshot": snapshot_id, "now": clock()})).scalar_one()
