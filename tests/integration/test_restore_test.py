@@ -387,3 +387,59 @@ async def test_an_error_outside_a_step_still_fails_the_run(
     }
     assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)
     assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("steps", ["a_step_fails", "every_step_passes"])
+async def test_a_cleanup_error_is_reported_beside_the_steps_outcome_never_in_its_place(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    steps: str,
+) -> None:
+    """T26-5 (2): the cleanup's drop of the scratch database fails, with an error that is no database error.
+    It is logged (`restore_test_scratch_not_dropped`, its class) and recorded in the report beside the
+    outcome (`cleanup_error`), never in its place: a run whose load failed is still `failed` with
+    `pg_restore:pg_restore_failed`, and one whose steps all passed still `succeeded`. The scratch directory is
+    removed all the same; the scratch database stays until the next restore test's start drops it."""
+    set_id = await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    admin = restore_test._admin
+    drops: list[int] = []
+
+    async def the_cleanup_breaks(cfg: AppConfig, *statements: Any) -> None:
+        drops.append(len(statements))
+        if len(drops) > 1:  # the scratch step's call (drop, create) is the first; the cleanup's drop next
+            raise RuntimeError("the cleanup broke")
+        await admin(cfg, *statements)
+
+    monkeypatch.setattr(restore_test, "_admin", the_cleanup_breaks)
+    loader = ContainerRunner(migrated, fail="pg_restore") if steps == "a_step_fails" else runner
+
+    with capture_logs() as logs:
+        if steps == "a_step_fails":
+            with pytest.raises(RestoreTestFailed) as failed:
+                await restore_tested(backup_cfg, repo, loader, backup_engine)
+            assert failed.value.error == "pg_restore:pg_restore_failed"
+            run_id = failed.value.run_id
+        else:
+            run_id = await restore_tested(backup_cfg, repo, loader, backup_engine)
+
+    assert drops == [2, 1]
+    row = await one(engine, _RUN, id=run_id)
+    if steps == "a_step_fails":
+        assert (row.status, row.error) == ("failed", "pg_restore:pg_restore_failed")
+        assert [e["step"] for e in events(logs, "restore_test_failed")] == ["pg_restore"]
+    else:
+        assert (row.status, row.error) == ("succeeded", None)
+        assert row.report["replayed"] == {"ok": True, "failures": []}
+    assert (row.backup_set_id, row.report["cleanup_error"]) == (set_id, "RuntimeError")
+    [not_dropped] = events(logs, "restore_test_scratch_not_dropped")
+    assert not_dropped["error_class"] == "RuntimeError"
+    assert "the cleanup broke" not in str(logs)
+    assert sorted(path.name for path in backup_cfg.staging_dir.iterdir()) == []
+    assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (1,)
+    assert await restore_test.remove_leftovers(backup_cfg, restore_staging=False) == (RESTORE_TEST_DB,)
+    assert pg_one(migrated, "superuser", _SCRATCH_EXISTS, db="postgres") == (0,)

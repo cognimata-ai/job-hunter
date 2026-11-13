@@ -584,7 +584,10 @@ A restore test started by hand restores the latest set into a scratch database a
 and removes both when it ends. If that process is killed hard (an OOM, a `kill -9`), nothing removes that full
 copy of the database until another restore test or a restart of the backup service: so run
 `$JH exec backup jobhunter backup restore-test` again, or `$JH restart backup`. Every restore test, the monthly
-one included, first removes what an earlier one left.
+one included, first removes what an earlier one left. A restore test that could not drop its scratch database
+says so in its run's report, `cleanup_error` (the error's class), beside its outcome, which stays its steps'
+(a failed step keeps its code): the same applies, and `$JH logs backup` names it
+(`restore_test_scratch_not_dropped`).
 
 **The prune's report.** A prune records what it did in its run's report, read with:
 

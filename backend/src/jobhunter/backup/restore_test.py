@@ -25,9 +25,16 @@ scheduler's next start removes with `remove_leftovers`, below), and the run beco
 report (the set and snapshot, the stream, both verification reports, the migrate steps and the exports ended:
 ids, codes and counts only), or `failed` with `error` = `<step>:<code>` (the step's `RestoreFailed` code, or
 an unforeseen error's class) and the report so far, and `RestoreTestFailed` is raised. An exception outside
-every step (the cleanup's included) fails the run too, as `unexpected:<error class>`: a run is never left
-`running` by its own process. A failed run raises `backup.restore_test_failed` through the worker's
-`backup_health` reconciler (Task 7): no alert is raised here.
+every step fails the run too, as `unexpected:<error class>`: a run is never left `running` by its own
+process. A failed run raises `backup.restore_test_failed` through the worker's `backup_health` reconciler
+(Task 7): no alert is raised here.
+
+**A cleanup that fails** (T26-5 (2)): a drop of the scratch database that raises, a refusal of the server's
+or any other error, is logged (`restore_test_scratch_not_dropped`, its class) and recorded in the report
+beside the outcome, as `cleanup_error` (its class), never in its place: a failed step keeps its
+`<step>:<code>`, and a run whose steps all passed still succeeds. The scratch directory is removed all the
+same, and the next restore test's start, or the scheduler's, drops the scratch database it left
+(`remove_leftovers`).
 
 **`remove_leftovers`** (final review I1), at the backup scheduler's start (`scheduler.fail_interrupted`): a
 restore test killed mid-run (a restart past the backup service's stop grace, an OOM, a host reboot) leaves
@@ -252,14 +259,18 @@ async def remove_leftovers(cfg: AppConfig, *, restore_staging: bool = True) -> t
     return (*databases, *staging)
 
 
-async def _clean_up(cfg: AppConfig) -> None:
-    """The scratch database dropped and the scratch directory removed, after a failure too; a cleanup that
-    fails is logged, and the next restore test's start drops what it left."""
+async def _clean_up(cfg: AppConfig) -> str | None:
+    """The scratch database dropped and the scratch directory removed, after a failure too; the class of the
+    error that kept the database from being dropped, logged, else `None` (module docstring, "A cleanup that
+    fails"). It raises none: the next restore test's start drops what it left."""
+    error: str | None = None
     try:
         await _admin(cfg, _drop())
-    except psycopg.Error as exc:
-        log.warning("restore_test_scratch_not_dropped", error_class=type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 - reported beside the steps' outcome, never in its place (T26-5)
+        error = type(exc).__name__
+        log.warning("restore_test_scratch_not_dropped", error_class=error)
     shutil.rmtree(cfg.staging_dir / RESTORE_TEST_STAGING, ignore_errors=True)
+    return error
 
 
 async def _end(engine: AsyncEngine, run_id: int, report: dict[str, JSONValue], *, error: str | None) -> None:
@@ -292,15 +303,18 @@ async def run_restore_test(
         error: str | None = None
         failed_at: RestoreStep | None = None
         cause: Exception | None = None
+        cleanup_error: str | None = None
         try:
             try:
                 await _steps(cfg, restic, runner, engine, run_id, report, now=clock())
             finally:
-                await _clean_up(cfg)
+                cleanup_error = await _clean_up(cfg)  # raises none: the steps' outcome stands
         except RestoreFailed as failed:
             error, failed_at, cause = f"{failed.step}:{failed.error}", failed.step, failed
         except Exception as exc:  # noqa: BLE001 - outside every step: recorded `unexpected:<class>`, re-raised
             error, cause = f"{UNEXPECTED}:{type(exc).__name__}", exc
+        if cleanup_error is not None:
+            report["cleanup_error"] = cleanup_error  # beside the outcome, never in its place (T26-5 (2))
         await _end(engine, run_id, report, error=error)
         if error is not None:
             log.error("restore_test_failed", run_id=run_id, step=failed_at, error=error)
