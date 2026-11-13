@@ -180,6 +180,8 @@ class FakeRepository(Restic):
         self.infos: list[SnapshotInfo] = []
         self.restores: list[Restored] = []
         self.forgets: list[tuple[str, Any]] = []
+        # Added to the time of every snapshot made from now on: a clock stepped back makes it negative.
+        self.shift = timedelta(0)
         self._made = 0
 
     def stored(self, snapshot: str, path: Path) -> Path:
@@ -209,7 +211,7 @@ class FakeRepository(Restic):
         for file in listed:
             self._inside(stored, file).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file, self._inside(stored, file))
-        time = self._EPOCH + timedelta(minutes=self._made - 1)
+        time = self._EPOCH + timedelta(minutes=self._made - 1) + self.shift
         names = tuple(str(path) for path in [*paths, *listed])
         files = len(listed) + sum(1 for path in paths for found in path.rglob("*") if found.is_file())
         self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names, files))

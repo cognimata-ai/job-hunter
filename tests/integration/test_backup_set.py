@@ -36,7 +36,7 @@ from jobhunter.backup.restore_test import run_restore_test
 from jobhunter.backup.runner import CommandResult
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.db.migrate import BACKUP_GRANT_TABLES
+from jobhunter.db.migrate import BACKUP_DELETE_TABLES, BACKUP_GRANT_TABLES, BACKUP_UNSHIP_COLUMNS
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import pg_error
 from jobhunter.graphs.checkpointer import open_saver
@@ -68,6 +68,12 @@ _PRIVILEGES: Final = (
     "has_table_privilege('jobhunter_backup', c.oid, 'TRUNCATE') "
     "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
     "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname"
+)
+# The columns of `deletion_manifests` the backup role may update.
+_MANIFEST_COLUMNS_UPDATED: Final = (
+    "SELECT attname FROM pg_attribute WHERE attrelid = 'public.deletion_manifests'::regclass AND attnum > 0 "
+    "AND NOT attisdropped AND has_column_privilege('jobhunter_backup', attrelid, attnum, 'UPDATE') "
+    "ORDER BY attname"
 )
 _IDLE_IN_TRANSACTION: Final = (
     "SELECT usename FROM pg_stat_activity WHERE state = 'idle in transaction' AND pid <> pg_backend_pid()"
@@ -121,7 +127,8 @@ def write_dump(path: Path) -> None:
 class FakeCommands:
     """`CommandRunner` for `pg_dump`, `pg_restore` and restic (module docstring). `fail` names the program
     that fails: `pg_dump` and `pg_restore` exit 1, restic exits 3 (a backup) or 11 (a forget). `during_dump`
-    runs while the dump runs, before it reads the snapshot. restic's `snapshots` answers `listing`."""
+    runs while the dump runs, before it reads the snapshot; `during_restic` runs at each restic command, with
+    its argv. restic's `snapshots` answers `listing`."""
 
     def __init__(
         self,
@@ -129,11 +136,13 @@ class FakeCommands:
         *,
         fail: str | None = None,
         during_dump: Callable[[], Awaitable[None]] | None = None,
+        during_restic: Callable[[list[str]], Awaitable[None]] | None = None,
         listing: bytes = b"[]",
     ) -> None:
         self.server = server
         self.fail = fail
         self.during_dump = during_dump
+        self.during_restic = during_restic
         self.listing = listing
         self.calls: list[Call] = []
         self.snapshot_id: str | None = None
@@ -152,6 +161,8 @@ class FakeCommands:
             assert argv[1] == "--list"
             return CommandResult(1 if self.fail == "pg_restore" else 0, b";\n; Archive\n", FAILURE_DETAIL)
         assert program == "restic", argv
+        if self.during_restic is not None:
+            await self.during_restic(list(argv))
         if argv[1] == "forget":
             return CommandResult(11 if self.fail == "restic" else 0, b"", FAILURE_DETAIL)
         if argv[1] == "snapshots":
@@ -217,6 +228,11 @@ async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -
 async def scalar(engine: AsyncEngine, statement: str) -> Any:
     async with engine.connect() as conn:
         return (await conn.execute(sa.text(statement))).scalar_one()
+
+
+async def rows(engine: AsyncEngine, statement: sa.TextClause) -> list[Any]:
+    async with engine.connect() as conn:
+        return list((await conn.execute(statement)).all())
 
 
 async def run_set(cfg: AppConfig, commands: FakeCommands, started: Any = None) -> int:
@@ -415,17 +431,28 @@ async def test_the_backup_role_writes_only_the_backup_tables(
         for table, *privileges in pg_rows(migrated, "superuser", _PRIVILEGES)
         if any(privileges)
     }
-    # INSERT and UPDATE on its own four tables (`migrate`'s explicit grants), and nothing else: never a
-    # DELETE or a TRUNCATE, never an application table.
-    assert written == dict.fromkeys(BACKUP_GRANT_TABLES, (True, True, False, False))
+    # INSERT and UPDATE on its own four tables (`migrate`'s explicit grants), DELETE only on the two receipt
+    # tables (the prune's removal of a false receipt, final fix D1), and nothing else: never a TRUNCATE,
+    # never an application table.
+    assert written == {
+        **dict.fromkeys(BACKUP_GRANT_TABLES, (True, True, False, False)),
+        **dict.fromkeys(BACKUP_DELETE_TABLES, (True, True, True, False)),
+    }
     with pytest.raises(sa.exc.ProgrammingError) as denied:
         async with backup_engine.begin() as conn:
             await conn.execute(sa.text("DELETE FROM backup_sets"))
     assert pg_error(denied.value).sqlstate == "42501"  # insufficient privilege
-    # Ruling T26-1 (a) T24-4 M3: no INSERT and no UPDATE on a table of the application either.
+    # On `deletion_manifests`, the UPDATE of the four columns that return a manifest to `completed`, no other.
+    assert [row[0] for row in pg_rows(migrated, "superuser", _MANIFEST_COLUMNS_UPDATED)] == sorted(
+        BACKUP_UNSHIP_COLUMNS
+    )
+    # Ruling T26-1 (a) T24-4 M3: no INSERT and no UPDATE on a table of the application either, nor of a
+    # manifest's content.
     for statement in (
         "INSERT INTO alerts (code, severity, dedup_key, message) VALUES ('t', 'info', 'backup-role', 'x')",
         "UPDATE settings_versions SET version_no = version_no",
+        "UPDATE deletion_manifests SET scope = scope",
+        "DELETE FROM deletion_manifests",
     ):
         with pytest.raises(sa.exc.ProgrammingError) as refused:
             async with backup_engine.begin() as conn:
@@ -571,35 +598,126 @@ async def test_prune_forgets_the_manifests_snapshots_older_than_the_latest_recei
     assert forget.argv == SET_FORGET
     row = await one(engine, _RUN, id=run_id)
     assert (row.kind, row.status, row.error, row.backup_set_id) == ("prune", "succeeded", None, None)
-    assert row.report == {"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 3, "manifests_forgotten": 2}
+    assert row.report == {
+        "keep_daily": 7,
+        "keep_weekly": 4,
+        "keep_monthly": 3,
+        "manifests_forgotten": 2,
+        "receipts_removed": [],
+    }
     assert row.started_at == started and row.finished_at is not None
 
 
-@pytest.mark.parametrize("receipt", [None, "e5" * 32], ids=["no_receipt", "a_receipt_restic_does_not_list"])
-async def test_prune_without_a_listed_receipt_forgets_no_manifests_snapshot(
+async def test_prune_without_a_receipt_forgets_no_manifests_snapshot(
     migrated: PgServer,
     clean_db: None,
     backup_cfg: AppConfig,
     backup_engine: AsyncEngine,
     engine: AsyncEngine,
-    receipt: str | None,
 ) -> None:
-    """With no receipt, nothing proves a `manifests` snapshot complete, so the prune forgets none (final fix
-    C1), and neither does it when restic does not list the receipted snapshot: it cannot tell which are older.
-    The sets' forget runs as always."""
-    if receipt is not None:
-        async with backup_engine.begin() as conn:
-            await conn.execute(_RECEIPT, {"snapshot": receipt})
+    """With no receipt, nothing proves a `manifests` snapshot complete, so the prune lists none and forgets
+    none (final fix C1). The sets' forget runs as always."""
     commands = FakeCommands(migrated, listing=manifests_listing())
 
     run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
 
-    assert [call.argv[1] for call in commands.calls] == ([] if receipt is None else ["snapshots"]) + [
-        "forget"
-    ]
-    assert commands.calls[-1].argv == SET_FORGET
+    assert [call.argv for call in commands.calls] == [SET_FORGET]
     row = await one(engine, _RUN, id=run_id)
-    assert (row.status, row.report["manifests_forgotten"]) == ("succeeded", 0)
+    assert (row.status, row.report["manifests_forgotten"], row.report["receipts_removed"]) == (
+        "succeeded",
+        0,
+        [],
+    )
+
+
+_ITEM: Final = sa.text(
+    "INSERT INTO manifest_shipment_items (shipment_id, manifest_uuid, file_sha256) "
+    "VALUES (:shipment, gen_random_uuid(), :sha)"
+)
+_RECEIPTS: Final = sa.text("SELECT id, restic_snapshot_id FROM manifest_shipments ORDER BY id")
+_ITEMS: Final = sa.text("SELECT shipment_id, count(*) FROM manifest_shipment_items GROUP BY shipment_id")
+
+
+@pytest.mark.parametrize("listed", [True, False], ids=["down_to_a_listed_receipt", "until_none_remains"])
+async def test_prune_removes_each_receipt_whose_snapshot_restic_does_not_list(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+    listed: bool,
+) -> None:
+    """A receipt whose snapshot restic does not list is false (final fix D1 (b)): in the same step, under
+    the shipment lock, the prune removes it with its items, logging the shipment id, the snapshot id and the
+    item count, then the receipt below it, and so on until restic lists one or none remains. It forgets no
+    `manifests` snapshot in that run and reports the receipts it removed. The sets' forget runs as always."""
+    oldest = RECEIPTED if listed else "e4" * 32
+    snapshots = (oldest, "e5" * 32, "e6" * 32)  # restic lists RECEIPTED, never an `e…` one
+    async with backup_engine.begin() as conn:
+        for count, snapshot in enumerate(snapshots, start=1):
+            await conn.execute(_RECEIPT, {"snapshot": snapshot})
+            shipment = (await conn.execute(sa.text("SELECT max(id) FROM manifest_shipments"))).scalar_one()
+            for _ in range(count):
+                await conn.execute(_ITEM, {"shipment": shipment, "sha": os.urandom(32)})
+    receipts = [row.id for row in await rows(engine, _RECEIPTS)]
+    commands = FakeCommands(migrated, listing=manifests_listing())
+
+    with capture_logs() as logs:
+        run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
+
+    assert [call.argv[1] for call in commands.calls] == ["snapshots", "forget"]
+    assert commands.calls[-1].argv == SET_FORGET
+    removed = receipts[:0:-1] if listed else receipts[::-1]
+    assert [row.id for row in await rows(engine, _RECEIPTS)] == (receipts[:1] if listed else [])
+    assert {row.shipment_id: row.count for row in await rows(engine, _ITEMS)} == (
+        {receipts[0]: 1} if listed else {}
+    )
+    by_id = dict(zip(receipts, zip(snapshots, range(1, 4), strict=True), strict=True))
+    assert [
+        (entry["shipment_id"], entry["snapshot_id"], entry["items"])
+        for entry in logs
+        if entry["event"] == "manifest_receipt_removed"
+    ] == [(shipment, *by_id[shipment]) for shipment in removed]
+    row = await one(engine, _RUN, id=run_id)
+    assert (row.status, row.report["manifests_forgotten"], row.report["receipts_removed"]) == (
+        "succeeded",
+        0,
+        removed,
+    )
+
+
+_ADVISORY_HELD: Final = (
+    "SELECT objid::bigint FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 AND granted "
+    "AND objid IN (7261006, 7261007) ORDER BY objid"
+)
+
+
+async def test_the_prune_holds_the_shipment_lock_inside_its_job_lock_through_its_forget(
+    migrated: PgServer,
+    clean_db: None,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+) -> None:
+    """The prune takes the shipment lock (7261007) after its job lock (7261006) and holds it from its receipt
+    read through the listing and the forget of the `manifests` snapshots (final fix D1 (a)), so no shipment
+    lands between them; it releases it before the sets' forget, whose prune can take long."""
+    async with backup_engine.begin() as conn:
+        for snapshot in (OLDER_RECEIPTED, RECEIPTED):
+            await conn.execute(_RECEIPT, {"snapshot": snapshot})
+    held: list[tuple[str, list[object]]] = []
+
+    async def locks_held(argv: list[str]) -> None:
+        held.append((argv[1], [row[0] for row in pg_rows(migrated, "superuser", _ADVISORY_HELD)]))
+
+    commands = FakeCommands(migrated, listing=manifests_listing(), during_restic=locks_held)
+
+    await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
+
+    assert held == [
+        ("snapshots", [7261006, 7261007]),
+        ("forget", [7261006, 7261007]),  # the `manifests` snapshots, by id
+        ("forget", [7261006]),  # the sets
+    ]
 
 
 async def test_prune_takes_its_counts_from_the_settings_and_records_a_failure(

@@ -403,7 +403,7 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 | `notify.delivery_failed` | warn | auto | ntfy failed 3 deliveries; this alert shows in the app only. `$JH run --rm --no-deps worker jobhunter ops notify-test` prints the error code; check the server, `NTFY_TOPIC_URL` and `ntfy_token` (section 7). A delivery resolves it. |
 | `eval.gate_failed` | warn | manual | A candidate failed the golden-set gate (**The golden eval run on the installation before an activation**). Never override it without reading which gate failed; then resolve it. |
 | `privacy.purge_failed` | critical | auto | Fenced work stays blocked until the purge completes. Read the operation's error, fix the cause, then System → Needs attention → Failed purges → **[Retry]** (`POST /api/system/purges/{id}/retry`). |
-| `privacy.manifest_unshipped` | critical | auto | Check the backup container (`$JH ps backup`, `$JH logs backup`) and the S3 keys, then ship by hand: `$JH exec backup jobhunter backup ship`. The deletion is reported done only once shipped. |
+| `privacy.manifest_unshipped` | critical | auto | Check the backup container (`$JH ps backup`, `$JH logs backup`) and the S3 keys, then ship by hand: `$JH exec backup jobhunter backup ship`. The deletion is reported done only once shipped. It also opens after a prune removed a false receipt (`manifest_receipt_removed` in `$JH logs backup`, section 8): the manifests that receipt shipped are not offsite, the next shipment uploads the whole stream, and the alert resolves once they are marked shipped again. |
 | `llm.unexpected_stop_reason` | warn | manual | A call ended with a stop reason the gateway does not expect, and failed. Report it if it repeats; then resolve it. |
 | `profile.extract_generation_mismatch` | warn | manual | A profile extraction met its draft in another generation; the draft stays `extracting_profile` and holds the one open-draft slot. Fail it by hand (below the table), then resolve the alert. |
 | `dedup.ambiguous_grouping` | info | auto | A job could join more than one duplicate group, and joined the best. Information. |
@@ -530,10 +530,12 @@ the prune on Sundays at 02:30 (`JOBHUNTER_BACKUP_PRUNE_CRON`), which keeps 7 dai
 sets, and forgets the `manifests` snapshots older than the latest one a shipment confirmed (that one holds
 every manifest shipped up to it, and newer ones are kept, so no manifest is lost, §19.5); the restore test on
 the first Sunday of the month at 03:30 (`JOBHUNTER_RESTORE_TEST_CRON`). One backup job runs at a time:
-another prints `{"error": "backup_job_busy"}` and changes nothing. A shipment holds a lock of its own instead (§19.5's shipment lock): one by hand while
-the scheduler's runs waits for it, then ships what is left, so it never prints `backup_job_busy`. A restore
-reads every `manifests` snapshot, never only the newest (section 9). System → Health shows the latest set,
-shipment and restore test, with their ages. By hand, each printing one JSON line:
+another prints `{"error": "backup_job_busy"}` and changes nothing. A shipment holds a lock of its own instead
+(§19.5's shipment lock): one by hand while the scheduler's runs waits for it, then ships what is left, so it
+never prints `backup_job_busy`. The prune holds the shipment lock too while it chooses and forgets `manifests`
+snapshots, so a ship started then waits for it as well. A restore reads every `manifests` snapshot, never only
+the newest (section 9). System → Health shows the latest set, shipment and restore test, with their ages. By
+hand, each printing one JSON line:
 
 ```
 $JH exec backup jobhunter backup set
@@ -546,6 +548,16 @@ and removes both when it ends. If that process is killed hard (an OOM, a `kill -
 copy of the database until another restore test or a restart of the backup service: so run
 `$JH exec backup jobhunter backup restore-test` again, or `$JH restart backup`. Every restore test, the monthly
 one included, first removes what an earlier one left.
+
+**A false receipt.** A shipment's receipt (a `manifest_shipments` row) names the snapshot that confirmed its
+manifests offsite. If the prune finds the latest receipt's snapshot missing from the repository (deleted by
+hand, or lost), that receipt confirms nothing: the prune removes it, and every receipt below it whose snapshot
+is missing too, logs `manifest_receipt_removed` with each one's shipment id, snapshot id and item count,
+forgets no `manifests` snapshot that week, and lists the removed receipts in its run's report
+(`receipts_removed`). The deletions those receipts confirmed are no longer shown confirmed offsite, and
+`privacy.manifest_unshipped` opens for them. Nothing else is needed: the next shipment (within 5 minutes)
+uploads the whole stream, and the alert resolves. If it does not, the shipment fails: treat it as that alert
+says (section 6). Find out how the snapshot went missing before the next prune.
 
 **A restart of the backup service waits for its job.** `$JH restart backup`, `$JH stop` and an `up` that
 recreates the service let a running job finish: the service has a stop grace of 10 minutes (§19.5). Between

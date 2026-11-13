@@ -9,7 +9,10 @@ logging `manifest_ship_waiting` once, then lists the stream itself: it never ski
 exits 0 shipped, or found shipped, every file there when it started. The snapshots are therefore made in the
 order of the lists they hold, and an older list never becomes the newest snapshot after a newer list's
 receipt. Shipping takes no backup job lock (`backup_set.BACKUP_JOB_LOCK_KEY`): restic's own repository lock
-orders it against a prune.
+orders its upload against a prune's. The prune takes this shipment lock too, inside its job lock, from its
+receipt read through its forget of the `manifests` snapshots (`backup.prune`, final fix D1), so a shipment
+never lands between the prune's choice of the latest receipt and its forget; a shipper meanwhile waits for it
+as for another shipper. That is the lock order `db.migrate` registers (`LOCK_ORDER`).
 
 `ship_manifests` reads the stream: the regular files of `cfg.manifests_dir` named `<manifest_uuid>.json` with
 the uuid in canonical form (`privacy.manifests.manifest_file_name`), never a `*.tmp` being written (its name
@@ -129,18 +132,18 @@ async def _try_ship_lock(conn: psycopg.AsyncConnection[Any]) -> bool:
 
 
 @asynccontextmanager
-async def ship_lock(cfg: AppConfig) -> AsyncIterator[None]:
-    """`SHIP_LOCK_KEY` held for the block, on a dedicated autocommit connection as `jobhunter_backup`; while
-    another shipper holds it, waited for (module docstring). Released and closed on every path; closing the
-    connection would drop it too."""
+async def ship_lock(cfg: AppConfig, *, holder: str = "ship") -> AsyncIterator[None]:
+    """`SHIP_LOCK_KEY` held for the block, on a dedicated autocommit connection as `jobhunter_backup`
+    (`jobhunter-backup-<holder>`: a shipper, or the prune); while another holds it, waited for (module
+    docstring). Released and closed on every path; closing the connection would drop it too."""
     conn = await psycopg.AsyncConnection.connect(
-        cfg.dsn("psycopg", db_role="backup"), autocommit=True, application_name="jobhunter-backup-ship"
+        cfg.dsn("psycopg", db_role="backup"), autocommit=True, application_name=f"jobhunter-backup-{holder}"
     )
     try:
         waiting = False
         while not await _try_ship_lock(conn):  # polls the database, so there is no event to wait for
             if not waiting:
-                log.info("manifest_ship_waiting", lock_key=SHIP_LOCK_KEY)
+                log.info("manifest_ship_waiting", lock_key=SHIP_LOCK_KEY, holder=holder)
                 waiting = True
             await asyncio.sleep(LOCK_POLL_S)
         try:

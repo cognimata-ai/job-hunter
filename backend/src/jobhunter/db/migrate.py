@@ -92,6 +92,10 @@ STEP_GROUPS: Final[Mapping[StepGroup, tuple[MigrateStep, ...]]] = MappingProxyTy
 )
 # Tables of later milestones that the backup role writes (the backup role has no default privileges).
 BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")
+# What the prune's removal of a false receipt needs besides (final fix D1 (b), `backup.prune`): DELETE on the
+# receipt tables, and UPDATE of exactly the columns that return a shipped manifest to `completed`.
+BACKUP_DELETE_TABLES: Final = ("manifest_shipments", "manifest_shipment_items")
+BACKUP_UNSHIP_COLUMNS: Final = ("status", "completed_at", "shipped_at", "shipment_id")
 # Session-level advisory lock that serialises `migrate` runs. The project's advisory keys: a session lock and
 # a transaction lock on the same key conflict, so each use has a key of its own. PostgreSQL keeps the one-key
 # form (one bigint; `objsubid = 1` in `pg_locks`) and the two-key form (two integers; `objsubid = 2`) apart,
@@ -106,8 +110,13 @@ BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments"
 #            between two pings (final review M1)
 #   7261006  backup jobs: a set, a prune or a restore test at a time (one key, session lock;
 #            `backup.backup_set.BACKUP_JOB_LOCK_KEY`, M5 Task 26)
-#   7261007  manifest shipment: one shipper from its listing through its receipt (one key, session lock;
-#            `backup.shipper.SHIP_LOCK_KEY`, final review C1)
+#   7261007  manifest shipment: one shipper from its listing through its receipt, and the prune from its
+#            receipt read through its forget of the `manifests` snapshots (one key, session lock;
+#            `backup.shipper.SHIP_LOCK_KEY`, final review C1, final fix D1)
+# The lock order: a process holds two of these at once only as `LOCK_ORDER` lists them, the outer one first.
+# The prune takes 7261007 while it holds 7261006; a shipper takes 7261007 and never 7261006, so no shipper
+# holding 7261007 waits for 7261006, and no cycle can form.
+LOCK_ORDER: Final = ((7261006, 7261007),)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 
@@ -117,21 +126,34 @@ class SchemaAheadIncompatible(Exception):
     `ahead_incompatible`); `migrate` refuses it before any step, and the RUNBOOK rolls back by restore."""
 
 
-async def apply_explicit_grants(conn: AsyncConnection) -> list[str]:
-    """Grant `INSERT, UPDATE` to the backup role on each table of `BACKUP_GRANT_TABLES` that exists.
+async def _exists(conn: AsyncConnection, table: str) -> bool:
+    return bool(
+        (
+            await conn.execute(q("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{table}"})
+        ).scalar_one()
+    )
 
-    Idempotent. Returns the tables it granted on, in the order of `BACKUP_GRANT_TABLES`; a table that does
+
+async def apply_explicit_grants(conn: AsyncConnection) -> list[str]:
+    """Grant `INSERT, UPDATE` to the backup role on each table of `BACKUP_GRANT_TABLES` that exists; and, for
+    the prune's removal of a false receipt, `DELETE` on each of `BACKUP_DELETE_TABLES` and `UPDATE` of
+    `BACKUP_UNSHIP_COLUMNS` on `deletion_manifests`.
+
+    Idempotent. Returns the tables of `BACKUP_GRANT_TABLES` it granted on, in that order; a table that does
     not exist yet (the M0 schema has none of them) is skipped, and a later `migrate` grants on it.
     """
     quote = conn.dialect.identifier_preparer.quote
     granted: list[str] = []
     for table in BACKUP_GRANT_TABLES:
-        exists = (
-            await conn.execute(q("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{table}"})
-        ).scalar_one()
-        if exists:
+        if await _exists(conn, table):
             await conn.execute(q(f"GRANT INSERT, UPDATE ON public.{quote(table)} TO jobhunter_backup"))
             granted.append(table)
+    for table in BACKUP_DELETE_TABLES:
+        if await _exists(conn, table):
+            await conn.execute(q(f"GRANT DELETE ON public.{quote(table)} TO jobhunter_backup"))
+    if await _exists(conn, "deletion_manifests"):
+        columns = ", ".join(quote(column) for column in BACKUP_UNSHIP_COLUMNS)
+        await conn.execute(q(f"GRANT UPDATE ({columns}) ON public.deletion_manifests TO jobhunter_backup"))
     return granted
 
 

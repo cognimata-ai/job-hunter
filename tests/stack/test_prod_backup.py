@@ -154,7 +154,7 @@ def test_prune_runs(initialised: list[Any]) -> None:
     kind, status, report = row.strip().split("|")
     assert (kind, status) == ("prune", "succeeded"), row
     keeps = {"keep_daily": 1, "keep_weekly": 1, "keep_monthly": 1}
-    assert json.loads(report) == {**keeps, "manifests_forgotten": len(older)}
+    assert json.loads(report) == {**keeps, "manifests_forgotten": len(older), "receipts_removed": []}
     # One of each period kept: the newest set; every older one forgotten.
     assert [snapshot["id"] for snapshot in snapshots("set")] == [sets[-1]["id"]]
     # The latest receipt's `manifests` snapshot and every newer one kept, every older one forgotten by id, and

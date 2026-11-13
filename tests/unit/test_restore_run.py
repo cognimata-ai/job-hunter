@@ -19,15 +19,17 @@ import shutil
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
 from jobhunter import cli, cli_backup, crypto
+from jobhunter.backup import shipper
 from jobhunter.backup.backup_set import run_backup_set
 from jobhunter.backup.prune import run_prune
-from jobhunter.backup.restic import ResticError
+from jobhunter.backup.restic import ResticError, SnapshotInfo
 from jobhunter.backup.restore import (
     ManifestStreamConflict,
     RestoreFailed,
@@ -37,18 +39,27 @@ from jobhunter.backup.restore import (
     restore_set,
     run_restore,
 )
-from jobhunter.backup.shipper import ship_manifests
+from jobhunter.backup.shipper import ShipResult, ship_manifests
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_null_engine
+from jobhunter.observability.alerts import open_subjects
 from jobhunter.privacy.manifests import (
     ManifestContent,
+    ManifestRow,
     canonical_bytes,
+    complete_manifest,
+    insert_manifest,
     manifest_file_name,
+    read_manifest,
+    record_manifest,
     write_manifest_file,
 )
+from jobhunter.privacy.reconcilers import MANIFEST_UNSHIPPED_ALERT, UNSHIPPED_AFTER, manifest_shipping
 from jobhunter.profile.storage import CvStore
+from jobhunter.worker.reconcilers import ReconcileContext
+from jobhunter.worker.tasks import defer_in_tx, task_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -156,6 +167,11 @@ async def scalar(engine: AsyncEngine, statement: sa.TextClause, **params: object
 async def one(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> Any:
     async with engine.connect() as conn:
         return (await conn.execute(statement, params)).one()
+
+
+async def scalars(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> list[Any]:
+    async with engine.connect() as conn:
+        return list((await conn.execute(statement, params)).scalars())
 
 
 def a_manifest(max_alert: int) -> ManifestContent:
@@ -583,6 +599,176 @@ async def test_incomplete_snapshots_after_a_receipt_never_evict_the_receipted_on
     assert [info.id for info in repo.infos if "manifests" in info.tags] == [confirmed.snapshot_id, *partial]
     [restored] = events(logs, "manifest_stream_restored")
     assert (restored["snapshots"], restored["manifests"]) == (11, 3)
+
+
+class ShipWaits:
+    """The shipper's logger, which also tells the test when a shipment waits for the shipment lock."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.waiting = asyncio.Event()
+
+    def info(self, event: str, **fields: Any) -> None:
+        if event == "manifest_ship_waiting":
+            self.waiting.set()
+        self.inner.info(event, **fields)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+async def test_a_shipment_during_a_prune_waits_for_it_and_is_never_forgotten(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final re-review's round-2 sequence (R2-C1), with the real prune and shipper over the fakes. A set
+    predates M2; `{M1}` ships with its receipt (A). The prune reads A's receipt, and just before it lists the
+    `manifests` snapshots, M2 is written and a shipment starts whose snapshot (B) is timestamped before A's:
+    the clock stepped back. The prune holds the shipment lock from its receipt read through its forget, so
+    the shipment waits for it and ships `{M1, M2}` afterwards: B is never forgotten, and a restore of the
+    older set replays M2."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2 = a_manifest(max_alert=50), a_manifest(max_alert=51)
+    write_manifest_file(site.manifests, m1)
+    first = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    spy = ShipWaits(shipper.log)
+    monkeypatch.setattr(shipper, "log", spy)
+    list_snapshots = repo.snapshots
+    shipping: list[asyncio.Task[ShipResult]] = []
+
+    async def listing(*, tags: Sequence[str]) -> list[SnapshotInfo]:
+        if not shipping:  # the prune, after its receipt read: M2 is written and a shipment starts
+            write_manifest_file(site.manifests, m2)
+            repo.shift = -timedelta(hours=1)
+            ship = ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+            shipping.append(asyncio.create_task(ship))
+            waits = asyncio.create_task(spy.waiting.wait())
+            # The shipment either waits on the shipment lock or, unserialised, ships at once.
+            await asyncio.wait((shipping[0], waits), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            waits.cancel()
+        return await list_snapshots(tags=tags)
+
+    monkeypatch.setattr(repo, "snapshots", listing)
+    await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
+    second = await asyncio.wait_for(shipping[0], 30)
+
+    assert first.snapshot_id is not None and second.snapshot_id is not None and second.files == 2
+    kept = [info for info in repo.infos if "manifests" in info.tags]
+    assert [info.id for info in kept] == [first.snapshot_id, second.snapshot_id]
+    assert kept[1].time < kept[0].time  # B is the earlier in time, and still kept
+    assert spy.waiting.is_set()  # the shipment waited for the prune
+    site.lose()
+    await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    for manifest in (m1, m2):
+        assert stream_file(site, manifest).read_bytes() == canonical_bytes(manifest)
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+
+
+async def completed_manifest(engine: AsyncEngine, site: Site, *, max_alert: int) -> ManifestRow:
+    """A golden-case deletion that deletes nothing, as the worker leaves it: its row recorded with its file's
+    hash and `completed`, its file in the site's manifests volume."""
+    async with engine.begin() as conn:
+        manifest = await insert_manifest(conn, kind="golden_case_delete", request={}, now=utcnow())
+    content = a_manifest(max_alert)
+    content["manifest_uuid"] = str(manifest.manifest_uuid)
+    sha = write_manifest_file(site.manifests, content)
+    async with engine.begin() as conn:
+        await record_manifest(conn, manifest, content, sha)
+        await complete_manifest(conn, manifest.id)
+        row = await read_manifest(conn, manifest.id)
+    assert row is not None
+    return row
+
+
+async def unshipped_alerts(engine: AsyncEngine) -> list[str]:
+    """The subjects of the open `privacy.manifest_unshipped` alerts."""
+    async with engine.connect() as conn:
+        return sorted(await open_subjects(conn, code=MANIFEST_UNSHIPPED_ALERT))
+
+
+async def ship_marks(engine: AsyncEngine, *, now: datetime) -> None:
+    """The worker's `manifest_shipping` reconciler, once, at `now`."""
+    await manifest_shipping(
+        ReconcileContext(engine=engine, queue=task_app(), defer=defer_in_tx, now=now, epoch=1)
+    )
+
+
+_SHIPPED: Final = sa.text(
+    "SELECT status, completed_at, shipped_at, shipment_id FROM deletion_manifests WHERE id = :id"
+)
+_RECEIPTS: Final = sa.text("SELECT id FROM manifest_shipments ORDER BY id")
+_ITEMS_OF: Final = sa.text("SELECT count(*) FROM manifest_shipment_items WHERE shipment_id = :id")
+_PRUNE_REPORT: Final = sa.text("SELECT status, report FROM backup_runs WHERE id = :id")
+
+
+async def test_a_receipt_whose_snapshot_restic_lost_is_removed_and_its_manifest_shipped_again(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    current_epoch: int,
+    queue_app: Any,
+) -> None:
+    """A receipt that names a snapshot restic no longer lists is false (final fix D1 (b)). M1 completes and
+    ships (receipt R1); a set is taken; M2 completes and ships (R2), and the reconciler marks both shipped.
+    Then R2's snapshot is gone from the repository. The prune, under the shipment lock, removes R2 and its
+    items and forgets nothing: M2 is `completed` again, its completion time kept, while R1's snapshot is
+    listed, so R1 and M1 stay. The reconciler then raises `privacy.manifest_unshipped` for M2, the next ship
+    uploads the whole stream, and a restore of the set replays M1 and M2."""
+    m1 = await completed_manifest(engine, site, max_alert=50)
+    await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    await ship_marks(engine, now=utcnow())
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m2 = await completed_manifest(engine, site, max_alert=51)
+    lost = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    await ship_marks(engine, now=utcnow())
+    r1, r2 = await scalars(engine, _RECEIPTS)
+    assert (await one(engine, _SHIPPED, id=m2.id)).shipment_id == r2
+    assert lost.snapshot_id is not None
+    await repo.forget_snapshots([lost.snapshot_id])
+    forgets = len(repo.forgets)
+
+    run_id = await run_prune(backup_cfg, repo, backup_engine, clock=utcnow)
+
+    assert [kind for kind, _ in repo.forgets[forgets:]] == ["set"]  # no `manifests` snapshot forgotten
+    assert await scalars(engine, _RECEIPTS) == [r1]
+    assert await scalar(engine, _ITEMS_OF, id=r2) == 0
+    unshipped = await one(engine, _SHIPPED, id=m2.id)
+    assert (unshipped.status, unshipped.shipped_at, unshipped.shipment_id) == ("completed", None, None)
+    assert unshipped.completed_at == m2.completed_at
+    kept = await one(engine, _SHIPPED, id=m1.id)
+    assert (kept.status, kept.shipment_id) == ("shipped", r1)
+    run = await one(engine, _PRUNE_REPORT, id=run_id)
+    assert (run.status, run.report["receipts_removed"], run.report["manifests_forgotten"]) == (
+        "succeeded",
+        [r2],
+        0,
+    )
+
+    await ship_marks(engine, now=utcnow() + UNSHIPPED_AFTER + timedelta(minutes=1))
+    assert await unshipped_alerts(engine) == [f"manifest:{m2.manifest_uuid}"]
+    again = await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    assert (again.shipped, again.files) == (True, 2)
+    await ship_marks(engine, now=utcnow() + UNSHIPPED_AFTER + timedelta(minutes=1))
+    assert (await one(engine, _SHIPPED, id=m2.id)).status == "shipped"
+    assert await unshipped_alerts(engine) == []
+    site.lose()
+    await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    for manifest in (m1, m2):
+        assert await scalar(target.engine, _MANIFEST, u=manifest.manifest_uuid) in {"completed", "shipped"}
+    assert await scalar(target.engine, _MANIFEST, u=m2.manifest_uuid) == "completed"  # replayed
 
 
 # ---- the refusals (review M1) ------------------------------------------------------------------------------

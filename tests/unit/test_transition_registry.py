@@ -100,6 +100,10 @@ def test_a_spec_with_a_column_effect_for_a_state_in_no_edge_is_refused() -> None
         TransitionSpec("t", "s", None, {"gone": "at"}, frozenset(), {}, frozenset({("a", "b")}))
     with pytest.raises(ValueError, match="managed by transition"):
         TransitionSpec("t", "s", "r", {}, frozenset(), {}, frozenset({("a", "b")}), settable=frozenset({"r"}))
+    with pytest.raises(ValueError, match=r"\['b'\] have no changed-at column to keep"):
+        TransitionSpec(
+            "t", "s", None, {}, frozenset(), {}, frozenset({("a", "b")}), first_entry_kept=frozenset("b")
+        )
 
 
 async def test_a_reason_for_a_table_without_a_reason_column_is_refused(monkeypatch) -> None:
@@ -487,12 +491,20 @@ def test_m3_machines() -> None:
 
 
 def test_m5_machines() -> None:
-    # §7.14: a manifest is written, then its file shipped; no owner and no reason column
+    # §7.14: a manifest is written, then its file shipped; no owner and no reason column. The prune returns
+    # a manifest to `completed` when its receipt names a snapshot restic no longer lists (final fix D1): the
+    # shipment is cleared, and the completion keeps its time.
     manifests = TRANSITIONS["deletion_manifests"]
-    assert manifests.allowed == {("executing", "completed"), ("completed", "shipped")}
+    assert manifests.allowed == {
+        ("executing", "completed"),
+        ("completed", "shipped"),
+        ("shipped", "completed"),
+    }
     assert (manifests.state_col, manifests.reason_col) == ("status", None)
     assert manifests.changed_at == {"completed": "completed_at", "shipped": "shipped_at"}
-    assert (manifests.owner_cols, manifests.clear_on_exit) == (frozenset(), {})
+    assert manifests.owner_cols == frozenset()
+    assert manifests.clear_on_exit == {"shipped": ("shipped_at", "shipment_id")}
+    assert manifests.first_entry_kept == {"completed"}
     assert manifests.settable == {"file_sha256", "scope", "shipment_id", "replay_log"}
 
     # D9: an export is built (`running`), then served until it expires or a purge removes it

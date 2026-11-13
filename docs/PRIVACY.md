@@ -126,7 +126,7 @@ The names in code font are names inside the app: its database tables, columns, s
 **When a deletion is done.**
 
 - **Manifests.** Every purge first records a deletion manifest, which holds ids, table and column names and key hashes, never content. The manifests are shipped to the offsite backup storage every 5 minutes.
-- **Confirmed offsite.** A deletion counts as done only when the app shows it "confirmed offsite": its manifest is shipped, so no restore can bring the deleted data back.
+- **Confirmed offsite.** A deletion counts as done only when the app shows it "confirmed offsite": its manifest is shipped, so no restore can bring the deleted data back. The weekly backup prune checks that the offsite copy confirming it still exists; if it is missing, the deletion is shown as not confirmed offsite again, the operator is alerted, and its manifest is shipped again within minutes.
 - **Backups.** Older backup sets still hold the deleted data until they age out, within about 3 months (backup sets are kept as 7 daily, 4 weekly and 3 monthly ones). The backup storage then keeps the deleted files of an aged-out set for up to 30 days more, as a safeguard against the backups being destroyed, so deleted data can remain in the offsite backups for about 4 months in all.
 - **Restore.** A restore replays the shipped manifests before the app starts again, so the manifest replay keeps deleted data from returning on a restore.
 

@@ -44,7 +44,9 @@ class TransitionSpec:
     `changed_at` maps a to-state to the column that records entering it. `owner_cols` are the columns an
     ownership predicate may test. `clear_on_exit` maps a state to the columns set to NULL when a row leaves it
     for another state. `settable` are the other columns a caller may assign in the same update (`set_`); the
-    columns the helper manages itself are not among them.
+    columns the helper manages itself are not among them. `first_entry_kept` are to-states whose changed-at
+    column keeps the time of the row's first entry when the row enters them again (a column that is still
+    `NULL` is set then).
     """
 
     table: str
@@ -55,12 +57,15 @@ class TransitionSpec:
     clear_on_exit: Mapping[str, tuple[str, ...]]
     allowed: frozenset[tuple[str, str]]
     settable: frozenset[str] = frozenset()
+    first_entry_kept: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         states = {state for edge in self.allowed for state in edge}
         unknown = (set(self.changed_at) | set(self.clear_on_exit)) - states
         if unknown:
             raise ValueError(f"{self.table}: states {sorted(unknown)} are in no allowed edge")
+        if unstamped := self.first_entry_kept - set(self.changed_at):
+            raise ValueError(f"{self.table}: states {sorted(unstamped)} have no changed-at column to keep")
         managed = {self.state_col, *self.changed_at.values()}
         if self.reason_col is not None:
             managed.add(self.reason_col)
@@ -711,16 +716,22 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
         ),
         # §7.14 (M5). A manifest's file is written and its deletes run (`executing`), it is complete with
         # the file's hash, then shipped with the shipment that holds it; the §7.14 CHECKs pair each state
-        # with its columns. No owner columns: the purge holds its operation's claim.
+        # with its columns. No owner columns: the purge holds its operation's claim. `shipped -> completed`
+        # is the prune's alone, when the receipt that shipped it names a snapshot restic no longer lists
+        # (§19.5 Retention, final fix D1): the shipment is cleared and the completion keeps its time, so
+        # `privacy.manifest_unshipped` judges it from its completion.
         "deletion_manifests": TransitionSpec(
             table="deletion_manifests",
             state_col="status",
             reason_col=None,
             changed_at=MappingProxyType({"completed": "completed_at", "shipped": "shipped_at"}),
             owner_cols=frozenset(),
-            clear_on_exit=MappingProxyType({}),
-            allowed=frozenset({("executing", "completed"), ("completed", "shipped")}),
+            clear_on_exit=MappingProxyType({"shipped": ("shipped_at", "shipment_id")}),
+            allowed=frozenset(
+                {("executing", "completed"), ("completed", "shipped"), ("shipped", "completed")}
+            ),
             settable=frozenset({"file_sha256", "scope", "shipment_id", "replay_log"}),
+            first_entry_kept=frozenset({"completed"}),
         ),
         # §7.14 (M5, D9). An export is built (`running`, one at a time: `exports_one_running`), then served
         # until it expires; a purge removes it in either state. No changed-at column.
@@ -866,7 +877,8 @@ def _assignments(
     - The new state, and the reason when `reason` is given: a text, or `CLEAR_REASON` for `NULL`. Without one
       (`None`) the reason column keeps whatever it held.
     - The changed-at column of `to_state`, unless the row is already in `to_state` (a self-edge keeps the
-      time of the first entry).
+      time of the first entry), or `to_state` is one of `first_entry_kept`, whose column keeps the time it
+      holds (`coalesce`).
     - `NULL` for the `cleared` columns.
     - The `set_` columns. A value that is a SQL expression is rendered as it is, a mapping or a list is bound
       as JSONB, anything else as an ordinary parameter.
@@ -879,7 +891,9 @@ def _assignments(
     if reason is not None and spec.reason_col is not None:
         assignments[spec.reason_col] = sa.null() if reason is CLEAR_REASON else reason
     changed_at = spec.changed_at.get(to_state)
-    if changed_at is not None:
+    if changed_at is not None and to_state in spec.first_entry_kept:
+        assignments[changed_at] = sa.func.coalesce(target.c[changed_at], sa.func.now())
+    elif changed_at is not None:
         assignments[changed_at] = (
             sa.case((state == to_state, target.c[changed_at]), else_=sa.func.now())
             if to_state in from_states
