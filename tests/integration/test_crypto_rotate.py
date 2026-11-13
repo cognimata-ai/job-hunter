@@ -415,6 +415,63 @@ async def test_a_stale_export_hash_under_the_data_key_is_corrected(
     assert inodes(cfg) == files
 
 
+def _damaged(path: Path, damage: str, other: Path) -> None:
+    """`path`'s archive damaged as `damage` says: its last byte (the last segment's tag) flipped, its last
+    byte cut, or another export's archive (`other`, sealed under the same key) in its place."""
+    data = path.read_bytes()
+    if damage == "a_flipped_byte":
+        path.write_bytes(data[:-1] + bytes([data[-1] ^ 0x01]))
+    elif damage == "cut_short":
+        path.write_bytes(data[:-1])
+    else:
+        path.write_bytes(other.read_bytes())
+
+
+@pytest.mark.parametrize("damage", ["a_flipped_byte", "cut_short", "another_exports_archive"])
+async def test_a_stale_export_hash_is_repaired_only_on_an_archive_that_opens(
+    migrated: PgServer,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    volumes: tuple[Path, Path],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+) -> None:
+    """T28-7: the hash repair first opens every segment of the archive under the data key as this export's
+    (its id, index and final flag). An archive under the data key that does not (a flipped byte, a file cut
+    short, another export's archive in its place), whose row therefore holds another sha256, stops the run
+    with the named error `ExportUnauthenticated`, on stdout and in `crypto_rotate_failed`, by its kind, table
+    and row id: its row's sha256 and its file stay as they were. A genuine one is still repaired (the test
+    above)."""
+    old, new = os.urandom(32), os.urandom(32)
+    cfg = rotation_cfg(make_config, migrated, volumes, current=new, previous=old)
+    export, other = [await seed_export(engine, cfg.exports_dir, new) for _ in range(2)]
+    path = cfg.exports_dir / export.storage_path
+    _damaged(path, damage, cfg.exports_dir / other.storage_path)
+    damaged = path.read_bytes()
+    async with engine.connect() as conn:
+        stored = {int(row.id): bytes(row.sha256) for row in (await conn.execute(_EXPORTS)).all()}
+    assert stored[export.export_id] != hashlib.sha256(damaged).digest()
+    events: list[dict[str, Any]] = []
+
+    code, printed = await rotate_cli(
+        migrated, tmp_path, volumes, monkeypatch, capsys, current=new, previous=old, events=events
+    )
+
+    where = {"kind": "exports", "table": "exports", "row_id": export.export_id}
+    assert (code, printed) == (1, {"error": "unexpected", "error_class": "ExportUnauthenticated", **where})
+    [failed] = [event for event in events if event["event"] == "crypto_rotate_failed"]
+    assert {name: failed[name] for name in ("error_class", *where)} == {
+        "error_class": "ExportUnauthenticated",
+        **where,
+    }
+    async with engine.connect() as conn:
+        assert {int(row.id): bytes(row.sha256) for row in (await conn.execute(_EXPORTS)).all()} == stored
+    assert path.read_bytes() == damaged
+    assert leftovers(cfg) == []
+
+
 async def test_a_run_stopped_inside_a_file_leaves_it_whole_and_the_next_clears_leftovers(
     engine: AsyncEngine,
     make_config: Any,

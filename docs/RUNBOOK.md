@@ -522,7 +522,9 @@ but pointless.
    | 3 | `"error": "other_keys_remain"` | Keys it was not given remain (`remaining_by_key_id`): the next pass installs one of them, copied from the kit, as `data_key_previous` (the copy deleted once installed), restarts api and worker, and runs it again. |
 
    Exit 1 is also `{"error": "database"}`, or `{"error": "unexpected", …}` naming the kind, the table and the
-   row of a ciphertext that cannot be rotated; every rerun stops at that row until it is dealt with.
+   row of a ciphertext that cannot be rotated; every rerun stops at that row until it is dealt with. Its
+   `error_class` `ExportUnauthenticated` names an export already under the current key whose row's hash
+   differs from its archive's and whose archive does not open: the rotation does not repair that hash.
 3. Once it exits 0, empty `data_key_previous` and restart again:
 
    ```

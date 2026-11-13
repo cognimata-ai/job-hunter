@@ -23,9 +23,12 @@ which `crypto.blob_key_id` reads from a blob's header) with the data key, then c
    takes the same segments, each with its own index and final flag; then the rename, and the row's `sha256`
    becomes the new file's (its name and `size_bytes` stay), in the same transaction, committed before the
    next export. An archive already under the data key whose row holds another `sha256` than the file's (an
-   earlier run stopped between the rename and its commit) has the row's `sha256` corrected. The name is the
-   export's `<id>-*`, made while the row is held `ready` (`privacy.export`'s guard), so a purge's unlink of
-   `<id>-*` follows it. The plaintext is never on a disk: the segments stream through memory.
+   earlier run stopped between the rename and its commit) has the row's `sha256` corrected, once every
+   segment of the file opens under the data key as this export's (`iter_decrypted`: its id, index and final
+   flag), and to the hash of the bytes so authenticated (T28-7); one that does not (a damaged file, another
+   export's) is not repaired: `ExportUnauthenticated` stops the run (below), its row as it was. The name is
+   the export's `<id>-*`, made while the row is held `ready` (`privacy.export`'s guard), so a purge's unlink
+   of `<id>-*` follows it. The plaintext is never on a disk: the segments stream through memory.
 
 Each kind is decided per ciphertext by its key id, so a run is **resumable and idempotent**: a ciphertext
 under the data key is skipped (each row and file is rewritten once), and a run stopped anywhere (the fault
@@ -56,7 +59,8 @@ restarted): restart api and worker and run it again.
 **A failure** prints `{"error": "database"}` for a database error, else `{"error": "unexpected",
 "error_class", "kind", "table", "row_id"}` (exit 1): a ciphertext that cannot be rotated or counted
 (`RotationFailed`: one under the previous key that does not open, `crypto.DecryptError` or
-`privacy.export.ExportCorrupt`, or a row whose `storage_path` is no name of its volume) stops the run, and the
+`privacy.export.ExportCorrupt`; an export under the data key whose hash the repair refuses,
+`ExportUnauthenticated`; or a row whose `storage_path` is no name of its volume) stops the run, and the
 output and the log line `crypto_rotate_failed` name its kind (`cv_files`, `cv_texts`, `totp`, `exports`), its
 table and its row id, never its content; every rerun stops at it until it is dealt with. Log lines carry
 kinds, counts, row ids and key ids, never content.
@@ -87,7 +91,7 @@ from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.sql import q
 from jobhunter.faults import afault_point
 from jobhunter.observability.logging import configure_logging, get_logger
-from jobhunter.privacy.export import iter_decrypted, write_segments
+from jobhunter.privacy.export import ExportCorrupt, iter_decrypted, write_segments
 from jobhunter.profile.storage import CvStore, remove_replace_leftovers, replace_file
 from jobhunter.types import JSONValue
 
@@ -164,6 +168,12 @@ class RotationFailed(Exception):
         }
 
 
+class ExportUnauthenticated(Exception):
+    """An archive under the data key whose row holds another `sha256` than the file's, and which does not open
+    under the data key as its export's (`privacy.export.ExportCorrupt`): the hash repair refuses it, and its
+    row keeps its hash (module docstring, step 3; T28-7)."""
+
+
 @contextmanager
 def _at(kind: Kind, table: str, row_id: int) -> Iterator[None]:
     """A failure inside (but a database error, which is the command's own) is the ciphertext's, at its row."""
@@ -225,6 +235,38 @@ def _export_key_id(path: Path) -> bytes | None:
 def _file_sha256(path: Path) -> bytes:
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
+
+
+class _Hashed(io.RawIOBase):
+    """The bytes of `source`, hashed (sha256) as they are read."""
+
+    def __init__(self, source: BinaryIO) -> None:
+        self._source = source
+        self.digest = hashlib.sha256()
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Buffer, /) -> int:
+        view = memoryview(buffer).cast("B")
+        data = self._source.read(len(view))
+        view[: len(data)] = data
+        self.digest.update(data)
+        return len(data)
+
+
+def _authenticated_sha256(path: Path, export_id: int, key: bytes) -> bytes:
+    """The sha256 of the archive `path` once every segment of it opens under `key` as export `export_id`'s
+    (`iter_decrypted` reads the file to its end, each segment authenticated with its index and final flag;
+    the plaintext is dropped); `ExportUnauthenticated` when one does not (T28-7)."""
+    with path.open("rb") as file:
+        source = _Hashed(file)
+        try:
+            for _ in iter_decrypted(io.BufferedReader(source), [key], export_id=export_id):
+                pass
+        except ExportCorrupt as exc:
+            raise ExportUnauthenticated(f"export {export_id}: its archive does not open") from exc
+    return source.digest.digest()
 
 
 class _Plaintext(io.RawIOBase):
@@ -318,10 +360,9 @@ async def _rotate_exports(cfg: AppConfig, engine: AsyncEngine, keys: _Keys, rewr
                 if key == keys.previous_id:
                     sha256 = await asyncio.to_thread(_reseal_export, path, export_id, row.size_bytes, keys)
                     outcome = "resealed"
-                elif (
-                    key == keys.current_id
-                    and (sha256 := await asyncio.to_thread(_file_sha256, path)) != stored
-                ):
+                elif key == keys.current_id and await asyncio.to_thread(_file_sha256, path) != stored:
+                    # the bytes authenticated under the data key give the row its hash, or nothing does
+                    sha256 = await asyncio.to_thread(_authenticated_sha256, path, export_id, keys.current)
                     outcome = "sha256_corrected"
                 else:
                     continue
