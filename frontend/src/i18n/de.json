@@ -1749,7 +1749,7 @@
   "settings_privacy.row.finished_jobs": "Erledigte Hintergrundaufgaben und Idempotenz-Einträge",
   "settings_privacy.kept.finished_jobs": "Jeweils 7 Tage",
   "settings_privacy.row.logs": "Protokolle",
-  "settings_privacy.kept.logs": "Etwa 14 Tage (Rotation)",
+  "settings_privacy.kept.logs": "Rotation nach Größe; etwa 14 Tage bei normalem Aufkommen",
   "settings_privacy.row.sessions": "Sitzungen, Anmeldeversuche und Anmeldesperren",
   "settings_privacy.kept.sessions": "Sitzungen bis 1 Tag nach Ablauf; Anmeldeversuche 30 Tage; eine Sperre bis zur nächsten Anmeldung von ihrer Adresse nach ihrem Ende, bis zur Entsperrung oder bis zum Löschen aller Daten",
   "settings_privacy.row.alerts": "Meldungen",

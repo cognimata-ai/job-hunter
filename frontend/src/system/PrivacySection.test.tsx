@@ -51,6 +51,7 @@ describe("PrivacySection", () => {
     expect(kept("Backups")).toBe(
       "Backup sets: 7 daily, 4 weekly and 3 monthly. Manifest snapshots: the latest one a shipment confirmed, which holds every manifest shipped up to it, and every newer one, so the manifests are kept indefinitely",
     );
+    expect(kept("Logs")).toBe("Rotated by size; about 14 days at normal volume");
     expect(kept("Backup set and backup run records")).toBe(
       "13 months after they finished, except the newest successful backup set and restore test, and a set a kept run refers to",
     );

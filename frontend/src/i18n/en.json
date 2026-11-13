@@ -1749,7 +1749,7 @@
   "settings_privacy.row.finished_jobs": "Finished background jobs and idempotency records",
   "settings_privacy.kept.finished_jobs": "7 days each",
   "settings_privacy.row.logs": "Logs",
-  "settings_privacy.kept.logs": "About 14 days (rotation)",
+  "settings_privacy.kept.logs": "Rotated by size; about 14 days at normal volume",
   "settings_privacy.row.sessions": "Sessions, login attempts and login lockouts",
   "settings_privacy.kept.sessions": "Sessions until 1 day after they expire; login attempts 30 days; a lockout until the next sign-in from its address after it ended, an unlock, or deleting everything",
   "settings_privacy.row.alerts": "Alerts",
