@@ -549,6 +549,17 @@ copy of the database until another restore test or a restart of the backup servi
 `$JH exec backup jobhunter backup restore-test` again, or `$JH restart backup`. Every restore test, the monthly
 one included, first removes what an earlier one left.
 
+**The prune's report.** A prune records what it did in its run's report, read with:
+
+```
+$JH exec postgres psql -U jobhunter_app -d jobhunter -c "SELECT id, status, report FROM backup_runs WHERE kind = 'prune' ORDER BY id DESC LIMIT 1"
+```
+
+`manifests_forgotten` counts the `manifests` snapshots it forgot. When it forgot none on purpose,
+`manifests_skipped` says why: `no_receipt` (no shipment has written a receipt yet) or `receipt_not_listed` (it
+removed a false receipt, below); it is `null` otherwise. Either clears by itself: the next shipment writes a
+receipt, and the next prune forgets again.
+
 **A false receipt.** A shipment's receipt (a `manifest_shipments` row) names the snapshot that confirmed its
 manifests offsite. If the prune finds the latest receipt's snapshot missing from the repository (deleted by
 hand, or lost), that receipt confirms nothing: the prune removes it, and every receipt below it whose snapshot

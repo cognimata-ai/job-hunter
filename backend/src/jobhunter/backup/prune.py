@@ -5,15 +5,16 @@ R13): `jobhunter backup prune`, and the scheduler's `prune` job (`JOBHUNTER_BACK
 steps. First the manifest stream's snapshots strictly older than the latest receipt's (final fix C1, the
 reason below), under the shipment lock (`shipper.ship_lock`, final fix D1): it reads the newest shipment's
 `restic_snapshot_id`, lists `restic snapshots --tag manifests`, and runs `restic forget -- <id>…` on those
-whose time is before the receipted one's, if any. With no receipt it forgets none; a receipted snapshot
-restic does not list is repaired, below. Then `restic forget --tag set --keep-daily <d> --keep-weekly <w>
+whose time is before the receipted one's, if any. With no receipt it forgets none; a receipted snapshot restic
+does not list is repaired, below. Then `restic forget --tag set --keep-daily <d> --keep-weekly <w>
 --keep-monthly <m> --prune`, the counts from `JOBHUNTER_BACKUP_KEEP_DAILY` / `_WEEKLY` / `_MONTHLY`
-(`cfg.backup`; 7, 4 and 3 by default), whose prune removes the data both forgets left unreferenced. Its
-filter is the `set` tag, which every backup set's snapshot carries (`backup_set.SET_TAG`) and no `manifests`
-snapshot does. The run then becomes `succeeded` with its report: the sets' three counts,
-`manifests_forgotten` and `receipts_removed` (the shipment ids of the false receipts it removed); or `failed`
-with `error` = `prune:<error class>`, and `PruneFailed` is raised. A prune's failure raises no alert (§17.6
-has none): the health page shows the run. It holds the backup jobs' lock for its whole run
+(`cfg.backup`; 7, 4 and 3 by default), whose prune removes the data both forgets left unreferenced. Its filter
+is the `set` tag, which every backup set's snapshot carries (`backup_set.SET_TAG`) and no `manifests` snapshot
+does. The run then becomes `succeeded` with its report: the sets' three counts, `manifests_forgotten`,
+`manifests_skipped` (why it forgot none: `no_receipt`, `receipt_not_listed`, or `null` when it did not skip;
+final fix D3) and `receipts_removed` (the shipment ids of the false receipts it removed); or `failed` with
+`error` = `prune:<error class>`, and `PruneFailed` is raised. A prune's failure raises no alert (§17.6 has
+none): the health page shows the run. It holds the backup jobs' lock for its whole run
 (`backup_set.backup_job_lock`): while another backup job runs it writes no row and raises `BackupJobBusy`.
 
 **One step with the shipments** (final fix D1 (a)). The prune takes the shipment lock (7261007) inside its job
@@ -52,7 +53,7 @@ failing, and then `privacy.manifest_unshipped` pages.
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -110,9 +111,14 @@ class _FalseReceipt:
     manifests: int
 
 
+# Why the prune forgot no `manifests` snapshot, in its report's `manifests_skipped` (final fix D3).
+SkipReason = Literal["no_receipt", "receipt_not_listed"]
+
+
 @dataclass(frozen=True)
 class _ManifestsPruned:
     forgotten: int
+    skipped: SkipReason | None
     removed: tuple[int, ...]
 
 
@@ -150,7 +156,7 @@ async def _prune_manifests(
             latest = (await conn.execute(_LATEST_RECEIPT)).first()
         if latest is None:
             log.info("manifests_forget_skipped", run_id=run_id, reason="no_receipt")
-            return _ManifestsPruned(0, ())
+            return _ManifestsPruned(0, "no_receipt", ())
         snapshots = await restic.snapshots(tags=[MANIFESTS_TAG])
         anchor = next((snapshot for snapshot in snapshots if snapshot.id == latest.restic_snapshot_id), None)
         if anchor is None:
@@ -166,12 +172,14 @@ async def _prune_manifests(
                     manifests=receipt.manifests,
                 )
             log.warning("manifests_forget_skipped", run_id=run_id, reason="receipt_not_listed")
-            return _ManifestsPruned(0, tuple(receipt.shipment_id for receipt in removed))
+            return _ManifestsPruned(
+                0, "receipt_not_listed", tuple(receipt.shipment_id for receipt in removed)
+            )
         older = [snapshot.id for snapshot in snapshots if snapshot.time < anchor.time]
         if older:
             await held.confirm()
             await restic.forget_snapshots(older)
-        return _ManifestsPruned(len(older), ())
+        return _ManifestsPruned(len(older), None, ())
 
 
 async def _prune(
@@ -198,6 +206,7 @@ async def _prune(
         report = {
             **sets,
             "manifests_forgotten": manifests.forgotten,
+            "manifests_skipped": manifests.skipped,
             "receipts_removed": list(manifests.removed),
         }
         await transition(conn, "backup_runs", run_id, ["running"], "succeeded", set_={"report": report})

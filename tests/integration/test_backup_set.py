@@ -603,9 +603,15 @@ async def test_prune_forgets_the_manifests_snapshots_older_than_the_latest_recei
         "keep_weekly": 4,
         "keep_monthly": 3,
         "manifests_forgotten": 2,
+        "manifests_skipped": None,  # nothing skipped (final fix D3)
         "receipts_removed": [],
     }
     assert row.started_at == started and row.finished_at is not None
+
+
+# The report's keys on the `manifests` snapshots: how many were forgotten, why none were (`None` when not
+# skipped), and the false receipts removed.
+_MANIFESTS_REPORT: Final = ("manifests_forgotten", "manifests_skipped", "receipts_removed")
 
 
 async def test_prune_without_a_receipt_forgets_no_manifests_snapshot(
@@ -616,18 +622,20 @@ async def test_prune_without_a_receipt_forgets_no_manifests_snapshot(
     engine: AsyncEngine,
 ) -> None:
     """With no receipt, nothing proves a `manifests` snapshot complete, so the prune lists none and forgets
-    none (final fix C1). The sets' forget runs as always."""
+    none (final fix C1), and its report says why (`manifests_skipped`, final fix D3). The sets' forget runs
+    as always."""
     commands = FakeCommands(migrated, listing=manifests_listing())
 
     run_id = await run_prune(backup_cfg, Restic(backup_cfg, commands), backup_engine, clock=utcnow)
 
     assert [call.argv for call in commands.calls] == [SET_FORGET]
     row = await one(engine, _RUN, id=run_id)
-    assert (row.status, row.report["manifests_forgotten"], row.report["receipts_removed"]) == (
-        "succeeded",
-        0,
-        [],
-    )
+    assert row.status == "succeeded"
+    assert {key: row.report[key] for key in _MANIFESTS_REPORT} == {
+        "manifests_forgotten": 0,
+        "manifests_skipped": "no_receipt",
+        "receipts_removed": [],
+    }
 
 
 _ITEM: Final = sa.text(
@@ -679,11 +687,12 @@ async def test_prune_removes_each_receipt_whose_snapshot_restic_does_not_list(
         if entry["event"] == "manifest_receipt_removed"
     ] == [(shipment, *by_id[shipment]) for shipment in removed]
     row = await one(engine, _RUN, id=run_id)
-    assert (row.status, row.report["manifests_forgotten"], row.report["receipts_removed"]) == (
-        "succeeded",
-        0,
-        removed,
-    )
+    assert row.status == "succeeded"
+    assert {key: row.report[key] for key in _MANIFESTS_REPORT} == {
+        "manifests_forgotten": 0,
+        "manifests_skipped": "receipt_not_listed",  # final fix D3
+        "receipts_removed": removed,
+    }
 
 
 _ADVISORY_HELD: Final = (
