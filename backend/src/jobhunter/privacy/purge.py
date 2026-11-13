@@ -17,15 +17,17 @@ registers one): `compute` (A2, after the quiesce, under the fence: the content o
 `postconditions` (the kind's own, checked in phase C after the typed ones), `reapply_admission` (replay's
 re-application of A0's effects beyond the manifest, its fences and its operation, at the manifest's place in
 the stream; `high_water` is each table's greatest id when the replay began, so a row above it is the replay's
-own: a no-op for every kind but the source purge), `deletes_exports` (true for every kind but
-`job_tombstone`: M5-R3, Deviation 18), `max_ids_keys`, the `max_ids` keys the procedure reads (its
-`execute`, its `postconditions` and, for the source purge, the rebuild), which a replay checks every manifest
-of the kind for before it starts (`replay.required_bounds`, final review M3), and `max_ids_keys_added`, the
-keys a release added after manifests of the kind were written (final fix C3). A table created after a
-manifest was written has no row within that manifest's bound, so an added key's absence reads as 0: the
-procedure reads it only as `max_ids.get(key, 0)`, and no replay requires it. A release that starts reading a
-key declares it added, never required (or the change counts as a manifest-format change, `db.compat`); no key
-is both (`register_kind` refuses one).
+own: a no-op for every kind but the source purge), `deletes_exports` (true for every kind but `job_tombstone`:
+M5-R3, Deviation 18), `max_ids_keys`, the `max_ids` keys the procedure reads (its `execute`, its
+`postconditions` and, for the source purge, the rebuild), which a replay checks every manifest of the kind for
+before it starts (`replay.required_bounds`, final review M3), and `max_ids_keys_added`, the keys a release
+added after manifests of the kind were written (final fix C3). A table created empty after a manifest was
+written has no row within that manifest's bound, so an added key's absence reads as 0: the procedure reads it
+only as `max_ids.get(key, 0)`, and no replay requires it. Only a table created empty: a migration that fills a
+new table from existing rows makes its key a manifest-format change (`db.compat`), since `migrate` runs
+`alembic` before the replay and the backfill would copy rows an older manifest deletes. A release that starts
+reading a key declares it added, never required (or the change counts as a manifest-format change,
+`db.compat`); no key is both (`register_kind` refuses one).
 `compute_content` runs `compute` and completes what the kind cannot know: `fenced_at` (and a watermark's)
 becomes the fence's commit cutoff the quiesce waited from (`fences.fence_committed_at`), and a kind that
 deletes exports gets `deletion_graph.export_ops` last, bounded by its `max_ids["exports"]`.

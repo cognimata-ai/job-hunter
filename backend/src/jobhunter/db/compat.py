@@ -33,22 +33,26 @@ head's `schema_compat` row, which the newer release's `migrate` recorded:
   a row (or several heads): `migrate` refuses before any step and `/readyz` fails; the RUNBOOK rolls back
   by restore.
 
-`classify_schema` is that rule without the database. The floors only move forward along a validated chain,
-so a floor the older code knows also means that no destructive revision lies between its head and the
-database's. `schema_compat` versions the schema only, not the transition matrix (an older release on a newer
-schema keeps the newer one, `seed_defaults(sync_matrix=False)`) nor the manifest stream (step 1 and step 7 of
-`migrate` parse it). A release whose revision narrows a transition edge of an existing table declares that
-revision `destructive`, so its rollback is a restore: with a compatible floor the older release would pass
-`/readyz` and fail later, at a refused `transition()`. A change of the manifest format ships expand/contract
-instead (spec §19.6): release N teaches the parser the new format while it still writes the old one, and
-release N+1 writes the new format. A rollback from N+1 therefore lands on N, whose restore reads both, so no
-release ever needs a restore its own parser cannot replay (one that skipped release N would stop its restore
-at a `ManifestInvalid`). Beside it, the `max_ids` rule (final fix C3, spec §19.6): a release that makes a kind
-read a `max_ids` key its older manifests lack (a table it creates) declares the key added
-(`KindProcedure.max_ids_keys_added`), never required. A table created after a manifest was written has no row
-within its bound, so the key's absence reads as 0 and `migrate`'s bound check requires it of no manifest;
-declared required, it would stop every `migrate` that meets an older manifest of the kind, so that release
-counts as a manifest-format change and ships expand/contract.
+`classify_schema` is that rule without the database. The floors only move forward along a validated chain, so
+a floor the older code knows also means that no destructive revision lies between its head and the database's.
+`schema_compat` versions the schema only, not the transition matrix (an older release on a newer schema keeps
+the newer one, `seed_defaults(sync_matrix=False)`) nor the manifest stream (step 1 and step 7 of `migrate`
+parse it). A release whose revision narrows a transition edge of an existing table declares that revision
+`destructive`, so its rollback is a restore: with a compatible floor the older release would pass `/readyz`
+and fail later, at a refused `transition()`. A change of the manifest format ships expand/contract instead
+(spec §19.6): release N teaches the parser the new format while it still writes the old one, and release N+1
+writes the new format. A rollback from N+1 therefore lands on N, whose restore reads both, so no release ever
+needs a restore its own parser cannot replay (one that skipped release N would stop its restore at a
+`ManifestInvalid`). Beside it, the `max_ids` rule (final fix C3, spec §19.6): a release that makes a kind read
+a `max_ids` key its older manifests lack (a table it creates) declares the key added
+(`KindProcedure.max_ids_keys_added`), never required. A table created empty after a manifest was written has
+no row within its bound, so the key's absence reads as 0 and `migrate`'s bound check requires it of no
+manifest. That holds only for a table its migration creates empty: a migration that fills a new table from
+existing rows makes its key a manifest-format change, since `migrate` runs `alembic` before `replay`
+(`MIGRATE_ORDER`) and on a restored set the backfill copies rows an older manifest was written to delete,
+which a bound read as 0 would leave (unless the new table cascades from a table the manifest bounds). A key
+declared required instead would stop every `migrate` that meets an older manifest of the kind, so that release
+too counts as a manifest-format change and ships expand/contract.
 """
 
 import functools
