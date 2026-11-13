@@ -7,8 +7,10 @@ here, not as a bare `KeyError` in a replay of a manifest that lacks the key.
 `postconditions` and its other methods, and in the module's functions they reach; `compute` reads the bounds
 it has just taken (`max_identity_ids`, every identity table), never a manifest's, so what only `compute`
 reaches is left out. A bound read is a subscript or a `.get` of a manifest's bounds: `<content or
-scope>["max_ids"]`, a name bound to one in the same function, a parameter named `max_ids` or `bounds` (the
-modules' names for them), or any parameter a call in the module gives one. Its key is a string, a module
+scope>["max_ids"]`, a name bound to one in the same function (by `=`, an annotated `=` or `:=`, an alias of
+an alias included: final fix C4), a parameter named `max_ids` or `bounds` (the modules' names for them), or
+any parameter a call in the module gives one. Any other use of a tracked bound (iterated, its `.items()`,
+kept on an attribute) fails the check too, as an unhandled use. Its key is a string, a module
 constant, a loop variable over a literal or a module constant (a tuple's element too), a local name bound to
 such a literal, or a parameter, resolved through every call of its function in the module (a `*args`
 parameter through every argument from its position on). A read whose key cannot be resolved fails the check as
@@ -22,8 +24,10 @@ manifest's bound, so an added key's absence reads as 0, and the check requires e
 
 The check is shown to fail on reads planted in a kind's syntax tree: a key it does not declare, read in
 `execute`, through `.get`, or in a helper its `postconditions` call; a key no rule resolves; the bounds passed
-whole to another module; an added key read by subscript or with another default. A read planted in `compute`
-alone is left out, and an added key read as `.get(key, 0)` passes, as the check says.
+whole to another module; an added key read by subscript or with another default; a read through an annotated
+alias or an alias of an alias; a use of the bounds the check does not follow (iterated, kept on an attribute).
+A read planted in `compute` alone is left out, and an added key read as `.get(key, 0)` passes, as the check
+says.
 """
 
 import ast
@@ -32,7 +36,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import pytest
 from jobhunter.privacy import manifests
@@ -267,22 +271,63 @@ def constant_items(value: Any, index: int | None) -> set[str] | None:
     return keys if len(keys) == len(set(items)) else None
 
 
+def bindings(function: Function) -> Iterator[tuple[ast.expr, ast.expr]]:
+    """Every (target, value) `function` binds: `=` (a tuple's elements pairwise), an annotated `=`, and
+    `:=`."""
+    for node in ast.walk(function.node):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    yield from zip(target.elts, node.value.elts, strict=False)
+                else:
+                    yield target, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            yield node.target, node.value
+        elif isinstance(node, ast.NamedExpr):
+            yield node.target, node.value
+
+
 def bounds_names(function: Function, given: AbstractSet[str] = frozenset()) -> set[str]:
     """The names that hold a manifest's bounds in `function`: its parameters named so, those a caller in the
-    module gives a manifest's bounds (`given`), and the names it binds to a `["max_ids"]` subscript (a tuple's
-    element too)."""
-    names = (parameters(function.node) & BOUNDS_NAMES) | given
-    for node in ast.walk(function.node):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            pairs = (
-                zip(target.elts, node.value.elts, strict=False)
-                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
-                else [(target, node.value)]
-            )
-            names |= {t.id for t, v in pairs if isinstance(t, ast.Name) and is_max_ids(v)}
+    module gives a manifest's bounds (`given`), and every name it binds to one, by `=` (a tuple's element
+    too), an annotated `=` or `:=`, from a `["max_ids"]` subscript or another such name, to a fixed point
+    (final fix C4: an alias of an alias)."""
+    names = (parameters(function.node) & BOUNDS_NAMES) | set(given)
+    changed = True
+    while changed:
+        changed = False
+        for target, value in bindings(function):
+            if isinstance(target, ast.Name) and target.id not in names and holding(value, names):
+                names.add(target.id)
+                changed = True
     return names
+
+
+def unhandled_uses(function: Function, holders: set[str]) -> Iterator[int]:
+    """The line of every use of a manifest's bounds in `function` that the check does not follow (final fix
+    C4): any but a subscript read, a `.get(...)` read, an argument of a call (whose callee `escapes_in` and
+    `given_bounds` judge) and the value bound to a name (an alias)."""
+    parents = {child: node for node in ast.walk(function.node) for child in ast.iter_child_nodes(node)}
+    aliased = {id(value) for target, value in bindings(function) if isinstance(target, ast.Name)}
+    for node in ast.walk(function.node):
+        if not isinstance(node, ast.Name | ast.Subscript) or not isinstance(node.ctx, ast.Load):
+            continue
+        if not (node.id in holders if isinstance(node, ast.Name) else is_max_ids(node)):
+            continue
+        parent = parents.get(node)
+        read = isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load)
+        get = (
+            isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr == "get"
+            and isinstance(parents.get(parent), ast.Call)
+            and cast(ast.Call, parents[parent]).func is parent
+        )
+        argument = isinstance(parent, ast.Call) and (
+            node in parent.args or any(keyword.value is node for keyword in parent.keywords)
+        )
+        if not (read or get or argument or id(node) in aliased):
+            yield node.lineno
 
 
 def is_max_ids(expr: ast.expr) -> bool:
@@ -416,6 +461,9 @@ def bound_reads(tree: ast.Module, namespace: Mapping[str, Any], procedure: str) 
     reads = Reads()
     for name in sorted(replay_reach(known, procedure)):
         holders = bounds_names(known[name], given[name])
+        reads.unresolved += [
+            f"{name}:{line} (unhandled use)" for line in unhandled_uses(known[name], holders)
+        ]
         for line, callee in escapes_in(known[name], holders, known):
             if callee in PASSED_OUT:
                 reads.keys |= read_by(PASSED_OUT[callee])
@@ -543,6 +591,36 @@ PLANTS: Final = {
         "",
         ("planted",),
         ["added_read:planted"],
+    ),
+    # the final re-review's R-M1: an annotated alias, and an alias of an alias (final fix C4)
+    "an_annotated_alias": (
+        "execute",
+        'limits: dict[str, int] = content["max_ids"]\nlimits["planted"]',
+        "",
+        (),
+        ["undeclared:planted"],
+    ),
+    "an_alias_of_an_alias": (
+        "execute",
+        'limits = content["max_ids"]\nother = limits\nother["planted"]',
+        "",
+        (),
+        ["undeclared:planted"],
+    ),
+    # a use of the bounds that is no read the check can follow (final fix C4)
+    "the_bounds_iterated": (
+        "execute",
+        'limits = content["max_ids"]\n[value for value in limits.values()]',
+        "",
+        (),
+        ["execute:2 (unhandled use)"],
+    ),
+    "the_bounds_kept_on_an_attribute": (
+        "execute",
+        'run.kept = content["max_ids"]',
+        "",
+        (),
+        ["execute:1 (unhandled use)"],
     ),
     # accepted: an added key read as 0 where an older manifest lacks it (final fix C3)
     "an_added_key_read_as_0_when_absent": (
