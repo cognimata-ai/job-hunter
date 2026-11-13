@@ -4,8 +4,10 @@
 // link scrolls to it, and its contents scroll to each of its sections. (a) Export → ready → the download: a
 // zip (`PK\x03\x04`) whose central directory names README.txt and jobs.json. (b) Delete everything: Submit stays
 // disabled until the exact phrase (a wrong one is marked), and a wrong password is refused with the
-// `reauth_failed` text. (c) The phrase and the password: 202, "Deleting…", the completion ends the session and
-// the next read leads to the login; the same user and password sign in again (M5-U3), the Jobs page is the
+// `reauth_failed` text. (c) The phrase and the password: 202, "Deleting…" and the executing state, checked with
+// the worker paused (`docker compose pause worker`, from before the request until after those checks), so a fast
+// purge cannot end the session first (final review M2); the cleanup unpauses it whatever ends the spec. Then the
+// completion ends the session and the next read leads to the login; the same user and password sign in again (M5-U3), the Jobs page is the
 // first-use empty state, and the deletion shows "Completed — not yet confirmed offsite" with the offsite banner,
 // never "Confirmed offsite", until the shipper has run (`runShipper`, the shipper service of the dev stack, whose
 // local restic repository the spec initialises first): then "Confirmed offsite" and no banner within 120 s. The
@@ -45,6 +47,27 @@ const MAX_COMMENT_BYTES = 0xffff;
 
 // Destructive and one-shot per stack: a retry would find nothing left to export or delete.
 test.describe.configure({ retries: 0 });
+
+/** Whether the spec paused the worker and has not unpaused it yet (part c). */
+let workerPaused = false;
+
+/** The worker paused: the purge it would run waits until `unpauseWorker`. */
+async function pauseWorker(): Promise<void> {
+  await compose(["pause", "worker"]);
+  workerPaused = true;
+}
+
+async function unpauseWorker(): Promise<void> {
+  await compose(["unpause", "worker"]);
+  workerPaused = false;
+}
+
+// A failure or a timeout between the pause and the unpause never leaves the stack's worker paused.
+test.afterEach(async () => {
+  if (workerPaused) {
+    await unpauseWorker();
+  }
+});
 
 /** The names of a zip's entries, read from its central directory (where the end record says it starts). */
 function zipEntryNames(zip: Uint8Array): string[] {
@@ -166,8 +189,11 @@ test("E18: the export downloads a zip; delete everything takes the exact phrase 
   await expectNoSeriousA11yViolations(page);
   await compose(["run", "--rm", "-T", "api", "jobhunter", "sessions", "unlock"]); // the note above
 
-  // (c) The phrase and the password: requested, "Deleting…", then the session ends and the login follows.
+  // (c) The phrase and the password: requested, "Deleting…", then the session ends and the login follows. The
+  // api admits the purge and answers 202 by itself; the worker, paused, runs it only once the executing state
+  // has been checked.
   await fillPassword(page, user.password);
+  await pauseWorker();
   const accepted = answerTo(page, "POST", DELETE_PATH);
   await submit.click();
   const answer = await accepted;
@@ -178,6 +204,7 @@ test("E18: the export downloads a zip; delete everything takes the exact phrase 
   const item = deletionItem(page, manifestId);
   await expect(state(item, "executing")).toBeVisible();
   await expectNoSeriousA11yViolations(page, "#deletion-status");
+  await unpauseWorker();
   await expect(page).toHaveURL(/\/login\?redirect=/, { timeout: LOGGED_OUT_WITHIN_MS });
   await expectNoSeriousA11yViolations(page);
 
