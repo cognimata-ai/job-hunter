@@ -79,6 +79,12 @@
   overflow-wrap: anywhere;
 }
 
+/* A note of the UI in an operator value's place, while there is none to show (loading, not available). */
+.status {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
 .code {
   padding: 0 3px;
   border-radius: var(--radius-1);

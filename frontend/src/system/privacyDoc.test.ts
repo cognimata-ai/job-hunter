@@ -116,7 +116,7 @@ describe("fillOperator", () => {
         "Unknown: [set at deployment: something else]",
       ].join("\n"),
     );
-    const filled = fillOperator(blocks, VALUES);
+    const filled = fillOperator(blocks, { values: VALUES });
     expect(filled).toEqual([
       blocks[0],
       blocks[1],
@@ -147,9 +147,10 @@ describe("fillOperator", () => {
 
   it("keeps the markers without values, and a value's own characters as they are", () => {
     const blocks = parsePrivacyDoc("- **Operator:** [set at deployment: operator name] / [set at deployment: VPS provider]");
-    expect(fillOperator(blocks, null)).toEqual(blocks);
+    const nulls: OperatorValues = { operator: null, contact: null, controller: null, vps_provider: null, s3_provider: null };
+    expect(fillOperator(blocks, { values: nulls })).toEqual(blocks);
     const odd: OperatorValues = { ...VALUES, operator: "$& **not bold** `no code` <b>no tag</b>", vps_provider: null };
-    expect(fillOperator(blocks, odd)).toEqual([
+    expect(fillOperator(blocks, { values: odd })).toEqual([
       {
         kind: "ul",
         items: [
@@ -159,6 +160,28 @@ describe("fillOperator", () => {
           ],
         ],
       },
+    ]);
+  });
+
+  it("puts a note in the UI's language in every marker's place while there are no values to show", () => {
+    const blocks = parsePrivacyDoc(
+      ["- **Operator:** [set at deployment: operator name]", "- **Contact address:** [set at deployment: contact address] (by mail)", "", "Unknown: [set at deployment: something else]"].join("\n"),
+    );
+    expect(fillOperator(blocks, { note: "wird geladen …", lang: "de" })).toEqual([
+      {
+        kind: "ul",
+        items: [
+          [{ kind: "strong", text: "Operator:" }, { kind: "text", text: " " }, { kind: "note", text: "wird geladen …", lang: "de" }],
+          [
+            { kind: "strong", text: "Contact address:" },
+            { kind: "text", text: " " },
+            { kind: "note", text: "wird geladen …", lang: "de" },
+            { kind: "text", text: " (by mail)" },
+          ],
+        ],
+      },
+      // a marker the statement does not have stays as it is
+      { kind: "p", inlines: [{ kind: "text", text: "Unknown: [set at deployment: something else]" }] },
     ]);
   });
 });

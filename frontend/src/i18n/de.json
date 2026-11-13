@@ -1699,6 +1699,8 @@
   "privacy_statement.title": "Datenschutzerklärung",
   "privacy_statement.contents": "Inhalt",
   "privacy_statement.english_only": "Die Datenschutzerklärung liegt nur auf Englisch vor.",
+  "privacy_statement.operator_loading": "wird geladen …",
+  "privacy_statement.operator_unavailable": "derzeit nicht verfügbar",
   "health.state": "Zustand",
   "attention.mass_meta_one": "{{absent}} Stelle von {{baseline}} fehlt · Snapshot {{time}}",
   "attention.mass_meta_other": "{{absent}} Stellen von {{baseline}} fehlen · Snapshot {{time}}",

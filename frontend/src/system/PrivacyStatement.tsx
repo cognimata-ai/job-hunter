@@ -6,14 +6,15 @@
 // statement. Its `##` sections are headings a level below its own, each anchored (`privacy-statement-<id>`), with
 // a list of contents linking to them. The document is English: in another UI language a note says so, and its
 // text is marked `lang="en"`. Its Operator section's markers show the deployment's values once they are read
-// (`useOperator`, M5 follow-ups Task F1), as text; until then, and on a server without an operator file, the
-// markers themselves.
+// (`useOperator`, M5 follow-ups Task F1), as text, and stay as they are on a server without an operator file (all
+// null). While the read is pending each shows a loading note instead, and after it failed a "not available"
+// note (F1 fix round 1, M6): text of the UI, marked with the UI's language.
 import { Link } from "@tanstack/react-router";
 import { Fragment, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import source from "../../../docs/PRIVACY.md?raw";
 import { useOperator } from "./privacyApi";
-import { type Block, fillOperator, type Inline, parsePrivacyDoc } from "./privacyDoc";
+import { type Block, fillOperator, type Inline, type OperatorFill, parsePrivacyDoc } from "./privacyDoc";
 import styles from "./PrivacyStatement.module.css";
 
 export const STATEMENT_ID = "privacy-statement";
@@ -34,6 +35,8 @@ function Inlines({ inlines }: { inlines: Inline[] }) {
         return <strong key={i}>{inline.text}</strong>;
       case "code":
         return <code key={i} className={styles.code}>{inline.text}</code>;
+      case "note":
+        return <span key={i} lang={inline.lang} className={styles.status}>{inline.text}</span>;
       default:
         return <Fragment key={i}>{inline.text}</Fragment>;
     }
@@ -83,8 +86,13 @@ export function StatementBlocks({ blocks }: { blocks: Block[] }) {
 
 export function PrivacyStatement() {
   const { t, i18n } = useTranslation();
-  const operator = useOperator();
-  const blocks = useMemo(() => fillOperator(BLOCKS, operator.data ?? null), [operator.data]);
+  const { data, isError } = useOperator();
+  const lang = i18n.language;
+  const blocks = useMemo(() => {
+    const note = t(isError ? "privacy_statement.operator_unavailable" : "privacy_statement.operator_loading");
+    const fill: OperatorFill = data !== undefined ? { values: data } : { note, lang };
+    return fillOperator(BLOCKS, fill);
+  }, [data, isError, t, lang]);
   return (
     <section id={STATEMENT_ID} aria-labelledby={`${STATEMENT_ID}-heading`} className={styles.statement}>
       <h2 id={`${STATEMENT_ID}-heading`} className={styles.title}>{t("privacy_statement.title")}</h2>

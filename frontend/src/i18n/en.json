@@ -1699,6 +1699,8 @@
   "privacy_statement.title": "Privacy statement",
   "privacy_statement.contents": "Contents",
   "privacy_statement.english_only": "The privacy statement is available in English only.",
+  "privacy_statement.operator_loading": "loading…",
+  "privacy_statement.operator_unavailable": "not available right now",
   "health.state": "State",
   "attention.mass_meta_one": "{{absent}} posting of {{baseline}} missing · snapshot {{time}}",
   "attention.mass_meta_other": "{{absent}} postings of {{baseline}} missing · snapshot {{time}}",

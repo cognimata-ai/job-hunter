@@ -11,9 +11,14 @@
 //
 // The Operator section's five markers (`[set at deployment: …]`) stay in the repository; `fillOperator` puts the
 // deployment's values in their place (M5 follow-ups Task F1, `GET /api/privacy/operator`), in text spans only,
-// after the parse: a value is text, whatever characters it has.
+// after the parse: a value is text, whatever characters it has. While there is no value to show (the read is
+// pending or failed), a note of the UI takes each marker's place instead, marked with the UI's language.
 
-export type Inline = { kind: "text" | "strong" | "code"; text: string };
+/** A span of the document's own text. */
+type DocInline = { kind: "text" | "strong" | "code"; text: string };
+/** A note of the UI in an operator marker's place (`fillOperator`), in the UI's language (`lang`). */
+type NoteInline = { kind: "note"; text: string; lang: string };
+export type Inline = DocInline | NoteInline;
 
 export type Block =
   | { kind: "h2" | "h3"; text: string; id: string }
@@ -33,7 +38,7 @@ const FOREIGN = /^\s*(#|>|\d+[.)](\s|$)|[*+](\s|$)|<|```|~~~|\|)/;
 /** `text`'s inline spans: `` `code` `` (its text verbatim), `**bold**` (non-empty), the rest text. */
 function parseInlines(text: string): Inline[] {
   const spans: Inline[] = [];
-  const push = (kind: Inline["kind"], part: string) => {
+  const push = (kind: DocInline["kind"], part: string) => {
     const last = spans.at(-1);
     if (kind === "text" && last?.kind === "text") {
       last.text += part;
@@ -188,32 +193,54 @@ export const OPERATOR_MARKERS = {
 export type OperatorKey = (typeof OPERATOR_MARKERS)[keyof typeof OPERATOR_MARKERS];
 /** The operator file's values (`OperatorOut`); `null` for one the server does not have. */
 export type OperatorValues = Record<OperatorKey, string | null>;
+/** What takes the markers' place: the server's values (a null one keeps its marker, as a server without an
+ * operator file answers), or one note of the UI for every marker while there is no answer to show. */
+export type OperatorFill = { values: OperatorValues } | { note: string; lang: string };
 
 const MARKER = /\[set at deployment:[^\]\n]*\]/g;
 const MARKER_KEYS: ReadonlyMap<string, OperatorKey> = new Map(Object.entries(OPERATOR_MARKERS));
 
-/** `blocks` with each marker in a text span replaced by its value; a marker without a value (`values` null, or
- * that key's null) or of no key stays, and so does a code span (the document's own text). The value is inserted
- * as it is: `replace` reads no pattern in what its function returns. */
-export function fillOperator(blocks: Block[], values: OperatorValues | null): Block[] {
-  if (values === null) {
-    return blocks;
-  }
-  const fillText = (text: string): string =>
-    text.replace(MARKER, (marker) => {
-      const key = MARKER_KEYS.get(marker);
-      return (key === undefined ? null : values[key]) ?? marker;
-    });
-  const fill = (inlines: Inline[]): Inline[] =>
-    inlines.map((inline) => (inline.kind === "text" ? { kind: "text", text: fillText(inline.text) } : inline));
+/** `blocks` with each marker in a text span replaced by its value, or by the note; a marker of no key stays, a
+ * marker whose value is null stays, and so does a code span (the document's own text). A value is inserted as
+ * it is (`replace` reads no pattern in what its function returns); a note becomes a span of its own, which keeps
+ * its language. */
+export function fillOperator(blocks: Block[], fill: OperatorFill): Block[] {
+  const fillText = (text: string): Inline[] => {
+    if ("values" in fill) {
+      const { values } = fill;
+      const filled = text.replace(MARKER, (marker) => {
+        const key = MARKER_KEYS.get(marker);
+        return (key === undefined ? null : values[key]) ?? marker;
+      });
+      return [{ kind: "text", text: filled }];
+    }
+    const parts: Inline[] = [];
+    let rest = 0;
+    const plain = (end: number) => {
+      if (end > rest) {
+        parts.push({ kind: "text", text: text.slice(rest, end) });
+      }
+    };
+    for (const match of text.matchAll(MARKER)) {
+      if (MARKER_KEYS.has(match[0])) {
+        plain(match.index);
+        parts.push({ kind: "note", text: fill.note, lang: fill.lang });
+        rest = match.index + match[0].length;
+      }
+    }
+    plain(text.length);
+    return parts.length > 0 ? parts : [{ kind: "text", text }];
+  };
+  const fillInlines = (inlines: Inline[]): Inline[] =>
+    inlines.flatMap((inline) => (inline.kind === "text" ? fillText(inline.text) : [inline]));
   return blocks.map((block): Block => {
     switch (block.kind) {
       case "p":
-        return { kind: "p", inlines: fill(block.inlines) };
+        return { kind: "p", inlines: fillInlines(block.inlines) };
       case "ul":
-        return { kind: "ul", items: block.items.map(fill) };
+        return { kind: "ul", items: block.items.map(fillInlines) };
       case "table":
-        return { kind: "table", head: block.head.map(fill), rows: block.rows.map((row) => row.map(fill)) };
+        return { kind: "table", head: block.head.map(fillInlines), rows: block.rows.map((row) => row.map(fillInlines)) };
       default:
         return block;
     }
