@@ -21,7 +21,11 @@ exits 1):
 - `refuse` (R16): the application database must hold no `alembic_version` and `cv_store` no entry, else
   `database_not_empty` or `cv_store_not_empty`: a restore never runs over data;
 - `stream` (1): `restic snapshots --tag manifests`; a restic failure (an unreachable repository, a wrong
-  password) is `restic_failed`; none is an empty stream (`manifest_stream_empty` logged, nothing restored).
+  password) is `restic_failed`. A snapshot whose listing counts no file (`SnapshotInfo.files == 0`: restic's
+  exit 3 with no listed file readable, final fix B8) holds no manifest, so it can hide none: it contributes
+  nothing, is never restored (its manifests folder may not exist, which would fail the restore) and is logged
+  `manifest_snapshot_empty` with its id. A snapshot without a count (no summary) is restored as any other. No
+  snapshot left is an empty stream (`manifest_stream_empty` logged, nothing restored).
   Otherwise the stream is the **union of every `manifests` snapshot** (final review C1, M2), never the newest
   alone: a snapshot restic saved on exit 3 (incomplete, named by no shipment) or an older list two
   unserialised shippers uploaded last (before the shipment lock, `shipper.SHIP_LOCK_KEY`) may lack a manifest
@@ -50,9 +54,10 @@ exits 1):
   then `pg_restore --no-owner --no-acl --exit-on-error -L <list>` as the migrator, its password in the child's
   environment only (`pg_restore_failed` for either's non-zero exit);
 - `verify_restored` (5): `privacy.restore_verify.verify_restored` in one transaction (`verify_failed`), and,
-  with an empty stream (no `manifests` snapshot at all), a restored `deletion_manifests` row that is `shipped`
-  stops it with `manifest_stream_missing` (a shipped manifest must be in the stream; `executing` and
-  `completed` rows without files are §19.5's pending retries and rewrites); either rolls the transaction back;
+  with an empty stream (no `manifests` snapshot that may hold a file), a restored `deletion_manifests` row
+  that is `shipped` stops it with `manifest_stream_missing` (a shipped manifest must be in the stream;
+  `executing` and `completed` rows without files are §19.5's pending retries and rewrites); either rolls the
+  transaction back;
 - `cv` (6): the set's `cfg.cv_store_dir` restored into `cfg.cv_store_dir`, checked to hold no directory
   (`cv_not_restored`);
 - `migrate` (7): `run_migrate_async(cfg)`, every step as the migrator on the volumes of the configuration
@@ -74,7 +79,8 @@ returns the set restored with its data key ids (`RestoreResult`), which `restore
 **`restore_verify`** is `jobhunter restore verify --set <id> --phase restored|replayed [--database <db>]`
 (review M4; `cli_backup` parses and prints): the `restored` phase is step 5's `check_restored` on a set an
 operator staged in `<staging_dir>/restore` (the stream empty when the repository holds no `manifests`
-snapshot, as step 1 reads it), the `replayed` phase step 8 on the restored stream, the union.
+snapshot that may hold a file, as step 1 reads it), the `replayed` phase step 8 on the restored stream, the
+union.
 
 Log lines carry steps, codes, ids and counts only: no row content, no path of a file's content, no secret.
 """
@@ -279,6 +285,24 @@ def _copy_union(union: Path, target: Path) -> None:
     fsync_directory(target)
 
 
+def holds_files(snapshot: SnapshotInfo) -> bool:
+    """Whether `snapshot` may hold a file: all but one whose listing counts none (`SnapshotInfo.files == 0`,
+    module docstring, step 1); one without a count may."""
+    return snapshot.files != 0
+
+
+async def stream_snapshots(restic: Restic) -> list[SnapshotInfo]:
+    """The `manifests` snapshots that may hold a manifest, oldest first; each of the others, which holds no
+    file, logged `manifest_snapshot_empty` with its id (module docstring, step 1)."""
+    snapshots = []
+    for snapshot in await restic.snapshots(tags=[MANIFESTS_TAG]):  # oldest first
+        if holds_files(snapshot):
+            snapshots.append(snapshot)
+        else:
+            log.info("manifest_snapshot_empty", snapshot_id=snapshot.id)
+    return snapshots
+
+
 async def restore_stream(
     restic: Restic, *, subfolder: Path, target: Path, scratch: Path
 ) -> RestoredStream | None:
@@ -286,7 +310,7 @@ async def restore_stream(
     `target`, which is created first, through `scratch` (removed whatever the outcome); the stream, or `None`
     for an empty one. `ManifestStreamConflict` for a file name two snapshots hold with different bytes,
     `RestoreFailed('stream', 'manifest_stream_not_restored')` when the files are not where they must be."""
-    snapshots = await restic.snapshots(tags=[MANIFESTS_TAG])  # oldest first
+    snapshots = await stream_snapshots(restic)
     await asyncio.to_thread(target.mkdir, mode=0o700, parents=True, exist_ok=True)
     if not snapshots:
         log.info("manifest_stream_empty")
@@ -474,7 +498,7 @@ async def load_dump(
 
 async def check_restored(engine: AsyncEngine, staged: StagedSet, *, empty_stream: bool) -> VerifyReport:
     """Step 5 (module docstring): `verify_restored` and the empty stream's rule (`empty_stream`: no
-    `manifests` snapshot at all), in one transaction that commits only a report that holds."""
+    `manifests` snapshot that may hold a file), in one transaction that commits only a report that holds."""
     async with engine.connect() as conn:
         async with conn.begin() as transaction:
             report = await verify_restored(conn, staged.inventory, snapshot_id=staged.snapshot.id)
@@ -685,7 +709,7 @@ async def restore_verify(
             if restic is None:
                 raise RestoreFailed("verify_restored", "not_configured")
             staged = await _staged_by_hand(restic, set_id=set_id, directory=cfg.staging_dir / RESTORE_STAGING)
-            empty_stream = not await restic.snapshots(tags=[MANIFESTS_TAG])
+            empty_stream = not await stream_snapshots(restic)
             return await check_restored(engine, staged, empty_stream=empty_stream)
     finally:
         await engine.dispose()

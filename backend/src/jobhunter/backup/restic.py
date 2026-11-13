@@ -21,11 +21,13 @@ newest snapshot of those tags may be that incomplete one. `restore` runs `restic
 <snapshot>:<subfolder> --target <target>` (the `snapshotID:subfolder` form of restic >= 0.17, read from
 0.19.1's `restore --help`): the subfolder's content lands directly in `target`, not under its absolute path.
 `snapshots` lists the snapshots carrying every one of `tags`, sorted by time, oldest first (whatever order
-restic printed them in). `forget_prune` forgets the snapshots tagged `tag` beyond the daily, weekly and
-monthly counts and prunes the data they alone held. `forget_last` forgets the snapshots tagged `tag` beyond
-the newest `keep_last`, grouped by host alone (`--group-by host`: restic's default groups by host and paths,
-and a `manifests` snapshot's paths are the files it lists, so each would be a group of its own and every one
-kept), and prunes nothing itself: the `forget_prune` that follows it does.
+restic printed them in), each with the number of files it holds (`files`): its summary's
+`total_files_processed`, which restic >= 0.17 stores in every snapshot it makes (0 for one saved on exit 3
+with no file readable), `None` for a snapshot without a summary. `forget_prune` forgets the snapshots tagged
+`tag` beyond the daily, weekly and monthly counts and prunes the data they alone held. `forget_last` forgets
+the snapshots tagged `tag` beyond the newest `keep_last`, grouped by host alone (`--group-by host`: restic's
+default groups by host and paths, and a `manifests` snapshot's paths are the files it lists, so each would be
+a group of its own and every one kept), and prunes nothing itself: the `forget_prune` that follows it does.
 
 Every failure raises `ResticError(command, code)`: the code is `incomplete` (exit 3: a source file could not
 be read), `repository_absent` (10), `locked` (11), `wrong_password` (12), `failed` (any other exit status),
@@ -67,6 +69,7 @@ class SnapshotInfo:
     time: datetime
     tags: tuple[str, ...]
     paths: tuple[str, ...]
+    files: int | None = None
 
 
 class ResticError(Exception):
@@ -122,6 +125,18 @@ def _strings(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _files(summary: Any) -> int | None:
+    """The `total_files_processed` of a snapshot's summary, `None` without one (module docstring)."""
+    if summary is None or (isinstance(summary, dict) and "total_files_processed" not in summary):
+        return None
+    if not isinstance(summary, dict):
+        raise ValueError("not a summary")
+    files = summary["total_files_processed"]
+    if not isinstance(files, int) or isinstance(files, bool) or files < 0:
+        raise ValueError("not a file count")
+    return files
+
+
 def _snapshot_infos(stdout: bytes) -> list[SnapshotInfo]:
     try:
         listing = json.loads(stdout)
@@ -132,9 +147,8 @@ def _snapshot_infos(stdout: bytes) -> list[SnapshotInfo]:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                 raise ValueError("not a snapshot")
             time = datetime.fromisoformat(item["time"]).astimezone(UTC)
-            infos.append(
-                SnapshotInfo(item["id"], time, _strings(item.get("tags")), _strings(item.get("paths")))
-            )
+            tags, paths = _strings(item.get("tags")), _strings(item.get("paths"))
+            infos.append(SnapshotInfo(item["id"], time, tags, paths, _files(item.get("summary"))))
     except (ValueError, TypeError, KeyError):
         raise ResticError("snapshots", "unparsable", 0) from None
     return sorted(infos, key=lambda info: info.time)  # stable: restic's order among equal times

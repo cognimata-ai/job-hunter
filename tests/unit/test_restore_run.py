@@ -408,6 +408,57 @@ async def test_a_manifest_only_an_older_snapshot_holds_is_restored_and_replayed(
     ]
 
 
+@pytest.mark.parametrize("beside", ["a_complete_snapshot", "nothing"])
+async def test_a_manifests_snapshot_that_holds_no_file_contributes_nothing(
+    migrated: PgServer,
+    site: Site,
+    backup_cfg: AppConfig,
+    backup_engine: AsyncEngine,
+    repo: FakeRepository,
+    runner: ContainerRunner,
+    target: RestoredDatabase,
+    beside: str,
+) -> None:
+    """A `manifests` snapshot restic saved on exit 3 with no listed file readable holds no file: the stub
+    saves it without the manifests folder, which a restore of that subfolder cannot find (final fix B8). It
+    holds no manifest, so it cannot hide one: the restore skips it, logged by id (`manifest_snapshot_empty`),
+    and restores the others, never `restic_failed`. Beside a complete snapshot, that one's manifest is
+    restored and replayed; alone, the stream is empty, as with no `manifests` snapshot at all."""
+    await run_backup_set(backup_cfg, repo, runner, clock=utcnow)
+    m1, m2 = a_manifest(max_alert=50), a_manifest(max_alert=51)
+    expected = []
+    if beside == "a_complete_snapshot":
+        write_manifest_file(site.manifests, m1)
+        assert (await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)).shipped
+        expected = [m1]
+    write_manifest_file(site.manifests, m2)
+    repo.unreadable.update(stream_file(site, m) for m in (m1, m2))
+    with pytest.raises(ResticError):
+        await ship_manifests(backup_cfg, repo, backup_engine, clock=utcnow)
+    empty = repo.infos[-1]
+    assert "manifests" in empty.tags and empty.files == 0
+    site.lose()
+
+    with capture_logs() as logs:
+        await run_restore(restore_cfg(migrated, site, target), repo, runner, set_id=None, clock=utcnow)
+
+    assert [e["snapshot_id"] for e in events(logs, "manifest_snapshot_empty")] == [empty.id]
+    assert empty.id not in [restored.snapshot for restored in repo.restores]
+    names = sorted(manifest_file_name(m["manifest_uuid"]) for m in expected)
+    assert sorted(path.name for path in site.manifests.iterdir()) == names
+    for manifest in expected:
+        assert await scalar(target.engine, _MANIFEST, u=uuid.UUID(manifest["manifest_uuid"])) == "completed"
+    if expected:
+        [restored] = events(logs, "manifest_stream_restored")
+        assert (restored["snapshots"], restored["manifests"]) == (1, 1)
+    else:
+        assert len(events(logs, "manifest_stream_empty")) == 1
+    assert [(e["phase"], e["ok"]) for e in events(logs, "restore_verified")] == [
+        ("restored", True),
+        ("replayed", True),
+    ]
+
+
 async def test_one_file_name_with_other_bytes_in_two_snapshots_stops_the_restore(
     migrated: PgServer,
     site: Site,

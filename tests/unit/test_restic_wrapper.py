@@ -267,6 +267,40 @@ async def test_snapshots_are_read_from_the_json_listing(tmp_path: Path) -> None:
     assert refused.value.code == "unparsable"
 
 
+async def test_a_snapshots_file_count_is_its_summarys(tmp_path: Path) -> None:
+    """restic >= 0.17 stores a backup's summary in its snapshot, and the listing shows it: `files` is its
+    `total_files_processed`, 0 for a snapshot that holds no file (restic's exit 3 with no listed file
+    readable, final fix B8), and `None` when the listing carries no summary (a snapshot of an older restic).
+    A count that is no integer is no listing restic wrote."""
+    summaries: list[dict[str, object] | None] = [
+        {"files_new": 2, "total_files_processed": 2},
+        {"files_new": 0, "total_files_processed": 0},
+        None,
+    ]
+    listing = [
+        {
+            "time": f"2026-11-10T07:0{n}:00Z",
+            "paths": ["/data/manifests/a.json"],
+            "id": key * 32,
+            **({} if summary is None else {"summary": summary}),
+        }
+        for n, (key, summary) in enumerate(zip(("a1", "b2", "c3"), summaries, strict=True))
+    ]
+    runner = FakeRunner({"snapshots": [exited(0, json.dumps(listing).encode())]})
+
+    found = await Restic(backup_config(tmp_path), runner).snapshots(tags=["manifests"])
+
+    assert [(info.id, info.files) for info in found] == [("a1" * 32, 2), ("b2" * 32, 0), ("c3" * 32, None)]
+    for count in ("2", True, -1):
+        garbled = [{**listing[0], "summary": {"total_files_processed": count}}]
+        restic = Restic(
+            backup_config(tmp_path), FakeRunner({"snapshots": [exited(0, json.dumps(garbled).encode())]})
+        )
+        with pytest.raises(ResticError) as refused:
+            await restic.snapshots(tags=())
+        assert refused.value.code == "unparsable", count
+
+
 async def test_snapshots_are_sorted_oldest_first(tmp_path: Path) -> None:
     """Whatever order restic prints, newest first here, and whatever offset each time carries: by time."""
     times = {

@@ -19,7 +19,8 @@ does (a subfolder the snapshot lacks fails as restic does). `failing` names the 
 subfolder would (`restic restore <id> --target`): the files one level deeper, or more, than the step expects.
 `stored(snapshot, path)` is where a snapshot holds a backed-up file, for a test to alter it. `unreadable`
 names listed files restic cannot read (final review C1): as restic 0.19.1 does on exit 3, `backup` still saves
-the snapshot of the files it could read, with the tags given, then raises `ResticError("backup",
+the snapshot of the files it could read, with the tags given and its file count (`SnapshotInfo.files`, 0 when
+none was readable: then the snapshot has no manifests folder at all), then raises `ResticError("backup",
 "incomplete", 3)`. `forget_last(tag=, keep_last=)` forgets the snapshots of `tag` beyond the newest
 `keep_last` (one group: every snapshot has the one host, final fix B7), their directories with them;
 `forget_prune` is recorded in `forgets` and forgets no set (the set policy is real restic's, which
@@ -210,7 +211,8 @@ class FakeRepository(Restic):
             shutil.copy2(file, self._inside(stored, file))
         time = self._EPOCH + timedelta(minutes=self._made - 1)
         names = tuple(str(path) for path in [*paths, *listed])
-        self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names))
+        files = len(listed) + sum(1 for path in paths for found in path.rglob("*") if found.is_file())
+        self.infos.append(SnapshotInfo(snapshot_id, time, tuple(tags), names, files))
         if len(listed) < len(named):  # exit 3: the incomplete snapshot is saved all the same
             raise ResticError("backup", "incomplete", 3)
         return snapshot_id

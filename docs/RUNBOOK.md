@@ -621,7 +621,9 @@ worker stay stopped until the last step.
    restore jobhunter restore run --set <id>` takes another), `pg_restore`, the `restored` verification, the CV
    files, `migrate` with its replay, the exports and the `replayed` verification. The manifest stream is the
    union of every `manifests` snapshot, never only the newest: a snapshot restic left incomplete hides no
-   manifest an earlier one holds. A file name two snapshots hold with different bytes stops the restore at
+   manifest an earlier one holds. A snapshot that holds no file at all (a shipment whose files restic could
+   not read) is skipped with the log line `manifest_snapshot_empty` and its id: it holds no manifest, so
+   nothing is to be done about it. A file name two snapshots hold with different bytes stops the restore at
    its first step (`{"error": "manifest_stream_conflict", "step": "stream"}`; the log line
    `manifest_stream_conflict` names the file and both snapshots): a manifest file is written once, so this is
    a damaged repository, and the restore never picks one. Stop there and keep the repository as it is: the
