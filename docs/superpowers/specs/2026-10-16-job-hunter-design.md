@@ -6736,7 +6736,7 @@ Afterwards, no Adzuna-derived text, salary or score remains in the database, in 
    | RapidAPI/OpenWeb Ninja, SerpApi, Adzuna | Search queries |
    | Arbeitnow and ATS hosts | GET requests |
    | ntfy | Alert texts without PII |
-   | healthchecks.io | Pings only |
+   | healthchecks.io | Pings, and the check's period |
    | The VPS provider, the S3 backup provider | Infrastructure (§23) |
 
 5. **The retention table** (§20.1).

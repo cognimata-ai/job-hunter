@@ -37,7 +37,7 @@ These parties receive data from the app. The api, which serves the web interface
 | RapidAPI/OpenWeb Ninja, SerpApi, Adzuna | Search queries |
 | Arbeitnow and ATS hosts | GET requests |
 | ntfy | Alert texts without PII |
-| healthchecks.io | Pings only |
+| healthchecks.io | Pings, and the check's period |
 | The VPS provider, the S3 backup provider | Infrastructure (§23) |
 
 The § references in this table, (§23), and in the retention table below point to Job Hunter's design specification, not to sections of this statement. The original PDF goes to Anthropic only when you opt in (section 3). LangSmith receives traces at its EU endpoint with their inputs and outputs hidden. The operator section below names the VPS provider and the S3 backup provider.
