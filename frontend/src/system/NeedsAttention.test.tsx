@@ -473,7 +473,7 @@ describe("NeedsAttention", () => {
     // each deletion by its kind and id, when it was asked for, its attempts and its last error code
     const failed = item(purges, /#12/);
     expect(failed.textContent).toContain(en["settings_privacy.kind.source_purge"]);
-    expect(failed.textContent).toContain("3 attempts");
+    expect(failed.textContent).toContain("requeued 3\u00a0times"); // no break inside, plan M5 Task 33
     expect(within(failed).getByText("postcondition_failed").tagName).toBe("CODE");
     // one without a purge operation has nothing to retry: the reconciler queues it again
     const waiting = item(purges, /#11/);
@@ -515,6 +515,23 @@ describe("NeedsAttention", () => {
       expect(within(await block("failed_purges")).getByText(en["attention.nothing"])).toBeTruthy();
     });
     expect(app.router.state.location.pathname).toBe("/settings");
+  });
+
+  it("a purge's requeues show only when there were some, as requeues (plan M5 Task 33, Ruling T33-15)", async () => {
+    // `operations.attempts` counts requeues, not runs: a purge that failed on its first run has 0
+    const api = fakeApi({ signedIn: true });
+    const failedPurge = (manifestId: number, attempts: number) => ({
+      manifest_id: manifestId, kind: "golden_case_delete" as const, created_at: "2026-11-03T04:00:00Z",
+      operation_id: 80 + manifestId, last_error_code: "postcondition_failed", attempts,
+    });
+    api.attention = attentionOut({ failed_purges: { count: 3, items: [failedPurge(3, 0), failedPurge(2, 1), failedPurge(1, 2)] } });
+    renderApp("/settings#system");
+    const purges = await block("failed_purges");
+    const first = item(purges, /#3/);
+    expect(first.textContent).not.toMatch(/requeued|attempt/);
+    expect(first.textContent).toContain("postcondition_failed");
+    expect(item(purges, /#2/).textContent).toContain("requeued 1\u00a0time");
+    expect(item(purges, /#1/).textContent).toContain("requeued 2\u00a0times");
   });
 
   it("a retried purge that leaves the list hands the focus to its block's heading", async () => {

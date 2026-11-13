@@ -20,8 +20,9 @@
 // - **Paused scoring**: [Acknowledge] sends the pausing alert's acknowledgement.
 // - **Failed scope apply**: [Retry apply] (`useRetryApply`, telling its own failure at the item).
 // - **Broken sources** are information only; a `degraded` one shows as a warning.
-// - **Failed purges** (M5 Task 20, Deviation 22): each deletion by its kind and id, when it was asked for, its purge
-//   operation's attempts and last error code; [Retry] asks in a `ConfirmDialog` (a new attempt carries the deletion
+// - **Failed purges** (M5 Task 20, Deviation 22): each deletion by its kind and id, when it was asked for, how often
+//   its purge operation was requeued (its `attempts`, which count requeues, not runs: shown only when above 0,
+//   M5 Task 33) and its last error code; [Retry] asks in a `ConfirmDialog` (a new attempt carries the deletion
 //   on; its fence stays), whose confirm sends `POST /api/system/purges/{operation_id}/retry` (not keyed) once and is
 //   busy until answered; its refusal shows by its code (`PrivacyProblem`). A deletion without a purge operation has
 //   no Retry: the reconciler queues one.
@@ -543,8 +544,9 @@ function FailedPurgeItem({ item }: { item: Item<"failed_purges"> }) {
       </p>
       <Meta>
         {t("attention.purge_requested", { time: format.dayMonthTime(item.created_at) })}
-        {" · "}
-        {t("attention.purge_attempts", { count: item.attempts, value: format.number(item.attempts) })}
+        {/* `attempts` counts requeues, not runs: none for a purge that failed on its first run (M5 Task 33) */}
+        {item.attempts > 0 && " · "}
+        {item.attempts > 0 && t("attention.purge_requeued", { count: item.attempts, value: format.number(item.attempts) })}
       </Meta>
       {item.last_error_code !== null && (
         <p className={styles.codes}>
