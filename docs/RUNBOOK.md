@@ -526,7 +526,11 @@ but pointless.
    Exit 1 is also `{"error": "database"}`, or `{"error": "unexpected", …}` naming the kind, the table and the
    row of a ciphertext that cannot be rotated; every rerun stops at that row until it is dealt with. Its
    `error_class` `ExportUnauthenticated` names an export already under the current key whose row's hash
-   differs from its archive's and whose archive does not open: the rotation does not repair that hash.
+   differs from its archive's and whose archive does not open: the rotation does not repair that hash. That
+   archive is damaged or another's, and not the rotation's to fix. Keep `data_key_previous` mounted and wait:
+   an export expires 7 days after it was made, the `exports` retention rule then ends it (`expired`, its
+   archive removed) at the next nightly pass or at `jobhunter retention run` (section 11), and the rotation,
+   which reads `ready` exports only, passes it when run again.
 3. Once it exits 0, empty `data_key_previous` and restart again:
 
    ```
