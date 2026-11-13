@@ -8,6 +8,9 @@
 # anything:
 # - a real run only: it runs as root, from the checkout at /opt/jobhunter, and deploy/release.lock and
 #   /etc/jobhunter/jobhunter.env exist (step 5 needs them);
+# - the operator file /etc/jobhunter/operator.json exists (M5 follow-ups Task F1): the api's startup check of
+#   step 5 refuses a prod api without it, and compose creates no api container without it. A real run stops
+#   here; a dry run names it and goes on. Its content is step 5's to check;
 # - nft is installed (`command -v nft`; the package nftables): step 4's unit loads the egress rule with it, so
 #   a host without it would stop at step 4, after the secrets were installed;
 # - every secret file of deploy/secrets.example is in <dir>, except the two optional ones (step 3);
@@ -40,6 +43,7 @@ set -euo pipefail
 readonly APP_DIR=/opt/jobhunter
 readonly SECRETS_DIR=/etc/jobhunter/secrets
 readonly ENV_FILE=/etc/jobhunter/jobhunter.env
+readonly OPERATOR_FILE=/etc/jobhunter/operator.json
 readonly GID=10010
 readonly GROUP=jobhunter-secrets
 readonly UNIT=jobhunter-egress.service
@@ -162,6 +166,12 @@ if [ "$dry_run" -eq 0 ]; then
     for file in "$root/deploy/release.lock" "$ENV_FILE"; do
         [ -f "$file" ] || die "$file is missing; the startup checks (step 5) need it; nothing was changed"
     done
+fi
+if [ ! -f "$OPERATOR_FILE" ]; then
+    [ "$dry_run" -eq 1 ] ||
+        die "$OPERATOR_FILE is missing: write it first (RUNBOOK section 2, item 3); the api's startup check" \
+            "(step 5) needs it; nothing was changed"
+    note "$OPERATOR_FILE is missing: write it before the real run, which stops here without it"
 fi
 command -v nft >/dev/null ||
     die "nft is not installed: install the package nftables (apt-get install nftables); step 4's egress rule" \

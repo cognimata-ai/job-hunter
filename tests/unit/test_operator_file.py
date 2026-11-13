@@ -5,8 +5,9 @@ operator values, which the repository never holds.
   at most 200 characters, with no control character: the details. No file at the path is `None`; anything
   else is `OperatorFileInvalid`, whose reason names the problem and never a value or an unknown key's name:
   a file that cannot be read, that is no regular file or too large, that is not UTF-8 or not JSON, not an
-  object, with a key missing, another key or a key twice, a value of another type, or a blank, overlong or
-  control-character value.
+  object, with a key missing, another key or a key twice, a value of another type, or a value without a
+  visible character, overlong, with a control character, or still the RUNBOOK template's `<…>` placeholder.
+  The read stops one byte past the limit, whatever the file's size.
 - `at_start`, the api's one read: outside prod a missing or invalid file is no details (the statement keeps
   its markers), the invalid one logged; in prod either raises.
 - The startup check `operator_file` refuses a prod api without a valid file, naming the path and the problem,
@@ -14,7 +15,8 @@ operator values, which the repository never holds.
   CLI exits 78.
 - The compose mount: `deploy/compose.yaml` mounts `/etc/jobhunter/operator.json` read-only into the api only,
   at the setting's default, and never makes a directory in its place; the test stack mounts
-  `deploy/test/operator.json` there instead, whose values are fictional and valid.
+  `deploy/test/operator.json` there instead, whose values are fictional and valid, and so does the dev and E2E
+  stack (F1 fix round 1, I1), whose statement shows values too.
 - No value reaches a log line, whatever the outcome (a caplog probe; no value has a shape the redaction
   masks).
 """
@@ -42,7 +44,7 @@ from jobhunter.observability.redact import mask_text
 from jobhunter.privacy import operator
 from jobhunter.privacy.operator import FIELDS, MAX_BYTES, MAX_CHARS, OperatorDetails, OperatorFileInvalid
 
-from tests.unit.test_compose_prod import DEPLOY, prod_config, pt_config
+from tests.unit.test_compose_prod import DEPLOY, dev_config, prod_config, pt_config
 from tests.unit.test_config import API_SECRETS, BASE_ENV, WORKER_SECRETS, write_secrets
 
 # Distinctive values, none e-mail- or phone-shaped: the log redaction (which runs before a record is captured)
@@ -102,6 +104,10 @@ def json_object(*pairs: str) -> bytes:
     return ("{" + ", ".join([*pairs, *rest]) + "}").encode()
 
 
+# A Hebrew transcription of "Quirinus Zappelmeier": a right-to-left value.
+RTL_NAME: Final = (
+    "\u05e7\u05d5\u05d5\u05d9\u05e8\u05d9\u05e0\u05d5\u05e1 \u05e6\u05e4\u05dc\u05de\u05d9\u05d9\u05e8"
+)
 OTHER_KEYS: Final = "other than operator, contact, controller, vps_provider, s3_provider"
 
 
@@ -145,6 +151,9 @@ def test_a_path_under_a_file_is_none(tmp_path: Path) -> None:
         (b"\xff\xfe{}", "is not valid UTF-8"),
         ("﻿".encode() + json.dumps(VALUES).encode(), "is not valid JSON (line 1, column 1)"),
         (b"[" * 10000, "is nested too deeply"),
+        pytest.param(
+            json_object('"operator": ' + "1" * 5000), "is not valid JSON", id="int-past-digit-limit"
+        ),
         (b"[]", "must be a JSON object"),
         (b'"Quirinus Zappelmeier"', "must be a JSON object"),
         (b"null", "must be a JSON object"),
@@ -160,9 +169,18 @@ def test_a_path_under_a_file_is_none(tmp_path: Path) -> None:
         (document(vps_provider=True), "vps_provider must be a string"),
         (json_object('"operator": null'), "operator must be a string"),
         (json_object('"operator": NaN'), "operator must be a string"),
-        (document(operator=""), "operator must not be empty"),
-        (document(s3_provider="   "), "s3_provider must not be empty"),
-        (document(s3_provider=" \t "), "s3_provider must not be empty"),  # blank, before its characters
+        (document(operator=""), "operator must have a visible character"),
+        (document(s3_provider="   "), "s3_provider must have a visible character"),
+        (document(s3_provider=" \t "), "s3_provider must have a visible character"),  # before its characters
+        # M3: format and zero-width characters, and space separators, show nothing
+        (document(controller="\u200b"), "controller must have a visible character"),
+        (document(controller="\u200b\u200c\u200d\u2060\ufeff"), "controller must have a visible character"),
+        (document(controller="\u202e\u2066"), "controller must have a visible character"),  # bidi controls
+        (document(controller="\u00a0\u3000\u2028"), "controller must have a visible character"),
+        # M5: the RUNBOOK template's placeholder, unedited, is no value
+        (document(operator="<operator name>"), "operator is still a placeholder"),
+        (document(contact=" <contact address> "), "contact is still a placeholder"),
+        (document(vps_provider="<>"), "vps_provider is still a placeholder"),
         (document(contact="q" * (MAX_CHARS + 1)), f"contact must be at most {MAX_CHARS} characters"),
         (document(operator="Quirinus\nZappelmeier"), "operator must contain no control character"),
         (document(operator="Quirinus\x00Zappelmeier"), "operator must contain no control character"),
@@ -183,6 +201,45 @@ def test_an_invalid_file_is_refused_naming_the_problem_never_a_value(
     assert found == reason
     assert_no_value(found)
     assert "Quirinus" not in found and "phone" not in found and "vps-provider" not in found
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Zappelmeier\u200bDatenhaltung",  # a zero-width character between visible ones
+        RTL_NAME,  # right to left
+        "Acme <ops> GmbH",  # angle brackets inside a value
+        "<b>Zappelmeier</b>",  # more than one `<…>`: text, never markup (the SPA renders it so)
+        "Z",
+    ],
+    ids=["zero-width-inside", "rtl", "brackets-inside", "two-brackets", "one-letter"],
+)
+def test_a_value_with_visible_text_is_kept_as_it_is(tmp_path: Path, value: str) -> None:
+    details = operator.load(write(tmp_path / "operator.json", document(controller=value)))
+    assert details is not None and details.controller == value
+
+
+def test_the_read_stops_one_byte_past_the_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M2: a file of 64 MiB is refused after at most `MAX_BYTES + 1` bytes are read, by requests of at most
+    that size: the size is never the file's own."""
+    path = tmp_path / "operator.json"
+    with path.open("wb") as file:
+        file.write(json.dumps(VALUES).encode())
+        file.truncate(64 * 2**20)  # sparse: no 64 MiB written
+    asked: list[int] = []
+    got: list[int] = []
+    real_read = os.read
+
+    def counting_read(fd: int, n: int) -> bytes:
+        asked.append(n)
+        chunk = real_read(fd, n)
+        got.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(os, "read", counting_read)  # the module reads with os.read
+    assert problem_of(path) == f"is larger than {MAX_BYTES} bytes"
+    assert sum(got) == MAX_BYTES + 1
+    assert asked and max(asked) <= MAX_BYTES + 1
 
 
 def test_a_file_too_large_is_refused(tmp_path: Path) -> None:
@@ -335,6 +392,35 @@ def test_the_cli_exits_78_naming_the_path_and_the_problem_never_a_value(tmp_path
     assert mask_text(f"the operator file {DEFAULT_OPERATOR_FILE} is missing").endswith(f"{TARGET} is missing")
 
 
+def test_an_integer_past_the_digit_limit_exits_78_too(tmp_path: Path) -> None:
+    """M1: `json.loads` refuses an integer of more than 4300 digits with a plain `ValueError`; the startup
+    check names the path and the problem like any other, and the CLI exits 78, without a traceback."""
+    (tmp_path / "operator.json").write_bytes(json_object('"operator": ' + "1" * 5000))
+    secrets = write_secrets(tmp_path / "s", **API_SECRETS)
+    env = {
+        **app_free_environ(),
+        **PROD_API_ENV,
+        "JOBHUNTER_SECRETS_DIR": str(secrets),
+        "JOBHUNTER_OPERATOR_FILE": "operator.json",
+    }
+    done = subprocess.run(
+        [sys.executable, "-m", "jobhunter.cli", "startup-check", "--role", "api"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 78, done.stdout + done.stderr
+    (line,) = done.stdout.splitlines()
+    event = json.loads(line)
+    assert (event["check"], event["detail"]) == (
+        "operator_file",
+        "the operator file operator.json is not valid JSON",
+    )
+    assert done.stderr == ""  # no traceback
+
+
 # --- no value in a log line ---------------------------------------------------------------------------------
 
 
@@ -438,3 +524,18 @@ def test_the_test_stack_mounts_its_fictional_file_in_place_of_the_host_s() -> No
     assert details is not None
     assert details.operator == "Test Operator" and details.contact == "operator@example.org"
     assert all(value.startswith("Test ") or value.endswith("@example.org") for value in values_of(details))
+
+
+def test_the_dev_and_e2e_stack_mounts_the_fictional_file_too() -> None:
+    """I1: the dev stack's api (and so the E2E suite's) serves the test file's values, read-only, the api
+    alone, at the setting's default; nothing is made in place of a missing file."""
+    mounts = operator_mounts(dev_config())
+    assert set(mounts) == {"api"}
+    [mount] = mounts["api"]
+    assert (mount["source"], mount["target"], mount.get("read_only")) == (
+        str(TEST_OPERATOR_FILE),
+        TARGET,
+        True,
+    )
+    assert mount["bind"]["create_host_path"] is False
+    assert "JOBHUNTER_OPERATOR_FILE" not in dev_config()["services"]["api"].get("environment", {})

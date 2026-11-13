@@ -89,7 +89,7 @@ VPS. No secret goes into this repository, an issue or a chat.
 | GHCR: the release's images | run `release.yml`, merge its digest PR and check out the release tag (section 10); the VPS logs in to `ghcr.io` with a read-only token (section 2) |
 | The place of the offline recovery kit | off the VPS and offline, named in the deployment record (section 8) |
 | The embedder's export: fp32 (the one locked) or int8 | V7 on the VPS's CPU decides (section 13, item 9); int8 means a new `embedder/model.lock` and a new release (section 12) |
-| The privacy statement's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | the operator file `/etc/jobhunter/operator.json` on the VPS (section 2, item 3), never the repository: a JSON object of exactly the keys `operator`, `contact`, `controller`, `vps_provider` and `s3_provider`, each a string of at most 200 characters without control characters. Compose mounts it read-only into the api only; the statement shows the values in place of the markers `docs/PRIVACY.md` keeps. The api does not start without a valid file (startup check `operator_file`, which names the problem, never a value); a changed file applies after `$JH restart api` |
+| The privacy statement's five operator fields: operator name, contact address, controller name, VPS provider and S3 backup provider | the operator file `/etc/jobhunter/operator.json` on the VPS (section 2, item 3), never the repository: a JSON object of exactly the keys `operator`, `contact`, `controller`, `vps_provider` and `s3_provider`, each a string with a visible character (not blank), of at most 200 characters, without control characters, and no longer the template's `<…>` placeholder. Compose mounts it read-only into the api only; the statement shows the values in place of the markers `docs/PRIVACY.md` keeps. The api does not start without a valid file (startup check `operator_file`, which names the problem, never a value), and neither do the api's one-off commands. The offline recovery kit keeps a copy (section 8). A changed file applies after a restart: check it first with `$JH run --rm --no-deps api jobhunter startup-check --role api`, then `$JH restart api` (section 4) |
 | The exclusivity confirmations: the SerpApi account is used by this app only (C2), the Anthropic workspace by this installation only (C3) | the deployment record; a foreign use shows as `quota.serpapi_foreign_usage`, or as spend the app did not count |
 
 **The environment file** `/etc/jobhunter/jobhunter.env`, root's, mode 0640, written with an editor. It holds no
@@ -213,9 +213,10 @@ Once before the first start: on the VPS of the deployment step, and on the fresh
    ```
 
    Its preflight changes nothing and stops at the first failure: it runs as root from `/opt/jobhunter`;
-   `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; `nft` is installed (the package
-   `nftables`, item 2); `<dir>` holds every name of
-   `deploy/secrets.example` but the optional `data_key_previous` and `ntfy_token`; gid 10010 is free or the
+   `deploy/release.lock` and `/etc/jobhunter/jobhunter.env` exist; the operator file
+   `/etc/jobhunter/operator.json` exists (item 3; a dry run only names it when it is missing); `nft` is
+   installed (the package `nftables`, item 2); `<dir>` holds every name of `deploy/secrets.example` but the
+   optional `data_key_previous` and `ntfy_token`; gid 10010 is free or the
    group `jobhunter-secrets` without members, and no host user has it as its primary group; the swap check
    passes. Then it runs the steps below, each command printed first: the group, the directory, the files, the
    egress rule's unit, the startup assertions of api, worker, migrate, backup and restore, and, with
@@ -325,6 +326,17 @@ Once, after host setup, in this order (section 13, items 5 and 6):
   ```
   $JH stop api worker
   $JH up -d --wait
+  ```
+
+  The offline recovery kit's copy of the file changes too (section 8).
+- **A changed operator file.** The api reads `/etc/jobhunter/operator.json` once, when it starts. After an edit,
+  run the api's startup check on the file in a one-off container first: a file it refuses would stop the
+  restarted api (exit 78), again at each of Docker's restarts. It exits 0, or 78 naming the problem, never a
+  value; then restart the api:
+
+  ```
+  $JH run --rm --no-deps api jobhunter startup-check --role api
+  $JH restart api
   ```
 
   The offline recovery kit's copy of the file changes too (section 8).
@@ -648,11 +660,12 @@ key. The kit holds:
 - every earlier data key a retained backup set may still need, each labelled with its key id;
 - `restic_password`, `s3_access_key_id` and `s3_secret_access_key`;
 - `RESTIC_REPOSITORY`, with `AWS_DEFAULT_REGION`;
-- a copy of `/etc/jobhunter/jobhunter.env`.
+- a copy of `/etc/jobhunter/jobhunter.env`;
+- a copy of `/etc/jobhunter/operator.json`, the privacy statement's operator values (section 1).
 
 It is kept offline, at the place the deploy checklist names (section 1): never on the VPS alone, in the bucket
 or in this repository. It changes before the stack does: a new data key goes into it before it is installed
-(section 7), and new S3 keys or a changed environment file when they change. A key id is the first 8 bytes of
+(section 7), and new S3 keys, a changed environment file or a changed operator file when they change. A key id is the first 8 bytes of
 the key's sha256, in hex, as `crypto rotate` and `restore run` print it: `base64 -d <key file> | sha256sum |
 cut -c1-16`.
 
@@ -667,9 +680,10 @@ On a fresh host (a lost VPS, or the timed restore of section 13), from the offli
 worker stay stopped until the last step.
 
 1. Host setup (section 2), with the kit's current `data_key`, `restic_password`, `s3_access_key_id` and
-   `s3_secret_access_key` in `<dir>`, its `/etc/jobhunter/jobhunter.env`, and the operator file written again
-   (section 2, item 3); the other secrets are new (the database passwords made afresh, the providers' keys from
-   the providers). The DNS A record names the new host. No `backup init`: the repository exists.
+   `s3_secret_access_key` in `<dir>`, and its `/etc/jobhunter/jobhunter.env` and `/etc/jobhunter/operator.json`
+   (section 2, item 3, with the modes there); the other secrets are new (the database passwords made afresh,
+   the providers' keys from the providers). The DNS A record names the new host. No `backup init`: the
+   repository exists.
 2. The restore:
 
    ```
@@ -865,7 +879,10 @@ full history, builds the release before migration 0012 for it as `jobhunter-app:
 revokes every session. A lost authenticator: `$JH run --rm --no-deps api jobhunter user totp disable`, then
 `$JH run --rm --no-deps api jobhunter user totp enable` for a new one; it prints the otpauth URI, which holds
 the TOTP secret, and its QR code, so clear the terminal and its scrollback afterwards. A login lockout:
-`$JH run --rm --no-deps api jobhunter sessions unlock`.
+`$JH run --rm --no-deps api jobhunter sessions unlock`. Each runs in the api's container and passes the api's
+startup assertions first, so `user …` and `sessions …` need a valid operator file, as the api does: compose
+does not create the container without `/etc/jobhunter/operator.json`, and an invalid one exits 78 naming the
+problem (section 4, a changed operator file).
 
 ## 12. The embedder model
 

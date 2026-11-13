@@ -114,7 +114,16 @@ services:
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080 # readiness and system health probe it
     secrets: [session_secret, data_key, db_app]
-    volumes: [cv_store:/data/cv, exports:/data/exports:ro] # the encrypted CV uploads (§12.1); export downloads
+    volumes:
+      - cv_store:/data/cv # the encrypted CV uploads (§12.1)
+      - exports:/data/exports:ro # export downloads
+      # The privacy statement's operator values (§19.2, §20.6): the test stack's fictional file, read-only, at
+      # the setting's default, so the statement shows values in dev and in the E2E suite (M5 follow-ups F1).
+      - type: bind
+        source: ./test/operator.json
+        target: /run/config/operator.json
+        read_only: true
+        bind: { create_host_path: false }
     networks: [proxy, internal] # both internal: no route to the internet
     healthcheck:
       test: ["CMD", "jobhunter", "http-check", "http://localhost:8000/healthz"]

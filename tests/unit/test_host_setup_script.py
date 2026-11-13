@@ -8,9 +8,16 @@ each command it would run, executing none. Shims stand first on PATH for every c
 host, and record any call. The preflight's reading commands (`getent`, `swapon`, `findmnt`, `lsblk`) are stubs
 too, which log their arguments and answer from the test, so the host's own group database and swap are never
 consulted. Each source file holds a planted dummy value, which must never appear in the output.
+
+The operator file (M5 follow-ups Task F1, Ruling FU-4): a real run's preflight stops without
+`/etc/jobhunter/operator.json`, before any change, and a dry run names it. Those cases run a copy of the
+script in a temporary checkout whose `readonly` paths (the operator file, the environment file, the checkout)
+are temporary ones; a real run's copy gets an `id` that answers 0, and every command that changes the host
+still records any call.
 """
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -66,6 +73,14 @@ DEFAULTS: Final[Answers] = {
 }
 
 
+OPERATOR_FILE: Final = "/etc/jobhunter/operator.json"
+OPERATOR_STOP: Final = (
+    "host-setup: {} is missing: write it first (RUNBOOK section 2, item 3); the api's startup check (step 5) "
+    "needs it; nothing was changed\n"
+)
+OPERATOR_NOTE: Final = "host-setup: {} is missing: write it before the real run, which stops here without it"
+
+
 @dataclass(frozen=True)
 class DryRun:
     done: subprocess.CompletedProcess[str]
@@ -96,6 +111,7 @@ def dry_run(
     *flags: str,
     answers: Answers | None = None,
     nft: bool = True,
+    script: Path = SCRIPT,
 ) -> DryRun:
     """The script's dry run on a new source directory holding `present`, each file a planted value, the probes
     answering from `answers` over `DEFAULTS`, answer by answer, and `nft` on PATH (a shim) unless `nft` is
@@ -120,7 +136,7 @@ def dry_run(
     assert (shutil.which("nft", path=path) is None) is not nft, "nft on PATH as the case says"
     env = {"PATH": path, "HOME": str(tmp_path), "LC_ALL": "C.UTF-8"}
     done = subprocess.run(
-        [str(SCRIPT), "--secrets-from", str(source), *flags, "--dry-run"],
+        [str(script), "--secrets-from", str(source), *flags, "--dry-run"],
         env=env,
         capture_output=True,
         text=True,
@@ -401,3 +417,97 @@ def test_the_swap_check(tmp_path: Path, case: Swap) -> None:
         )
     else:
         assert run.done.stderr == NOT_ENCRYPTED.format(fill(case.stop))
+
+
+# --- the operator file (F1 fix round 1, Ruling FU-4) --------------------------------------------------------
+
+
+def script_copy(tmp_path: Path, **paths: Path) -> Path:
+    """The script in a temporary checkout (`deploy/secrets.example` beside it), with each `readonly NAME=`
+    line of `paths` (`OPERATOR_FILE`, `ENV_FILE`, `APP_DIR`) set to that path. A real run needs `APP_DIR` to
+    be the checkout itself."""
+    root = tmp_path / "checkout"
+    (root / "scripts").mkdir(parents=True)
+    (root / "deploy").mkdir()
+    shutil.copy(REPO / "deploy/secrets.example", root / "deploy/secrets.example")
+    text = SCRIPT.read_text(encoding="utf-8")
+    for name, value in paths.items():
+        line = re.compile(rf"^readonly {name}=.*$", re.M)
+        assert len(line.findall(text)) == 1, name
+        text = line.sub(f"readonly {name}={shlex.quote(str(value))}", text)
+    script = root / "scripts/host-setup.sh"
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_the_operator_file_is_the_deployment_s() -> None:
+    assert f"readonly OPERATOR_FILE={OPERATOR_FILE}\n" in SCRIPT.read_text(encoding="utf-8")
+
+
+def test_a_dry_run_names_a_missing_operator_file_and_goes_on(tmp_path: Path) -> None:
+    absent = tmp_path / "etc/operator.json"
+    run = dry_run(tmp_path, NAMES, script=script_copy(tmp_path, OPERATOR_FILE=absent))
+    assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
+    assert OPERATOR_NOTE.format(absent) in run.done.stdout.splitlines()
+    assert commands(run.done.stdout) == expected(run.source)
+
+
+def test_a_dry_run_with_the_operator_file_says_nothing_of_it(tmp_path: Path) -> None:
+    present = tmp_path / "operator.json"
+    present.write_text("{}\n", encoding="utf-8")  # its content is the api's startup check's (step 5)
+    run = dry_run(tmp_path, NAMES, script=script_copy(tmp_path, OPERATOR_FILE=present))
+    assert (run.done.returncode, run.done.stderr) == (0, ""), run.done.stderr
+    assert [line for line in run.done.stdout.splitlines() if str(present) in line] == []
+
+
+def real_run(tmp_path: Path, operator_file: Path) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """A real run of a copy whose checkout, environment file and release lock exist, as root (an `id` shim
+    answers 0), on a host without nft; every other command that changes the host records any call."""
+    checkout = tmp_path / "checkout"
+    env_file = tmp_path / "jobhunter.env"
+    env_file.write_text("JOBHUNTER_ENV=prod\n", encoding="utf-8")
+    script = script_copy(tmp_path, OPERATOR_FILE=operator_file, ENV_FILE=env_file, APP_DIR=checkout)
+    (checkout / "deploy/release.lock").write_text("", encoding="utf-8")
+    source = tmp_path / "secrets-src"
+    source.mkdir()
+    shims, record = tmp_path / "bin", tmp_path / "changed"
+    shims.mkdir()
+    for command in CHANGES:
+        if command not in ("id", "nft"):
+            (shims / command).write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{record}"\nexit 97\n')
+    (shims / "id").write_text('#!/bin/sh\n[ "$1" = "-u" ] && echo 0 && exit 0\nexit 97\n')
+    for shim in shims.iterdir():
+        shim.chmod(0o755)
+    env = {
+        "PATH": f"{shims}{os.pathsep}{without_nft(os.environ['PATH'])}",
+        "HOME": str(tmp_path),
+        "LC_ALL": "C.UTF-8",
+    }
+    done = subprocess.run(
+        [str(script), "--secrets-from", str(source)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return done, record
+
+
+def test_a_real_run_without_the_operator_file_stops_before_any_change(tmp_path: Path) -> None:
+    """The api's startup check (step 5) refuses a prod api without the file, and compose creates no api
+    container without it: the preflight stops on it after the root, checkout and file checks, before nft, the
+    secrets and every step."""
+    absent = tmp_path / "operator.json"
+    done, record = real_run(tmp_path, absent)
+    assert (done.returncode, done.stdout, done.stderr) == (1, "", OPERATOR_STOP.format(absent))
+    assert not record.exists(), record.read_text(encoding="utf-8")
+
+
+def test_a_real_run_with_the_operator_file_goes_on_to_the_next_check(tmp_path: Path) -> None:
+    present = tmp_path / "operator.json"
+    present.write_text("{}\n", encoding="utf-8")
+    done, record = real_run(tmp_path, present)
+    assert done.returncode == 1 and "nft is not installed" in done.stderr  # the next check: no nft here
+    assert not record.exists(), record.read_text(encoding="utf-8")

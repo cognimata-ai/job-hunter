@@ -7,9 +7,11 @@ puts in their place (`GET /api/privacy/operator`). On the VPS the file is `/etc/
 root's, mode 0644, mounted read-only into the api only, at `/run/config/operator.json`
 (`config.DEFAULT_OPERATOR_FILE`, the setting `JOBHUNTER_OPERATOR_FILE`).
 
-**The file** is a JSON object with exactly the keys of `FIELDS`, each a string that is not blank, of at most
-`MAX_CHARS` characters, with no control character (Unicode `Cc`, and the line and paragraph separators) and
-no lone surrogate. `load` reads at most `MAX_BYTES + 1` bytes of it: the details, `None` when there is no
+**The file** is a JSON object with exactly the keys of `FIELDS`, each a string with a visible character (not
+only whitespace, separators, format or zero-width characters), of at most `MAX_CHARS` characters, with no
+control character (Unicode `Cc`, and the line and paragraph separators) and no lone surrogate, and not the
+RUNBOOK template's placeholder: a value that is one `<…>` as a whole is refused, so an unedited template never
+goes live. `load` reads at most `MAX_BYTES + 1` bytes of it: the details, `None` when there is no
 file at the path, else `OperatorFileInvalid`, whose `reason` names the problem: a key of `FIELDS` or a rule,
 never a value and never an unknown key (which may be a value typed in the wrong place). It is raised without
 its cause, since a JSON parser's error keeps the whole text.
@@ -26,6 +28,7 @@ No log line, metric, export or trace carries a value: `OperatorDetails`' repr sh
 
 import json
 import os
+import re
 import stat
 import unicodedata
 from dataclasses import dataclass, field
@@ -41,6 +44,10 @@ MAX_CHARS: Final = 200
 MAX_BYTES: Final = 16384
 # What a value must not hold: control characters (C0, DEL, C1) and the line and paragraph separators.
 _CONTROL_CATEGORIES: Final = frozenset({"Cc", "Zl", "Zp"})
+# What shows nothing: control and format characters (zero-width ones, bidi controls) and the separators.
+_INVISIBLE_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp"})
+# The RUNBOOK template's placeholders (`"<operator name>"`): one `<…>` as the whole value.
+_PLACEHOLDER: Final = re.compile(r"<[^<>]*>")
 _READ_FLAGS: Final = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
 
 log = get_logger("jobhunter.privacy.operator")
@@ -108,15 +115,17 @@ def _read(path: Path) -> bytes | None:
 def _check_value(key: str, value: object) -> str:
     if not isinstance(value, str):
         raise OperatorFileInvalid(f"{key} must be a string")
-    if not value.strip():
-        raise OperatorFileInvalid(f"{key} must not be empty")
+    categories = {unicodedata.category(char) for char in value}
+    if categories <= _INVISIBLE_CATEGORIES:  # the empty value too
+        raise OperatorFileInvalid(f"{key} must have a visible character")
     if len(value) > MAX_CHARS:
         raise OperatorFileInvalid(f"{key} must be at most {MAX_CHARS} characters")
-    categories = {unicodedata.category(char) for char in value}
     if categories & _CONTROL_CATEGORIES:
         raise OperatorFileInvalid(f"{key} must contain no control character")
     if "Cs" in categories:
         raise OperatorFileInvalid(f"{key} must be valid Unicode text")
+    if _PLACEHOLDER.fullmatch(value.strip()):
+        raise OperatorFileInvalid(f"{key} is still a placeholder")
     return value
 
 
@@ -138,6 +147,8 @@ def parse(raw: bytes) -> OperatorDetails:
         raise OperatorFileInvalid(f"is not valid JSON ({where})") from None
     except RecursionError:  # arrays or objects nested thousands deep
         raise OperatorFileInvalid("is nested too deeply") from None
+    except ValueError:  # after its two subclasses: an integer of more than 4300 digits, for one
+        raise OperatorFileInvalid("is not valid JSON") from None
     if not isinstance(document, dict):
         raise OperatorFileInvalid("must be a JSON object")
     if missing := [key for key in FIELDS if key not in document]:

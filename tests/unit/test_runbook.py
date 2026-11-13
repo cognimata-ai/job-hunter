@@ -11,7 +11,9 @@ checks it against what it documents:
   `deploy/compose.yaml` reads, PRIVACY.md's operator fields and the deployment's other inputs, the bucket's
   noncurrent-version expiry is 30 days and no other (Ruling T32-2), and the file holds nothing e-mail-shaped;
 - the operator file (M5 follow-ups Task F1): the checklist names it and its five keys, and host setup has it
-  written before its startup checks run, on a first deployment and on a restore's fresh host;
+  written before its startup checks run, on a first deployment and, from the kit, on a restore's fresh host;
+  its template is refused as it stands; an edited file passes the api's startup check before
+  `$JH restart api`, and the api's one-off commands say they need it (F1 fix round 1, M4, M5);
 - no rotation is followed by an `up -d`: in section 7 each secret install is followed by a restart, and the
   rows of the two key alerts say `$JH restart worker`;
 - every `startup-check` names its role, the role of the service it runs in, and host setup names all five;
@@ -33,16 +35,19 @@ checks it against what it documents:
 """
 
 import argparse
+import json
 import re
 import shlex
 from functools import cache
 from pathlib import Path
 from typing import Any, Final, get_args
 
+import pytest
 import yaml
 from jobhunter import cli
 from jobhunter.config import Role
 from jobhunter.observability.catalogue import CATALOGUE, RESOLVE_ON_ACK
+from jobhunter.privacy import operator
 from jobhunter.privacy.operator import FIELDS as OPERATOR_KEYS
 
 REPO: Final = Path(__file__).resolve().parents[2]
@@ -131,6 +136,7 @@ KIT_ITEMS: Final = (
     "`data_key_ids`",
     "`RESTIC_REPOSITORY`",
     "`/etc/jobhunter/jobhunter.env`",
+    "`/etc/jobhunter/operator.json`",  # F1 fix round 1 (Ruling FU-4): a restore writes it from the kit
     "offline",
     "3 months and a week",
 )
@@ -433,8 +439,35 @@ def test_the_operator_file_is_written_before_host_setup() -> None:
     assert f"chmod 0644 {OPERATOR_FILE}" in _snippets(host)
     code, _ = _split(host)
     assert all(f'"{key}": ' in "\n".join(code) for key in OPERATOR_KEYS)
-    assert "operator file" in _section(RESTORE).split("2. The restore")[0]
+    assert f"`{OPERATOR_FILE}`" in _section(RESTORE).split("2. The restore")[0]  # the kit's copy
     assert "operator file" in _section(DEPLOYMENT)
+
+
+API_CHECK: Final = "$JH run --rm --no-deps api jobhunter startup-check --role api"
+
+
+def test_an_edited_operator_file_is_checked_before_the_api_restarts() -> None:
+    """M4: a changed file applies at `$JH restart api`, so the api's startup check runs on it first, in a
+    one-off container: a file it refuses would stop the restarted api (exit 78, again and again). The api's
+    one-off commands (`user …`, `sessions …`) need a valid file too."""
+    [row] = [line for line in _section(CHECKLIST).splitlines() if OPERATOR_FILE in line]
+    assert API_CHECK in row and row.index(API_CHECK) < row.index("$JH restart api")
+    assert "visible character" in row and "placeholder" in row
+    code, prose = _split(_section(SECTIONS[3]))  # section 4: a changed operator file
+    assert code.index(API_CHECK) < code.index("$JH restart api")
+    assert "a changed operator file" in prose.lower()
+    lost = " ".join(_section(SECTIONS[10]).split())  # section 11: a lost password, a lockout
+    assert "`user …` and `sessions …` need a valid operator file" in lost
+
+
+def test_the_operator_file_template_cannot_go_live() -> None:
+    """M5: section 2's template, saved as it stands, is refused by the loader, which names the first key."""
+    code, _ = _split(_section(HOST_SETUP))
+    start = code.index("{")
+    template = "\n".join(code[start : code.index("}", start) + 1])
+    assert json.loads(template) == {key: json.loads(template)[key] for key in OPERATOR_KEYS}
+    with pytest.raises(operator.OperatorFileInvalid, match=r"^operator is still a placeholder$"):
+        operator.parse(template.encode())
 
 
 def test_no_up_d_follows_a_rotation() -> None:
