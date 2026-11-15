@@ -1,6 +1,8 @@
 // Privacy & data's deletions (spec §15.7 "each deletion's status (executing → completed → confirmed offsite)",
-// §19.5; plan M5 Task 20, Deviation 22, D18): the newest deletion manifests (`GET /api/privacy/manifests`), read
-// again every 10 s in the background while one is not shipped. Each shows its kind and id, when it was asked for,
+// §19.5; plan M5 Task 20, Deviation 22, D18): the deletion manifests (`GET /api/privacy/manifests`), the newest 20
+// first and Load more for older ones (M5 follow-ups Task F5), every loaded page read again every 10 s in the
+// background while one is not shipped. A failed Load more keeps the loaded ones and shows its problem by its code
+// (`PrivacyProblem`). Each shows its kind and id, when it was asked for,
 // and its state: `executing` "Deleting…", `completed` "Completed — not yet confirmed offsite", `shipped`
 // "Confirmed offsite", the only state that counts as done. An Adzuna purge lists the golden cases it deleted once
 // it has recorded them (by id: the cases are gone), or that it deleted none.
@@ -15,6 +17,7 @@ import { Skeleton } from "../components/Skeleton";
 import { intlLocale } from "../i18n/index";
 import styles from "./DeletionStatus.module.css";
 import { useFormat } from "./format";
+import { LoadMore } from "./lists";
 import { PrivacyProblem } from "./PrivacyProblem";
 import { type ManifestOut, type ManifestStatus, useManifests } from "./privacyApi";
 
@@ -59,17 +62,18 @@ export function DeletionStatus() {
   const id = useId();
   const manifests = useManifests();
   let body;
-  if (manifests.isPending) {
-    body = <Skeleton variant="line" count={2} />;
-  } else if (manifests.isError) {
-    body = <PrivacyProblem error={manifests.error} onRetry={() => { void manifests.refetch(); }} />;
-  } else if (manifests.data.items.length === 0) {
+  if (manifests.items === undefined) {
+    body = manifests.error === null ? <Skeleton variant="line" count={2} /> : <PrivacyProblem error={manifests.error} onRetry={manifests.retry} />;
+  } else if (manifests.items.length === 0) {
     body = <p className={styles.empty}>{t("settings_privacy.no_deletions")}</p>;
   } else {
     body = (
-      <ul role="list" className={styles.list}>
-        {manifests.data.items.map((manifest) => <ManifestItem key={manifest.id} manifest={manifest} />)}
-      </ul>
+      <>
+        <ul role="list" className={styles.list}>
+          {manifests.items.map((manifest) => <ManifestItem key={manifest.id} manifest={manifest} />)}
+        </ul>
+        <LoadMore list={manifests} problem={(error) => <PrivacyProblem error={error} />} />
+      </>
     );
   }
   return (

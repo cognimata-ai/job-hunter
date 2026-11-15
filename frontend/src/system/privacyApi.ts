@@ -9,7 +9,8 @@
 //   `actionId` leaves out), as the server's fingerprint leaves them out (Deviation 21), so the retry of a lost
 //   request with a new code, its first one used, keeps the key.
 // - **The reads** are background polls (`X-JH-Background: 1`): an export every 3 s while it runs, the deletions
-//   every 10 s while one is not `shipped` (D18: done only then).
+//   every 10 s while one is not `shipped` (D18: done only then). The deletions are keyset-paged, the newest 20
+//   first and Load more for the next 20 (M5 follow-ups Task F5), and a poll reads every loaded page again.
 // - **The exports in use** (`GET /api/privacy/exports`, M5 follow-ups Task F5) are read when the export's card
 //   shows, so after a reload it finds a running export, or a ready one before its expiry, again; it then reads that
 //   export by its own route, as one it started.
@@ -34,14 +35,13 @@ import { useKeyedMutation } from "../api/idempotency";
 import { isTransient } from "../api/queryClient";
 import type { components } from "../api/schema";
 import { STATUS_KEY } from "./api";
-import { ATTENTION_KEY, HEALTH_KEY } from "./systemApi";
+import { ATTENTION_KEY, HEALTH_KEY, type PagedList, usePaged } from "./systemApi";
 
 export type ExportOut = components["schemas"]["ExportOut"];
 export type ManifestOut = components["schemas"]["ManifestOut"];
 export type ManifestKind = ManifestOut["kind"];
 export type ManifestStatus = ManifestOut["status"];
 export type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
-type ManifestsPageOut = components["schemas"]["ManifestsPageOut"];
 type ExportsOut = components["schemas"]["ExportsOut"];
 type ExportQueuedOut = components["schemas"]["ExportQueuedOut"];
 type PurgeRetryOut = components["schemas"]["PurgeRetryOut"];
@@ -57,7 +57,7 @@ export const OPERATOR_KEY = ["privacy", "operator"] as const;
 export const EXPORT_POLL_MS = 3_000;
 /** How often a deletion that is not confirmed offsite is read again. */
 export const MANIFEST_POLL_MS = 10_000;
-/** The newest deletions the list shows. */
+/** The deletions a page of the list asks for. */
 export const MANIFESTS_LIMIT = 20;
 
 /** The phrases the server takes (`api/routes/privacy.py`), typed by the user exactly. */
@@ -69,14 +69,12 @@ export const SOURCES_ENABLED_FIELD = "payload.sources.enabled";
 
 // --- the reads ---
 
-/** The newest deletions, newest first (`GET /api/privacy/manifests`), read again every 10 s while one is not
- * shipped. */
-export function useManifests(): UseQueryResult<ManifestsPageOut, ProblemError> {
-  return useQuery({
-    queryKey: MANIFESTS_KEY,
-    queryFn: ({ signal }) =>
-      apiSend<ManifestsPageOut>(`/api/privacy/manifests?limit=${String(MANIFESTS_LIMIT)}`, { signal, background: true }),
-    refetchInterval: (query) => (query.state.data?.items.some((m) => m.status !== "shipped") === true ? MANIFEST_POLL_MS : false),
+/** The deletions, newest first (`GET /api/privacy/manifests`), 20 a page with Load more; every loaded page is read
+ * again every 10 s, in the background, while one of them is not shipped. */
+export function useManifests(): PagedList<ManifestOut> {
+  return usePaged<ManifestOut>(MANIFESTS_KEY, "/api/privacy/manifests", { limit: String(MANIFESTS_LIMIT) }, {
+    background: true,
+    pollMs: (items) => (items.some((m) => m.status !== "shipped") ? MANIFEST_POLL_MS : false),
   });
 }
 
