@@ -15,6 +15,7 @@ file, never onto a command line.
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -105,6 +106,134 @@ def one_off_script(compose_tail: list[str]) -> tuple[str, list[str]]:
     """The one-off container's `sh -c` text and its arguments, from the compose command that runs it."""
     assert compose_tail[: len(ONE_OFF)] == ONE_OFF, compose_tail
     return compose_tail[len(ONE_OFF)], compose_tail[len(ONE_OFF) + 1 :]
+
+
+# A psql for the bootstrap one-off: the role's password is FAKE_ROLE_PASSWORD's content, and a login with
+# another PGPASSWORD is refused as postgres refuses it (exit 2). Each call appends to FAKE_PSQL_LOG its argv,
+# whether it logged in with the old (FAKE_OLD) or the new (FAKE_NEW) password, whether a `secret=` file holds
+# the new one, and its stdin (no value); an ALTER (a call without `-c`) sets the role's password to that
+# file's.
+FAKE_PSQL: Final = """#!/bin/sh
+role=$(cat "$FAKE_ROLE_PASSWORD")
+{
+    echo "call:"
+    printf "argv:"; printf " [%s]" "$@"; echo
+    [ "$PGPASSWORD" = "$FAKE_OLD" ] && echo "PGPASSWORD:old"
+    [ "$PGPASSWORD" = "$FAKE_NEW" ] && echo "PGPASSWORD:new"
+    for arg in "$@"; do
+        case $arg in secret=*) [ "$(cat "${arg#secret=}")" = "$FAKE_NEW" ] && echo "secret:new" ;; esac
+    done
+} >> "$FAKE_PSQL_LOG"
+if [ "$PGPASSWORD" != "$role" ]; then
+    echo 'psql: error: FATAL:  password authentication failed for user "jobhunter_bootstrap"' >&2
+    exit 2
+fi
+case " $* " in *" -c "*) exit 0 ;; esac
+sql=$(cat)
+{ echo "stdin:"; printf '%s\\n' "$sql"; } >> "$FAKE_PSQL_LOG"
+for arg in "$@"; do case $arg in secret=*) cat "${arg#secret=}" > "$FAKE_ROLE_PASSWORD" ;; esac; done
+"""
+# A docker whose `compose … run … sh -c <script> <args>` runs the one-off's script here (`/run/secrets` the
+# secrets directory the script installs into, `/dev/shm` a temporary directory, POSTGRES_USER the bootstrap
+# role's name, the caller's stdin) and whose `restart` exits 0; each call is recorded in FAKE_CALLS.
+FAKE_DOCKER: Final = f"""#!{sys.executable}
+import os, subprocess, sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_CALLS"], "a") as out:
+    out.write(("run" if "run" in args else " ".join(args[args.index("restart") :])) + "\\n")
+if "run" in args:
+    at = args.index("sh")
+    script = args[at + 2].replace("/run/secrets", os.environ["FAKE_SECRETS"])
+    script = script.replace("/dev/shm", os.environ["FAKE_SHM"])
+    env = {{**os.environ, "POSTGRES_USER": "jobhunter_bootstrap"}}
+    sys.exit(subprocess.run(["/bin/sh", "-c", script, *args[at + 3 :]], env=env).returncode)
+"""
+FAKE_INSTALL: Final = """#!/bin/sh
+for arg; do source=$target; target=$arg; done
+echo "install $target" >> "$FAKE_CALLS"
+cp "$source" "$target"
+"""
+
+
+@dataclass(frozen=True)
+class BootstrapSite:
+    """The fakes of a `pg_bootstrap` rotation: the secrets directory (the one-off's `/run/secrets`), its
+    `/dev/shm`, the fakes' directory, the role's password and the logs."""
+
+    secrets: Path
+    shm: Path
+    bin: Path
+    role: Path
+    psql_log: Path
+    calls_log: Path
+
+    def env(self) -> dict[str, str]:
+        return {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "POSTGRES_USER": "jobhunter_bootstrap",
+            "FAKE_ROLE_PASSWORD": str(self.role),
+            "FAKE_PSQL_LOG": str(self.psql_log),
+            "FAKE_CALLS": str(self.calls_log),
+            "FAKE_SECRETS": str(self.secrets),
+            "FAKE_SHM": str(self.shm),
+            "FAKE_OLD": BOOTSTRAP,
+            "FAKE_NEW": PLANTED,
+        }
+
+    def one_off(self, script: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+        """The one-off's script run here, with the new password on its stdin."""
+        local = script.replace("/run/secrets", str(self.secrets)).replace("/dev/shm", str(self.shm))  # noqa: S108
+        return subprocess.run(
+            ["sh", "-c", local, *args],
+            input=f"{PLANTED}\n",
+            capture_output=True,
+            text=True,
+            env=self.env(),
+            timeout=30,
+            check=False,
+        )
+
+    def full_run(self, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+        """`rotate-db-role.sh pg_bootstrap`, not a dry run, on the fakes."""
+        new_file = tmp_path / "new-password"
+        new_file.write_text(f"{PLANTED}\n")
+        argv = [str(SCRIPT), "--compose", "docker compose -p fake", "--secrets-dir", str(self.secrets)]
+        return subprocess.run(
+            [*argv, "pg_bootstrap", str(new_file)],
+            capture_output=True,
+            text=True,
+            env=self.env(),
+            cwd=REPO,
+            timeout=60,
+            check=False,
+        )
+
+    def psql_calls(self) -> list[str]:
+        text = self.psql_log.read_text() if self.psql_log.exists() else ""
+        return [f"call:{block}" for block in text.split("call:")[1:]]
+
+    def calls(self) -> list[str]:
+        return self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+
+    def role_password(self) -> str:
+        return self.role.read_text().strip()
+
+
+def a_bootstrap_site(tmp_path: Path, *, role: str) -> BootstrapSite:
+    """The fakes, `BOOTSTRAP` installed as pg_bootstrap and `role` the bootstrap role's password."""
+    names = ("site-secrets", "shm", "fake-bin", "role-password", "psql.log", "calls.log")
+    site = BootstrapSite(*(tmp_path / name for name in names))
+    for directory in (site.secrets, site.shm, site.bin):
+        directory.mkdir()
+    (site.secrets / "pg_bootstrap").write_text(f"{BOOTSTRAP}\n")
+    site.role.write_text(f"{role}\n")
+    for name, body in (("psql", FAKE_PSQL), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL)):
+        (site.bin / name).write_text(body)
+        (site.bin / name).chmod(0o755)
+    (site.bin / "id").write_text("#!/bin/sh\necho 0\n")  # as root
+    (site.bin / "id").chmod(0o755)
+    return site
 
 
 @pytest.mark.parametrize("name", list(ROLES))
@@ -216,44 +345,86 @@ def test_the_bootstrap_password_is_set_with_the_old_one_then_installed(tmp_path:
     assert args == ["rotate-db-role"]
     assert f"{NOTE}no running service holds pg_bootstrap: nothing to restart" in ran.done.stdout.splitlines()
 
-    mounted, shm, fake = tmp_path / "run-secrets", tmp_path / "shm", tmp_path / "fake-bin"
-    for directory in (mounted, shm, fake):
-        directory.mkdir()
-    (mounted / "pg_bootstrap").write_text(f"{BOOTSTRAP}\n")
-    expected = tmp_path / "expected"
-    expected.write_text(f"{PLANTED}\n")
-    recorded = tmp_path / "psql.log"
-    (fake / "psql").write_text(
-        "#!/bin/sh\n"
-        f'{{ printf "argv:"; printf " [%s]" "$@"; echo; '
-        f'[ "$PGPASSWORD" = {shlex.quote(BOOTSTRAP)} ] && echo "PGPASSWORD:old"; '
-        'for arg in "$@"; do case $arg in secret=*) '
-        f'cmp -s "${{arg#secret=}}" {shlex.quote(str(expected))} && echo "secret:new";; esac; done; '
-        f"echo stdin:; cat; }} > {shlex.quote(str(recorded))}\n"
-    )
-    (fake / "psql").chmod(0o755)
-    local = script.replace("/run/secrets", str(mounted)).replace("/dev/shm", str(shm))  # noqa: S108
-    env = {"PATH": f"{fake}:/usr/bin:/bin", "POSTGRES_USER": "jobhunter_bootstrap"}
-    done = subprocess.run(
-        ["sh", "-c", local, *args],
-        input=f"{PLANTED}\n",
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=30,
-        check=False,
-    )
+    site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
+    done = site.one_off(script, args)
     assert done.returncode == 0, done.stderr
-    record = recorded.read_text()
-    argv_line = record.splitlines()[0]
+    probe, alter = site.psql_calls()
+    # first a login with the new password, which the role refuses (it still has the old one)
+    assert "PGPASSWORD:new" in probe and "[-c] [SELECT 1]" in probe and "stdin:" not in probe
+    # then the ALTER, connected with the old password, the new one read by psql from the /dev/shm file
+    argv_line = alter.splitlines()[1]
     assert PLANTED not in argv_line and BOOTSTRAP not in argv_line
     assert "[-h] [postgres] [-U] [jobhunter_bootstrap]" in argv_line
-    assert "[role=jobhunter_bootstrap]" in argv_line and f"[secret={shm}/" in argv_line
-    assert "PGPASSWORD:old" in record and "secret:new" in record
-    stdin = record.split("stdin:\n", 1)[1]
+    assert "[role=jobhunter_bootstrap]" in argv_line and f"[secret={site.shm}/" in argv_line
+    assert "PGPASSWORD:old" in alter and "secret:new" in alter
+    stdin = alter.split("stdin:\n", 1)[1]
     assert "\\set pw `cat :'secret'`" in stdin and "ALTER ROLE :\"role\" PASSWORD :'pw';" in stdin
-    assert PLANTED not in stdin and PLANTED not in done.stdout + done.stderr
-    assert list(shm.iterdir()) == []
+    assert PLANTED not in site.psql_log.read_text() and PLANTED not in done.stdout + done.stderr
+    assert site.role_password() == PLANTED
+    assert list(site.shm.iterdir()) == []
+
+
+def test_the_bootstrap_one_off_sets_nothing_when_the_role_has_the_new_password(tmp_path: Path) -> None:
+    """Fix round 1, review M1: an earlier run set the role's password and was cut off before its install, so
+    the role has the new password and the file still holds the old one. The one-off logs in with the new
+    password, says so and sets nothing (no ALTER), and ends well, so the script goes on to install."""
+    script, args = one_off_script(dry_run(tmp_path, "pg_bootstrap", "NEW").compose_commands(PROD_COMPOSE)[0])
+    site = a_bootstrap_site(tmp_path, role=PLANTED)
+    done = site.one_off(script, args)
+    assert done.returncode == 0, done.stderr
+    [probe] = site.psql_calls()
+    assert "PGPASSWORD:new" in probe and "stdin:" not in probe
+    assert "the bootstrap role has the new password already (an earlier run set it)" in done.stderr
+    assert site.role_password() == PLANTED
+    assert list(site.shm.iterdir()) == []
+
+
+def test_a_bootstrap_rotation_sets_the_password_then_installs_the_file(tmp_path: Path) -> None:
+    """The whole script, not a dry run, on fakes (a docker that runs the one-off's script here, an install
+    that copies, an `id` of root): the role takes the new password, then the file is installed; nothing
+    restarts."""
+    site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
+    done = site.full_run(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert site.calls() == ["run", f"install {site.secrets}/pg_bootstrap"]
+    assert site.role_password() == PLANTED
+    assert (site.secrets / "pg_bootstrap").read_text() == f"{PLANTED}\n"
+    assert done.stdout.splitlines()[-1] == (
+        f"{NOTE}done: the bootstrap superuser has its new password; restarted nothing"
+    )
+    assert PLANTED not in done.stdout + done.stderr and BOOTSTRAP not in done.stdout + done.stderr
+
+
+def test_a_bootstrap_run_cut_off_after_its_alter_is_finished_by_a_run_again(tmp_path: Path) -> None:
+    """Review M1: the role has the new password and the file still holds the old one (a run cut off between
+    its ALTER and its install, which printed nothing about it). A run again does not loop on a false "still
+    has its old password": it sets nothing and installs the file."""
+    site = a_bootstrap_site(tmp_path, role=PLANTED)
+    done = site.full_run(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert site.calls() == ["run", f"install {site.secrets}/pg_bootstrap"]
+    assert len(site.psql_calls()) == 1  # the login with the new password only, no ALTER
+    assert (site.secrets / "pg_bootstrap").read_text() == f"{PLANTED}\n"
+    assert done.stdout.splitlines()[-1] == (
+        f"{NOTE}done: the bootstrap superuser has its new password; restarted nothing"
+    )
+
+
+def test_a_bootstrap_one_off_that_sets_nothing_says_so_accurately(tmp_path: Path) -> None:
+    """Neither the new password nor the installed one logs in (the role has another): the one-off fails, and
+    the script says only what it knows, that the password was not set and the file is unchanged, and to run
+    it again once the cause is fixed; nothing is installed."""
+    site = a_bootstrap_site(tmp_path, role="another-password-entirely")
+    done = site.full_run(tmp_path)
+    assert done.returncode == 1
+    assert site.calls() == ["run"]
+    assert (site.secrets / "pg_bootstrap").read_text() == f"{BOOTSTRAP}\n"
+    assert done.stderr.splitlines()[-1] == (
+        f"{NOTE}the one-off did not set the bootstrap superuser's password (the line above says why; neither "
+        f"the new password nor the installed one set it) and {site.secrets}/pg_bootstrap is unchanged: "
+        "run it again once the cause is fixed"
+    )
+    assert "still has its old password" not in done.stderr
 
 
 def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: Path) -> None:

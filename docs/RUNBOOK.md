@@ -570,9 +570,12 @@ sudo scripts/rotate-db-role.sh --dry-run pg_bootstrap <new file>
 sudo scripts/rotate-db-role.sh pg_bootstrap <new file>
 ```
 
-Then delete `<new file>`. If it stops before the install, the role keeps its old password: run it again. If
-the install itself fails, the script says so: install `<new file>` as `pg_bootstrap` with the `install` command
-above before any other database role's rotation, whose one-off connects with that file.
+Then delete `<new file>`. If it stops before the install, run it again: its one-off first logs in with the new
+password, and when the role has it already (an earlier run set it and was cut off before its install), sets
+nothing and goes on to the install. If the one-off fails (`the one-off did not set …`), the file is unchanged:
+fix the cause its line above names, then run it again. If the install itself fails, the script says so:
+install `<new file>` as `pg_bootstrap` with the `install` command above before any other database role's
+rotation, whose one-off connects with that file.
 
 **The restic password** (`restic_password`; §19.5). restic encrypts the repository with a master key that each
 of its keys wraps, one per password, so the rotation adds a key for the new password and removes the old

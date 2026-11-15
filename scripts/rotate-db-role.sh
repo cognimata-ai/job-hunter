@@ -28,7 +28,9 @@
 # 1. the bootstrap role's password set to the new one first, by the one-off postgres container, connecting with
 #    the old one (its fresh mount of the installed pg_bootstrap): the script feeds the new file to the
 #    one-off's stdin (`< <new-file>`), which writes it to a file of its own on /dev/shm (a RAM filesystem, mode
-#    0600, removed when it ends), and psql reads it from there into `pw` as above;
+#    0600, removed when it ends), and psql reads it from there into `pw` as above. When the role logs in with
+#    the new password already (an earlier run set it and was cut off before step 2), the one-off sets nothing
+#    and the script goes on with step 2, so a run again after any stop finishes the rotation;
 # 2. the new file installed as the secret;
 # 3. no restart: postgres reads pg_bootstrap at its first start only, and every one-off of this script mounts
 #    it afresh.
@@ -62,8 +64,10 @@ EOSQL
 SCRIPT
 )
 
-# The one-off postgres container's script for pg_bootstrap, no arguments: connected with the installed (old)
-# password, it sets the bootstrap role's to the new one, which it reads from its stdin into a file on /dev/shm.
+# The one-off postgres container's script for pg_bootstrap, no arguments: it reads the new password from its
+# stdin into a file on /dev/shm; when the bootstrap role logs in with it already (an earlier run set it and was
+# cut off before its install, review M1), it changes nothing; else, connected with the installed (old) password,
+# it sets the role's to the new one. Either password is in psql's environment only, never on a command line.
 readonly ALTER_BOOTSTRAP=$(
     cat <<'SCRIPT'
 set -eu
@@ -72,6 +76,10 @@ new=$(mktemp -p /dev/shm)
 trap 'rm -f "$new"' EXIT
 cat >"$new"
 grep -q '[^[:space:]]' "$new" || { echo "rotate-db-role: no new password on stdin" >&2; exit 1; }
+if PGPASSWORD=$(cat "$new") psql -X -q -h postgres -U "$POSTGRES_USER" -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
+    echo "rotate-db-role: the bootstrap role has the new password already (an earlier run set it); it is not set again" >&2
+    exit 0
+fi
 PGPASSWORD=$(cat /run/secrets/pg_bootstrap)
 export PGPASSWORD
 psql -X -q -v ON_ERROR_STOP=1 -h postgres -U "$POSTGRES_USER" -d postgres -v role="$POSTGRES_USER" -v secret="$new" <<'EOSQL'
@@ -169,7 +177,8 @@ if [ "$name" = pg_bootstrap ]; then
     step cd "$root"
     if ! step_from "$new_file" "${compose[@]}" run --rm --no-deps -T postgres sh -c "$ALTER_BOOTSTRAP" \
         rotate-db-role; then
-        die "$role still has its old password and nothing was installed: run it again"
+        die "the one-off did not set $role's password (the line above says why; neither the new password nor" \
+            "the installed one set it) and $secrets_dir/$name is unchanged: run it again once the cause is fixed"
     fi
     # 2. The new file.
     if ! step install -o root -g "$GID" -m 0440 "$new_file" "$secrets_dir/$name"; then
