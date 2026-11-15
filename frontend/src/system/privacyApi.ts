@@ -132,11 +132,18 @@ export function downloadHref(exportId: number): string {
 
 const OWN = { ownToast: true } as const;
 
-/** Ask for an export (`POST /api/privacy/export`, keyed, 202 `{export_id}`). */
+/** Ask for an export (`POST /api/privacy/export`, keyed, 202 `{export_id}`); once answered, the exports in use are
+ * read again, so a card shown later (Settings left and opened again) finds the new export, not the one before it. */
 export function useStartExport(): UseMutationResult<ExportQueuedOut, ProblemError, undefined> {
+  const queryClient = useQueryClient();
   return useKeyedMutation(
     (_vars: undefined, key) => apiSend<ExportQueuedOut>("/api/privacy/export", { method: "POST", idempotencyKey: key }),
-    { meta: OWN },
+    {
+      meta: OWN,
+      onSuccess: () => {
+        void queryClient.invalidateQueries({ queryKey: EXPORTS_KEY });
+      },
+    },
   );
 }
 

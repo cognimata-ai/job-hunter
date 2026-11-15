@@ -1,9 +1,10 @@
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import en from "../i18n/en.json";
 import { type FakeApi, fakeApi, json, problem, requestsTo, SESSION } from "../test/api";
-import { renderInProviders } from "../test/app";
+import { renderInProviders, settled } from "../test/app";
 import { makeFormat } from "./format";
 import { DeletionStatus } from "./DeletionStatus";
 import { PrivacyActions } from "./PrivacyActions";
@@ -66,6 +67,18 @@ function exportOut(status: ExportOut["status"], overrides: Partial<ExportOut> = 
 /** An export as `GET /api/privacy/exports` lists it: its id, state and times only. */
 function listed(id: number, status: ExportListedOut["status"]): ExportListedOut {
   return { id, status, created_at: "2026-11-03T07:00:00Z", expires_at: "2026-11-10T07:00:00Z" };
+}
+
+/** The actions with a button that hides and shows them again, in one query client: leaving Settings and coming
+ * back to it within the cache's lifetime. */
+function Revisited() {
+  const [shown, setShown] = useState(true);
+  return (
+    <>
+      <button type="button" onClick={() => { setShown((now) => !now); }}>leave or come back</button>
+      {shown && <PrivacyActions />}
+    </>
+  );
 }
 
 describe("PrivacyActions", () => {
@@ -375,16 +388,26 @@ describe("PrivacyActions", () => {
     const api = fakeApi({ signedIn: true });
     api.exports = [listed(8, "running"), listed(7, "ready")];
     let state = exportOut("running", { id: 8 });
-    api.routes.set("GET /api/privacy/exports/8", () => json(state));
+    // its own first read is held: until it answers, the card shows the state the list gave
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    api.routes.set("GET /api/privacy/exports/8", async () => {
+      await held;
+      return json(state);
+    });
     renderInProviders(<PrivacyActions />);
-    expect(await screen.findByText(en["settings_privacy.export.running"])).toBeTruthy();
-    const start = screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] });
-    expect(start.disabled).toBe(true); // one export at a time
-    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
     const reads = () => requestsTo(api, "GET /api/privacy/exports/8");
     await waitFor(() => {
       expect(reads()).toHaveLength(1);
     });
+    expect(screen.getByText(en["settings_privacy.export.running"])).toBeTruthy();
+    const start = screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] });
+    expect(start.disabled).toBe(true); // one export at a time
+    release();
+    await settled();
+    expect(screen.getByText(en["settings_privacy.export.running"])).toBeTruthy();
+    expect(start.disabled).toBe(true);
+    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
     state = exportOut("ready", { id: 8 });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3_000);
@@ -442,5 +465,46 @@ describe("PrivacyActions", () => {
     fireEvent.click(within(alert).getByRole("button", { name: en["action.retry"] }));
     expect(await screen.findByRole("link", { name: en["settings_privacy.export.download"] })).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a card shown again after a start follows the started export, never the one before it", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.exports = [listed(7, "ready")];
+    api.routes.set("GET /api/privacy/exports/7", () => json(exportOut("ready", { id: 7 })));
+    api.routes.set(EXPORT, () => {
+      api.exports = [listed(9, "running"), listed(7, "ready")];
+      return json({ export_id: 9 }, 202);
+    });
+    api.routes.set("GET /api/privacy/exports/9", () => json(exportOut("running", { id: 9 })));
+    renderInProviders(<Revisited />);
+    await screen.findByRole("link", { name: en["settings_privacy.export.download"] });
+    fireEvent.click(screen.getByRole("button", { name: en["settings_privacy.export.start"] }));
+    expect(await screen.findByText(en["settings_privacy.export.running"])).toBeTruthy();
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/privacy/exports/9")).toHaveLength(1);
+    });
+    await settled();
+    // leave Settings and come back while the export runs; the list's read on the way back is held
+    const lists = requestsTo(api, "GET /api/privacy/exports").length;
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    api.routes.set("GET /api/privacy/exports", async () => {
+      await held;
+      return json({ items: api.exports });
+    });
+    const toggle = screen.getByRole("button", { name: "leave or come back" });
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("button", { name: en["settings_privacy.export.start"] })).toBeNull();
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/privacy/exports").length).toBeGreaterThan(lists);
+    });
+    // before that read answers: the started export, running, and no Export
+    expect(screen.getByText(en["settings_privacy.export.running"])).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] }).disabled).toBe(true);
+    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
+    release();
+    await settled();
+    expect(screen.getByText(en["settings_privacy.export.running"])).toBeTruthy();
   });
 });
