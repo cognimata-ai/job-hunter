@@ -3,8 +3,11 @@
  * screens and 200 % zoom read each row as a card: its cells in a grid, each under its column's name
  * (`data-label`), the column heads kept for screen readers only. So does Queries & sources' table whenever its
  * box is narrower than it needs (`.boxCards`). */
-/* A safety net, as the quota table's: a table wider than its section scrolls in its box, never the page. */
+/* A safety net, as the quota table's: a table wider than its section scrolls in its box, never the page. The box
+ * is positioned, so an absolutely positioned descendant (a visually hidden column head) is placed and clipped in
+ * it too, and cannot push the page wider (M5 follow-ups Task F5, Ruling FU-12 (3)). */
 .scroll {
+  position: relative;
   min-width: 0;
   max-width: 100%;
   overflow-x: auto;
@@ -12,12 +15,9 @@
 
 /* Queries & sources' table, the widest (eleven columns: some 815 px in English, 895 px in German), is narrower
  * than its box only from about 1260 px: beside the page's navigation (961 px and up) and just above 760 px it
- * would scroll sideways, and its Actions head, visually hidden and so absolutely positioned, would push the page
- * wider too (M5 follow-ups Task F5). Its box is always the cards' container (below), so the table reads as cards
- * whenever the box is narrower than 60rem; and the box is positioned, so nothing positioned in it overflows the
- * page. */
+ * would scroll sideways in its box (M5 follow-ups Task F5). Its box is always the cards' container (below), so the
+ * table reads as cards whenever the box is narrower than 60rem. */
 .boxCards {
-  position: relative;
   container: table-box / inline-size;
 }
 
