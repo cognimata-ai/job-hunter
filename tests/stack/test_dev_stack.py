@@ -33,6 +33,7 @@ import httpx
 import pytest
 from jobhunter.db.alembic_runner import code_head
 
+from tests.support import prebuilt
 from tests.support.profile import SYNTHETIC_CV, minimal_pdf
 
 pytestmark = pytest.mark.stack
@@ -81,7 +82,11 @@ TEXT_REVIEW_WITHIN_S: Final = 120
 # The services the stack builds (`up --build`), and those of them whose existing image is used as it is when
 # `JOBHUNTER_STACK_PREBUILT` names them (comma-separated, e.g. `embedder`): for a host that can reach PyPI
 # but not the embedder's other build sources (its Debian mirror, the model download). Unset, every image is
-# built, as always; a named image that does not exist fails the start.
+# built, as always. Set, `tests/support/prebuilt.py`'s `start` first checks that the image each named
+# service uses (as the compose model names it) exists locally and fails the start naming the service and
+# the image when one does not, then builds the others and starts with `up --no-build`: compose builds a
+# missing image of a service with a `build:` section unless told not to, so it never sees a missing
+# prebuilt one (F6, Ruling F6-2).
 BUILT_SERVICES: Final = ("migrate", "api", "worker", "embedder", "docparse")
 PREBUILT: Final = tuple(name for name in os.environ.get("JOBHUNTER_STACK_PREBUILT", "").split(",") if name)
 
@@ -154,12 +159,7 @@ def stack() -> Iterator[None]:
     _created_key[:] = [not key_file.exists() and not key_file.is_symlink()]
     try:
         dev_secrets()
-        if PREBUILT:
-            built = [name for name in BUILT_SERVICES if name not in PREBUILT]
-            subprocess.run([*DC, "build", *built], check=True, timeout=900)
-            up = subprocess.run([*DC, "up", "-d", "--wait"], check=False, timeout=900)
-        else:
-            up = subprocess.run([*DC, "up", "-d", "--build", "--wait"], check=False, timeout=900)
+        up = prebuilt.start(DC, BUILT_SERVICES, PREBUILT, timeout_s=900)
         if up.returncode != 0:
             pytest.fail(f"docker compose up failed ({up.returncode}); last log lines:\n{_logs_tail()}")
         python = next(
