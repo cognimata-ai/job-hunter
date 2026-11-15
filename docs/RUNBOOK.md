@@ -597,20 +597,28 @@ waits for a running job's repository lock, as the jobs' calls do. Its last line 
 opens nothing any more.
 
 If it stops before the install (`… is unchanged and nothing was restarted`), run it again: it adds no second
-key. If the restart fails, it says so: `$JH restart backup`, then remove the old key by hand. If the removal
-fails, it exits 1 naming the old key's id (`… the old key <id> is still in the repository …`): the new
-password is installed and backup restarted, and the old password still opens the repository. Once the cause
-is fixed (the line before it says how restic exited), remove that key by hand, as the new password, with the
-id the script named:
+key. If the install fails (`… still holds the old one: run it again`), run it again too. Once the new file is
+installed, never remove the old key before backup has restarted: until then the running backup container
+may still mount the old password. So if the restart fails, it says so, and a run of the script again after
+an install whose run then stopped (`… holds the new password already …`, naming the repository's other keys)
+says the same: restart backup first (`$JH restart backup`, harmless when the earlier run restarted it), then
+remove the old key by hand, below. If the removal fails, it exits 1 naming the old key's id (`… the old key
+<id> may still be in the repository …`): the new password is installed and backup restarted, and the line
+before it says how restic exited (a failed `restic key remove`, or a failed check after it, when the key may
+be gone already). Once the cause is fixed, list the keys, as the new password:
+
+```
+$JH run --rm --no-deps -T backup sh -c 'AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id) AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key) restic key list --no-cache --retry-lock 30m --password-file /run/secrets/restic_password'
+```
+
+It lists each key by the first 8 hex digits of its id, the one the installed password opens marked `*`. If
+the old key is listed, remove it by its id (the full one the script named, or those 8 digits):
 
 ```
 $JH run --rm --no-deps -T backup sh -c 'AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id) AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key) restic key remove --no-cache --retry-lock 30m --password-file /run/secrets/restic_password <old key id>'
 ```
 
-It prints `removed key <old key id>`; the same command with `restic key list` in place of `restic key remove
-<old key id>` lists the keys left, the one the new password opens marked `current`. A run of the script again
-after its install stops with `the new password is the installed one`, naming the repository's other keys:
-remove the old one the same way. The bucket's versioning keeps a removed key as a noncurrent version for its
+It prints `removed key <old key id>`. The bucket's versioning keeps a removed key as a noncurrent version for its
 30 days (section 1): until then, someone holding both the old password and the bucket's keys could still open
 the repository, so a rotation because the password may have leaked rotates the S3 keys too (the table above).
 

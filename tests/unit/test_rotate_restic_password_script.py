@@ -55,7 +55,8 @@ OLD_ID: Final = f"{1:064x}"  # the fake repository's first key
 
 # A restic that keeps a repository's keys as files `<FAKE_REPO>/<id>` holding their passwords, and records
 # each call (its arguments, and whether the S3 keys and the repository reached its environment) in FAKE_LOG.
-# FAKE_ADDED stores another password for an added key; FAKE_REMOVE_FAILS makes `key remove` fail.
+# FAKE_ADDED stores another password for an added key; FAKE_REMOVE_FAILS makes `key remove` fail;
+# FAKE_LIST_FAILS_AFTER_REMOVE makes every `key list` after a removal fail (exit 1).
 FAKE_RESTIC: Final = f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
@@ -80,6 +81,9 @@ def opened():
             return key.name
     sys.exit(12)
 
+removed = repo.parent / "fake-restic-removed"
+if args[:2] == ["key", "list"] and removed.exists() and os.environ.get("FAKE_LIST_FAILS_AFTER_REMOVE"):
+    sys.exit(1)
 current = opened()
 if args[:2] == ["key", "list"]:
     print(json.dumps([{{"current": key.name == current, "id": key.name}} for key in sorted(repo.iterdir())]))
@@ -92,6 +96,7 @@ elif args[:2] == ["key", "remove"]:
         print("Fatal: refusing to remove key currently used to access repository", file=sys.stderr)
         sys.exit(1)
     (repo / args[-1]).unlink()
+    removed.touch()
     print("removed key", args[-1])
 else:
     sys.exit(1)
@@ -118,9 +123,11 @@ with open(calls, "a") as out:
     out.write(" ".join(args[args.index("restart") :]) + "\\n")
 sys.exit(int(os.environ.get("FAKE_RESTART_EXIT", "0")))
 """
+# An install that copies, or fails (exit 1, nothing copied) with FAKE_INSTALL_FAILS.
 FAKE_INSTALL: Final = """#!/bin/sh
 for arg; do source=$target; target=$arg; done
 echo "install $target" >> "$FAKE_CALLS"
+[ -z "${FAKE_INSTALL_FAILS:-}" ] || exit 1
 cp "$source" "$target"
 """
 
@@ -370,18 +377,14 @@ def test_a_new_password_that_opens_a_key_already_is_not_added_again(tmp_path: Pa
     ("keys", "installed", "env", "message"),
     [
         ([OLD], NEW, {}, "the installed password opens no key"),
-        ([OLD, NEW], NEW, {}, f"the new password is the installed one; nothing was changed (the repository's "
-         f"other keys: {OLD_ID[:8]})"),
         ([OLD], OLD, {"FAKE_ADDED": "not-the-new-password"}, "the new key does not open the repository"),
     ],
-)  # fmt: skip
+)
 def test_the_first_one_off_stops_unless_the_new_key_opens_the_repository(
     tmp_path: Path, keys: list[str], installed: str, env: dict[str, str], message: str
 ) -> None:
     """The first one-off names no old key, and so nothing is installed, restarted or removed, when the
-    installed password opens nothing, when it is the new password already (a run again after the install:
-    the other keys are named, for a removal by hand), or when the added key does not open with the new
-    password."""
+    installed password opens nothing, or when the added key does not open with the new password."""
     (add, add_args), _ = dry_run(tmp_path, "NEW").one_offs()
     site = a_site(tmp_path, keys, installed=installed)
     done = one_off(site, add, add_args, stdin=f"{NEW}\n", **env)
@@ -390,6 +393,21 @@ def test_the_first_one_off_stops_unless_the_new_key_opens_the_repository(
     assert "old-key" not in done.stdout
     assert "remove" not in [step for step, _ in steps(site)]
     assert list(site.shm.iterdir()) == []
+
+
+def test_the_first_one_off_names_the_other_keys_when_the_new_password_is_installed_already(
+    tmp_path: Path,
+) -> None:
+    """Fix round 1, review I1: the new password is the installed one already (an earlier run installed it and
+    stopped). The one-off changes nothing and, in place of `old-key`, names every other key in full
+    (`installed-already <ids>`), for the script's message."""
+    (add, add_args), _ = dry_run(tmp_path, "NEW").one_offs()
+    site = a_site(tmp_path, [OLD, NEW], installed=NEW)
+    done = one_off(site, add, add_args, stdin=f"{NEW}\n")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == [f"installed-already {OLD_ID}"]
+    assert [step for step, _ in steps(site)] == ["list", "list"]
+    assert list(site.keys.values()) == [OLD, NEW]
 
 
 def test_the_second_one_off_removes_the_old_key_with_the_new_password(tmp_path: Path) -> None:
@@ -458,20 +476,105 @@ def test_a_rotation_adds_installs_restarts_then_removes(tmp_path: Path) -> None:
     assert_no_secret_anywhere(site, done)
 
 
-def test_a_removal_that_fails_leaves_the_old_key_and_names_it(tmp_path: Path) -> None:
-    """Step 5 fails after the install and the restart: the script exits non-zero, naming the old key's id
-    (never a password) and the RUNBOOK's removal by hand; the old key is still in the repository, the new
-    password installed, backup restarted."""
+@pytest.mark.parametrize(
+    ("env", "keys_left", "stopped"),
+    [
+        ({"FAKE_REMOVE_FAILS": "1"}, [OLD, NEW], "restic key remove exited 1"),
+        ({"FAKE_LIST_FAILS_AFTER_REMOVE": "1"}, [NEW], "restic key list exited 1"),  # review M3
+    ],
+)
+def test_a_removal_that_fails_names_the_old_key_and_the_listing(
+    tmp_path: Path, env: dict[str, str], keys_left: list[str], stopped: str
+) -> None:
+    """Step 5 fails after the install and the restart, either in `restic key remove` (the old key stays) or in
+    the check after it (the key is gone): the second one-off's line says which, and the script exits non-zero
+    saying the old key, named by its full id (never a password), may still be in the repository, so list the
+    keys and remove it by hand if it is listed (review M3); the new password is installed, backup
+    restarted."""
     site = a_site(tmp_path, [OLD])
-    done = full_run(tmp_path, site, FAKE_REMOVE_FAILS="1")
+    done = full_run(tmp_path, site, **env)
     assert done.returncode == 1
     assert site.calls[-2:] == ["restart backup", f"run {NAME} {OLD_ID}"]
+    assert list(site.keys.values()) == keys_left
+    assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    *_, why, last = done.stderr.splitlines()
+    assert stopped in why
+    assert f"the old key {OLD_ID} may still be in the repository" in last
+    assert "list the keys, and if it is listed, remove it by hand (docs/RUNBOOK.md, section 7)" in last
+    assert "done:" not in done.stdout
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+
+
+def test_a_run_again_after_the_install_says_restart_backup_first(tmp_path: Path) -> None:
+    """Review I1: an earlier run installed the new file and stopped, maybe before its restart, so the backup
+    container may still mount the old password. A run again finds the new password installed: it changes
+    nothing, restarts nothing, removes nothing, and exits 1 saying to restart backup first, then to remove
+    the old key by hand (RUNBOOK section 7), naming the other keys in full; never "run it again", and a run
+    again says the same."""
+    site = a_site(tmp_path, [OLD, NEW], installed=NEW)
+    for _ in range(2):
+        done = full_run(tmp_path, site)
+        assert done.returncode == 1
+        last = done.stderr.splitlines()[-1]
+        assert (
+            "restic_password holds the new password already (an earlier run installed it and stopped)" in last
+        )
+        assert "restart backup first (docker compose -p fake restart backup)" in last
+        assert "then remove the old key by hand with the command of docs/RUNBOOK.md, section 7" in last
+        assert last.endswith(f"the repository's other keys: {OLD_ID}")
+        assert "run it again" not in done.stderr
+    assert site.calls == [f"run {NAME}", f"run {NAME}"]
     assert list(site.keys.values()) == [OLD, NEW]
     assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
-    last = done.stderr.splitlines()[-1]
-    assert f"the old key {OLD_ID} is still in the repository" in last
-    assert "remove it by hand (docs/RUNBOOK.md, section 7)" in last
-    assert "done:" not in done.stdout
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+
+
+def test_a_run_again_after_a_finished_rotation_has_nothing_to_rotate(tmp_path: Path) -> None:
+    """The new password is installed and opens the repository's only key: nothing is left to rotate, and
+    nothing is changed."""
+    site = a_site(tmp_path, [NEW], installed=NEW)
+    done = full_run(tmp_path, site)
+    assert done.returncode == 1
+    assert "opens the repository's only key: nothing is left to rotate" in done.stderr.splitlines()[-1]
+    assert site.calls == [f"run {NAME}"] and list(site.keys.values()) == [NEW]
+
+
+def test_an_install_that_fails_leaves_both_keys_and_a_run_again_finishes(tmp_path: Path) -> None:
+    """Review M2, step 3: the install fails after the key was added. The script exits 1: the repository opens
+    with both passwords and the file holds the old one, so it says to run it again, and nothing was
+    restarted or removed. A run again adds no second key and finishes the rotation."""
+    site = a_site(tmp_path, [OLD])
+    done = full_run(tmp_path, site, FAKE_INSTALL_FAILS="1")
+    assert done.returncode == 1
+    assert site.calls == [f"run {NAME}", f"install {site.secrets}/restic_password"]
+    assert list(site.keys.values()) == [OLD, NEW]
+    assert (site.secrets / "restic_password").read_text() == f"{OLD}\n"
+    assert done.stderr.splitlines()[-1].endswith(
+        f"the repository opens with both passwords, but {site.secrets}/restic_password still holds the old "
+        "one: run it again"
+    )
+    again = full_run(tmp_path, site)
+    assert again.returncode == 0, again.stderr
+    assert [step for step, _ in steps(site)].count("add") == 1
+    assert list(site.keys.values()) == [NEW]
+    assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+
+
+def test_a_restart_that_fails_says_restart_then_remove_by_hand(tmp_path: Path) -> None:
+    """Review M2, step 4: the restart fails after the install. The script exits 1 saying the file holds the
+    new password but backup was not restarted, to restart it, then to remove the old key, named by its full
+    id, by hand; no key was removed."""
+    site = a_site(tmp_path, [OLD])
+    done = full_run(tmp_path, site, FAKE_RESTART_EXIT="1")
+    assert done.returncode == 1
+    assert site.calls == [f"run {NAME}", f"install {site.secrets}/restic_password", "restart backup"]
+    assert list(site.keys.values()) == [OLD, NEW]
+    assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    assert done.stderr.splitlines()[-1].endswith(
+        f"{site.secrets}/restic_password holds the new password, but backup was not restarted: restart it, "
+        f"then remove the old key {OLD_ID} by hand (docs/RUNBOOK.md, section 7)"
+    )
     assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
 
 

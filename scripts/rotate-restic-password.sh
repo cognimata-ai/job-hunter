@@ -43,7 +43,9 @@
 # checks the arguments and that the new file holds a password (`grep -q`, which prints nothing), then prints the
 # commands, the old key's id as `<old-key-id>`. Only service names, paths, key ids and the commands are printed,
 # never a value. After a failure before the install, run it again: a new password that opens a key already is
-# not added twice. After the install, it says what is left to do.
+# not added twice. After the install, it says what is left to do, and so does a run again that finds the new
+# password installed already (an earlier run stopped after its install): restart backup first, then remove the
+# old key by hand (fix round 1, review I1), since its restart may not have happened.
 set -euo pipefail
 
 readonly DEFAULT_COMPOSE="docker compose -p jobhunter --env-file deploy/images.lock --env-file deploy/release.lock \
@@ -92,8 +94,10 @@ old_id=$(key_of "$installed")
 [ -n "$old_id" ] || fail "the installed password opens no key; nothing was changed"
 new_id=$(key_of "$new")
 if [ "$new_id" = "$old_id" ]; then
-    others=$(python -I -c 'import json, sys; print(" ".join(k["id"][:8] for k in json.load(sys.stdin) if not k["current"]) or "none")' <"$work/keys")
-    fail "the new password is the installed one; nothing was changed (the repository's other keys: $others)"
+    others=$(python -I -c 'import json, sys; print(" ".join(k["id"] for k in json.load(sys.stdin) if not k["current"]))' <"$work/keys")
+    note "the new password is the installed one already; nothing was changed"
+    echo "installed-already $others"
+    exit 0
 fi
 if [ -z "$new_id" ]; then
     status=0
@@ -213,6 +217,18 @@ if [ "$dry_run" -eq 0 ]; then
         die "$secrets_dir/$NAME is unchanged and nothing was restarted; the line above says where it stopped:" \
             "run it again"
     fi
+    if printf '%s\n' "$added" | grep -q '^installed-already'; then
+        # An earlier run installed the new file and stopped (its restart may not have happened): never remove a
+        # key before backup mounts the new password (Ruling FU-10, review I1).
+        others=$(printf '%s\n' "$added" | sed -n 's/^installed-already *//p' | tail -n 1)
+        if [ -z "$others" ]; then
+            die "$secrets_dir/$NAME holds the new password already and it opens the repository's only key:" \
+                "nothing is left to rotate; if an earlier run stopped before its restart, $(shown "${compose[@]}" restart backup)"
+        fi
+        die "$secrets_dir/$NAME holds the new password already (an earlier run installed it and stopped):" \
+            "restart backup first ($(shown "${compose[@]}" restart backup)), then remove the old key by hand with" \
+            "the command of docs/RUNBOOK.md, section 7; the repository's other keys: $others"
+    fi
     old_id=$(printf '%s\n' "$added" | sed -n 's/^old-key \([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
     [ -n "$old_id" ] || die "the one-off named no old key; $secrets_dir/$NAME is unchanged: run it again"
     note "the old key is $old_id"
@@ -232,8 +248,9 @@ fi
 # 5. The old key, removed by a one-off backup container that mounts the new password.
 if ! step "${compose[@]}" run --rm --no-deps -T backup sh -c "$PRELUDE"$'\n'"$REMOVE_KEY" rotate-restic-password \
     "$old_id"; then
-    die "the new password is installed and backup restarted, but the old key $old_id is still in the" \
-        "repository and still opens with the old password: remove it by hand (docs/RUNBOOK.md, section 7)"
+    die "the new password is installed and backup restarted, but the old key $old_id may still be in the" \
+        "repository (the line above says where the removal stopped): list the keys, and if it is listed," \
+        "remove it by hand (docs/RUNBOOK.md, section 7)"
 fi
 if [ "$dry_run" -eq 0 ]; then
     note "done: installed $NAME, restarted backup and removed the old key ${old_id:0:8}; the repository opens" \
