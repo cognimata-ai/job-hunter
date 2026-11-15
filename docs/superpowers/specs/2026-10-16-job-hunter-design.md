@@ -5152,6 +5152,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/alerts/{id}/resolve` | Resolve a manual alert | → 200 the alert. Only for a code the catalogue marks manual (§17.6); 409 for an auto-resolving code |
 | POST | `/api/privacy/export` | Start an export | → 202 `{export_id}` |
 | GET | `/api/privacy/exports/{id}` | Export status / download | → status JSON; `?download=1` streams the zip when ready; 410 `gone` once expired or purged |
+| GET | `/api/privacy/exports` | The exports in use | → `{items}`: the `running` export and the `ready` ones before their `expires_at`, newest first, at most 5, each `{id, status, created_at, expires_at}`, so the UI finds them again after a reload; no size and no download address, which stay `/api/privacy/exports/{id}`'s |
 | POST | `/api/privacy/delete-everything` | Delete all data | `{confirm: "DELETE EVERYTHING", password, totp?}` → 202 `{manifest_id}` |
 | GET | `/api/privacy/manifests` | Deletion statuses | keyset paged, newest first → `{items, next_cursor}`, each item as below |
 | GET | `/api/privacy/manifests/{id}` | Deletion status | → `{id, kind, status: executing \| completed \| shipped, created_at, completed_at, shipped_at, deleted_golden_case_ids}`. The UI reports a deletion as done only at `shipped` (§19.5). |

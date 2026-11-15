@@ -4,7 +4,9 @@
 // - **Export my data** sends the keyed `POST /api/privacy/export`, then reads the export every 3 s in the
 //   background until it is no longer running: a ready one offers its zip (`?download=1`) with its size and its
 //   expiry; a failed, expired or purged one says so. Following the link reads the export again, so a purge that
-//   deleted it meanwhile shows.
+//   deleted it meanwhile shows. Until the user starts one, the card follows the newest export in use
+//   (`GET /api/privacy/exports`, M5 follow-ups Task F5), read as one it started: after a reload, a running export
+//   shows its state and a ready one before its expiry its zip.
 // - **Purge Adzuna data** and **Delete everything** each open a dialog: what it deletes, §20.4's statement (backup
 //   data is gone within about 4 months; the replay of the deletion records keeps the data from returning on a
 //   restore; done once it shows "Confirmed offsite"), the phrase to type (`PURGE ADZUNA`, `DELETE EVERYTHING`),
@@ -37,6 +39,7 @@ import {
   type ManifestQueuedOut,
   PHRASES,
   useExport,
+  useExportsInUse,
   useRequestDeletion,
   useSingleFlight,
   useStartExport,
@@ -66,18 +69,24 @@ function ExportAction() {
   const queryClient = useQueryClient();
   const start = useStartExport();
   const send = useSingleFlight(start);
-  const [exportId, setExportId] = useState<number | null>(null);
+  const inUse = useExportsInUse();
+  const [started, setStarted] = useState<number | null>(null);
   const [problem, setProblem] = useState<ProblemError | null>(null);
+  // the export the user started here, else the newest one in use (a reload's)
+  const found = started === null ? inUse.data?.items.at(0) : undefined;
+  const exportId = started ?? found?.id ?? null;
   const state = useExport(exportId);
   const current = state.data;
-  // from the request until the export is no longer running (its first read included)
-  const running = start.isPending || (exportId !== null && current === undefined && !state.isError) || current?.status === "running";
+  // from the request until the export is no longer running (a started one's first read included; a found one is in
+  // the state the list gave until its own read answers)
+  const unread = started !== null && current === undefined && !state.isError;
+  const running = start.isPending || unread || (current?.status ?? found?.status) === "running";
   return (
     <Card title={t("settings_privacy.export.title")} body={t("settings_privacy.export.body")}>
       <button type="button" className={fields.button} disabled={running} aria-busy={running}
         onClick={() => {
           setProblem(null);
-          send(undefined, { onSuccess: (out) => { setExportId(out.export_id); }, onError: setProblem });
+          send(undefined, { onSuccess: (out) => { setStarted(out.export_id); }, onError: setProblem });
         }}>
         {t("settings_privacy.export.start")}
       </button>
@@ -99,6 +108,7 @@ function ExportAction() {
       {current?.status === "failed" && <p className={styles.note}>{t("settings_privacy.export.failed")}</p>}
       {(current?.status === "expired" || current?.status === "purged") && <p className={styles.note}>{t("settings_privacy.export.gone")}</p>}
       {problem !== null && <PrivacyProblem error={problem} keyed />}
+      {exportId === null && inUse.isError && <PrivacyProblem error={inUse.error} onRetry={() => { void inUse.refetch(); }} />}
       {state.isError && <PrivacyProblem error={state.error} onRetry={() => { void state.refetch(); }} />}
     </Card>
   );

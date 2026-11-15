@@ -10,6 +10,7 @@ import { PrivacyActions } from "./PrivacyActions";
 import { makeUnits } from "./units";
 
 type ExportOut = components["schemas"]["ExportOut"];
+type ExportListedOut = components["schemas"]["ExportListedOut"];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DELETE = "POST /api/privacy/delete-everything";
@@ -60,6 +61,11 @@ function exportOut(status: ExportOut["status"], overrides: Partial<ExportOut> = 
     size_bytes: status === "ready" ? 58_700_000 : null,
     ...overrides,
   };
+}
+
+/** An export as `GET /api/privacy/exports` lists it: its id, state and times only. */
+function listed(id: number, status: ExportListedOut["status"]): ExportListedOut {
+  return { id, status, created_at: "2026-11-03T07:00:00Z", expires_at: "2026-11-10T07:00:00Z" };
 }
 
 describe("PrivacyActions", () => {
@@ -337,5 +343,104 @@ describe("PrivacyActions", () => {
     fireEvent.click(link);
     expect(await screen.findByText(en["settings_privacy.export.gone"])).toBeTruthy();
     expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
+  });
+
+  it("after a reload, finds the ready export again and offers its download", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.exports = [listed(7, "ready"), listed(6, "ready")];
+    let answer: (response: Response) => void = () => undefined;
+    api.routes.set("GET /api/privacy/exports/7", () => new Promise<Response>((resolve) => { answer = resolve; }));
+    renderInProviders(<PrivacyActions />);
+    // the newest export in use, read by its own route for its size; a ready one is never shown as running
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/privacy/exports/7")).toHaveLength(1);
+    });
+    expect(screen.queryByText(en["settings_privacy.export.running"])).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] }).disabled).toBe(false);
+    answer(json(exportOut("ready", { id: 7 })));
+    const link = await screen.findByRole("link", { name: en["settings_privacy.export.download"] });
+    expect(link.getAttribute("href")).toBe("/api/privacy/exports/7?download=1");
+    const expires = makeFormat("en-GB", "Europe/Berlin").dateTimeMinutes("2026-11-10T07:00:00Z");
+    const size = makeUnits("en-GB").bytes(58_700_000);
+    expect(screen.getByText(new RegExp(`${expires}.*${size}|${size}.*${expires}`))).toBeTruthy();
+    expect(requestsTo(api, "GET /api/privacy/exports")).toHaveLength(1);
+    expect(requestsTo(api, "GET /api/privacy/exports/6")).toHaveLength(0);
+    expect(requestsTo(api, EXPORT)).toHaveLength(0);
+    expect(screen.queryByText(en["settings_privacy.export.running"])).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] }).disabled).toBe(false);
+  });
+
+  it("after a reload, shows a running export's status and reads it until it is ready", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fakeApi({ signedIn: true });
+    api.exports = [listed(8, "running"), listed(7, "ready")];
+    let state = exportOut("running", { id: 8 });
+    api.routes.set("GET /api/privacy/exports/8", () => json(state));
+    renderInProviders(<PrivacyActions />);
+    expect(await screen.findByText(en["settings_privacy.export.running"])).toBeTruthy();
+    const start = screen.getByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] });
+    expect(start.disabled).toBe(true); // one export at a time
+    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
+    const reads = () => requestsTo(api, "GET /api/privacy/exports/8");
+    await waitFor(() => {
+      expect(reads()).toHaveLength(1);
+    });
+    state = exportOut("ready", { id: 8 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    const link = await screen.findByRole("link", { name: en["settings_privacy.export.download"] });
+    expect(link.getAttribute("href")).toBe("/api/privacy/exports/8?download=1");
+    expect(start.disabled).toBe(false);
+    for (const read of reads()) {
+      expect(read.headers.get("X-JH-Background")).toBe("1");
+    }
+  });
+
+  it("with no export in use shows only Export, and a new export replaces a found one", async () => {
+    const api = fakeApi({ signedIn: true });
+    renderInProviders(<PrivacyActions />);
+    const start = await screen.findByRole<HTMLButtonElement>("button", { name: en["settings_privacy.export.start"] });
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/privacy/exports")).toHaveLength(1);
+    });
+    expect(screen.queryByText(en["settings_privacy.export.running"])).toBeNull();
+    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
+    expect(api.requests.filter((r) => r.path.startsWith("/api/privacy/exports/"))).toHaveLength(0);
+    expect(start.disabled).toBe(false);
+    cleanup();
+
+    api.exports = [listed(7, "ready")];
+    api.routes.set("GET /api/privacy/exports/7", () => json(exportOut("ready", { id: 7 })));
+    api.routes.set(EXPORT, () => json({ export_id: 9 }, 202));
+    api.routes.set("GET /api/privacy/exports/9", () => json(exportOut("running", { id: 9 })));
+    renderInProviders(<PrivacyActions />);
+    await screen.findByRole("link", { name: en["settings_privacy.export.download"] });
+    fireEvent.click(screen.getByRole("button", { name: en["settings_privacy.export.start"] }));
+    expect(await screen.findByText(en["settings_privacy.export.running"])).toBeTruthy();
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/privacy/exports/9")).toHaveLength(1);
+    });
+    expect(screen.queryByRole("link", { name: en["settings_privacy.export.download"] })).toBeNull();
+  });
+
+  it("a failed read of the exports in use says so by its code, with Retry", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fakeApi({ signedIn: true });
+    // the first read and its three retries (after 1 s, 2 s and 4 s) fail
+    const answers = Array.from({ length: 4 }, () => problem(503, "internal", { detail: "the server says so" }));
+    api.routes.set("GET /api/privacy/exports", () => answers.shift() ?? json({ items: [listed(7, "ready")] }));
+    api.routes.set("GET /api/privacy/exports/7", () => json(exportOut("ready", { id: 7 })));
+    renderInProviders(<PrivacyActions />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(8_000);
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(en["problem.internal"]);
+    expect(alert.textContent).not.toContain("the server says so");
+    expect(requestsTo(api, "GET /api/privacy/exports")).toHaveLength(4);
+    fireEvent.click(within(alert).getByRole("button", { name: en["action.retry"] }));
+    expect(await screen.findByRole("link", { name: en["settings_privacy.export.download"] })).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

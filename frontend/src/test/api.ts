@@ -2,7 +2,7 @@
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
 // stats, watchlist, golden-run and shipped-version reads, the System section's reads (needs attention, runs,
 // score cycles, alerts by status, golden cases, health), the deletion manifests (the list and each one), the
-// privacy statement's operator values, the settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
+// exports in use, the privacy statement's operator values, the settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
 // answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
@@ -39,6 +39,7 @@ type GoldenCaseOut = components["schemas"]["GoldenCaseOut"];
 type SystemHealthOut = components["schemas"]["SystemHealthOut"];
 type ManifestOut = components["schemas"]["ManifestOut"];
 type OperatorOut = components["schemas"]["OperatorOut"];
+type ExportListedOut = components["schemas"]["ExportListedOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -1052,6 +1053,8 @@ export interface FakeApi {
   manifests: ManifestOut[];
   /** What `GET /api/privacy/operator` answers (all null, a server without an operator file, by default). */
   operator: OperatorOut;
+  /** The exports in use `GET /api/privacy/exports` lists (none, by default). */
+  exports: ExportListedOut[];
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -1093,6 +1096,7 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     health: healthOut(),
     manifests: [],
     operator: { operator: null, contact: null, controller: null, vps_provider: null, s3_provider: null },
+    exports: [],
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -1201,6 +1205,9 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/privacy/operator") {
       return Promise.resolve(json(api.operator));
+    }
+    if (method === "GET" && path === "/api/privacy/exports") {
+      return Promise.resolve(json({ items: api.exports }));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

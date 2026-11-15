@@ -10,6 +10,9 @@
 //   request with a new code, its first one used, keeps the key.
 // - **The reads** are background polls (`X-JH-Background: 1`): an export every 3 s while it runs, the deletions
 //   every 10 s while one is not `shipped` (D18: done only then).
+// - **The exports in use** (`GET /api/privacy/exports`, M5 follow-ups Task F5) are read when the export's card
+//   shows, so after a reload it finds a running export, or a ready one before its expiry, again; it then reads that
+//   export by its own route, as one it started.
 // - **The retry of a failed purge** (`POST /api/system/purges/{operation_id}/retry`) is not keyed (§14.1).
 // - **The statement's operator values** (`GET /api/privacy/operator`, M5 follow-ups Task F1) are read once per
 //   session: the api reads its operator file only when it starts, and the query cache is emptied at the logout
@@ -39,6 +42,7 @@ export type ManifestKind = ManifestOut["kind"];
 export type ManifestStatus = ManifestOut["status"];
 export type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
 type ManifestsPageOut = components["schemas"]["ManifestsPageOut"];
+type ExportsOut = components["schemas"]["ExportsOut"];
 type ExportQueuedOut = components["schemas"]["ExportQueuedOut"];
 type PurgeRetryOut = components["schemas"]["PurgeRetryOut"];
 export type OperatorOut = components["schemas"]["OperatorOut"];
@@ -46,6 +50,7 @@ export type OperatorOut = components["schemas"]["OperatorOut"];
 export const MANIFESTS_KEY = ["privacy", "manifests"] as const;
 export const MANIFEST_KEY = ["privacy", "manifest"] as const;
 export const EXPORT_KEY = ["privacy", "export"] as const;
+export const EXPORTS_KEY = ["privacy", "exports"] as const;
 export const OPERATOR_KEY = ["privacy", "operator"] as const;
 
 /** How often a running export is read again. */
@@ -87,6 +92,15 @@ export function useManifest(manifestId: number): UseQueryResult<ManifestOut, Pro
       }
       return query.state.data?.status === "shipped" ? false : MANIFEST_POLL_MS;
     },
+  });
+}
+
+/** The exports in use (`GET /api/privacy/exports`), newest first: the running one and the ready ones before their
+ * expiry, by id, state and times only. */
+export function useExportsInUse(): UseQueryResult<ExportsOut, ProblemError> {
+  return useQuery({
+    queryKey: EXPORTS_KEY,
+    queryFn: ({ signal }) => apiSend<ExportsOut>("/api/privacy/exports", { signal }),
   });
 }
 

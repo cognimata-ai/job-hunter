@@ -63,6 +63,7 @@ from tests.support.settings import fresh_key, save, settings_body
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
 
 EXPORT: Final = "/api/privacy/export"
+EXPORTS: Final = "/api/privacy/exports"
 DELETE_EVERYTHING: Final = "/api/privacy/delete-everything"
 PURGE_SOURCE: Final = "/api/privacy/purge-source"
 MANIFESTS: Final = "/api/privacy/manifests"
@@ -291,6 +292,56 @@ async def test_a_refused_export_rolls_back_and_leaves_no_running_export(
     assert (*code_of(r), r.json()["detail"]) == (409, "conflict_state", "export_running")
     after = await counts(engine)
     assert (after.exports, after.running, after.keys) == (before.exports, 0, before.keys)
+
+
+async def test_the_exports_list_finds_the_running_and_the_unexpired_ready_ones_again(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    exports_configured: Purger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M5 follow-ups Task F5 (a): after a reload the SPA finds its exports again with `GET
+    /api/privacy/exports`: the running export and the ready ones before their `expires_at`, newest first, at
+    most `LISTED_EXPORTS`, each by its id, state and times only (no size, no file name, no address to
+    download from: the zip stays `GET /api/privacy/exports/{id}?download=1`'s, behind the session). A failed,
+    expired or purged export, and a ready one past its `expires_at` that retention has not expired yet, is not
+    listed."""
+    assert (await logged_in_client.get(EXPORTS)).json() == {"items": []}
+    ready = [(await ready_export(logged_in_client, engine, exports_configured))[0] for _ in range(6)]
+    r = await keyed(logged_in_client, EXPORT)
+    assert r.status_code == 202, r.text
+    running = int(r.json()["export_id"])
+    page = (await logged_in_client.get(EXPORTS)).json()
+    assert set(page) == {"items"}
+    assert privacy_routes.LISTED_EXPORTS == 5
+    assert [(e["id"], e["status"]) for e in page["items"]] == [
+        (running, "running"),
+        *((i, "ready") for i in reversed(ready[2:])),
+    ]
+    for item in page["items"]:
+        assert set(item) == {"id", "status", "created_at", "expires_at"}, item
+        state = (await logged_in_client.get(f"/api/privacy/exports/{item['id']}")).json()
+        assert {k: state[k] for k in item} == item
+    # the running one fails, the newest ready one is purged: neither is listed
+    async with engine.begin() as conn:
+        await transition(conn, "exports", running, ["running"], "failed")
+        await transition(conn, "exports", ready[-1], ["ready"], "purged", set_={"storage_path": None})
+    page = (await logged_in_client.get(EXPORTS)).json()
+    assert [e["id"] for e in page["items"]] == list(reversed(ready[:5]))
+    # past their expiry by the route's clock, before the retention pass: no longer listed, still downloadable
+    expires_at = (await logged_in_client.get(f"/api/privacy/exports/{ready[0]}")).json()["expires_at"]
+    later = utcnow() + export.EXPORT_TTL + timedelta(minutes=1)
+    monkeypatch.setattr(privacy_routes, "utcnow", lambda: later)
+    assert (await logged_in_client.get(EXPORTS)).json() == {"items": []}
+    r = await logged_in_client.get(f"/api/privacy/exports/{ready[0]}", params={"download": 1})
+    assert r.status_code == 200, r.text
+    # expired by the retention pass: not listed by the real clock either
+    monkeypatch.setattr(privacy_routes, "utcnow", utcnow)
+    assert len((await logged_in_client.get(EXPORTS)).json()["items"]) == 5
+    await export.retain_exports(engine, now=later, epoch=1)
+    assert (await logged_in_client.get(EXPORTS)).json() == {"items": []}
+    state = (await logged_in_client.get(f"/api/privacy/exports/{ready[0]}")).json()
+    assert (state["status"], state["expires_at"]) == ("expired", expires_at)
 
 
 async def test_a_download_racing_a_purge_answers_410_not_500(
@@ -724,6 +775,7 @@ async def test_the_privacy_routes_need_a_session_and_the_writes_csrf(api_client:
         ("GET", MANIFESTS),
         ("GET", f"{MANIFESTS}/1"),
         ("GET", "/api/privacy/exports/1"),
+        ("GET", EXPORTS),
         ("POST", EXPORT),
         ("POST", DELETE_EVERYTHING),
         ("POST", PURGE_SOURCE),

@@ -43,7 +43,11 @@ The source purge's refusal when Adzuna is the only enabled source is the setting
 **The export** (`POST /export`, no body or `{}`): one transaction, `active_config FOR SHARE` (the request's
 first lock) before the key's row, then `privacy.export.request_export` inside `run_idempotent`, so its
 refusal (409 `export_running`, `delete_everything_in_progress`) rolls the new `running` row back with the
-key's: no `running` export is left without its operation. `GET /exports/{id}` is the export's state; with
+key's: no `running` export is left without its operation. `GET /exports` lists the exports in use, so the SPA
+finds them again after a reload (M5 follow-ups Task F5): the `running` one and the `ready` ones before their
+`expires_at` by the route's clock, newest first, at most `LISTED_EXPORTS`, each by its id, state and times
+only. It names no size, no file and no address to download from: the zip is the session's `GET /exports/{id}`
+alone. `GET /exports/{id}` is the export's state; with
 `?download=1` on a `ready` export, its zip (`application/zip`, `Content-Disposition: attachment;
 filename="jobhunter-export-<id>.zip"`, `Content-Length` the zip's size): the stored file of the exports
 directory (`cfg.exports_dir`, which the api reads from its configuration, never from the worker's
@@ -137,6 +141,8 @@ PURGE_ADZUNA_PHRASE: Final = "PURGE ADZUNA"
 CREDENTIALS: Final = frozenset({"password", "totp"})
 DOWNLOAD_MEDIA_TYPE: Final = "application/zip"
 GONE_STATES: Final = frozenset({"expired", "purged"})
+# The exports in use `GET /exports` lists at most: the running one and the newest ready ones.
+LISTED_EXPORTS: Final = 5
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 _BIGINT_MAX: Final = 2**63 - 1
@@ -149,6 +155,10 @@ _CONFIG_FOR_UPDATE: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDA
 _OWN_KEY_ROW: Final = q("SELECT id FROM api_idempotency WHERE route = :route AND idem_key = :key")
 _EXPORT: Final = q(
     "SELECT id, status, created_at, expires_at, size_bytes, storage_path FROM exports WHERE id = :e"
+)
+_LISTED_EXPORTS: Final = q(
+    "SELECT id, status, created_at, expires_at FROM exports "
+    "WHERE status = 'running' OR (status = 'ready' AND expires_at > :now) ORDER BY id DESC LIMIT :limit"
 )
 _MANIFEST_COLUMNS: Final = (
     "SELECT id, kind, status, created_at, completed_at, shipped_at, CASE WHEN kind = 'source_purge' "
@@ -212,6 +222,20 @@ class ExportOut(BaseModel):
     created_at: UtcDatetime
     expires_at: UtcDatetime
     size_bytes: int | None = Field(description="The size of the zip in bytes; null until the export is ready")
+
+
+class ExportListedOut(BaseModel):
+    """An export in use: being made, or ready to download until `expires_at`. Its size and its zip are the
+    export's own read."""
+
+    id: int
+    status: Literal["running", "ready"]
+    created_at: UtcDatetime
+    expires_at: UtcDatetime
+
+
+class ExportsOut(BaseModel):
+    items: list[ExportListedOut]
 
 
 class DeleteEverythingIn(BaseModel):
@@ -452,6 +476,22 @@ async def _download(
     if export.size_bytes is not None:
         headers["Content-Length"] = str(export.size_bytes)
     return StreamingResponse(stream, media_type=DOWNLOAD_MEDIA_TYPE, headers=headers)
+
+
+@router.get("/exports", response_model=ExportsOut)
+async def list_exports(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> ExportsOut:
+    """The exports in use, newest first: the one being made and the ready ones until they expire (at most
+    5)."""
+    async with engine.connect() as conn:
+        rows = (await conn.execute(_LISTED_EXPORTS, {"now": utcnow(), "limit": LISTED_EXPORTS})).all()
+    return ExportsOut(
+        items=[
+            ExportListedOut(
+                id=int(row.id), status=row.status, created_at=row.created_at, expires_at=row.expires_at
+            )
+            for row in rows
+        ]
+    )
 
 
 @router.get(

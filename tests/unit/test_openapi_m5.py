@@ -26,6 +26,8 @@ M5_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("post", "/api/alerts/{alert_id}/resolve"): {"401", "403", "404", "409", "422", "429"},
     ("post", "/api/privacy/export"): KEYED_PRIVACY,
     ("get", "/api/privacy/exports/{export_id}"): {"401", "404", "409", "410", "422", "429"},
+    # M5 follow-ups Task F5: the exports in use, found again after a reload; no parameter.
+    ("get", "/api/privacy/exports"): {"401", "429"},
     ("post", "/api/privacy/delete-everything"): KEYED_PRIVACY,
     ("post", "/api/privacy/purge-source"): KEYED_PRIVACY,
     ("get", "/api/privacy/manifests"): {"400", "401", "422", "429"},
@@ -141,6 +143,15 @@ def test_the_privacy_documents_name_their_fields(document: dict[str, Any]) -> No
         assert field["anyOf"] == [{"type": "string"}, {"type": "null"}], name
     read = document["paths"]["/api/privacy/operator"]["get"]["responses"]["200"]["content"]
     assert read["application/json"]["schema"] == {"$ref": "#/components/schemas/OperatorOut"}
+    # F5: the exports list names ids, states and times only: no size, no file name, no address to download
+    # from.
+    assert set(schemas["ExportsOut"]["required"]) == set(schemas["ExportsOut"]["properties"]) == {"items"}
+    listed = schemas["ExportListedOut"]
+    assert set(listed["required"]) == set(listed["properties"])
+    assert set(listed["properties"]) == {"id", "status", "created_at", "expires_at"}
+    assert listed["properties"]["status"]["enum"] == ["running", "ready"]
+    read = document["paths"]["/api/privacy/exports"]["get"]["responses"]["200"]["content"]
+    assert read == {"application/json": {"schema": {"$ref": "#/components/schemas/ExportsOut"}}}
     download = document["paths"]["/api/privacy/exports/{export_id}"]["get"]["responses"]["200"]["content"]
     assert set(download) == {"application/json", "application/zip"}
     deleted = document["paths"]["/api/golden-cases/{case_id}"]["delete"]["responses"]

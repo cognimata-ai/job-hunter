@@ -586,6 +586,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/privacy/exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Exports
+         * @description The exports in use, newest first: the one being made and the ready ones until they expire (at most
+         *     5).
+         */
+        get: operations["list_exports_api_privacy_exports_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/privacy/exports/{export_id}": {
         parameters: {
             query?: never;
@@ -2630,6 +2651,30 @@ export interface components {
          */
         ExportIn: Record<string, never>;
         /**
+         * ExportListedOut
+         * @description An export in use: being made, or ready to download until `expires_at`. Its size and its zip are the
+         *     export's own read.
+         */
+        ExportListedOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready";
+        };
+        /**
          * ExportOut
          * @description An export: its state, when it was requested and until when it can be downloaded, and the size of its
          *     zip once it is ready.
@@ -2662,6 +2707,11 @@ export interface components {
         ExportQueuedOut: {
             /** Export Id */
             export_id: number;
+        };
+        /** ExportsOut */
+        ExportsOut: {
+            /** Items */
+            items: components["schemas"]["ExportListedOut"][];
         };
         /** ExtractingOut */
         ExtractingOut: {
@@ -8143,6 +8193,44 @@ export interface operations {
             };
             /** @description A body other than an empty object (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_exports_api_privacy_exports_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
