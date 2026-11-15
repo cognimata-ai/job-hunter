@@ -3,7 +3,7 @@
     "browserName": "chromium",
     "launchOptions": {
       "headless": true,
-      "executablePath": "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+      "executablePath": "/opt/pw-browsers/chromium"
     },
     "contextOptions": {
       "viewport": { "width": 1280, "height": 800 },
