@@ -12,7 +12,10 @@ honest, without which it chose nested loops over whole-table scans and JIT compi
   the walk's estimate down to one row (and make a full sort look cheaper than the LIMIT walk of its index);
 - the deferred members that match (`DEFERRED_MEMBER`) are one uncorrelated set, an InitPlan run once per
   statement, not an EXISTS costed (and planned around) for every row it would rarely run for;
-- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`);
+- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`), once
+  per request: its matches are read in the read snapshot (`NEAR_MATCHES`), as the keyword's are below, and
+  every statement binds them (plan `2026-11-16-jobs-list-perf` Task P2). Decided in every statement, the
+  steps ran for every job of the posted window in each count of a first page;
 - a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8) is filtered only while a fence is open: the list
   and its facets read `privacy.fences.any_fence_open` once per request, in their read snapshot, and add
   `NOT_FENCED` only when it holds (plan `2026-11-16-jobs-list-perf` Task P1, Ruling JP-1). With none open, a
@@ -210,6 +213,7 @@ TAG: Final[Mapping[str, str]] = MappingProxyType(
         "count": "/* jobs_list.count */ ",
         "count_unscored": "/* jobs_list.count_unscored */ ",
         "keyword": "/* jobs_list.keyword */ ",
+        "near": "/* jobs_list.near */ ",
     }
 )
 
@@ -254,6 +258,12 @@ NEAR_BAND: Final = (
 )
 NEAR_BAND_WIDENING: Final = 1e-6
 JSONB_BINDS: Final = ("near_box",)
+# The location's matches, read once per request (module docstring, Plans at scale): `NEAR_MATCHES`, then the
+# near term and the posted window's terms rendered for `j` and joined by AND, then `NEAR_MATCHES_END`. Every
+# job the set is checked for is in the same window, a conjunct of the same predicate, so the window changes
+# no match: it spares the jsonpath steps for the jobs outside it, half of them under the default 30 days.
+NEAR_MATCHES: Final = "SELECT ARRAY(SELECT j.id FROM jobs j WHERE "
+NEAR_MATCHES_END: Final = ")"
 # B4: the word similarity `<%` requires, pg_trgm's `word_similarity_threshold`. The list sets nothing: it runs
 # under the server's value, and `test_jobs_listing.py` checks that value is this one for the app's role.
 TRGM_WORD_THRESHOLD: Final = 0.6
@@ -264,10 +274,12 @@ ROW_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
         # the keyword's matches, as `KEYWORD_MATCHES` read them (`listing.Matches`)
         "keyword": "({x}.current_revision_id IN (SELECT unnest(CAST(:keyword_revisions AS bigint[]))) "
         "OR {x}.id IN (SELECT unnest(CAST(:keyword_jobs AS bigint[]))))",
+        # the location's predicate, which `NEAR_MATCHES` reads; a statement binds its matches, `near_matched`
         "near": "((jsonb_path_exists({x}.locations, " + NEAR_INSIDE + ", :near_box, true) "
         "OR (jsonb_path_exists({x}.locations, " + NEAR_BAND + ", :near_box, true) "
         "AND job_within_km({x}.locations, CAST(:lat AS float8), CAST(:lon AS float8), "
         "CAST(:radius_km AS float8)))) AND {x}.location_kind <> 'country_wide')",
+        "near_matched": "{x}.id IN (SELECT unnest(CAST(:near_jobs AS bigint[])))",
         # B5: an unknown work mode is never remote
         "remote": "({x}.location_kind = 'remote' OR ({x}.work_mode_source <> 'none' "
         "AND 'remote' = ANY({x}.work_mode_possible)))",

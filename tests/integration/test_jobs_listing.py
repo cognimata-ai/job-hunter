@@ -400,6 +400,91 @@ async def test_the_keyword_matches_follow_the_page_snapshot(engine: AsyncEngine,
     assert await ids(engine, JobsQuery(q="Entwickler")) == [other]
 
 
+# Task P2 of the jobs-list perf plan: the location's matches are read once per request, in its snapshot
+_MOVE: Final = q("UPDATE jobs SET locations = :locations WHERE id = :id", jsonb=["locations"])
+
+
+def in_city(point: tuple[float, float], **fields: Any) -> Card:
+    return Card(locations=(place(point),), location_kind="city", **fields)
+
+
+async def test_a_location_page_and_its_facets_decide_the_radius_once(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """A first page with its counts, and the facets, each decide the radius in one statement, the location's
+    read; every other statement binds its matches."""
+    berlin, _ = await seed_cards(engine, [in_city(BERLIN), in_city(MUNICH)])
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        selected = await page(engine, query, with_counts=True)
+        of_page = list(statements)
+        statements.clear()
+        async with read_snapshot(engine) as conn:
+            counted = await facets(conn, query, window=ANY, company_q="", limit=10)
+        of_facets = list(statements)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert [row.job_id for row in selected.rows] == [berlin]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert [company.count for company in counted.companies] == [1]
+    for ran in (of_page, of_facets):
+        deciding = [s for s in ran if "job_within_km" in s or "jsonb_path_exists" in s]
+        assert len(deciding) == 1 and deciding[0].startswith("/* jobs_list.near */"), deciding
+
+
+async def test_the_location_matches_follow_the_page_snapshot(engine: AsyncEngine, active_tuple: int) -> None:
+    """The location's matches are read in the page's snapshot, so they agree with its every statement: jobs
+    moved after the snapshot began change neither the page nor its counts."""
+    moved, other = await seed_cards(engine, [in_city(BERLIN), in_city(MUNICH)])
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    async with read_snapshot(engine) as conn:
+        await listing.read_active(conn)  # the snapshot is taken
+        async with engine.begin() as write:
+            await write.execute(_MOVE, {"id": moved, "locations": [place(MUNICH)]})
+            await write.execute(_MOVE, {"id": other, "locations": [place(BERLIN)]})
+        selected = await select_page(conn, query, window=ANY, after=None, limit=20, with_counts=True)
+    assert [row.job_id for row in selected.rows] == [moved]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert await ids(engine, query) == [other]
+
+
+async def test_the_location_matches_hold_within_the_posted_window_job_by_job(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """Within a posted window, a card within the radius is listed by its own date, and a deferred member
+    within it brings its card in by the member's date (B2), whatever the representative's place."""
+    day = timedelta(days=1)
+    recent, old = SEEN - day, SEEN - 10 * day
+
+    def at(point: tuple[float, float], seen: datetime) -> dict[str, Any]:
+        return {"locations": (place(point),), "location_kind": "city", "first_seen_at": seen}
+
+    near_recent, _, rep_recent, _, rep_old, _ = await seed_cards(
+        engine,
+        [
+            scored(60, 70, **at(BERLIN, recent)),
+            scored(50, 60, **at(BERLIN, old)),
+            scored(40, 50, **at(MUNICH, recent)),  # its member is near and recent
+            Card(deferred_to=2, **at(NORTH_OF_BERLIN, recent)),
+            scored(30, 40, **at(MUNICH, recent)),  # its member is near but old
+            Card(deferred_to=4, **at(NORTH_OF_BERLIN, old)),
+        ],
+    )
+    week = (SEEN - 7 * day, None)
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    for sort in ("score_mid", "posted", "first_seen"):
+        found = await ids(engine, query.model_copy(update={"sort": sort}), window=week)
+        assert sorted(found) == sorted([near_recent, rep_recent]), sort
+    assert rep_old not in await ids(engine, query, window=week)
+    assert rep_old in await ids(engine, query)  # without a window its member brings it in
+
+
 async def test_location_matches_any_resolved_candidate_and_never_unresolved_or_country_wide(
     engine: AsyncEngine, active_tuple: int
 ) -> None:

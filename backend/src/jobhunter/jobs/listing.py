@@ -2,11 +2,11 @@
 
 `select_page` selects one page of cards in the caller's read snapshot (`db.snapshot.read_snapshot`): it reads
 the active tuple and scope from `active_config` without a lock, whether a purge fence is open, and the matches
-of its keyword (`read_matches`), then runs one statement per segment of the page's walk until it holds
-`limit + 1` rows, and returns the first `limit`, the position after the last one (`next`, when there is more)
-and, on a first page that asks for them, the counts. `read_active` is that read of the active tuple and scope;
-`card_set` is the same cards under the same filters as SQL to aggregate over (the facets of M4 Task 5), and
-`display_timezone` the active settings' zone of a `custom` window (B31).
+of its keyword and location (`read_matches`), then runs one statement per segment of the page's walk until it
+holds `limit + 1` rows, and returns the first `limit`, the position after the last one (`next`, when there is
+more) and, on a first page that asks for them, the counts. `read_active` is that read of the active tuple and
+scope; `card_set` is the same cards under the same filters as SQL to aggregate over (the facets of M4 Task 5),
+and `display_timezone` the active settings' zone of a `custom` window (B31).
 
 **Cards** (B2). A card is an unmerged job with a current revision, not a synthetic golden-case job, not under
 a purge fence (§20.2, M5 Task 8: `jobs._sql.NOT_FENCED`, as its detail answers 404), whose current revision
@@ -22,11 +22,12 @@ under that scope and `u` the user's actions on it (no row: unseen).
 **Filters.** The non-score filters (posted, keyword, location, work mode, company, source, ad language,
 employment, seniority, availability, partial) match a card when its representative matches all of them or one
 of its group's deferred members does (§8.7 L3342); user status, contested, the scoring state and the score
-filters are the representative's own. The keyword's matches are read once per request, in the caller's
-snapshot like the fence (`read_matches`): the revisions whose full text and the jobs whose title it matches.
-Every statement binds them (`Matches`), the card's term and a deferred member's alike, so each agrees with
-the others as a sub-select of its own would (plan `2026-11-16-jobs-list-perf` Task P2; `jobs._sql`'s "Plans
-at scale"). Every SQL fragment is a static string of `jobs._sql`, a statement is
+filters are the representative's own. The keyword's and the location's matches are read once per request, in
+the caller's snapshot like the fence (`read_matches`): the revisions whose full text and the jobs whose title
+the keyword matches, and the jobs within the radius in the posted window. Every statement binds them
+(`Matches`), the card's term and a deferred member's alike, so each agrees with the others as a term decided
+in the statement would (plan `2026-11-16-jobs-list-perf` Task P2; `jobs._sql`'s "Plans at scale"). Every SQL
+fragment is a static string of `jobs._sql`, a statement is
 composed only by choosing among them, and every value is a bound parameter; the sort and the score variant
 choose fragments from closed mappings (§16.7). The scoring-state buckets are exclusive (B8); `cancelled`, and
 a published target whose result has no current instance under the active scope, are in none, so never
@@ -60,7 +61,7 @@ both stop at `COUNT_CAP` and `capped` is set.
 """
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from math import cos, degrees, isfinite, radians
@@ -72,7 +73,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.pagination import JobSection
 from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql
-from jobhunter.jobs.query import JobsQuery, score_filter_active
+from jobhunter.jobs.query import JobsQuery, LocationFilter, score_filter_active
 from jobhunter.normalize.text import fold
 from jobhunter.privacy.fences import any_fence_open
 from jobhunter.settings.model import Display
@@ -156,13 +157,15 @@ class CardSet:
 
 @dataclass(frozen=True)
 class Matches:
-    """The matches of a query's keyword, read once per request in the caller's snapshot (`read_matches`): the
-    revisions whose full text and the jobs whose title it matches (`jobs._sql.KEYWORD_MATCHES`); `None` while
-    not read, as for a query without a keyword. A filter binds them; one whose sets were not read is
-    refused."""
+    """The matches of a query's keyword and location, read once per request in the caller's snapshot
+    (`read_matches`): the revisions whose full text and the jobs whose title the keyword matches
+    (`jobs._sql.KEYWORD_MATCHES`), and the jobs within the radius in the posted window
+    (`jobs._sql.NEAR_MATCHES`); `None` while not read, as for a query without that term. A filter binds them;
+    one whose sets were not read is refused."""
 
     keyword_revisions: tuple[int, ...] | None = None
     keyword_jobs: tuple[int, ...] | None = None
+    near_jobs: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -192,20 +195,27 @@ def _read(matched: tuple[int, ...] | None) -> list[int]:
     return list(matched)
 
 
+def _window_terms(window: tuple[datetime | None, datetime | None]) -> tuple[list[str], dict[str, object]]:
+    """The posted window's terms (`_sql.ROW_TEMPLATES` names) and their binds."""
+    posted_after, posted_before = window
+    terms: list[str] = []
+    binds: dict[str, object] = {}
+    if posted_after is not None:
+        terms.append("posted_after")
+        binds["posted_after"] = posted_after
+    if posted_before is not None:
+        terms.append("posted_before")
+        binds["posted_before"] = posted_before
+    return terms, binds
+
+
 def _row_terms(
     q: JobsQuery, window: tuple[datetime | None, datetime | None], matches: Matches
 ) -> tuple[list[tuple[str, ...]], dict[str, object]]:
     """The non-score terms `q` selects, each a tuple of `_sql.ROW_TEMPLATES` names that are ORed, and their
-    binds; the keyword's are its `matches`."""
-    terms: list[tuple[str, ...]] = []
-    binds: dict[str, object] = {}
-    posted_after, posted_before = window
-    if posted_after is not None:
-        terms.append(("posted_after",))
-        binds["posted_after"] = posted_after
-    if posted_before is not None:
-        terms.append(("posted_before",))
-        binds["posted_before"] = posted_before
+    binds; the keyword's and the location's are their `matches`."""
+    dated, binds = _window_terms(window)
+    terms: list[tuple[str, ...]] = [(name,) for name in dated]
     if q.q is not None:
         terms.append(("keyword",))
         binds |= {
@@ -213,13 +223,8 @@ def _row_terms(
             "keyword_jobs": _read(matches.keyword_jobs),
         }
     if q.loc is not None:
-        terms.append(("near", "remote") if q.include_remote else ("near",))
-        binds |= {
-            "lat": q.loc.lat,
-            "lon": q.loc.lon,
-            "radius_km": q.loc.radius_km,
-            "near_box": _near_box(q.loc.lat, q.loc.lon, q.loc.radius_km),
-        }
+        terms.append(("near_matched", "remote") if q.include_remote else ("near_matched",))
+        binds["near_jobs"] = _read(matches.near_jobs)
     if q.work_mode != _ALL_MODES:
         known = sorted(q.work_mode - {"unknown"})
         terms.append(
@@ -492,18 +497,45 @@ async def read_active(conn: AsyncConnection) -> Active:
     return Active(llm_tuple, int(row.scope_version_id), MappingProxyType(dict(row.scope)))
 
 
-async def read_matches(conn: AsyncConnection, q: JobsQuery) -> Matches:
-    """The matches of `q`'s keyword (`Matches`), read once in the caller's snapshot by its two text indexes:
-    sequential scans are off for that one statement, and then the caller's setting is back (`jobs._sql`'s
-    "Plans at scale"). A failure leaves the setting to the transaction, which it aborts."""
-    if q.q is None:
-        return Matches()
+async def read_matches(
+    conn: AsyncConnection, q: JobsQuery, *, window: tuple[datetime | None, datetime | None]
+) -> Matches:
+    """The matches of `q`'s keyword and location (`Matches`), each read once in the caller's snapshot
+    (`jobs._sql`'s "Plans at scale"); `window` is the posted window's absolute bounds."""
+    matches = Matches()
+    if q.q is not None:
+        matches = await _keyword_matches(conn, q.q)
+    if q.loc is not None:
+        matches = replace(matches, near_jobs=await _near_matches(conn, q.loc, window))
+    return matches
+
+
+async def _keyword_matches(conn: AsyncConnection, keyword: str) -> Matches:
+    """The keyword's two sets, read by its two text indexes: sequential scans are off for that one statement,
+    and then the caller's setting is back. A failure leaves the setting to the transaction, which it
+    aborts."""
     setting = (await conn.execute(_sql.SEQSCAN)).scalar_one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": "off"})
     statement = _sql.clause(_sql.TAG["keyword"] + _sql.KEYWORD_MATCHES)
-    row = (await conn.execute(statement, {"q": q.q, "qf": fold(q.q)})).one()
+    row = (await conn.execute(statement, {"q": keyword, "qf": fold(keyword)})).one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": setting})
     return Matches(keyword_revisions=tuple(row.revisions), keyword_jobs=tuple(row.jobs))
+
+
+async def _near_matches(
+    conn: AsyncConnection, loc: LocationFilter, window: tuple[datetime | None, datetime | None]
+) -> tuple[int, ...]:
+    """The jobs within `loc`'s radius whose date is in the posted window (`jobs._sql.NEAR_MATCHES`)."""
+    dated, binds = _window_terms(window)
+    where = " AND ".join(_sql.ROW_SQL["j"][name] for name in (*dated, "near"))
+    statement = _sql.clause(_sql.TAG["near"] + _sql.NEAR_MATCHES + where + _sql.NEAR_MATCHES_END)
+    binds |= {
+        "lat": loc.lat,
+        "lon": loc.lon,
+        "radius_km": loc.radius_km,
+        "near_box": _near_box(loc.lat, loc.lon, loc.radius_km),
+    }
+    return tuple((await conn.execute(statement, binds)).scalar_one())
 
 
 async def display_timezone(conn: AsyncConnection) -> str:
@@ -548,7 +580,7 @@ async def select_page(
     _checked(q, after)
     active = await read_active(conn)
     fence_open = await any_fence_open(conn)  # once (module docstring, Cards)
-    matches = await read_matches(conn, q)  # once (module docstring, Filters)
+    matches = await read_matches(conn, q, window=window)  # once (module docstring, Filters)
     where = _filter(q, window, active, fence_open=fence_open, matches=matches)
     context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
     rows: list[SelectedRow] = []

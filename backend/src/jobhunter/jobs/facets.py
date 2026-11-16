@@ -84,7 +84,8 @@ async def facets(
         raise ValueError("the limit must be at least 1")
     active = await read_active(conn)
     fence_open = await any_fence_open(conn)  # once, for both sets (`listing`'s module docstring, Cards)
-    matches = await read_matches(conn, q)  # likewise (Filters): neither depends on the company or source
+    # likewise, for both sets (Filters): neither needs the company or the source a set leaves out
+    matches = await read_matches(conn, q, window=window)
     by_company = card_set(
         q.model_copy(update={"company": frozenset()}),
         window=window,
