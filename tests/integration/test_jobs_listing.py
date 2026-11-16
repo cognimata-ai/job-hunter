@@ -10,6 +10,7 @@ cap.
 
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -24,9 +25,12 @@ from jobhunter.db.sql import q
 from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql, listing
 from jobhunter.jobs._sql import TRGM_WORD_THRESHOLD
+from jobhunter.jobs.facets import facets
 from jobhunter.jobs.listing import Counts, PageSelection, Position, SelectedRow, select_page
 from jobhunter.jobs.query import JobsQuery, LocationFilter
-from sqlalchemy.ext.asyncio import AsyncEngine
+from jobhunter.normalize.titles import normalize_title
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.jobs_list import (
     BERLIN,
@@ -263,6 +267,42 @@ async def test_a_deferred_member_is_never_a_row_and_its_filters_match_the_card(
     assert counted.counts == Counts(total=1, unscored=0, capped=False)
 
 
+async def test_a_deferred_member_matching_the_keyword_brings_its_card_in(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """B2 for the keyword (plan `2026-11-16-jobs-list-perf`, Review Focus 4): a deferred member that matches
+    it, by its title or by its revision's full text alone, lists its group's card though the representative
+    does not match, in every sort, in the counts and in the facets; a member that does not match brings no
+    card, and no member is ever a row."""
+    by_title, _, by_text, _, unmatched, _ = await seed_cards(
+        engine,
+        [
+            scored(60, 70, title="Marketing Manager", company_key="firma-a"),
+            Card(title="Softwareentwickler", deferred_to=0),
+            scored(50, 60, title="Lagerist Logistik", company_key="firma-b"),
+            Card(
+                title="Buchhalter Finanzen",
+                description="Wir suchen Entwickler für ein erfundenes Team.",
+                deferred_to=2,
+            ),
+            scored(40, 50, title="Einkäufer Rohstoffe", company_key="firma-c"),
+            Card(title="Elektriker Gebäudetechnik", deferred_to=4),
+        ],
+    )
+    query = JobsQuery(q="Entwickler")
+    for sort in ("score_mid", "posted", "first_seen"):
+        found = await ids(engine, query.model_copy(update={"sort": sort}))
+        assert sorted(found) == sorted([by_title, by_text]), sort
+    counted = await page(engine, query, with_counts=True)
+    assert counted.counts == Counts(total=2, unscored=0, capped=False)
+    async with read_snapshot(engine) as conn:
+        shown = await facets(conn, query, window=ANY, company_q="", limit=10)
+    assert {company.company_key: company.count for company in shown.companies} == {"firma-a": 1, "firma-b": 1}
+    assert {source.source_id: source.count for source in shown.sources} == {"jsearch": 2}
+    every_card = JobsQuery(scoring_state=ALL_STATES, status=["unseen", "seen", "hidden"])
+    assert sorted(await ids(engine, every_card)) == sorted([by_title, by_text, unmatched])
+
+
 async def test_keyword_finds_softwareentwickler_by_entwickler(engine: AsyncEngine, active_tuple: int) -> None:
     senior, plain, marketing, english = await seed_cards(
         engine,
@@ -286,6 +326,223 @@ async def test_keyword_finds_softwareentwickler_by_entwickler(engine: AsyncEngin
     for sort in ("score_mid", "posted", "first_seen"):
         found = await ids(engine, JobsQuery(q="Entwickler", sort=sort))
         assert sorted(found) == sorted([senior, plain])
+
+
+# Task P2 of the jobs-list perf plan: the keyword's matches are read once per request, in its snapshot
+# Each text index's scans by this backend since its stats were last flushed, which no flush changes inside a
+# transaction: the title's and the full text's
+_TEXT_INDEX_SCANS: Final = q(
+    "SELECT pg_stat_get_xact_numscans(CAST('jobs_title_trgm' AS regclass)) AS title, "
+    "pg_stat_get_xact_numscans(CAST('job_revisions_tsv' AS regclass)) AS text"
+)
+_SEQSCAN: Final = {setting: q(f"SET LOCAL enable_seqscan = {setting}") for setting in ("on", "off")}
+_SHOW_SEQSCAN: Final = q("SHOW enable_seqscan")
+_CURRENT_REVISION: Final = q("SELECT current_revision_id FROM jobs WHERE id = :id")
+_RETITLE: Final = (
+    q("UPDATE jobs SET title = :title, title_norm = :title_norm WHERE id = :id"),
+    q(
+        "UPDATE job_revisions SET llm_input = jsonb_build_object('title', CAST(:title AS text)) "
+        "WHERE id = :revision"
+    ),
+)
+
+
+async def test_a_keyword_page_and_its_facets_read_each_text_index_once(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """A first page with its counts, and the facets, each read the keyword's matches once, by the two text
+    indexes (a sequential scan reads neither), in one statement; every other statement binds them."""
+    developer, _ = await seed_cards(
+        engine, [Card(title="Softwareentwickler"), Card(title="Marketing Manager")]
+    )
+    query = JobsQuery(q="Entwickler")
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool) -> None:
+        statements.append(statement)
+
+    async def scans(conn: AsyncConnection) -> tuple[int, int]:
+        row = (await conn.execute(_TEXT_INDEX_SCANS)).one()
+        return int(row.title), int(row.text)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        async with read_snapshot(engine) as conn:
+            before = await scans(conn)
+            selected = await select_page(conn, query, window=ANY, after=None, limit=20, with_counts=True)
+            listed = tuple(n - b for n, b in zip(await scans(conn), before, strict=True))
+        of_page = list(statements)
+        statements.clear()
+        async with read_snapshot(engine) as conn:
+            before = await scans(conn)
+            counted = await facets(conn, query, window=ANY, company_q="", limit=10)
+            faceted = tuple(n - b for n, b in zip(await scans(conn), before, strict=True))
+        of_facets = list(statements)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert [row.job_id for row in selected.rows] == [developer]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert [company.count for company in counted.companies] == [1]
+    assert (listed, faceted) == ((1, 1), (1, 1))
+    for ran in (of_page, of_facets):
+        matching = [s for s in ran if "<%" in s or "websearch_to_tsquery" in s]
+        assert len(matching) == 1 and matching[0].startswith("/* jobs_list.keyword */"), matching
+
+
+@pytest.mark.parametrize("setting", ["on", "off"])
+async def test_the_keyword_read_leaves_the_planner_setting_as_it_found_it(
+    engine: AsyncEngine, active_tuple: int, setting: str
+) -> None:
+    """The keyword's read takes the text indexes under a planner setting of its own; the page's other
+    statements, and whatever its caller runs after it, are planned under the caller's."""
+    await seed_cards(engine, [Card(title="Softwareentwickler")])
+    async with read_snapshot(engine) as conn:
+        await conn.execute(_SEQSCAN[setting])
+        selected = await select_page(
+            conn, JobsQuery(q="Entwickler"), window=ANY, after=None, limit=5, with_counts=True
+        )
+        shown = (await conn.execute(_SHOW_SEQSCAN)).scalar_one()
+    assert (len(selected.rows), shown) == (1, setting)
+
+
+async def retitle(conn: AsyncConnection, job_id: int, title: str) -> None:
+    """The job's title, and its current revision's, whose full text it is."""
+    revision = (await conn.execute(_CURRENT_REVISION, {"id": job_id})).scalar_one()
+    params = {
+        "id": job_id,
+        "revision": revision,
+        "title": title,
+        "title_norm": normalize_title(title).title_norm,
+    }
+    for statement in _RETITLE:
+        await conn.execute(statement, params)
+
+
+async def test_the_keyword_matches_follow_the_page_snapshot(engine: AsyncEngine, active_tuple: int) -> None:
+    """The keyword's matches are read in the page's snapshot, so they agree with its every statement: titles
+    changed after the snapshot began change neither the page nor its counts."""
+    renamed, other = await seed_cards(
+        engine, [Card(title="Softwareentwickler"), Card(title="Marketing Manager")]
+    )
+    async with read_snapshot(engine) as conn:
+        await listing.read_active(conn)  # the snapshot is taken
+        async with engine.begin() as write:
+            await retitle(write, renamed, "Marketing Manager")
+            await retitle(write, other, "Softwareentwickler")
+        selected = await select_page(
+            conn, JobsQuery(q="Entwickler"), window=ANY, after=None, limit=20, with_counts=True
+        )
+    assert [row.job_id for row in selected.rows] == [renamed]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert await ids(engine, JobsQuery(q="Entwickler")) == [other]
+
+
+# Task P2 of the jobs-list perf plan: the location's matches are read once per request, in its snapshot
+_MOVE: Final = q("UPDATE jobs SET locations = :locations WHERE id = :id", jsonb=["locations"])
+
+
+def in_city(point: tuple[float, float], **fields: Any) -> Card:
+    return Card(locations=(place(point),), location_kind="city", **fields)
+
+
+async def test_a_location_page_and_its_facets_decide_the_radius_once(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """A first page with its counts, and the facets, each decide the radius in one statement, the location's
+    read; every other statement binds its matches."""
+    berlin, _ = await seed_cards(engine, [in_city(BERLIN), in_city(MUNICH)])
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        selected = await page(engine, query, with_counts=True)
+        of_page = list(statements)
+        statements.clear()
+        async with read_snapshot(engine) as conn:
+            counted = await facets(conn, query, window=ANY, company_q="", limit=10)
+        of_facets = list(statements)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert [row.job_id for row in selected.rows] == [berlin]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert [company.count for company in counted.companies] == [1]
+    for ran in (of_page, of_facets):
+        deciding = [s for s in ran if "job_within_km" in s or "jsonb_path_exists" in s]
+        assert len(deciding) == 1 and deciding[0].startswith("/* jobs_list.near */"), deciding
+
+
+async def test_the_location_matches_follow_the_page_snapshot(engine: AsyncEngine, active_tuple: int) -> None:
+    """The location's matches are read in the page's snapshot, so they agree with its every statement: jobs
+    moved after the snapshot began change neither the page nor its counts."""
+    moved, other = await seed_cards(engine, [in_city(BERLIN), in_city(MUNICH)])
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    async with read_snapshot(engine) as conn:
+        await listing.read_active(conn)  # the snapshot is taken
+        async with engine.begin() as write:
+            await write.execute(_MOVE, {"id": moved, "locations": [place(MUNICH)]})
+            await write.execute(_MOVE, {"id": other, "locations": [place(BERLIN)]})
+        selected = await select_page(conn, query, window=ANY, after=None, limit=20, with_counts=True)
+    assert [row.job_id for row in selected.rows] == [moved]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert await ids(engine, query) == [other]
+
+
+async def test_the_location_matches_hold_within_the_posted_window_job_by_job(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """Within a posted window, a card within the radius is listed by its own date, and a deferred member
+    within it brings its card in by the member's date (B2), whatever the representative's place."""
+    day = timedelta(days=1)
+    recent, old = SEEN - day, SEEN - 10 * day
+
+    def at(point: tuple[float, float], seen: datetime) -> dict[str, Any]:
+        return {"locations": (place(point),), "location_kind": "city", "first_seen_at": seen}
+
+    near_recent, _, rep_recent, _, rep_old, _ = await seed_cards(
+        engine,
+        [
+            scored(60, 70, **at(BERLIN, recent)),
+            scored(50, 60, **at(BERLIN, old)),
+            scored(40, 50, **at(MUNICH, recent)),  # its member is near and recent
+            Card(deferred_to=2, **at(NORTH_OF_BERLIN, recent)),
+            scored(30, 40, **at(MUNICH, recent)),  # its member is near but old
+            Card(deferred_to=4, **at(NORTH_OF_BERLIN, old)),
+        ],
+    )
+    week = (SEEN - 7 * day, None)
+    query = JobsQuery(loc=NEAR_BERLIN, include_remote=False)
+    for sort in ("score_mid", "posted", "first_seen"):
+        found = await ids(engine, query.model_copy(update={"sort": sort}), window=week)
+        assert sorted(found) == sorted([near_recent, rep_recent]), sort
+    assert rep_old not in await ids(engine, query, window=week)
+    assert rep_old in await ids(engine, query)  # without a window its member brings it in
+
+
+async def test_each_set_is_rendered_once_per_page_and_per_facets_request(
+    engine: AsyncEngine, active_tuple: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_matches` renders each set it reads once per request as the array literal every statement binds
+    (`listing._array_literal`), though the facets filter twice: a keyword and a location are three sets."""
+    await seed_cards(engine, [in_city(BERLIN, title="Softwareentwickler")])
+    rendered: list[int] = []
+    render = listing._array_literal
+
+    def counting(ids: Iterable[int]) -> str:
+        rendered.append(1)
+        return render(ids)
+
+    monkeypatch.setattr(listing, "_array_literal", counting)
+    query = JobsQuery(q="Entwickler", loc=NEAR_BERLIN, include_remote=False)
+    selected = await page(engine, query, with_counts=True)
+    of_page = len(rendered)
+    async with read_snapshot(engine) as conn:
+        shown = await facets(conn, query, window=ANY, company_q="", limit=10)
+    assert len(selected.rows) == 1 and [company.count for company in shown.companies] == [1]
+    assert (of_page, len(rendered) - of_page) == (3, 3)
 
 
 async def test_location_matches_any_resolved_candidate_and_never_unresolved_or_country_wide(

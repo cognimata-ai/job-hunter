@@ -34,6 +34,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db.migrate import MIGRATE_ORDER, StepGroup, run_migrate_async
 from jobhunter.db.seed import content_hash
 from jobhunter.db.session import make_null_engine
+from jobhunter.db.snapshot import read_snapshot
 from jobhunter.errors import InvariantViolation
 from jobhunter.jobs.listing import select_page
 from jobhunter.jobs.query import JobsQuery
@@ -296,8 +297,9 @@ async def assert_replayed(engine: AsyncEngine, files: FileRoots, *manifests: Man
 
 
 async def listed(engine: AsyncEngine) -> set[int]:
-    """The jobs of the Jobs list's every card (every status, availability and scoring state)."""
-    async with engine.connect() as conn:
+    """The jobs of the Jobs list's every card (every status, availability and scoring state), read as the
+    list route reads them: in one read snapshot (`listing`'s module docstring, Cards)."""
+    async with read_snapshot(engine) as conn:
         page = await select_page(
             conn, EVERY_CARD, window=(None, None), after=None, limit=500, with_counts=False
         )

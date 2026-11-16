@@ -13,7 +13,9 @@ after the writer read its work) counts as fenced: the writer writes nothing for 
 - the `awaiting_embedding` reconciler and the `embed` node write no vector for a revision of J, and the
   similarity fill sets none on J's target;
 - Score now, Retry and Score individually answer 404 for J, as the detail does;
-- the Jobs list omits J.
+- the Jobs list omits J, from its page, its counts and its facets, as its read snapshot sees the fence: the
+  list reads "is any fence open" once per request in that snapshot (plan `2026-11-16-jobs-list-perf` Task P1,
+  Ruling JP-1), so a fence released after the snapshot began still hides J and one raised after it does not.
 
 `det_completeness` also meets a `source` fence that names J only through the lineage of J's revision
 (`job_revision_sources`), the branch `is_fenced` evaluates at call time. The embed write leaves out a revision
@@ -41,8 +43,10 @@ from jobhunter.errors import Refusal
 from jobhunter.graphs.collect.nodes import finalize
 from jobhunter.graphs.collect.nodes.embed import REVISIONS_AWAITING, make_embed
 from jobhunter.graphs.collect.state import initial_state
-from jobhunter.jobs.listing import select_page
+from jobhunter.jobs.facets import facets
+from jobhunter.jobs.listing import read_active, select_page
 from jobhunter.jobs.query import JobsQuery
+from jobhunter.privacy.fences import any_fence_open
 from jobhunter.quota import ledger
 from jobhunter.scoring import golden, similarity
 from jobhunter.scoring import reconcilers as scoring_reconcilers  # registers `det_completeness`
@@ -50,12 +54,12 @@ from jobhunter.settings import scope_apply
 from jobhunter.worker import operations as ops
 from jobhunter.worker.embedding_reconcile import reconcile_awaiting_embedding
 from jobhunter.worker.epoch import fence_epoch
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import ctx, make_deps, queued_run
 from tests.support.eval import scored_job
 from tests.support.faults import PausePoint
-from tests.support.fences import insert_test_fence
+from tests.support.fences import FenceKind, insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.jobs_list import Card, seed_cards
 from tests.support.m3 import Job, insert_job
@@ -503,6 +507,93 @@ async def test_the_jobs_list_omits_a_fenced_job(engine: AsyncEngine, active_tupl
     assert await listed() == ([other], 1)
     await release(engine, fence_id)
     assert await listed() == ([other, fenced], 2)
+
+
+FENCED_COMPANY: Final = "gesperrt gmbh"
+FENCED_SOURCE: Final = "adzuna"
+# In one snapshot: whether a fence is open, the first page's job ids, its counts (total, unscored), and the
+# facets' company and source counts.
+Seen = tuple[bool, list[int], tuple[int, int] | None, dict[str, int], dict[str, int]]
+
+
+async def fenced_and_other(engine: AsyncEngine) -> list[int]:
+    """Two unscored cards, the first of a company and a source of its own."""
+    fenced = Card(state="pending", company_key=FENCED_COMPANY, source_ids=(FENCED_SOURCE,))
+    return await seed_cards(engine, [fenced, Card(state="pending")])
+
+
+async def in_snapshot(conn: AsyncConnection) -> Seen:
+    """What the list and its facets show in `conn`'s snapshot (`Seen`), each reading the fence once."""
+    query = JobsQuery()
+    selected = await select_page(conn, query, window=(None, None), after=None, limit=100, with_counts=True)
+    counted = await facets(conn, query, window=(None, None), company_q="", limit=100)
+    counts = None if selected.counts is None else (selected.counts.total, selected.counts.unscored)
+    return (
+        await any_fence_open(conn),
+        [row.job_id for row in selected.rows],
+        counts,
+        {c.company_key: c.count for c in counted.companies},
+        {s.source_id: s.count for s in counted.sources},
+    )
+
+
+async def fence_of(engine: AsyncEngine, kind: FenceKind, job: int) -> int:
+    """An open fence of `kind` that covers `job`: a `jobs` fence over it, a `source` fence of its source
+    with it in the stored affected set (`seed_cards` writes no posting or lineage), or a `global` fence."""
+    if kind == "jobs":
+        return await fence(engine, job)
+    async with engine.begin() as conn:
+        if kind == "source":
+            return await insert_test_fence(conn, kind="source", source_id=FENCED_SOURCE, job_ids=[job])
+        return await insert_test_fence(conn, kind=kind)
+
+
+@pytest.mark.parametrize("kind", ["jobs", "source", "global"])
+async def test_the_page_its_counts_and_its_facets_omit_a_fenced_job_until_its_release(
+    engine: AsyncEngine, active_tuple: int, kind: FenceKind
+) -> None:
+    fenced, other = await fenced_and_other(engine)
+    fence_id = await fence_of(engine, kind, fenced)
+    async with read_snapshot(engine) as conn:
+        if kind == "global":  # every job is fenced
+            assert await in_snapshot(conn) == (True, [], (0, 0), {}, {})
+        else:
+            assert await in_snapshot(conn) == (True, [other], (1, 1), {"musterfirma": 1}, {"jsearch": 1})
+    await release(engine, fence_id)
+    async with read_snapshot(engine) as conn:
+        assert await in_snapshot(conn) == (
+            False,
+            [other, fenced],
+            (2, 2),
+            {"musterfirma": 1, FENCED_COMPANY: 1},
+            {"jsearch": 1, FENCED_SOURCE: 1},
+        )
+
+
+async def test_the_page_and_its_facets_follow_their_snapshot_while_a_fence_opens_or_closes(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    fenced, other = await fenced_and_other(engine)
+    hidden = (True, [other], (1, 1), {"musterfirma": 1}, {"jsearch": 1})
+    listed = (
+        False,
+        [other, fenced],
+        (2, 2),
+        {"musterfirma": 1, FENCED_COMPANY: 1},
+        {"jsearch": 1, FENCED_SOURCE: 1},
+    )
+    # a fence committed before the snapshot and released after it began still hides the job in it
+    fence_id = await fence(engine, fenced)
+    async with read_snapshot(engine) as conn:
+        await read_active(conn)  # the snapshot is taken
+        await release(engine, fence_id)
+        assert await in_snapshot(conn) == hidden
+    # a fence committed after the snapshot began does not
+    async with read_snapshot(engine) as conn:
+        await read_active(conn)
+        fence_id = await fence(engine, fenced)
+        assert await in_snapshot(conn) == listed
+    await release(engine, fence_id)
 
 
 # ---- a job deleted under its writer ------------------------------------------------------------------------

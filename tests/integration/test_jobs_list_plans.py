@@ -13,7 +13,8 @@ with (`/* jobs_list.<segment> */`):
 - P4: the `posted` sort walks `jobs_list_posted_any`, in its dated and its undated branch;
 - P5: a second page of the `first_seen` sort walks `jobs_list_first_seen` with the row comparison and sorts
   nothing;
-- P6: a keyword page reads `job_revisions_tsv` and `jobs_title_trgm` by bitmap index scans;
+- P6: a keyword page reads `job_revisions_tsv` and `jobs_title_trgm` by bitmap index scans, once: in its
+  keyword read, whose matches every other statement binds (plan `2026-11-16-jobs-list-perf` Task P2);
 - P8: each count of a first page aggregates a `Limit` (the cap).
 """
 
@@ -177,10 +178,12 @@ async def test_p6_a_keyword_page_reads_both_text_indexes(
 ) -> None:
     server, _ = seeded
     plans, _ = await explained(server, JobsQuery(q="Entwickler", sort=sort), window=(None, None))
+    tag, plan = "jobs_list.keyword", plans.pop("jobs_list.keyword")  # the page's one keyword read
+    assert "Bitmap Index Scan on job_revisions_tsv" in plan, (tag, plan)
+    assert "Bitmap Index Scan on jobs_title_trgm" in plan, (tag, plan)
     assert plans
-    for tag, plan in plans.items():
-        assert "Bitmap Index Scan on job_revisions_tsv" in plan, (tag, plan)
-        assert "Bitmap Index Scan on jobs_title_trgm" in plan, (tag, plan)
+    for tag, plan in plans.items():  # every other statement binds its matches: it reads no text
+        assert "job_revisions" not in plan and "<%" not in plan, (tag, plan)
 
 
 async def test_p8_each_count_aggregates_a_limit(seeded: tuple[PgServer, BulkSeed]) -> None:

@@ -5,16 +5,32 @@ name or variant name is ever interpolated, and every value is a bound parameter.
 card's score row: `j` the job, `t` its active-tuple target, `r` the published result, `d` the current
 instance, `h` the hard-filter result, `u` the user's actions, and `m` a deferred group member.
 
-**Plans at scale** (M4 Task 5, B29: the list's p95 on 50,000 cards). Three shapes keep the planner's estimates
+**Plans at scale** (M4 Task 5, B29: the list's p95 on 50,000 cards). Five shapes keep the planner's estimates
 honest, without which it chose nested loops over whole-table scans and JIT compilation:
 - a walk from an instance or a target finds its job by a fenced lateral lookup (`OFFSET 0`): the job is one
   row per walked row, so the redundant `current_revision_id` check is no join selectivity that would multiply
   the walk's estimate down to one row (and make a full sort look cheaper than the LIMIT walk of its index);
 - the deferred members that match (`DEFERRED_MEMBER`) are one uncorrelated set, an InitPlan run once per
   statement, not an EXISTS costed (and planned around) for every row it would rarely run for;
-- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`);
-- a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8, D21) is decided by one uncorrelated "no fence is
-  open" first, an InitPlan run once per statement, so no row pays for `is_fenced` while no fence stands.
+- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`), once
+  per request: its matches are read in the read snapshot (`NEAR_MATCHES`), as the keyword's are below, and
+  every statement binds them (plan `2026-11-16-jobs-list-perf` Task P2). Decided in every statement, the
+  steps ran for every job of the posted window in each count of a first page;
+- a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8) is filtered only while a fence is open: the list
+  and its facets read `privacy.fences.any_fence_open` once per request, in their read snapshot, and add
+  `NOT_FENCED` only when it holds (plan `2026-11-16-jobs-list-perf` Task P1, Ruling JP-1). With none open, a
+  statement names neither `is_fenced` nor `purge_fences`: it has no fence term at all, and for a query without
+  a keyword or a location it is M4's SQL. `is_fenced` is SQL the planner cannot see into, and as a conjunct of
+  every statement, even behind D21's uncorrelated "no fence is open", it skewed the row estimates:
+  `count_unscored` then joined `user_job_actions` by a scan per row;
+- the keyword's matches (`KEYWORD_MATCHES`) are read once per request, in the read snapshot, and every
+  statement binds them as arrays, each a hashed set as the sub-selects were (plan `2026-11-16-jobs-list-perf`
+  Task P2), from an array literal that `listing.read_matches` renders once per request. As a sub-select of
+  every statement, the title branch was a sequential scan that computed a word similarity per title, about
+  120 ms on 50,000 cards, in the statement and again in its deferred-member set: five times on a first page.
+  The read runs with sequential scans off (`SET_SEQSCAN`), so that it takes the two text indexes, 30 ms
+  against 140: the planner prices a GIN index's pending list (after a bulk load, and between two vacuums) as
+  random reads, and `<%` as one operator call, and so prefers the scans.
 """
 
 from collections.abc import Mapping
@@ -26,7 +42,6 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q as sql
 from jobhunter.jobs.query import ScoringBucket, UserStatus
-from jobhunter.privacy.fences import NO_OPEN_FENCE_SQL
 
 ACTIVE: Final = sql(
     "SELECT a.llm_tuple_id, a.scope_version_id, s.payload AS scope FROM active_config a "
@@ -199,6 +214,8 @@ TAG: Final[Mapping[str, str]] = MappingProxyType(
         "first_seen": "/* jobs_list.first_seen */ ",
         "count": "/* jobs_list.count */ ",
         "count_unscored": "/* jobs_list.count_unscored */ ",
+        "keyword": "/* jobs_list.keyword */ ",
+        "near": "/* jobs_list.near */ ",
     }
 )
 
@@ -213,6 +230,14 @@ TEXT_REVISIONS: Final = (
     "OR kr.tsv @@ websearch_to_tsquery('german_unaccent', :q)"
 )
 TITLE_JOBS: Final = "SELECT kt.id FROM jobs kt WHERE :qf <% kt.title_norm"
+# The keyword's matches, both sets in one statement, read once per request (module docstring, Plans at
+# scale) under a planner setting of its own: sequential scans off (`SET_SEQSCAN`), then the caller's setting
+# (`SEQSCAN`) again
+KEYWORD_MATCHES: Final = (
+    "SELECT ARRAY(" + TEXT_REVISIONS + ") AS revisions, ARRAY(" + TITLE_JOBS + ") AS jobs"
+)
+SEQSCAN: Final = sql("SELECT current_setting('enable_seqscan')")
+SET_SEQSCAN: Final = sql("SELECT set_config('enable_seqscan', :setting, true)")
 # The location filter is `job_within_km` (B5), decided in two jsonpath steps first (M4 Task 5, B29), since
 # the function is SQL, not inlinable, and costs ~11 µs a call. `:near_box` holds their bounds
 # (`listing._near_box`), a JSONB bind (`clause`), so the variables are one constant, not a document built per
@@ -235,6 +260,12 @@ NEAR_BAND: Final = (
 )
 NEAR_BAND_WIDENING: Final = 1e-6
 JSONB_BINDS: Final = ("near_box",)
+# The location's matches, read once per request (module docstring, Plans at scale): `NEAR_MATCHES`, then the
+# near term and the posted window's terms rendered for `j` and joined by AND, then `NEAR_MATCHES_END`. Every
+# job the set is checked for is in the same window, a conjunct of the same predicate, so the window changes
+# no match: it spares the jsonpath steps for the jobs outside it, half of them under the default 30 days.
+NEAR_MATCHES: Final = "SELECT ARRAY(SELECT j.id FROM jobs j WHERE "
+NEAR_MATCHES_END: Final = ")"
 # B4: the word similarity `<%` requires, pg_trgm's `word_similarity_threshold`. The list sets nothing: it runs
 # under the server's value, and `test_jobs_listing.py` checks that value is this one for the app's role.
 TRGM_WORD_THRESHOLD: Final = 0.6
@@ -242,11 +273,15 @@ ROW_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "posted_after": "coalesce({x}.posted_at_effective, {x}.first_seen_at) >= :posted_after",
         "posted_before": "coalesce({x}.posted_at_effective, {x}.first_seen_at) < :posted_before",
-        "keyword": "({x}.current_revision_id IN (" + TEXT_REVISIONS + ") OR {x}.id IN (" + TITLE_JOBS + "))",
+        # the keyword's matches, as `KEYWORD_MATCHES` read them (`listing.Matches`)
+        "keyword": "({x}.current_revision_id IN (SELECT unnest(CAST(:keyword_revisions AS bigint[]))) "
+        "OR {x}.id IN (SELECT unnest(CAST(:keyword_jobs AS bigint[]))))",
+        # the location's predicate, which `NEAR_MATCHES` reads; a statement binds its matches, `near_matched`
         "near": "((jsonb_path_exists({x}.locations, " + NEAR_INSIDE + ", :near_box, true) "
         "OR (jsonb_path_exists({x}.locations, " + NEAR_BAND + ", :near_box, true) "
         "AND job_within_km({x}.locations, CAST(:lat AS float8), CAST(:lon AS float8), "
         "CAST(:radius_km AS float8)))) AND {x}.location_kind <> 'country_wide')",
+        "near_matched": "{x}.id IN (SELECT unnest(CAST(:near_jobs AS bigint[])))",
         # B5: an unknown work mode is never remote
         "remote": "({x}.location_kind = 'remote' OR ({x}.work_mode_source <> 'none' "
         "AND 'remote' = ANY({x}.work_mode_possible)))",
@@ -300,8 +335,9 @@ STATUS_SQL: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 NOT_HIDDEN: Final = "u.hidden_at IS NULL"
-# No unreleased purge fence matches the card's job: a fenced job is no card (module docstring).
-NOT_FENCED: Final = f"({NO_OPEN_FENCE_SQL} OR NOT is_fenced(j.id))"
+# No unreleased purge fence matches the card's job: a fenced job is no card. Added only while the request's
+# snapshot shows a fence open, so it needs no "no fence is open" term of its own (module docstring).
+NOT_FENCED: Final = "NOT is_fenced(j.id)"
 BUCKET_ORDER: Final[tuple[ScoringBucket, ...]] = (
     "scored",
     "filtered",
