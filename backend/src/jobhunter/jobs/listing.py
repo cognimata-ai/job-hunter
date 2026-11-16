@@ -531,13 +531,15 @@ async def read_matches(
 
 
 async def _keyword_matches(conn: AsyncConnection, keyword: str) -> tuple[str, str]:
-    """The keyword's two sets, read by its two text indexes: sequential scans are off for that one statement,
-    and then the caller's setting is back. A failure leaves the setting to the transaction, which it
-    aborts."""
+    """The keyword's two sets, read by its two text indexes and rendered (`_array_literal`): sequential scans
+    are off for that one statement, and then the caller's setting is back. Nothing but the read runs in
+    between, so only a database error can leave the setting off; it aborts the transaction, whose rollback
+    restores the setting (`set_config(..., true)` is transaction-local)."""
+    statement = _sql.clause(_sql.TAG["keyword"] + _sql.KEYWORD_MATCHES)
+    params = {"q": keyword, "qf": fold(keyword)}
     setting = (await conn.execute(_sql.SEQSCAN)).scalar_one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": "off"})
-    statement = _sql.clause(_sql.TAG["keyword"] + _sql.KEYWORD_MATCHES)
-    row = (await conn.execute(statement, {"q": keyword, "qf": fold(keyword)})).one()
+    row = (await conn.execute(statement, params)).one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": setting})
     return _array_literal(row.revisions), _array_literal(row.jobs)
 
