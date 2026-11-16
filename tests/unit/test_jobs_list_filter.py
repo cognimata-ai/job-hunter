@@ -2,7 +2,8 @@
 
 The list and its facets read "is any purge fence open" once per request, in their read snapshot, and pass it
 to `listing._filter` as `fence_open`. With none open the filter names neither `is_fenced` nor `purge_fences`:
-M4's SQL for the same query. With one open it adds `NOT is_fenced(j.id)` alone, and nothing else changes.
+it has no fence term at all, and for a query without a keyword or a location it is M4's SQL (Task P2 binds
+those two terms' matches). With one open it adds `NOT is_fenced(j.id)` alone, and nothing else changes.
 `listing.card_set`, the facets' set, renders the same filter.
 """
 

@@ -19,9 +19,10 @@ honest, without which it chose nested loops over whole-table scans and JIT compi
 - a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8) is filtered only while a fence is open: the list
   and its facets read `privacy.fences.any_fence_open` once per request, in their read snapshot, and add
   `NOT_FENCED` only when it holds (plan `2026-11-16-jobs-list-perf` Task P1, Ruling JP-1). With none open, a
-  statement names neither `is_fenced` nor `purge_fences`: M4's SQL. `is_fenced` is SQL the planner cannot see
-  into, and as a conjunct of every statement, even behind D21's uncorrelated "no fence is open", it skewed the
-  row estimates: `count_unscored` then joined `user_job_actions` by a scan per row;
+  statement names neither `is_fenced` nor `purge_fences`: it has no fence term at all, and for a query without
+  a keyword or a location it is M4's SQL. `is_fenced` is SQL the planner cannot see into, and as a conjunct of
+  every statement, even behind D21's uncorrelated "no fence is open", it skewed the row estimates:
+  `count_unscored` then joined `user_job_actions` by a scan per row;
 - the keyword's matches (`KEYWORD_MATCHES`) are read once per request, in the read snapshot, and every
   statement binds them as arrays, each a hashed set as the sub-selects were (plan `2026-11-16-jobs-list-perf`
   Task P2), from an array literal built once per request (`listing._read`). As a sub-select of every
