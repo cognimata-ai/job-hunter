@@ -84,9 +84,9 @@ TEXT_REVIEW_WITHIN_S: Final = 120
 # but not the embedder's other build sources (its Debian mirror, the model download). Unset, every image is
 # built, as always. Set, `tests/support/prebuilt.py`'s `start` first checks that the image each named
 # service uses (as the compose model names it) exists locally and fails the start naming the service and
-# the image when one does not, then builds the others and starts with `up --no-build`: compose builds a
-# missing image of a service with a `build:` section unless told not to, so it never sees a missing
-# prebuilt one (F6, Ruling F6-2).
+# the image when one does not, then builds only the services whose image is no prebuilt one (migrate, api
+# and worker share one tag) and starts with `up --no-build`: compose builds a missing image of a service with
+# a `build:` section unless told not to, so it never sees a missing prebuilt one (F6, Rulings F6-2, F6-4).
 BUILT_SERVICES: Final = ("migrate", "api", "worker", "embedder", "docparse")
 PREBUILT: Final = tuple(name for name in os.environ.get("JOBHUNTER_STACK_PREBUILT", "").split(",") if name)
 

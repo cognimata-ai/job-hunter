@@ -13,8 +13,11 @@ HTTP stand-ins, and the helpers every stack module of M5 shares.
   too, it removes `PT`, `PB` and the stand-in with their volumes (`down -v`, M5-U2), each even when an earlier
   one failed. It never touches another compose project.
 - `up(argv, *services, build=True)` builds the images first, then `up -d --no-build --wait`; with
-  `build=False` (Task 27's `prev` image) nothing is built. The images named in `JOBHUNTER_STACK_PREBUILT`
-  (comma-separated, e.g. `embedder`) are never built: their existing image is used as it is.
+  `build=False` (Task 27's `prev` image) nothing is built. The images of the services named in
+  `JOBHUNTER_STACK_PREBUILT` (comma-separated, e.g. `embedder`) are never built: their existing image is used
+  as it is. `tests/support/prebuilt.py` first checks, by the project's compose model, that each name is a
+  service and its image exists, failing by name before anything starts, and leaves out of the build every
+  service whose image is a prebuilt one, a service sharing its tag included (F6 fix round 2, Ruling F6-4).
 - `caddy_root_ca`, `stub_log` and `psql` read the running stack: Caddy's internal root certificate (to verify
   TLS against `https://localhost:8443`), what `stubsvc` recorded, and a query's output as the bootstrap role.
   `caddy_root_pem` waits for that root and returns it as text.
@@ -36,6 +39,8 @@ from pathlib import Path
 from typing import Any, Final
 
 import pytest
+
+from tests.support import prebuilt
 
 REPO: Final = Path(__file__).resolve().parents[2]
 DEPLOY: Final = REPO / "deploy"
@@ -146,8 +151,11 @@ def logs_tail(argv: list[str], *services: str) -> str:
 
 def up(argv: list[str], *services: str, build: bool = True) -> None:
     """`up -d --wait` of `services` (`STACK_SERVICES` when none is named) with their dependencies; the images
-    built first unless `build` is false, but never one `JOBHUNTER_STACK_PREBUILT` names."""
-    if build and (built := [name for name in BUILT_SERVICES if name not in PREBUILT]):
+    built first unless `build` is false, but never the image of a service `JOBHUNTER_STACK_PREBUILT` names,
+    which must exist (the module docstring)."""
+    model = prebuilt.require_prebuilt(argv, PREBUILT) if PREBUILT else None
+    built = list(BUILT_SERVICES) if model is None else prebuilt.to_build(model, BUILT_SERVICES, PREBUILT)
+    if build and built:
         run([*argv, "build", *built], timeout=BUILD_TIMEOUT_S)
     named = services or STACK_SERVICES
     done = run([*argv, "up", "-d", "--no-build", "--wait", *named], timeout=UP_TIMEOUT_S, check=False)
