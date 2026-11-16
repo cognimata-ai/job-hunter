@@ -117,4 +117,7 @@ def test_no_secret_is_referenced() -> None:
     assert "--preserve-env" not in text  # dev-secrets.sh gets no key: the fake LLM needs none
     assert all("persist-credentials" in str(step.get("with", {})) for step in steps()[:1])
     env = workflow()["jobs"]["e2e"]["env"]
-    assert set(env) == {"DC"}
+    assert set(env) == {"DC", "BUILDX_BAKE_ENTITLEMENTS_FS"}
+    # compose builds through buildx bake, which refuses the `build_ca` secret's /dev/null default (a hosted
+    # runner has no SSL_CERT_FILE) without a filesystem entitlement that compose cannot pass
+    assert env["BUILDX_BAKE_ENTITLEMENTS_FS"] == "0"

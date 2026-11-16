@@ -37,6 +37,9 @@ jobs:
       DC: >-
         docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml
         -f deploy/compose.fakellm.yaml -f deploy/compose.e2e.yaml
+      # compose builds through buildx bake, which refuses the build_ca secret's /dev/null default (a hosted
+      # runner has no SSL_CERT_FILE) without a filesystem entitlement that compose cannot pass
+      BUILDX_BAKE_ENTITLEMENTS_FS: "0"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:

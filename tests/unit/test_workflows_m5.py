@@ -347,6 +347,9 @@ def test_prodstack_triggers_are_pull_requests_to_main_and_dispatch() -> None:
         "PT": PT,
         "PB": PB,
         "S3": S3,
+        # compose builds through buildx bake, which refuses the `build_ca` secret's /dev/null default (a
+        # hosted runner has no SSL_CERT_FILE) without a filesystem entitlement that compose cannot pass
+        "BUILDX_BAKE_ENTITLEMENTS_FS": "0",
     }
 
 
@@ -649,6 +652,7 @@ def test_no_secret_but_the_github_token_is_referenced() -> None:
             if action(step) == "actions/checkout":
                 assert step["with"]["persist-credentials"] is False, path
     # and no environment of the jobs this task writes holds one
-    assert set(load(PRODSTACK)["jobs"]["prodstack"]["env"]) == {"PT", "PB", "S3"}
+    prodstack_env = set(load(PRODSTACK)["jobs"]["prodstack"]["env"])
+    assert prodstack_env == {"PT", "PB", "S3", "BUILDX_BAKE_ENTITLEMENTS_FS"}
     for job in (load(CI)["jobs"]["images"], only_job(load(EMBEDDER)), *load(RELEASE)["jobs"].values()):
         assert "env" not in job
