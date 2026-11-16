@@ -61,7 +61,7 @@ both stop at `COUNT_CAP` and `capped` is set.
 """
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from math import cos, degrees, isfinite, radians
@@ -162,9 +162,16 @@ class Matches:
     (`jobs._sql.KEYWORD_MATCHES`), and the jobs within the radius in the posted window
     (`jobs._sql.NEAR_MATCHES`). Each set is held as the array literal every statement binds
     (`_array_literal`), rendered once per request however often the request filters (the facets filter
-    twice); `None` while not read, as for a query without that term. A filter binds them; one whose sets were
-    not read is refused."""
+    twice); `None` while not read, as for a query without that term.
 
+    They serve only the `keyword`, the `loc` and the `window` they were read for: the near set holds only the
+    jobs in that window, and either set would drop or add cards under another keyword or place. A filter of
+    another keyword, location or window refuses them, as it refuses a set that was not read; the query's other
+    filters (the company and the source the facets leave out) do not matter."""
+
+    keyword: str | None
+    loc: LocationFilter | None
+    window: tuple[datetime | None, datetime | None]
     keyword_revisions: str | None = None
     keyword_jobs: str | None = None
     near_jobs: str | None = None
@@ -223,7 +230,9 @@ def _row_terms(
     q: JobsQuery, window: tuple[datetime | None, datetime | None], matches: Matches
 ) -> tuple[list[tuple[str, ...]], dict[str, object]]:
     """The non-score terms `q` selects, each a tuple of `_sql.ROW_TEMPLATES` names that are ORed, and their
-    binds; the keyword's and the location's are their `matches`."""
+    binds; the keyword's and the location's are their `matches`, refused unless read for `q` and `window`."""
+    if (matches.keyword, matches.loc, matches.window) != (q.q, q.loc, window):
+        raise ValueError("the query's matches were read for another keyword, location or window")
     dated, binds = _window_terms(window)
     terms: list[tuple[str, ...]] = [(name,) for name in dated]
     if q.q is not None:
@@ -512,16 +521,16 @@ async def read_matches(
     conn: AsyncConnection, q: JobsQuery, *, window: tuple[datetime | None, datetime | None]
 ) -> Matches:
     """The matches of `q`'s keyword and location (`Matches`), each read once in the caller's snapshot
-    (`jobs._sql`'s "Plans at scale"); `window` is the posted window's absolute bounds."""
-    matches = Matches()
+    (`jobs._sql`'s "Plans at scale") and rendered once; `window` is the posted window's absolute bounds."""
+    revisions = jobs = near = None
     if q.q is not None:
-        matches = await _keyword_matches(conn, q.q)
+        revisions, jobs = await _keyword_matches(conn, q.q)
     if q.loc is not None:
-        matches = replace(matches, near_jobs=await _near_matches(conn, q.loc, window))
-    return matches
+        near = await _near_matches(conn, q.loc, window)
+    return Matches(q.q, q.loc, window, keyword_revisions=revisions, keyword_jobs=jobs, near_jobs=near)
 
 
-async def _keyword_matches(conn: AsyncConnection, keyword: str) -> Matches:
+async def _keyword_matches(conn: AsyncConnection, keyword: str) -> tuple[str, str]:
     """The keyword's two sets, read by its two text indexes: sequential scans are off for that one statement,
     and then the caller's setting is back. A failure leaves the setting to the transaction, which it
     aborts."""
@@ -530,7 +539,7 @@ async def _keyword_matches(conn: AsyncConnection, keyword: str) -> Matches:
     statement = _sql.clause(_sql.TAG["keyword"] + _sql.KEYWORD_MATCHES)
     row = (await conn.execute(statement, {"q": keyword, "qf": fold(keyword)})).one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": setting})
-    return Matches(keyword_revisions=_array_literal(row.revisions), keyword_jobs=_array_literal(row.jobs))
+    return _array_literal(row.revisions), _array_literal(row.jobs)
 
 
 async def _near_matches(
@@ -566,8 +575,8 @@ def card_set(
 ) -> CardSet:
     """The cards `select_page` lists for `q` under `active`, in no order (the facets' set, `jobs.facets`):
     every filter of `q` over the card's score row, with the sort's score variant; `fence_open` is
-    `privacy.fences.any_fence_open` and `matches` is `read_matches` in the caller's snapshot (module
-    docstring, Cards and Filters)."""
+    `privacy.fences.any_fence_open` and `matches` is `read_matches` for `q`'s keyword and location and this
+    `window`, in the caller's snapshot (module docstring, Cards and Filters; `Matches`)."""
     where = _filter(q, window, active, fence_open=fence_open, matches=matches)
     context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
     return CardSet(_sql.CARD_FROM + _sql.CARD + where.sql, MappingProxyType({**context, **where.binds}))

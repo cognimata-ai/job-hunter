@@ -33,10 +33,22 @@ QUERIES: Final = (
         contested="exclude",
     ),
 )
-# The keyword's and the location's matches, as `listing.read_matches` reads them (plan Task P2)
-MATCHES: Final = Matches(keyword_revisions="{11,12}", keyword_jobs="{21}", near_jobs="{31}")
 FENCE_TERMS: Final = ("is_fenced", "purge_fences")
 NOT_FENCED: Final = " AND NOT is_fenced(j.id)"
+
+
+def read_for(query: JobsQuery, window: Window) -> Matches:
+    """The keyword's and the location's matches, as `listing.read_matches` holds them for `query` and `window`
+    (plan Task P2)."""
+    return Matches(
+        keyword=query.q,
+        loc=query.loc,
+        window=window,
+        keyword_revisions="{11,12}",
+        keyword_jobs="{21}",
+        near_jobs="{31}",
+    )
+
 
 cases = pytest.mark.parametrize(
     ("query", "window", "active"),
@@ -53,8 +65,8 @@ cases = pytest.mark.parametrize(
 def test_without_an_open_fence_the_filter_names_no_fence(
     query: JobsQuery, window: Window, active: Active
 ) -> None:
-    where = _filter(query, window, active, fence_open=False, matches=MATCHES)
-    cards = card_set(query, window=window, active=active, fence_open=False, matches=MATCHES)
+    where = _filter(query, window, active, fence_open=False, matches=read_for(query, window))
+    cards = card_set(query, window=window, active=active, fence_open=False, matches=read_for(query, window))
     for sql in (where.sql, cards.sql):
         assert not [term for term in FENCE_TERMS if term in sql], sql
 
@@ -63,13 +75,17 @@ def test_without_an_open_fence_the_filter_names_no_fence(
 def test_with_an_open_fence_the_filter_adds_not_is_fenced_alone(
     query: JobsQuery, window: Window, active: Active
 ) -> None:
-    fenced = _filter(query, window, active, fence_open=True, matches=MATCHES)
-    unfenced = _filter(query, window, active, fence_open=False, matches=MATCHES)
+    fenced = _filter(query, window, active, fence_open=True, matches=read_for(query, window))
+    unfenced = _filter(query, window, active, fence_open=False, matches=read_for(query, window))
     assert fenced.sql == NOT_FENCED + unfenced.sql
     assert "purge_fences" not in fenced.sql  # the snapshot already showed a fence: no "none is open" term
     assert fenced.binds == unfenced.binds
-    fenced_cards = card_set(query, window=window, active=active, fence_open=True, matches=MATCHES)
-    unfenced_cards = card_set(query, window=window, active=active, fence_open=False, matches=MATCHES)
+    fenced_cards = card_set(
+        query, window=window, active=active, fence_open=True, matches=read_for(query, window)
+    )
+    unfenced_cards = card_set(
+        query, window=window, active=active, fence_open=False, matches=read_for(query, window)
+    )
     assert fenced_cards.sql.count("is_fenced") == 1 and "purge_fences" not in fenced_cards.sql
     assert fenced_cards.sql.replace(NOT_FENCED, "", 1) == unfenced_cards.sql
     assert fenced_cards.binds == unfenced_cards.binds
