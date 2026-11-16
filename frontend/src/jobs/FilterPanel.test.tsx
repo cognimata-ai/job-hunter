@@ -57,6 +57,8 @@ function url(app: AppParts): Record<string, unknown> {
 }
 
 describe("FilterPanel", () => {
+  // About twenty sequential user-event steps through every filter: 4.4 s alone on a fast machine, so the
+  // 5 s default leaves no room on a loaded CI runner. The bound is sized to the work, not to a hang.
   it("each filter writes its search param", async () => {
     const api = fakeApi({ signedIn: true });
     const { app, aside } = await panel(api);
@@ -212,7 +214,7 @@ describe("FilterPanel", () => {
       expect(url(app)).not.toHaveProperty("label");
     });
     expect(url(app)).toMatchObject({ partial: "exclude" });
-  });
+  }, 20_000);
 
   it("the place picker shows postal codes and population", async () => {
     const api = fakeApi({ signedIn: true });
