@@ -4,9 +4,10 @@ A page reads the matching sets of its costly row terms once per request, in its 
 (`listing.read_matches`): the revisions whose full text and the jobs whose title match the keyword, and the
 jobs within the radius in the posted window. Every statement of the page binds them as arrays, so the filter
 renders no text match and decides no radius of its own, for the card or for a deferred member, and
-`listing.card_set` (the facets' set) renders the same. Each set is bound as an array literal built once per
-request, since psycopg adapts a list again for every statement (about 40 ms for 50,000 ids). A query whose
-sets were not read is refused rather than rendered without them.
+`listing.card_set` (the facets' set) renders the same. `read_matches` renders each set once per request as
+the array literal every statement binds (`listing._array_literal`), since psycopg would adapt a list again for
+every statement (about 40 ms for 50,000 ids). A query whose sets were not read is refused rather than
+rendered without them.
 """
 
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from types import MappingProxyType
 from typing import Final
 
 import pytest
-from jobhunter.jobs.listing import Active, Matches, _filter, card_set
+from jobhunter.jobs.listing import Active, Matches, _array_literal, _filter, card_set
 from jobhunter.jobs.query import JobsQuery, LocationFilter
 
 Window = tuple[datetime | None, datetime | None]
@@ -26,7 +27,7 @@ KEYWORD: Final = JobsQuery(q="entwickler")
 BERLIN_30_KM: Final = JobsQuery(
     loc=LocationFilter(gazetteer_id="geonames:2950159", lat=52.52437, lon=13.41053, radius_km=30)
 )
-READ: Final = Matches(keyword_revisions=(11, 12), keyword_jobs=(21,), near_jobs=(31, 32))
+READ: Final = Matches(keyword_revisions="{11,12}", keyword_jobs="{21}", near_jobs="{31,32}")
 # What a text match of its own would name: the revisions' full text or the jobs' titles
 TEXT_MATCH: Final = ("job_revisions", "websearch_to_tsquery", "<%", "title_norm")
 # What a radius decided by the statement would name: the jsonpath steps, the function, their binds
@@ -53,7 +54,9 @@ def test_a_query_without_a_keyword_binds_no_matches() -> None:
     assert not {"keyword_revisions", "keyword_jobs"} & where.binds.keys()
 
 
-@pytest.mark.parametrize("unread", [Matches(), Matches(keyword_revisions=(11,)), Matches(keyword_jobs=(21,))])
+@pytest.mark.parametrize(
+    "unread", [Matches(), Matches(keyword_revisions="{11}"), Matches(keyword_jobs="{21}")]
+)
 def test_a_keyword_whose_matches_were_not_read_is_refused(unread: Matches) -> None:
     with pytest.raises(ValueError, match="not read"):
         _filter(KEYWORD, ANY, WITH_TUPLE, fence_open=False, matches=unread)
@@ -80,14 +83,12 @@ def test_a_location_filter_binds_its_read_matches_and_decides_no_radius(
         assert not {"lat", "lon", "radius_km", "near_box"} & binds.keys()
 
 
-@pytest.mark.parametrize("unread", [Matches(), Matches(keyword_revisions=(11,), keyword_jobs=(21,))])
+@pytest.mark.parametrize("unread", [Matches(), Matches(keyword_revisions="{11}", keyword_jobs="{21}")])
 def test_a_location_whose_matches_were_not_read_is_refused(unread: Matches) -> None:
     with pytest.raises(ValueError, match="not read"):
         _filter(BERLIN_30_KM, ANY, WITH_TUPLE, fence_open=False, matches=unread)
 
 
-def test_a_set_that_matched_nothing_binds_an_empty_array() -> None:
-    nothing = Matches(keyword_revisions=(), keyword_jobs=(), near_jobs=())
-    query = BERLIN_30_KM.model_copy(update={"q": "zahnarzt"})
-    binds = _filter(query, ANY, WITH_TUPLE, fence_open=False, matches=nothing).binds
-    assert (binds["keyword_revisions"], binds["keyword_jobs"], binds["near_jobs"]) == ("{}", "{}", "{}")
+def test_a_set_is_rendered_as_the_array_literal_its_statements_cast() -> None:
+    assert _array_literal([11, 12, 9_007_199_254_740_993]) == "{11,12,9007199254740993}"
+    assert _array_literal(()) == "{}"  # a set that matched nothing: an empty array, so no card

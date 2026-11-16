@@ -25,12 +25,12 @@ honest, without which it chose nested loops over whole-table scans and JIT compi
   `count_unscored` then joined `user_job_actions` by a scan per row;
 - the keyword's matches (`KEYWORD_MATCHES`) are read once per request, in the read snapshot, and every
   statement binds them as arrays, each a hashed set as the sub-selects were (plan `2026-11-16-jobs-list-perf`
-  Task P2), from an array literal built once per request (`listing._read`). As a sub-select of every
-  statement, the title branch was a sequential scan that computed a word similarity per title, about 120 ms
-  on 50,000 cards, in the statement and again in its deferred-member set: five times on a first page. The
-  read runs with sequential scans off (`SET_SEQSCAN`), so that it takes the two text indexes, 30 ms against
-  140: the planner prices a GIN index's pending list (after a bulk load, and between two vacuums) as random
-  reads, and `<%` as one operator call, and so prefers the scans.
+  Task P2), from an array literal that `listing.read_matches` renders once per request. As a sub-select of
+  every statement, the title branch was a sequential scan that computed a word similarity per title, about
+  120 ms on 50,000 cards, in the statement and again in its deferred-member set: five times on a first page.
+  The read runs with sequential scans off (`SET_SEQSCAN`), so that it takes the two text indexes, 30 ms
+  against 140: the planner prices a GIN index's pending list (after a bulk load, and between two vacuums) as
+  random reads, and `<%` as one operator call, and so prefers the scans.
 """
 
 from collections.abc import Mapping

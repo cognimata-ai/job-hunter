@@ -60,7 +60,7 @@ both stop at `COUNT_CAP` and `capped` is set.
 `jobs._sql`'s "Plans at scale", and the location filter's jsonpath bounds (`_near_box`).
 """
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -160,12 +160,14 @@ class Matches:
     """The matches of a query's keyword and location, read once per request in the caller's snapshot
     (`read_matches`): the revisions whose full text and the jobs whose title the keyword matches
     (`jobs._sql.KEYWORD_MATCHES`), and the jobs within the radius in the posted window
-    (`jobs._sql.NEAR_MATCHES`); `None` while not read, as for a query without that term. A filter binds them;
-    one whose sets were not read is refused."""
+    (`jobs._sql.NEAR_MATCHES`). Each set is held as the array literal every statement binds
+    (`_array_literal`), rendered once per request however often the request filters (the facets filter
+    twice); `None` while not read, as for a query without that term. A filter binds them; one whose sets were
+    not read is refused."""
 
-    keyword_revisions: tuple[int, ...] | None = None
-    keyword_jobs: tuple[int, ...] | None = None
-    near_jobs: tuple[int, ...] | None = None
+    keyword_revisions: str | None = None
+    keyword_jobs: str | None = None
+    near_jobs: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,12 +191,18 @@ class _Segment:
 # --- the filters -----------------------------------------------------------------------------------------
 
 
-def _read(matched: tuple[int, ...] | None) -> str:
-    """The matches as an array literal, built once per request: psycopg would adapt a list again for every
-    statement, about 40 ms for 50,000 ids, against 3 ms for the literal (every element an `int`)."""
-    if matched is None:
+def _array_literal(ids: Iterable[int]) -> str:
+    """`ids` as the PostgreSQL array literal a statement casts to `bigint[]`, every element an `int`. A bound
+    list would be adapted by psycopg again for every statement: about 40 ms for 50,000 ids, against 3 ms to
+    render the literal once (`read_matches`)."""
+    return "{" + ",".join(str(int(job_or_revision)) for job_or_revision in ids) + "}"
+
+
+def _matched(literal: str | None) -> str:
+    """A set of `Matches` to bind, refused while not read."""
+    if literal is None:
         raise ValueError("the query's matches were not read")
-    return "{" + ",".join(str(int(job_or_revision)) for job_or_revision in matched) + "}"
+    return literal
 
 
 def _window_terms(window: tuple[datetime | None, datetime | None]) -> tuple[list[str], dict[str, object]]:
@@ -221,12 +229,12 @@ def _row_terms(
     if q.q is not None:
         terms.append(("keyword",))
         binds |= {
-            "keyword_revisions": _read(matches.keyword_revisions),
-            "keyword_jobs": _read(matches.keyword_jobs),
+            "keyword_revisions": _matched(matches.keyword_revisions),
+            "keyword_jobs": _matched(matches.keyword_jobs),
         }
     if q.loc is not None:
         terms.append(("near_matched", "remote") if q.include_remote else ("near_matched",))
-        binds["near_jobs"] = _read(matches.near_jobs)
+        binds["near_jobs"] = _matched(matches.near_jobs)
     if q.work_mode != _ALL_MODES:
         known = sorted(q.work_mode - {"unknown"})
         terms.append(
@@ -522,12 +530,12 @@ async def _keyword_matches(conn: AsyncConnection, keyword: str) -> Matches:
     statement = _sql.clause(_sql.TAG["keyword"] + _sql.KEYWORD_MATCHES)
     row = (await conn.execute(statement, {"q": keyword, "qf": fold(keyword)})).one()
     await conn.execute(_sql.SET_SEQSCAN, {"setting": setting})
-    return Matches(keyword_revisions=tuple(row.revisions), keyword_jobs=tuple(row.jobs))
+    return Matches(keyword_revisions=_array_literal(row.revisions), keyword_jobs=_array_literal(row.jobs))
 
 
 async def _near_matches(
     conn: AsyncConnection, loc: LocationFilter, window: tuple[datetime | None, datetime | None]
-) -> tuple[int, ...]:
+) -> str:
     """The jobs within `loc`'s radius whose date is in the posted window (`jobs._sql.NEAR_MATCHES`)."""
     dated, binds = _window_terms(window)
     where = " AND ".join(_sql.ROW_SQL["j"][name] for name in (*dated, "near"))
@@ -538,7 +546,7 @@ async def _near_matches(
         "radius_km": loc.radius_km,
         "near_box": _near_box(loc.lat, loc.lon, loc.radius_km),
     }
-    return tuple((await conn.execute(statement, binds)).scalar_one())
+    return _array_literal((await conn.execute(statement, binds)).scalar_one())
 
 
 async def display_timezone(conn: AsyncConnection) -> str:

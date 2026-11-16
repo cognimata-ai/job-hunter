@@ -34,7 +34,7 @@ QUERIES: Final = (
     ),
 )
 # The keyword's and the location's matches, as `listing.read_matches` reads them (plan Task P2)
-MATCHES: Final = Matches(keyword_revisions=(11, 12), keyword_jobs=(21,), near_jobs=(31,))
+MATCHES: Final = Matches(keyword_revisions="{11,12}", keyword_jobs="{21}", near_jobs="{31}")
 FENCE_TERMS: Final = ("is_fenced", "purge_fences")
 NOT_FENCED: Final = " AND NOT is_fenced(j.id)"
 

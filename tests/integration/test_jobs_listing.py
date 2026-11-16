@@ -10,6 +10,7 @@ cap.
 
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -519,6 +520,29 @@ async def test_the_location_matches_hold_within_the_posted_window_job_by_job(
         assert sorted(found) == sorted([near_recent, rep_recent]), sort
     assert rep_old not in await ids(engine, query, window=week)
     assert rep_old in await ids(engine, query)  # without a window its member brings it in
+
+
+async def test_each_set_is_rendered_once_per_page_and_per_facets_request(
+    engine: AsyncEngine, active_tuple: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_matches` renders each set it reads once per request as the array literal every statement binds
+    (`listing._array_literal`), though the facets filter twice: a keyword and a location are three sets."""
+    await seed_cards(engine, [in_city(BERLIN, title="Softwareentwickler")])
+    rendered: list[int] = []
+    render = listing._array_literal
+
+    def counting(ids: Iterable[int]) -> str:
+        rendered.append(1)
+        return render(ids)
+
+    monkeypatch.setattr(listing, "_array_literal", counting)
+    query = JobsQuery(q="Entwickler", loc=NEAR_BERLIN, include_remote=False)
+    selected = await page(engine, query, with_counts=True)
+    of_page = len(rendered)
+    async with read_snapshot(engine) as conn:
+        shown = await facets(conn, query, window=ANY, company_q="", limit=10)
+    assert len(selected.rows) == 1 and [company.count for company in shown.companies] == [1]
+    assert (of_page, len(rendered) - of_page) == (3, 3)
 
 
 async def test_location_matches_any_resolved_candidate_and_never_unresolved_or_country_wide(
