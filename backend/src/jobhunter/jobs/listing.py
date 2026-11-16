@@ -27,11 +27,11 @@ the caller's snapshot like the fence (`read_matches`): the revisions whose full 
 the keyword matches, and the jobs within the radius in the posted window. Every statement binds them
 (`Matches`), the card's term and a deferred member's alike, so each agrees with the others as a term decided
 in the statement would (plan `2026-11-16-jobs-list-perf` Task P2; `jobs._sql`'s "Plans at scale"). Every SQL
-fragment is a static string of `jobs._sql`, a statement is
-composed only by choosing among them, and every value is a bound parameter; the sort and the score variant
-choose fragments from closed mappings (§16.7). The scoring-state buckets are exclusive (B8); `cancelled`, and
-a published target whose result has no current instance under the active scope, are in none, so never
-listed. An active score filter (B15) lists only cards with a score.
+fragment is a static string of `jobs._sql`, a statement is composed only by choosing among them, and every
+value is a bound parameter; the sort and the score variant choose fragments from closed mappings (§16.7). The
+scoring-state buckets are exclusive (B8); `cancelled`, and a published target whose result has no current
+instance under the active scope, are in none, so never listed. An active score filter (B15) lists only cards
+with a score.
 
 **Sections.** A score sort walks the scored section first: the current instances of the active scope by
 `det_rank_mid` or `det_rank_low` (the variant, then job id, both descending), joined to their result, the
@@ -317,7 +317,8 @@ def _filter(
     matches: Matches,
 ) -> _Filter:
     """Every predicate of `q` over a card's score row (`j`, `t`, `r`, `d`, `h`, `u`), module docstring; the
-    fence's only while the caller's snapshot shows one open (`fence_open`), the keyword's as its `matches`."""
+    fence's only while the caller's snapshot shows one open (`fence_open`), the keyword's and the location's
+    as their `matches`."""
     terms, binds = _row_terms(q, window, matches)
     conjuncts: list[str] = [_sql.NOT_FENCED] if fence_open else []  # a fenced job is no card (docstring)
     if terms and active.llm_tuple_id is None:  # no tuple, no deferred member
