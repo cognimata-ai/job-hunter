@@ -41,10 +41,13 @@ function-scoped, so the upgrade drill's projects are removed (`down -v`) before 
 
 Every secret it changes is a file of `.secrets/test`, PT's secrets directory (deploy/compose.test.env). It
 never reads a value: each new value is written by `openssl` in a child shell to a `mktemp` file (`Scratch`),
-and a file reaches a slot only by the two root commands of user decision M5-U6, run from the checkout with
-`sudo -n` (which fails rather than ask for a password): `install -o root -g 10010 -m 0440 <scratch file>
-.secrets/test/<name>`, and `scripts/rotate-db-role.sh --compose '<PT command line>' --secrets-dir
-.secrets/test db_app <file>`. A value that moves to another slot (the old data key, which becomes
+and a file reaches a slot only by the module's four root command shapes, run from the checkout with `sudo -n`
+(which fails rather than ask for a password), each against PT and `.secrets/test` only. User decision M5-U6:
+`install -o root -g 10010 -m 0440 <scratch file> .secrets/test/<name>`, and `scripts/rotate-db-role.sh
+--compose '<PT command line>' --secrets-dir .secrets/test db_app <file>`. User decision M5-U11, for the
+operational case: `scripts/rotate-db-role.sh --compose '<PT command line>' --secrets-dir .secrets/test
+pg_bootstrap <file>`, and `scripts/rotate-restic-password.sh --compose '<PT command line>' --secrets-dir
+.secrets/test <file>`. A value that moves to another slot (the old data key, which becomes
 `data_key_previous`) is installed again from its scratch file, so the drill installs its own old data key
 before it makes the data it rotates. What the containers report is key ids (hex), counts and inodes. At the
 end, after a failure too, `data_key_previous` is emptied again, every scratch file is removed, and
@@ -360,7 +363,8 @@ class Scratch:
 
 
 def as_root(*argv: str) -> subprocess.CompletedProcess[str]:
-    """One of the drill's two root commands (M5-U6), from the checkout; `sudo -n` fails rather than ask."""
+    """One of the module's four root command shapes (M5-U6, M5-U11), from the checkout; `sudo -n` fails
+    rather than ask."""
     done = subprocess.run(
         ["sudo", "-n", *argv], cwd=REPO, capture_output=True, text=True, timeout=600, check=False
     )
@@ -727,7 +731,7 @@ def test_operational_commands(rotation_stack: Scratch) -> None:
     assert install_at < restart_at < remove_at
     assert lines[-1] == (
         f"rotate-restic-password: done: installed restic_password, restarted backup and removed the old key "
-        f"{old_id[:8]}; the repository opens with the new password only"
+        f"{old_id[:8]}; the new password opens the repository, and its other keys are unchanged"
     )
     after = started()
     moved = {key for key in running if after.get(key) != running[key]}

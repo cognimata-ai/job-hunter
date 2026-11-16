@@ -453,7 +453,12 @@ def test_the_second_one_off_removes_the_old_key_with_the_new_password(tmp_path: 
     assert list(site.keys.values()) == [NEW]
     assert steps(site) == [("list", "new"), ("remove", "new"), ("list", "new")]
     assert site.restic_calls[1]["argv"][-1] == OLD_ID
-    assert f"removed the old key {OLD_ID[:8]}" in done.stderr
+    # Codex M1 (F6 fix round 2): what is true, the new password opens it and the old key is gone; any other
+    # key of the repository is left as it is
+    assert done.stderr.splitlines()[-1] == (
+        f"{NOTE}removed the old key {OLD_ID[:8]}; the new password opens the repository, and its other keys "
+        "are unchanged"
+    )
     assert_no_secret_anywhere(site, done)
 
 
@@ -480,7 +485,8 @@ def test_the_second_one_off_fails_when_the_old_key_stays(
 def test_a_rotation_adds_installs_restarts_then_removes(tmp_path: Path) -> None:
     """The whole script, on the fakes: the first one-off (the old password installed), the install of the new
     file, the restart of backup, then the second one-off with the old key's id (the new password installed),
-    in that order; afterwards the repository opens with the new password only, and the script says so."""
+    in that order; afterwards the new password opens the repository and the old key is gone, and the script
+    says so, and that the repository's other keys are unchanged (Codex M1)."""
     site = a_site(tmp_path, [OLD])
     done = full_run(tmp_path, site)
     assert done.returncode == 0, done.stderr
@@ -499,7 +505,7 @@ def test_a_rotation_adds_installs_restarts_then_removes(tmp_path: Path) -> None:
     assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
     assert done.stdout.splitlines()[-1] == (
         f"{NOTE}done: installed restic_password, restarted backup and removed the old key {OLD_ID[:8]}; the "
-        "repository opens with the new password only"
+        "new password opens the repository, and its other keys are unchanged"
     )
     assert_no_secret_anywhere(site, done)
 

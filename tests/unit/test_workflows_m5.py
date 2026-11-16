@@ -560,6 +560,9 @@ def test_the_digest_prs_head_commit_is_tagged_and_pushed_once_per_attempt(tmp_pa
         assert push == [f"git push --atomic origin release/{sha}-{500 + n}-{attempt} refs/tags/{tag}"]
         [created] = [call for call in calls if call.startswith("gh pr create")]
         assert tag in created  # the PR names the tag the deploy checks out
+        # on the commit the workflow made, which a later push to the branch would no longer make its head
+        assert f"The release tag is {tag}, on the commit this workflow made" in created
+        assert "head commit" not in created
         tags.append(tag)
     assert len(set(tags)) == 3
 

@@ -424,7 +424,7 @@ never content) is in System → Alerts, and in a read-only query (the introducti
 | `auth.lockout` | critical | auto | The global login lockout: failed logins from many addresses. It ends by itself; `$JH run --rm --no-deps api jobhunter sessions unlock` lifts it at once. |
 | `backup.failed` | critical | auto | `$JH logs backup --since 24h` and the set's error (System → Health) name the step; check the bucket, its keys and `RESTIC_REPOSITORY`, then `$JH exec backup jobhunter backup set` (section 8). The next succeeded set resolves it. |
 | `backup.stale` | warn / critical | auto | No succeeded set for 36 h (warn) or 72 h (critical): check that the backup container runs (`$JH ps backup`), then as `backup.failed`. |
-| `backup.restore_test_failed` | critical | auto | The monthly restore test failed: `$JH logs backup` names its step. Fix it, then `$JH exec backup jobhunter backup restore-test`; its success resolves it. A run that failed `cleanup:<error class>` passed every step but could not drop its scratch database, a full copy of the data (section 8): the next restore test drops it first, and so does `$JH restart backup`. |
+| `backup.restore_test_failed` | critical | auto | The monthly restore test failed: `$JH logs backup` names its step. Fix it, then `$JH exec backup jobhunter backup restore-test`; its success resolves it. A run that failed `cleanup:<error class>` passed every step but could not drop its scratch database or remove its scratch directory, a full copy of the data (section 8): the next restore test drops it first, and so does `$JH restart backup`. |
 | `system.disk_pressure` | warn / critical | auto | The data volumes' disk is 80 % full (critical from 90 %): section 11. |
 | `system.table_growth` | info | auto | `procrastinate_jobs` holds more than a million rows, or a table more than 10 GB: section 11. |
 | `deadman.update_failed` | warn | auto | The healthchecks Management API missed the period's update. Check `healthchecks_api_key` (read-write) and `HEALTHCHECKS_API_URL` with `$JH run --rm --no-deps worker jobhunter ops deadman-sync --show`; a renewed key takes `$JH restart worker` (section 7). The sync tries again with a backoff; a success resolves it. |
@@ -582,8 +582,9 @@ that file.
 
 **The restic password** (`restic_password`; §19.5). restic encrypts the repository with a master key that each
 of its keys wraps, one per password, so the rotation adds a key for the new password and removes the old
-password's key: every backup set stays as it is and opens with the new password only. Put the new password
-into the offline recovery kit first, beside the old one (section 8).
+password's key: every backup set stays as it is and opens with the new password, no longer with the old one.
+Any other key of the repository stays as it is: its removal is a step of its own, by hand (below). Put the new
+password into the offline recovery kit first, beside the old one (section 8).
 
 ```
 umask 077
@@ -861,22 +862,24 @@ The RTO is 4 h (§19.5), measured by the deployment step's timed restore (sectio
 **Releases** (R24; `.github/workflows/release.yml`). A release is dispatched by hand on the commit to deploy
 (Actions → Release → Run workflow). It pushes the app, backup, docparse and embedder images to GHCR, tagged
 with the commit, and opens the digest PR, which writes their digests into `deploy/release.lock`; a deploy runs
-that PR's head commit, by its release tag (below).
+the commit the workflow made on that PR's branch, by its release tag (below).
 
 - The workflow needs the repository setting that lets GitHub Actions create pull requests (Settings → Actions →
   General → Workflow permissions); it is off by default.
 - GHCR packages start private: the VPS logs in to `ghcr.io` with a read-only token (`read:packages`; section 2).
-- The digest PR is opened with the workflow's `GITHUB_TOKEN`, so it starts no CI: run CI on it by hand, by
-  dispatching the workflows that offer it or by pushing a commit to its branch.
+- The digest PR is opened with the workflow's `GITHUB_TOKEN`, so it starts no CI: run CI on it by hand,
+  preferably by dispatching the workflows that offer it on the PR's branch. A commit pushed to the branch
+  starts CI too, but then the PR's head is no longer the tagged commit, so that commit must not change the
+  tree (`git commit --allow-empty`): what is merged must be what the tag deploys.
 - An attempt that fails after its push leaves its branch `release/<sha>-<run id>-<attempt>` and its tag: delete
   both (`git push origin --delete <branch> <tag>`), as for a digest PR closed without merging.
 - The runner's disk for the real embedder build is checked at its first run.
-- The workflow tags the digest PR's head commit `release-<YYYYMMDD>-<12 hex digits>`, the run's date in UTC and
-  the start of that commit's hash, and pushes the tag with the PR's branch; the PR's description names it. It
-  tags the head commit, not a merge commit: the head's tree is the tree the images were built from plus
-  `deploy/release.lock`, while a merge commit can carry other commits that landed meanwhile. Every attempt
-  makes a commit and a tag of its own. Merge the PR, then deploy its tag: the release tag is what the VPS
-  checks out.
+- The workflow tags the commit it makes on the PR's branch `release-<YYYYMMDD>-<12 hex digits>`, the run's
+  date in UTC and the start of that commit's hash, and pushes the tag with the PR's branch; the PR's
+  description names it. It tags that commit, not a merge commit: its tree is the tree the images were built
+  from plus `deploy/release.lock`, while a merge commit can carry other commits that landed meanwhile. Every
+  attempt makes a commit and a tag of its own. Merge the PR, then deploy its tag: the release tag is what the
+  VPS checks out.
 
 **An upgrade** (§19.6):
 
@@ -1033,8 +1036,14 @@ what) or not attempted (why), in `docs/spikes/V21.md`, `docs/spikes/V15.md` and 
    LUKS where offered, no swap or encrypted swap only, the pinned Docker Engine version; SSH key-only.
 2. [ ] **The inputs.** The deploy checklist's inputs (section 1), the operator file's five values, and the
    exclusivity confirmations (C2, C3).
-3. [ ] **The release.** Run `release.yml`, merge the digest PR, check out the release tag on the VPS (section
-   10).
+3. [ ] **The release.** First, before the first deployment, the base image refresh of Ruling FU-7: refresh
+   `python` (and `uv`) in `deploy/images.lock` to the newest eligible digest, one at least 14 days old;
+   rebuild the images; and scan each with the Trivy of `deploy/images.lock` at `--severity HIGH,CRITICAL
+   --ignore-unfixed` (CI's gate fails on a fixable CRITICAL only). The refresh is due for the fixable HIGHs
+   the images carried when M5 closed: openssl/libssl3 and apt/libapt-pkg6.0 in all four images, which a newer
+   `python` base fixes. restic 0.19.1's Go HIGHs in the backup image wait for an upstream release; record what
+   the scan still finds in the deployment record. Then run `release.yml`, merge the digest PR, check out the
+   release tag on the VPS (section 10).
 4. [ ] **Host setup.** `sudo scripts/host-setup.sh --secrets-from <dir> --delete-sources` (section 2); the
    egress unit loads at boot.
 5. [ ] **DNS and Caddy.** The A record; Caddy against Let's Encrypt staging first (`acme_ca`), then production

@@ -136,7 +136,7 @@ restic key remove --no-cache --retry-lock 30m --password-file "$installed" "$old
 key_of "$installed" >/dev/null
 python -I -c 'import json, sys; sys.exit(sys.argv[1] in [k["id"] for k in json.load(sys.stdin)])' "$old_id" <"$work/keys" ||
     fail "the old key $(short "$old_id") is still listed"
-note "removed the old key $(short "$old_id"); the repository opens with the new password only"
+note "removed the old key $(short "$old_id"); the new password opens the repository, and its other keys are unchanged"
 SCRIPT
 )
 
@@ -284,6 +284,6 @@ if ! step "${compose[@]}" run --rm --no-deps -T backup sh -c "$PRELUDE"$'\n'"$RE
         "remove it by hand (docs/RUNBOOK.md, section 7)"
 fi
 if [ "$dry_run" -eq 0 ]; then
-    note "done: installed $NAME, restarted backup and removed the old key ${old_id:0:8}; the repository opens" \
-        "with the new password only"
+    note "done: installed $NAME, restarted backup and removed the old key ${old_id:0:8}; the new password" \
+        "opens the repository, and its other keys are unchanged"
 fi

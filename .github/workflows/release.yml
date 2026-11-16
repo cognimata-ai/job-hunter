@@ -167,6 +167,6 @@ jobs:
           git push --atomic origin "$branch" "refs/tags/$tag"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           body="deploy/release.lock: the four images built from $GITHUB_SHA by $run_url."
-          body="$body The release tag is $tag, this PR's head commit: the deploy checks it out once merged."
+          body="$body The release tag is $tag, on the commit this workflow made: the deploy checks it out once merged."
           gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
             --title "chore(release): the image digests of ${GITHUB_SHA:0:12}" --body "$body"
