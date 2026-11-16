@@ -72,6 +72,7 @@ def worker_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[...,
         directory = tmp_path / "secrets"
         directory.mkdir(exist_ok=True)
         for name, value in {"db_app": "pw", "data_key": "a" * 43 + "=", **secrets}.items():
+            (directory / name).unlink(missing_ok=True)  # replaced, not edited: non-root cannot write 0440
             (directory / name).write_text(value)
             (directory / name).chmod(0o440)
         env = {

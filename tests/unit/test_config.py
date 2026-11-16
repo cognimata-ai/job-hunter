@@ -28,6 +28,7 @@ def write_secrets(d: Path, **files: bytes) -> Path:
     d.mkdir(exist_ok=True)
     for name, value in files.items():
         p = d / name
+        p.unlink(missing_ok=True)  # replaced, not edited: a non-root owner cannot write a 0440 file
         p.write_bytes(value)
         p.chmod(0o440)
     return d

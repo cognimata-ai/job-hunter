@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import pytest
+import yaml
 from jobhunter.config import (
     DEFAULT_OPERATOR_FILE,
     ENV_NAMES,
@@ -46,6 +47,7 @@ from jobhunter.privacy.operator import FIELDS, MAX_BYTES, MAX_CHARS, OperatorDet
 
 from tests.unit.test_compose_prod import DEPLOY, dev_config, prod_config, pt_config
 from tests.unit.test_config import API_SECRETS, BASE_ENV, WORKER_SECRETS, write_secrets
+from tests.unit.test_smoke_m5_script import ComposeLoader
 
 # Distinctive values, none e-mail- or phone-shaped: the log redaction (which runs before a record is captured)
 # masks those, so a probe of such a value would pass whether it leaked or not.
@@ -499,12 +501,25 @@ def operator_mounts(config: Mapping[str, Any]) -> dict[str, list[Mapping[str, An
     return found
 
 
+def no_host_path_made(mount: Mapping[str, Any], compose_file: Path) -> bool:
+    """Whether a missing host file stops the start, no directory made in its place: `compose_file` declares
+    `create_host_path: false` on the api's operator mount, and the normalized `mount` does not say otherwise
+    (some compose releases leave a false out of their output)."""
+    text = compose_file.read_text("utf-8")
+    volumes = yaml.load(text, Loader=ComposeLoader)["services"]["api"]["volumes"]  # noqa: S506 - a SafeLoader
+    [declared] = [v for v in volumes if isinstance(v, dict) and v.get("target") == TARGET]
+    return (
+        declared["bind"] == {"create_host_path": False}
+        and mount.get("bind", {}).get("create_host_path", False) is False
+    )
+
+
 def test_the_prod_compose_mounts_the_host_file_read_only_into_the_api_only() -> None:
     [mount] = operator_mounts(prod_config())["api"]
     assert set(operator_mounts(prod_config())) == {"api"}
     assert (mount["source"], mount["target"], mount.get("read_only")) == (HOST_FILE, TARGET, True)
     # a missing host file stops the api's start: no directory is made in its place
-    assert mount["bind"]["create_host_path"] is False
+    assert no_host_path_made(mount, DEPLOY / "compose.yaml")
     # the api reads it at the setting's default: no service names another path
     for service in prod_config()["services"].values():
         assert "JOBHUNTER_OPERATOR_FILE" not in service.get("environment", {})
@@ -519,7 +534,7 @@ def test_the_test_stack_mounts_its_fictional_file_in_place_of_the_host_s() -> No
         TARGET,
         True,
     )
-    assert mount["bind"]["create_host_path"] is False
+    assert no_host_path_made(mount, DEPLOY / "compose.test.yaml")
     details = operator.load(TEST_OPERATOR_FILE)
     assert details is not None
     assert details.operator == "Test Operator" and details.contact == "operator@example.org"
@@ -537,5 +552,5 @@ def test_the_dev_and_e2e_stack_mounts_the_fictional_file_too() -> None:
         TARGET,
         True,
     )
-    assert mount["bind"]["create_host_path"] is False
+    assert no_host_path_made(mount, DEPLOY / "compose.dev.yaml")
     assert "JOBHUNTER_OPERATOR_FILE" not in dev_config()["services"]["api"].get("environment", {})

@@ -43,6 +43,7 @@ ENV: Final = {
 def write_secrets(directory: Path, **files: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     for name, value in files.items():
+        (directory / name).unlink(missing_ok=True)  # replaced, not edited: a non-root owner cannot write 0440
         (directory / name).write_text(value)
         (directory / name).chmod(0o440)
     return directory
