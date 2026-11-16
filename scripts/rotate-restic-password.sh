@@ -25,7 +25,11 @@
 # 2. the check, in the same one-off: the new password opens the repository through a key other than the old
 #    one, else it stops with nothing changed but the added key. The one-off's last line on stdout names the old
 #    key's id (`old-key <id>`), which the script keeps for step 5.
-# 3. the new file installed as the secret, as production installs one: root:10010, mode 0440.
+# 3. the new file installed as the secret, as production installs one: root:10010, mode 0440. It is installed
+#    into a temporary file of mktemp's in the secrets directory, with that owner, group and mode, and renamed
+#    over the secret (`mv -T`, one rename(2)), so the secret is the old file or the new one, never a partly
+#    written one (F6 fix round 2, Ruling F6-3); on any failure the temporary file is removed, the secret is as
+#    it was, and the script says so, naming <new-file>, which the run again needs.
 # 4. a restart of backup, whose container then mounts the new file (the restore container is one-off). Until
 #    then, the running backup service's restic calls still use the old password, whose key is still there.
 # 5. in a second one-off backup container, `<compose> run --rm --no-deps -T backup sh -c '…' <old key id>`,
@@ -54,6 +58,12 @@ readonly DEFAULT_SECRETS_DIR=/etc/jobhunter/secrets
 readonly GID=10010
 readonly NAME=restic_password
 readonly NO_KEY_YET="<old-key-id>" # the dry run's stand-in for the id step 2 names
+
+# The temporary file of an install in progress (install_new), removed if the script stops before its rename.
+staged=""
+trap '[ -z "$staged" ] || rm -f -- "$staged"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # What both one-off scripts start with: notes and failures on stderr, a scratch directory on /dev/shm, the S3
 # keys in the environment, and `key_of FILE`, the id of the key the password in FILE opens (nothing when it opens
@@ -167,6 +177,26 @@ step() {
     fi
 }
 
+# install_new: step 3, the new file installed as the secret through a temporary file of the secrets directory
+# (the header). A dry run prints both commands with mktemp's template. A running container keeps the file it
+# mounted until it is restarted, as with an install in place.
+install_new() {
+    local target="$secrets_dir/$NAME" template="$secrets_dir/.$NAME.XXXXXX"
+    if [ "$dry_run" -eq 1 ]; then
+        step install -o root -g "$GID" -m 0440 "$new_file" "$template"
+        step mv -f -T "$template" "$target"
+        return 0
+    fi
+    staged=$(mktemp "$template") || return 1
+    if step install -o root -g "$GID" -m 0440 "$new_file" "$staged" && step mv -f -T "$staged" "$target"; then
+        staged=""
+        return 0
+    fi
+    rm -f -- "$staged"
+    staged=""
+    return 1
+}
+
 compose_line=$DEFAULT_COMPOSE secrets_dir=$DEFAULT_SECRETS_DIR dry_run=0
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -235,8 +265,9 @@ if [ "$dry_run" -eq 0 ]; then
 fi
 
 # 3. The new file.
-if ! step install -o root -g "$GID" -m 0440 "$new_file" "$secrets_dir/$NAME"; then
-    die "the repository opens with both passwords, but $secrets_dir/$NAME still holds the old one: run it again"
+if ! install_new; then
+    die "$secrets_dir/$NAME is unchanged (it still holds the old password); the new password's key is added and" \
+        "verified, so the repository opens with both, and $new_file holds the new one: keep it, and run it again"
 fi
 
 # 4. The service that holds the secret.

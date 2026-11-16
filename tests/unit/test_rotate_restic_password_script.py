@@ -23,7 +23,9 @@ order, and what a removal that fails leaves and says.
 
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -46,7 +48,7 @@ PROD_COMPOSE: Final = shlex.split(
     "--env-file /etc/jobhunter/jobhunter.env -f deploy/compose.yaml"
 )
 PROD_SECRETS: Final = "/etc/jobhunter/secrets"
-CHANGES: Final = ("install", "docker", "restic", "sudo", "chown", "chmod", "rm", "mv", "cp", "tee")
+CHANGES: Final = ("install", "docker", "restic", "sudo", "chown", "chmod", "rm", "mv", "cp", "tee", "mktemp")
 NOTE: Final = "rotate-restic-password: "
 ONE_OFF: Final = ["run", "--rm", "--no-deps", "-T", "backup", "sh", "-c"]
 NAME: Final = "rotate-restic-password"
@@ -123,13 +125,25 @@ with open(calls, "a") as out:
     out.write(" ".join(args[args.index("restart") :]) + "\\n")
 sys.exit(int(os.environ.get("FAKE_RESTART_EXIT", "0")))
 """
-# An install that copies, or fails (exit 1, nothing copied) with FAKE_INSTALL_FAILS.
+# An install that copies, or fails (exit 1) with nothing copied (FAKE_INSTALL_FAILS) or after copying
+# (FAKE_INSTALL_FAILS_AFTER_WRITE: its target is written, as by an install cut off before its owner or mode).
 FAKE_INSTALL: Final = """#!/bin/sh
 for arg; do source=$target; target=$arg; done
 echo "install $target" >> "$FAKE_CALLS"
 [ -z "${FAKE_INSTALL_FAILS:-}" ] || exit 1
 cp "$source" "$target"
+[ -z "${FAKE_INSTALL_FAILS_AFTER_WRITE:-}" ] || exit 1
 """
+# The real mv, recorded, or failing (exit 1, nothing renamed) with FAKE_MV_FAILS.
+FAKE_MV: Final = f"""#!/bin/sh
+echo "mv $*" >> "$FAKE_CALLS"
+[ -z "${{FAKE_MV_FAILS:-}}" ] || exit 1
+exec {shutil.which("mv")} "$@"
+"""
+# The temporary file of the install (F6 fix round 2): mktemp's name in the secrets directory, as the calls
+# show it.
+STAGED: Final = re.compile(r"/\.restic_password\.[A-Za-z0-9]{6}(?=\s|$)")
+TMP: Final = ".restic_password.<tmp>"
 
 
 @dataclass(frozen=True)
@@ -228,7 +242,21 @@ class Site:
 
     @property
     def calls(self) -> list[str]:
-        return self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+        """The fakes' calls, the temporary file of the install named `TMP`."""
+        lines = self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+        return [STAGED.sub(f"/{TMP}", line) for line in lines]
+
+    @property
+    def installed(self) -> list[str]:
+        """The two install calls of step 3: into the temporary file, then its rename over the secret."""
+        return [
+            f"install {self.secrets}/{TMP}",
+            f"mv -f -T {self.secrets}/{TMP} {self.secrets}/restic_password",
+        ]
+
+    def files(self) -> list[str]:
+        """The secrets directory's file names: a temporary file left behind would be listed."""
+        return sorted(path.name for path in self.secrets.iterdir())
 
 
 def a_site(tmp_path: Path, keys: list[str], *, installed: str = OLD) -> Site:
@@ -243,7 +271,8 @@ def a_site(tmp_path: Path, keys: list[str], *, installed: str = OLD) -> Site:
     (site.secrets / "s3_secret_access_key").write_text(f"{S3_SECRET}\n")
     for n, password in enumerate(keys, start=1):
         (site.repo / f"{n:064x}").write_text(password)
-    for name, body in (("restic", FAKE_RESTIC), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL)):
+    fakes = (("restic", FAKE_RESTIC), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL), ("mv", FAKE_MV))
+    for name, body in fakes:
         (site.bin / name).write_text(body)
         (site.bin / name).chmod(0o755)
     (site.bin / "id").write_text("#!/bin/sh\necho 0\n")  # as root
@@ -319,7 +348,9 @@ def test_the_dry_run_prints_the_five_steps_in_their_order(tmp_path: Path) -> Non
     assert ran.done.stdout.splitlines()[0] == f"{NOTE}dry run: the commands are printed, none is run"
     assert ran.commands[0] == ["cd", str(REPO)]
     assert ran.lines[1].endswith(f" < {ran.new_file}")  # the first one-off reads the new password from stdin
-    target = f"{PROD_SECRETS}/restic_password"
+    # step 3 (F6 fix round 2): the new file installed into a temporary file of the secrets directory, with its
+    # owner, group and mode, then renamed over the secret; a dry run names mktemp's template
+    target, staged = f"{PROD_SECRETS}/restic_password", f"{PROD_SECRETS}/.restic_password.XXXXXX"
     assert ran.commands[2] == [
         "install",
         "-o",
@@ -329,16 +360,17 @@ def test_the_dry_run_prints_the_five_steps_in_their_order(tmp_path: Path) -> Non
         "-m",
         "0440",
         str(ran.new_file),
-        target,
+        staged,
     ]
+    assert ran.commands[3] == ["mv", "-f", "-T", staged, target]
     tails = ran.compose_commands(PROD_COMPOSE)
     assert [tail[: len(ONE_OFF)] if tail[0] == "run" else tail for tail in tails] == [
         ONE_OFF,
         ["restart", "backup"],
         ONE_OFF,
     ]
-    assert len(ran.commands) == 5
-    assert " < " not in ran.lines[4]  # the second one-off mounts the new password: no stdin
+    assert len(ran.commands) == 6
+    assert " < " not in ran.lines[5]  # the second one-off mounts the new password: no stdin
     (_, add_args), (_, remove_args) = ran.one_offs()
     assert (add_args, remove_args) == ([NAME], [NAME, NO_KEY_YET])
     assert all(NEW not in part for command in ran.commands for part in command)
@@ -452,12 +484,8 @@ def test_a_rotation_adds_installs_restarts_then_removes(tmp_path: Path) -> None:
     site = a_site(tmp_path, [OLD])
     done = full_run(tmp_path, site)
     assert done.returncode == 0, done.stderr
-    assert site.calls == [
-        f"run {NAME}",
-        f"install {site.secrets}/restic_password",
-        "restart backup",
-        f"run {NAME} {OLD_ID}",
-    ]
+    assert site.calls == [f"run {NAME}", *site.installed, "restart backup", f"run {NAME} {OLD_ID}"]
+    assert site.files() == ["restic_password", "s3_access_key_id", "s3_secret_access_key"]
     assert steps(site) == [
         ("list", "old"),
         ("list", "new"),
@@ -539,25 +567,66 @@ def test_a_run_again_after_a_finished_rotation_has_nothing_to_rotate(tmp_path: P
     assert site.calls == [f"run {NAME}"] and list(site.keys.values()) == [NEW]
 
 
+def installed_unchanged(site: Site, new_file: Path) -> str:
+    """The last line of a step 3 that failed: the live secret unchanged, the new key added and verified, the
+    retained new file named (F6 fix round 2, Ruling F6-3)."""
+    return (
+        f"{NOTE}{site.secrets}/restic_password is unchanged (it still holds the old password); the new "
+        f"password's key is added and verified, so the repository opens with both, and {new_file} holds the "
+        "new one: keep it, and run it again"
+    )
+
+
 def test_an_install_that_fails_leaves_both_keys_and_a_run_again_finishes(tmp_path: Path) -> None:
     """Review M2, step 3: the install fails after the key was added. The script exits 1: the repository opens
     with both passwords and the file holds the old one, so it says to run it again, and nothing was
     restarted or removed. A run again adds no second key and finishes the rotation."""
     site = a_site(tmp_path, [OLD])
+    before = site.files()
     done = full_run(tmp_path, site, FAKE_INSTALL_FAILS="1")
     assert done.returncode == 1
-    assert site.calls == [f"run {NAME}", f"install {site.secrets}/restic_password"]
+    assert site.calls == [f"run {NAME}", site.installed[0]]
     assert list(site.keys.values()) == [OLD, NEW]
     assert (site.secrets / "restic_password").read_text() == f"{OLD}\n"
-    assert done.stderr.splitlines()[-1].endswith(
-        f"the repository opens with both passwords, but {site.secrets}/restic_password still holds the old "
-        "one: run it again"
-    )
+    assert site.files() == before  # the temporary file is removed
+    assert done.stderr.splitlines()[-1] == installed_unchanged(site, tmp_path / "new-password")
     again = full_run(tmp_path, site)
     assert again.returncode == 0, again.stderr
     assert [step for step, _ in steps(site)].count("add") == 1
     assert list(site.keys.values()) == [NEW]
     assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
+    assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
+
+
+@pytest.mark.parametrize(
+    ("env", "calls"),
+    [
+        ({"FAKE_INSTALL_FAILS_AFTER_WRITE": "1"}, 1),  # the temporary file written, then install fails
+        ({"FAKE_MV_FAILS": "1"}, 2),  # the temporary file installed, then its rename fails
+    ],
+)
+def test_an_install_cut_off_after_its_temporary_file_leaves_the_secret_as_it_was(
+    tmp_path: Path, env: dict[str, str], calls: int
+) -> None:
+    """F6 fix round 2 (Codex I1, Fable M2; Ruling F6-3): step 3 installs into a temporary file of the secrets
+    directory and renames it over the secret, so a failure after the temporary file is written leaves the
+    secret byte-identical and no temporary file behind. The script exits 1 saying the secret is unchanged,
+    that the new key is added and verified, and naming the retained new file; nothing is restarted or
+    removed, and a run again finishes the rotation."""
+    site = a_site(tmp_path, [OLD])
+    live = site.secrets / "restic_password"
+    before, files = live.read_bytes(), site.files()
+    done = full_run(tmp_path, site, **env)
+    assert done.returncode == 1
+    assert site.calls == [f"run {NAME}", *site.installed[:calls]]
+    assert live.read_bytes() == before
+    assert site.files() == files
+    assert list(site.keys.values()) == [OLD, NEW]
+    assert done.stderr.splitlines()[-1] == installed_unchanged(site, tmp_path / "new-password")
+    assert "done:" not in done.stdout
+    again = full_run(tmp_path, site)
+    assert again.returncode == 0, again.stderr
+    assert list(site.keys.values()) == [NEW] and live.read_text() == f"{NEW}\n"
     assert not any(secret in done.stdout + done.stderr for secret in SECRET_VALUES)
 
 
@@ -568,7 +637,7 @@ def test_a_restart_that_fails_says_restart_then_remove_by_hand(tmp_path: Path) -
     site = a_site(tmp_path, [OLD])
     done = full_run(tmp_path, site, FAKE_RESTART_EXIT="1")
     assert done.returncode == 1
-    assert site.calls == [f"run {NAME}", f"install {site.secrets}/restic_password", "restart backup"]
+    assert site.calls == [f"run {NAME}", *site.installed, "restart backup"]
     assert list(site.keys.values()) == [OLD, NEW]
     assert (site.secrets / "restic_password").read_text() == f"{NEW}\n"
     assert done.stderr.splitlines()[-1].endswith(
@@ -592,7 +661,7 @@ def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: 
     ran = dry_run(tmp_path, "NEW", cwd=tmp_path)
     assert ran.done.returncode == 0, ran.done.stderr
     assert ran.commands[0] == ["cd", str(REPO)]  # the prod command line's paths are the checkout's
-    assert ran.commands[2][-1] == f"{PROD_SECRETS}/restic_password"
+    assert ran.commands[3][-1] == f"{PROD_SECRETS}/restic_password"
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
     assert len(composed) == 3 and all(command[: len(PROD_COMPOSE)] == PROD_COMPOSE for command in composed)
 
@@ -602,7 +671,7 @@ def test_compose_and_secrets_dir_replace_both(tmp_path: Path) -> None:
     ran = dry_run(tmp_path, "--compose", shlex.join(PT), "--secrets-dir", ".secrets/test", "NEW")
     assert ran.done.returncode == 0, ran.done.stderr
     assert "/etc/jobhunter" not in ran.done.stdout
-    assert ran.commands[2][-1] == f"{REPO}/.secrets/test/restic_password"
+    assert ran.commands[3][-1] == f"{REPO}/.secrets/test/restic_password"
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
     assert len(composed) == 3 and all(command[: len(PT)] == PT for command in composed)
     assert ran.calls == []

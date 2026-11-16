@@ -13,7 +13,9 @@ file, never onto a command line.
 """
 
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -50,7 +52,7 @@ PROD_COMPOSE: Final = shlex.split(
 )
 PROD_SECRETS: Final = "/etc/jobhunter/secrets"
 # What changes something in a real run; none may run in a dry run.
-CHANGES: Final = ("install", "docker", "psql", "sudo", "chown", "chmod", "rm", "mv", "cp", "tee")
+CHANGES: Final = ("install", "docker", "psql", "sudo", "chown", "chmod", "rm", "mv", "cp", "tee", "mktemp")
 NOTE: Final = "rotate-db-role: "
 ONE_OFF: Final = ["run", "--rm", "--no-deps", "-T", "postgres", "sh", "-c"]
 
@@ -149,11 +151,24 @@ if "run" in args:
     env = {{**os.environ, "POSTGRES_USER": "jobhunter_bootstrap"}}
     sys.exit(subprocess.run(["/bin/sh", "-c", script, *args[at + 3 :]], env=env).returncode)
 """
+# An install that copies, or fails (exit 1) with nothing copied (FAKE_INSTALL_FAILS) or after copying
+# (FAKE_INSTALL_FAILS_AFTER_WRITE: its target is written, as by an install cut off before its owner or mode).
 FAKE_INSTALL: Final = """#!/bin/sh
 for arg; do source=$target; target=$arg; done
 echo "install $target" >> "$FAKE_CALLS"
+[ -z "${FAKE_INSTALL_FAILS:-}" ] || exit 1
 cp "$source" "$target"
+[ -z "${FAKE_INSTALL_FAILS_AFTER_WRITE:-}" ] || exit 1
 """
+# The real mv, recorded, or failing (exit 1, nothing renamed) with FAKE_MV_FAILS.
+FAKE_MV: Final = f"""#!/bin/sh
+echo "mv $*" >> "$FAKE_CALLS"
+[ -z "${{FAKE_MV_FAILS:-}}" ] || exit 1
+exec {shutil.which("mv")} "$@"
+"""
+# The temporary file of an install (F6 fix round 2): mktemp's name in the secrets directory, as the calls
+# show it.
+STAGED: Final = re.compile(r"/\.(\w+)\.[A-Za-z0-9]{6}(?=\s|$)")
 
 
 @dataclass(frozen=True)
@@ -168,8 +183,9 @@ class BootstrapSite:
     psql_log: Path
     calls_log: Path
 
-    def env(self) -> dict[str, str]:
+    def env(self, **extra: str) -> dict[str, str]:
         return {
+            **extra,
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "POSTGRES_USER": "jobhunter_bootstrap",
             "FAKE_ROLE_PASSWORD": str(self.role),
@@ -194,16 +210,18 @@ class BootstrapSite:
             check=False,
         )
 
-    def full_run(self, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-        """`rotate-db-role.sh pg_bootstrap`, not a dry run, on the fakes."""
+    def full_run(
+        self, tmp_path: Path, name: str = "pg_bootstrap", **env: str
+    ) -> subprocess.CompletedProcess[str]:
+        """`rotate-db-role.sh <name>`, not a dry run, on the fakes."""
         new_file = tmp_path / "new-password"
         new_file.write_text(f"{PLANTED}\n")
         argv = [str(SCRIPT), "--compose", "docker compose -p fake", "--secrets-dir", str(self.secrets)]
         return subprocess.run(
-            [*argv, "pg_bootstrap", str(new_file)],
+            [*argv, name, str(new_file)],
             capture_output=True,
             text=True,
-            env=self.env(),
+            env=self.env(**env),
             cwd=REPO,
             timeout=60,
             check=False,
@@ -214,7 +232,19 @@ class BootstrapSite:
         return [f"call:{block}" for block in text.split("call:")[1:]]
 
     def calls(self) -> list[str]:
-        return self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+        """The fakes' calls, an install's temporary file named `.<secret>.<tmp>`."""
+        lines = self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+        return [STAGED.sub(r"/.\1.<tmp>", line) for line in lines]
+
+    def installed(self, name: str) -> list[str]:
+        """The install calls of the secret `name`: into its temporary file, then that file's rename over
+        it."""
+        staged = f"{self.secrets}/.{name}.<tmp>"
+        return [f"install {staged}", f"mv -f -T {staged} {self.secrets}/{name}"]
+
+    def files(self) -> list[str]:
+        """The secrets directory's file names: a temporary file left behind would be listed."""
+        return sorted(path.name for path in self.secrets.iterdir())
 
     def role_password(self) -> str:
         return self.role.read_text().strip()
@@ -227,8 +257,10 @@ def a_bootstrap_site(tmp_path: Path, *, role: str) -> BootstrapSite:
     for directory in (site.secrets, site.shm, site.bin):
         directory.mkdir()
     (site.secrets / "pg_bootstrap").write_text(f"{BOOTSTRAP}\n")
+    (site.secrets / "db_app").write_text("planted-old-app-password\n")
     site.role.write_text(f"{role}\n")
-    for name, body in (("psql", FAKE_PSQL), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL)):
+    fakes = (("psql", FAKE_PSQL), ("docker", FAKE_DOCKER), ("install", FAKE_INSTALL), ("mv", FAKE_MV))
+    for name, body in fakes:
         (site.bin / name).write_text(body)
         (site.bin / name).chmod(0o755)
     (site.bin / "id").write_text("#!/bin/sh\necho 0\n")  # as root
@@ -247,9 +279,11 @@ def test_the_password_never_reaches_a_command_line(tmp_path: Path, name: str) ->
     assert ran.done.returncode == 0, ran.done.stderr
     assert PLANTED not in ran.done.stdout + ran.done.stderr
     assert ran.calls == []
+    staged = f"{PROD_SECRETS}/.{name}.XXXXXX"  # F6 fix round 2: mktemp's template, then the rename
     assert ran.commands[0] == [
-        "install", "-o", "root", "-g", "10010", "-m", "0440", str(ran.new_file), f"{PROD_SECRETS}/{name}",
+        "install", "-o", "root", "-g", "10010", "-m", "0440", str(ran.new_file), staged,
     ]  # fmt: skip
+    assert ran.commands[1] == ["mv", "-f", "-T", staged, f"{PROD_SECRETS}/{name}"]
     [one_off, *_] = ran.compose_commands(PROD_COMPOSE)
     script, args = one_off_script(one_off)
     assert args == ["rotate-db-role", name, ROLES[name]]
@@ -327,7 +361,7 @@ def test_the_bootstrap_password_is_set_with_the_old_one_then_installed(tmp_path:
     printed = [line for line in ran.done.stdout.splitlines() if not line.startswith(NOTE)]
     assert ran.commands[0] == ["cd", str(REPO)]
     assert printed[1].endswith(f" < {ran.new_file}")  # the one-off reads the new password from its stdin
-    target = f"{PROD_SECRETS}/pg_bootstrap"
+    target, staged = f"{PROD_SECRETS}/pg_bootstrap", f"{PROD_SECRETS}/.pg_bootstrap.XXXXXX"
     assert ran.commands[2] == [
         "install",
         "-o",
@@ -337,9 +371,10 @@ def test_the_bootstrap_password_is_set_with_the_old_one_then_installed(tmp_path:
         "-m",
         "0440",
         str(ran.new_file),
-        target,
+        staged,
     ]
-    assert len(ran.commands) == 3
+    assert ran.commands[3] == ["mv", "-f", "-T", staged, target]
+    assert len(ran.commands) == 4
     [one_off] = ran.compose_commands(PROD_COMPOSE)
     script, args = one_off_script(one_off)
     assert args == ["rotate-db-role"]
@@ -386,7 +421,8 @@ def test_a_bootstrap_rotation_sets_the_password_then_installs_the_file(tmp_path:
     site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
     done = site.full_run(tmp_path)
     assert done.returncode == 0, done.stderr
-    assert site.calls() == ["run", f"install {site.secrets}/pg_bootstrap"]
+    assert site.calls() == ["run", *site.installed("pg_bootstrap")]
+    assert site.files() == ["db_app", "pg_bootstrap"]
     assert site.role_password() == PLANTED
     assert (site.secrets / "pg_bootstrap").read_text() == f"{PLANTED}\n"
     assert done.stdout.splitlines()[-1] == (
@@ -402,7 +438,7 @@ def test_a_bootstrap_run_cut_off_after_its_alter_is_finished_by_a_run_again(tmp_
     site = a_bootstrap_site(tmp_path, role=PLANTED)
     done = site.full_run(tmp_path)
     assert done.returncode == 0, done.stderr
-    assert site.calls() == ["run", f"install {site.secrets}/pg_bootstrap"]
+    assert site.calls() == ["run", *site.installed("pg_bootstrap")]
     assert len(site.psql_calls()) == 1  # the login with the new password only, no ALTER
     assert (site.secrets / "pg_bootstrap").read_text() == f"{PLANTED}\n"
     assert done.stdout.splitlines()[-1] == (
@@ -427,13 +463,87 @@ def test_a_bootstrap_one_off_that_sets_nothing_says_so_accurately(tmp_path: Path
     assert "still has its old password" not in done.stderr
 
 
+# An install that fails before it writes, after it wrote its temporary file, or at the rename (F6 fix round
+# 2): the environment of the fakes, and how many of the two install calls ran.
+INSTALL_FAILURES: Final = [
+    ({"FAKE_INSTALL_FAILS": "1"}, 1),
+    ({"FAKE_INSTALL_FAILS_AFTER_WRITE": "1"}, 1),
+    ({"FAKE_MV_FAILS": "1"}, 2),
+]
+
+
+@pytest.mark.parametrize(("env", "calls"), INSTALL_FAILURES)
+def test_a_bootstrap_install_that_fails_leaves_the_secret_as_it_was(
+    tmp_path: Path, env: dict[str, str], calls: int
+) -> None:
+    """F6 fix round 2 (Codex I1, Fable M2; Ruling F6-3): the new file is installed into a temporary file of
+    the secrets directory and renamed over pg_bootstrap, so an install that fails, before or after its
+    temporary file is written, leaves pg_bootstrap byte-identical and no temporary file behind. The role has
+    the new password already: the script says the file is unchanged and names the retained new file, and a
+    run again sets nothing and installs it."""
+    site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
+    live = site.secrets / "pg_bootstrap"
+    before, files = live.read_bytes(), site.files()
+    done = site.full_run(tmp_path, **env)
+    assert done.returncode == 1
+    assert site.calls() == ["run", *site.installed("pg_bootstrap")[:calls]]
+    assert live.read_bytes() == before and site.files() == files
+    assert site.role_password() == PLANTED
+    assert done.stderr.splitlines()[-1] == (
+        f"{NOTE}the bootstrap superuser has the new password, but {live} is unchanged (it still holds the "
+        f"old one); {tmp_path / 'new-password'} holds the new one: keep it, and run it again (it sets "
+        "nothing and installs the file) before any other database role's rotation"
+    )
+    assert PLANTED not in done.stdout + done.stderr and BOOTSTRAP not in done.stdout + done.stderr
+    again = site.full_run(tmp_path)
+    assert again.returncode == 0, again.stderr
+    assert live.read_text() == f"{PLANTED}\n" and site.files() == files
+
+
+@pytest.mark.parametrize(("env", "calls"), INSTALL_FAILURES)
+def test_a_role_install_that_fails_changes_nothing(tmp_path: Path, env: dict[str, str], calls: int) -> None:
+    """F6 fix round 2: an application role's install is its first step, so an install that fails, before or
+    after its temporary file is written, leaves the secret byte-identical, no temporary file behind, and
+    nothing else done (no one-off, no restart). The script says so and names the retained new file."""
+    site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
+    live = site.secrets / "db_app"
+    before, files = live.read_bytes(), site.files()
+    done = site.full_run(tmp_path, "db_app", **env)
+    assert done.returncode == 1
+    assert site.calls() == site.installed("db_app")[:calls]
+    assert live.read_bytes() == before and site.files() == files
+    assert site.psql_calls() == []
+    assert done.stderr.splitlines()[-1] == (
+        f"{NOTE}{live} is unchanged and jobhunter_app keeps its old password; nothing was restarted, and "
+        f"{tmp_path / 'new-password'} holds the new one: keep it, and run it again"
+    )
+    assert PLANTED not in done.stdout + done.stderr
+
+
+def test_a_role_rotation_installs_through_a_temporary_file_then_alters_and_restarts(tmp_path: Path) -> None:
+    """F6 fix round 2: the whole script for `db_app` on the fakes: the install into a temporary file and its
+    rename over the secret, then the one-off that sets the role's password, then the restart of api and
+    worker; no temporary file is left."""
+    site = a_bootstrap_site(tmp_path, role=BOOTSTRAP)
+    done = site.full_run(tmp_path, "db_app")
+    assert done.returncode == 0, done.stderr
+    assert site.calls() == [*site.installed("db_app"), "run", "restart api worker"]
+    assert (site.secrets / "db_app").read_text() == f"{PLANTED}\n"
+    assert site.files() == ["db_app", "pg_bootstrap"]
+    assert (
+        done.stdout.splitlines()[-1]
+        == f"{NOTE}done: jobhunter_app has its new password; restarted api worker"
+    )
+    assert PLANTED not in done.stdout + done.stderr
+
+
 def test_the_defaults_are_the_prod_command_line_and_secrets_directory(tmp_path: Path) -> None:
     """Without `--compose` and `--secrets-dir`: Task 21's prod command line, from the checkout (the RUNBOOK
     calls it without either), and /etc/jobhunter/secrets."""
     ran = dry_run(tmp_path, "db_app", "NEW", cwd=tmp_path)
     assert ran.done.returncode == 0, ran.done.stderr
-    assert ran.commands[0][-1] == f"{PROD_SECRETS}/db_app"
-    assert ran.commands[1] == ["cd", str(REPO)]  # the prod command line's paths are the checkout's
+    assert ran.commands[1][-1] == f"{PROD_SECRETS}/db_app"
+    assert ran.commands[2] == ["cd", str(REPO)]  # the prod command line's paths are the checkout's
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
     assert len(composed) == 2 and all(command[: len(PROD_COMPOSE)] == PROD_COMPOSE for command in composed)
 
@@ -444,7 +554,7 @@ def test_compose_and_secrets_dir_replace_both(tmp_path: Path) -> None:
     ran = dry_run(tmp_path, "--compose", shlex.join(PT), "--secrets-dir", ".secrets/test", "db_app", "NEW")
     assert ran.done.returncode == 0, ran.done.stderr
     assert "/etc/jobhunter" not in ran.done.stdout
-    assert ran.commands[0][-1] == f"{REPO}/.secrets/test/db_app"
+    assert ran.commands[1][-1] == f"{REPO}/.secrets/test/db_app"
     composed = [command for command in ran.commands if command[:2] == ["docker", "compose"]]
     assert len(composed) == 2 and all(command[: len(PT)] == PT for command in composed)
     assert not any(

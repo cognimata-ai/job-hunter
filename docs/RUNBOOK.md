@@ -554,9 +554,10 @@ sudo scripts/rotate-db-role.sh --dry-run db_app <new file>
 sudo scripts/rotate-db-role.sh db_app <new file>
 ```
 
-Then delete `<new file>`. For `db_app`, new connections of api and worker fail for a few seconds between the
-role's new password and their restart, which follows from the order install, alter, restart; connections
-already open keep working, and the restart ends the window.
+If its install fails, the file and the role are unchanged and nothing restarted; the script says so, naming
+`<new file>`: run it again. Then delete `<new file>`. For `db_app`, new connections of api and worker fail for
+a few seconds between the role's new password and their restart, which follows from the order install, alter,
+restart; connections already open keep working, and the restart ends the window.
 
 **The bootstrap role** (`pg_bootstrap`). The same script, with `pg_bootstrap`, goes the other way round: its
 one-off connects with the installed password and sets the bootstrap role's to the new one, which it reads from
@@ -573,9 +574,11 @@ sudo scripts/rotate-db-role.sh pg_bootstrap <new file>
 Then delete `<new file>`. If it stops before the install, run it again: its one-off first logs in with the new
 password, and when the role has it already (an earlier run set it and was cut off before its install), sets
 nothing and goes on to the install. If the one-off fails (`the one-off did not set …`), the file is unchanged:
-fix the cause its line above names, then run it again. If the install itself fails, the script says so:
-install `<new file>` as `pg_bootstrap` with the `install` command above before any other database role's
-rotation, whose one-off connects with that file.
+fix the cause its line above names, then run it again. If the install itself fails, `pg_bootstrap` is
+unchanged (each script installs into a temporary file of the secrets directory and renames it over the secret,
+so a secret is never partly written) and the script says so, naming `<new file>`: keep it, and run it again (it
+sets nothing and installs the file) before any other database role's rotation, whose one-off connects with
+that file.
 
 **The restic password** (`restic_password`; §19.5). restic encrypts the repository with a master key that each
 of its keys wraps, one per password, so the rotation adds a key for the new password and removes the old
@@ -600,15 +603,30 @@ waits for a running job's repository lock, as the jobs' calls do. Its last line 
 opens nothing any more.
 
 If it stops before the install (`… is unchanged and nothing was restarted`), run it again: it adds no second
-key. If the install fails (`… still holds the old one: run it again`), run it again too. Once the new file is
-installed, never remove the old key before backup has restarted: until then the running backup container
-may still mount the old password. So if the restart fails, it says so, and a run of the script again after
-an install whose run then stopped (`… holds the new password already …`, naming the repository's other keys)
-says the same: restart backup first (`$JH restart backup`, harmless when the earlier run restarted it), then
-remove the old key by hand, below. If the removal fails, it exits 1 naming the old key's id (`… the old key
-<id> may still be in the repository …`): the new password is installed and backup restarted, and the line
-before it says how restic exited (a failed `restic key remove`, or a failed check after it, when the key may
-be gone already). Once the cause is fixed, list the keys, as the new password:
+key. If the install fails (`… is unchanged (it still holds the old password) …`), the file is the old one and
+the new password's key is added and verified: keep `<new file>` and run it again too. The install never leaves
+`restic_password` partly written, but a disk or a hand outside the script can. An installed `restic_password`
+found missing or damaged stops every run again at its first one-off (`the installed password opens no key`),
+and every backup job once backup restarts. The script installs only after the new password's key is added and
+verified, so install the retained `<new file>` by hand and restart backup:
+
+```
+sudo install -o root -g 10010 -m 0440 <new file> /etc/jobhunter/secrets/restic_password
+$JH restart backup
+```
+
+Then remove the old key by hand, below (its id is the one the run printed: `the old key is <id>`). Damage with
+no rotation in progress takes the current password from the offline recovery kit (section 8) instead, installed
+the same way.
+
+Once the new file is installed, never remove the old key before backup has restarted: until then the running
+backup container may still mount the old password. So if the restart fails, it says so, and a run of the
+script again after an install whose run then stopped (`… holds the new password already …`, naming the
+repository's other keys) says the same: restart backup first (`$JH restart backup`, harmless when the earlier
+run restarted it), then remove the old key by hand, below. If the removal fails, it exits 1 naming the old
+key's id (`… the old key <id> may still be in the repository …`): the new password is installed and backup
+restarted, and the line before it says how restic exited (a failed `restic key remove`, or a failed check
+after it, when the key may be gone already). Once the cause is fixed, list the keys, as the new password:
 
 ```
 $JH run --rm --no-deps -T backup sh -c 'AWS_ACCESS_KEY_ID=$(cat /run/secrets/s3_access_key_id) AWS_SECRET_ACCESS_KEY=$(cat /run/secrets/s3_secret_access_key) restic key list --no-cache --retry-lock 30m --password-file /run/secrets/restic_password'
