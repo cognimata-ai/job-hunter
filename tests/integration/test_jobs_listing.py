@@ -266,6 +266,42 @@ async def test_a_deferred_member_is_never_a_row_and_its_filters_match_the_card(
     assert counted.counts == Counts(total=1, unscored=0, capped=False)
 
 
+async def test_a_deferred_member_matching_the_keyword_brings_its_card_in(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """B2 for the keyword (plan `2026-11-16-jobs-list-perf`, Review Focus 4): a deferred member that matches
+    it, by its title or by its revision's full text alone, lists its group's card though the representative
+    does not match, in every sort, in the counts and in the facets; a member that does not match brings no
+    card, and no member is ever a row."""
+    by_title, _, by_text, _, unmatched, _ = await seed_cards(
+        engine,
+        [
+            scored(60, 70, title="Marketing Manager", company_key="firma-a"),
+            Card(title="Softwareentwickler", deferred_to=0),
+            scored(50, 60, title="Lagerist Logistik", company_key="firma-b"),
+            Card(
+                title="Buchhalter Finanzen",
+                description="Wir suchen Entwickler für ein erfundenes Team.",
+                deferred_to=2,
+            ),
+            scored(40, 50, title="Einkäufer Rohstoffe", company_key="firma-c"),
+            Card(title="Elektriker Gebäudetechnik", deferred_to=4),
+        ],
+    )
+    query = JobsQuery(q="Entwickler")
+    for sort in ("score_mid", "posted", "first_seen"):
+        found = await ids(engine, query.model_copy(update={"sort": sort}))
+        assert sorted(found) == sorted([by_title, by_text]), sort
+    counted = await page(engine, query, with_counts=True)
+    assert counted.counts == Counts(total=2, unscored=0, capped=False)
+    async with read_snapshot(engine) as conn:
+        shown = await facets(conn, query, window=ANY, company_q="", limit=10)
+    assert {company.company_key: company.count for company in shown.companies} == {"firma-a": 1, "firma-b": 1}
+    assert {source.source_id: source.count for source in shown.sources} == {"jsearch": 2}
+    every_card = JobsQuery(scoring_state=ALL_STATES, status=["unseen", "seen", "hidden"])
+    assert sorted(await ids(engine, every_card)) == sorted([by_title, by_text, unmatched])
+
+
 async def test_keyword_finds_softwareentwickler_by_entwickler(engine: AsyncEngine, active_tuple: int) -> None:
     senior, plain, marketing, english = await seed_cards(
         engine,
