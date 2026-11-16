@@ -59,7 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from tests.support.collect import ctx, make_deps, queued_run
 from tests.support.eval import scored_job
 from tests.support.faults import PausePoint
-from tests.support.fences import insert_test_fence
+from tests.support.fences import FenceKind, insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.jobs_list import Card, seed_cards
 from tests.support.m3 import Job, insert_job
@@ -537,13 +537,28 @@ async def in_snapshot(conn: AsyncConnection) -> Seen:
     )
 
 
+async def fence_of(engine: AsyncEngine, kind: FenceKind, job: int) -> int:
+    """An open fence of `kind` that covers `job`: a `jobs` fence over it, a `source` fence of its source
+    with it in the stored affected set (`seed_cards` writes no posting or lineage), or a `global` fence."""
+    if kind == "jobs":
+        return await fence(engine, job)
+    async with engine.begin() as conn:
+        if kind == "source":
+            return await insert_test_fence(conn, kind="source", source_id=FENCED_SOURCE, job_ids=[job])
+        return await insert_test_fence(conn, kind=kind)
+
+
+@pytest.mark.parametrize("kind", ["jobs", "source", "global"])
 async def test_the_page_its_counts_and_its_facets_omit_a_fenced_job_until_its_release(
-    engine: AsyncEngine, active_tuple: int
+    engine: AsyncEngine, active_tuple: int, kind: FenceKind
 ) -> None:
     fenced, other = await fenced_and_other(engine)
-    fence_id = await fence(engine, fenced)
+    fence_id = await fence_of(engine, kind, fenced)
     async with read_snapshot(engine) as conn:
-        assert await in_snapshot(conn) == (True, [other], (1, 1), {"musterfirma": 1}, {"jsearch": 1})
+        if kind == "global":  # every job is fenced
+            assert await in_snapshot(conn) == (True, [], (0, 0), {}, {})
+        else:
+            assert await in_snapshot(conn) == (True, [other], (1, 1), {"musterfirma": 1}, {"jsearch": 1})
     await release(engine, fence_id)
     async with read_snapshot(engine) as conn:
         assert await in_snapshot(conn) == (
