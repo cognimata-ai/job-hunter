@@ -454,3 +454,26 @@ async def test_transition_where_binds_json_values_as_jsonb(engine) -> None:
         stored = tuple((await c.execute(CYCLE, {"id": cycle})).one())
         assert stored == ("completed", report, admitted, "object", "object", Decimal("0.104000"), True)
         await c.rollback()
+
+
+@pytest.mark.parametrize("report", [{"outcomes": {"refused": 0}, "ü": None}, None])
+async def test_transition_where_binds_a_jsonb_param_of_set_sql(engine, report) -> None:
+    """A `params` value named in `jsonb` is bound as JSONB (a mapping as an object, `None` as SQL NULL, never
+    a JSON `null`), so static SQL reads it with `CAST(:name AS jsonb)` (M5 Task 14, `spend_ledger.settle`)."""
+    async with engine.connect() as c:
+        cycle = await insert_cycle(c, (await insert_profile_chain(c)).llm_tuple_id)
+        rows = await transition_where(
+            c,
+            "score_cycles",
+            ["running"],
+            "completed",
+            where="t.id = :id",
+            params={"id": cycle, "report": report},
+            set_sql={"report": "CASE WHEN t.worker_epoch = 1 THEN CAST(:report AS jsonb) END"},
+            jsonb=["report"],
+            returning=("id", "report"),
+        )
+        assert [dict(row) for row in rows] == [{"id": cycle, "report": report}]
+        typed = sa.text("SELECT jsonb_typeof(report) FROM score_cycles WHERE id = :id")
+        assert (await c.execute(typed, {"id": cycle})).scalar_one() == (None if report is None else "object")
+        await c.rollback()

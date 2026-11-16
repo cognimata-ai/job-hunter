@@ -49,6 +49,13 @@ it removes everything that no live job holds (`sweep` names what is live), follo
 a directory of its own uid first. A sweep that cannot remove an entry ends the loop before any further job,
 and `main()` exits with `SWEEP_FAILED_EXIT`: compose restarts the container, which ends every process in it,
 and a sandbox whose sweep still fails is recreated with its volume.
+
+**The leftover marker** (M5 Task 3, M2 Carry-forward 3). Before that exit, `main()` writes `LEFTOVER_MARKER`
+in the root (`mark_leftover`: empty, mode 0660, so the worker's group reads it), and `serve` removes it
+after a clean start sweep (`clear_leftover_marker`); a sweep removes it too, as any entry of the root that is
+no directory, and a failed one ends in a new marker. While it is there, the worker's `metrics_refresh` raises
+`docparse.leftover`, so a sandbox whose sweep keeps failing at its start shows in the app, not only in its
+container's restarts.
 """
 
 import json
@@ -108,6 +115,12 @@ LEFTOVER_AFTER_S: Final = 120.0
 PROTOCOL_FILES: Final = frozenset({*INPUT_NAMES.values(), REQUEST, f"{REQUEST}.tmp", CLAIMED, TEXT, RESULT})
 IDLE_SWEEP_S: Final = 60.0
 SWEEP_FAILED_EXIT: Final = 70  # EX_SOFTWARE: compose restarts the container
+# Written in the root before that exit; the worker's half of the protocol repeats the name
+# (`jobhunter.profile.parse_client.LEFTOVER_MARKER`), keeps the marker through its start's cleanup and
+# reads it.
+LEFTOVER_MARKER: Final = ".docparse-leftover"
+# No symlink is followed and a FIFO is never waited on (a parse chooses what lies in the root).
+_MARKER_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
@@ -517,14 +530,37 @@ def _sweep_entry(root_fd: int, name: str, *, live: bool, now: float) -> int:
     return removed
 
 
+def mark_leftover(root: Path) -> None:
+    """Write the leftover marker in `root` (module docstring): empty, mode 0660 whatever the umask. A marker
+    that cannot be written is logged with its error class; the exit follows all the same."""
+    try:
+        fd = os.open(root / LEFTOVER_MARKER, _MARKER_FLAGS, FILE_MODE)
+    except OSError as exc:
+        log.error("docparse.marker_not_written error=%s", type(exc).__name__)
+        return
+    try:
+        os.fchmod(fd, FILE_MODE)
+    except OSError as exc:
+        log.error("docparse.marker_not_written error=%s", type(exc).__name__)
+    finally:
+        os.close(fd)
+
+
+def clear_leftover_marker(root: Path) -> None:
+    """Remove the leftover marker from `root` (the entry itself, never a symlink's target); none is fine."""
+    with suppress(FileNotFoundError):
+        os.unlink(root / LEFTOVER_MARKER)
+
+
 def serve(root: Path, *, stop: threading.Event | None = None) -> None:
     """Run every published job under `root`, scanning every `SCAN_INTERVAL_S`, until `stop` is set.
 
     The root is swept (`sweep`) before the first job, after every job (that job live), and every
     `IDLE_SWEEP_S` while no job comes. A sweep that fails raises `SweepFailed`: the loop ends at once and
-    takes no further job."""
+    takes no further job. After a clean start sweep, the leftover marker is gone (`clear_leftover_marker`)."""
     stop = stop if stop is not None else threading.Event()
     sweep(root)
+    clear_leftover_marker(root)
     swept = time.monotonic()
     log.info("docparse.serving")
     while not stop.is_set():
@@ -546,8 +582,9 @@ def serve(root: Path, *, stop: threading.Event | None = None) -> None:
 
 def main() -> None:
     """Serve the root of `JOBHUNTER_PARSE_JOBS_DIR` until SIGTERM or SIGINT; a running job finishes first. A
-    failed sweep exits with `SWEEP_FAILED_EXIT`, so compose restarts the container, which ends every process
-    in it; one whose sweep still fails at its start is recreated with its volume (the remedy)."""
+    failed sweep writes the leftover marker (`mark_leftover`), then exits with `SWEEP_FAILED_EXIT`, so compose
+    restarts the container, which ends every process in it; one whose sweep still fails at its start is
+    recreated with its volume (the remedy)."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stderr
     )
@@ -558,10 +595,12 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    root = Path(os.environ.get(ROOT_ENV, str(DEFAULT_ROOT)))
     try:
-        serve(Path(os.environ.get(ROOT_ENV, str(DEFAULT_ROOT))), stop=stop)
+        serve(root, stop=stop)
     except SweepFailed as failed:
         log.critical("docparse.sweep_failed failures=%d", failed.failures)
+        mark_leftover(root)
         raise SystemExit(SWEEP_FAILED_EXIT) from None
 
 

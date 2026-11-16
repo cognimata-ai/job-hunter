@@ -22,18 +22,25 @@ parses it (`_CappedBodyRoute`: 413 `upload_rejected`, `too_large` on `text`); th
 (`raw_text_enc`, `extraction_method = 'pasted'`), never as a file; the same transaction opens the draft.
 
 `POST /api/profile/query-proposals` (Idempotency-Key, no body) → 202 `{proposal_id}` (Task 20, §5.5.1): a
-query proposal for the active profile version. In one transaction: the key's row (`run_idempotent`), the
-active profile version (`active_config`, read without a lock; none, or a purged one, is 409 `conflict_state`
-and stores nothing), then `queries.proposals.request_proposal`, which returns the version's running proposal
-when there is one (a repeat with a new key gets the same id) and otherwise opens one with its
-`propose_queries` operation and job. The call counts against the non-scoring share of the budget (its spend
-owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `{status, items, failure_code}`:
+query proposal for the active profile version. In one transaction: `active_config FOR SHARE` (the lock
+schedule's step 2, before the key's row as `run_idempotent` asks; M5 Task 14, Deviation 54), then
+delete-everything's `global` fence read after that lock (`privacy.fences.refuse_under_global_fence`, 409
+`delete_everything_in_progress`: a request whose transaction began before the fence committed passed the write
+guard and waited for this lock behind delete-everything's admission), the key's row (`run_idempotent`), the
+active profile version read under that lock (none, or a purged one, is 409 `conflict_state` and stores
+nothing), the fault point `profile.proposal.before_request` (test env only), then
+`queries.proposals.request_proposal`, which returns the version's running proposal when there is one (a repeat
+with a new key gets the same id) and otherwise opens one with its `propose_queries` operation and job. The
+call counts against the non-scoring share of the budget (its spend owner is that operation, §6.9.1). The lock
+is `request_proposal`'s caller contract: a profile purge's admission takes it `FOR UPDATE` and cancels the
+version's live proposal operations, so this request either commits first (its operation then cancelled by the
+admission) or waits for it and then reads an active version no purge can hold, and no activation moves the
+active version before it commits. `GET /api/profile/query-proposals/{id}` → `{status, items, failure_code}`:
 `items` is the list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration,
 rationale}` each), `null` before and otherwise; `failure_code` is a `failed` proposal's code, the
 `last_error_code` of its newest `propose_queries` operation (`proposals.FAILURE_CODE_SQL`), `null` in every
-other status; an unknown id is 404 `not_found`. A stored item that the current model refuses (a
-later release tightened it; final review FR-3) is left out, and neither it nor the validation error is
-quoted.
+other status; an unknown id is 404 `not_found`. A stored item that the current model refuses (a later release
+tightened it; final review FR-3) is left out, and neither it nor the validation error is quoted.
 
 `POST /api/profile/drafts/{id}/confirm` (Idempotency-Key, `{expected_rescore_ack}`) → 201
 `{profile_version_id, targets_to_create, est_usd, bulk_budget_usd}` (Task 21, §12.6 step 2): a malformed key
@@ -43,7 +50,8 @@ never takes `FOR SHARE` first: two confirms holding the shared lock would deadlo
 way the second waits. A repeat with the key returns the stored response; a repeat with another key of a
 confirmed draft returns the draft's stored body (Deviation 2). 404 `not_found`; 409 `conflict_state` (not
 `ready`, or a stored profile that no longer fits the schema), `profile_purge_in_progress` (an identical
-version is being purged) and `idempotency_in_progress`; 422 `validation_failed` (a blocking issue or a
+version is being purged), `delete_everything_in_progress` (its fence committed while the confirm waited for
+`active_config`, M5 Task 14) and `idempotency_in_progress`; 422 `validation_failed` (a blocking issue or a
 contact in `user_entered` at its path, the missing `expected_rescore_ack` at `body.expected_rescore_ack`, an
 unknown body member) and `idempotency_key_reused`.
 `profile_confirmed` is logged with the ids after the commit, a confirmed draft's stored body under a new key
@@ -59,7 +67,8 @@ synthetic confirmed one of the adversarial seed (Carry T19-d), is 404 `not_found
 on the draft's state.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
-`jobhunter.api.routes.profile.utcnow`; the confirm takes its `now` from it.
+`jobhunter.api.routes.profile.utcnow`; the confirm takes its `now` from it. So is `afault_point`, which a test
+replaces to hold a proposal request at its fault point.
 
 Every route needs a session, and the POSTs pass the edge's CSRF check. Logs carry ids, sizes and reason codes
 only: never a file name, a file's content, a pasted text, a profile value or a query text (a version's id is
@@ -93,8 +102,10 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.errors import Refusal
+from jobhunter.faults import afault_point
 from jobhunter.llm import bounds
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import refuse_under_global_fence
 from jobhunter.profile import activation, upload
 from jobhunter.profile.estimate import rescore_estimate
 from jobhunter.profile.storage import CvStore
@@ -142,7 +153,12 @@ _CV_FORM: Final[dict[str, Any]] = {
 
 
 PROPOSAL_ROUTE: Final = "profile.query_proposals"
+# Between the read of the active version and `request_proposal`, the request holding `active_config FOR
+# SHARE` (module docstring; the profile purge's race tests hold a request here).
+PROPOSAL_BEFORE_REQUEST: Final = "profile.proposal.before_request"
 _BIGINT_MAX: Final = 2**63 - 1
+_SHARE_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE")
+# The active version, read in a statement of its own after the lock (`settings.active`'s rule).
 _ACTIVE_VERSION: Final = q(
     "SELECT a.profile_version_id, v.purged_at IS NOT NULL AS purged FROM active_config a "
     "LEFT JOIN profile_versions v ON v.id = a.profile_version_id WHERE a.id = 1"
@@ -458,6 +474,7 @@ async def request_query_proposal(
         if active.profile_version_id is None or active.purged:
             raise _no_profile()
         version_id = int(active.profile_version_id)
+        await afault_point(PROPOSAL_BEFORE_REQUEST)
         proposal_id, operation_id, created = await proposals.request_proposal(
             conn, version_id, defer=defer_in_tx
         )
@@ -465,6 +482,8 @@ async def request_query_proposal(
         return StoredResponse(202, ProposalCreatedOut(proposal_id=proposal_id).model_dump(mode="json"))
 
     async with engine.begin() as conn:
+        await conn.execute(_SHARE_ACTIVE_CONFIG)  # step 2, before the key's row (module docstring)
+        await refuse_under_global_fence(conn)  # a fence committed while this waited for the lock
         stored = await run_idempotent(
             conn,
             route=PROPOSAL_ROUTE,

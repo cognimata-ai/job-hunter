@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Final
 
 import pytest
+from jobhunter.privacy.retention import RULES
 
 REPO: Final = Path(__file__).resolve().parents[2]
 SPEC: Final = REPO / "docs/superpowers/specs/2026-10-16-job-hunter-design.md"
@@ -67,6 +68,7 @@ COVERED: Final[dict[str, str]] = {
     "Logs": "logs",
     "Sessions": "sessions",
     "Login attempts": "sessions",
+    "Login lockouts": "sessions",
     "Alerts": "alerts",
     "Exports": "exports",
     "Backups": "backups",
@@ -162,3 +164,31 @@ def test_each_ui_row_states_its_spec_rows_periods(lang: str) -> None:
         if "indefinitely" in retention.lower() and INDEFINITELY[lang] not in text.lower():
             missing.append(f"{spec_row!r}: {INDEFINITELY[lang]!r} not in {COVERED[spec_row]}")
     assert not missing, "\n".join(missing)
+
+
+# The Logs row: rotation by size, as §20.1 says, never a bare time (final re-review R-M2, N7; final fix C5).
+LOGS_KEPT: Final = {
+    "en": "Rotated by size; about 14 days at normal volume",
+    "de": "Rotation nach Größe; etwa 14 Tage bei normalem Aufkommen",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "de"])
+def test_the_logs_row_says_they_rotate_by_size(lang: str) -> None:
+    assert "Rotated by size" in spec_rows()["Logs"]
+    assert catalogue(lang)["settings_privacy.kept.logs"] == LOGS_KEPT[lang]
+
+
+# The lockouts' scheduled removal (T19-4): the retention rule `login_lockouts` deletes a lockout that ended as
+# long ago as the login attempts are kept; §20.1's row and the UI's sessions row both state its window.
+LOCKOUT_KEPT: Final = {
+    "en": "or {days} days after it ended, whichever comes first",
+    "de": "oder bis {days} Tage nach ihrem Ende, je nachdem, was zuerst eintritt",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "de"])
+def test_the_lockouts_row_states_their_scheduled_removal(lang: str) -> None:
+    days = {rule.name: rule.window for rule in RULES}["login_lockouts"].days
+    assert f"or {days} days after it ended, whichever comes first" in spec_rows()["Login lockouts"]
+    assert LOCKOUT_KEPT[lang].format(days=days) in catalogue(lang)["settings_privacy.kept.sessions"]

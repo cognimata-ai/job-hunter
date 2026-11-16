@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 import psycopg
 import pytest
-from jobhunter.config import ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
+from jobhunter.config import ENV_NAMES, ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
 from psycopg.rows import TupleRow
 
 PgRole = Literal["superuser", "migrator", "app", "backup", "restore"]
@@ -54,7 +54,7 @@ _PASSWORD_FILE: Final[Mapping[PgRole, str]] = MappingProxyType(
         "restore": "db_restore",
     }
 )
-_APP_ROLES: Final[tuple[Role, ...]] = ("api", "worker", "migrate")
+_APP_ROLES: Final[tuple[Role, ...]] = ("api", "worker", "migrate", "backup", "restore")
 
 _DB_NAME: Final = "jobhunter"
 _READY_MESSAGE: Final = "database system is ready to accept connections"
@@ -160,6 +160,14 @@ def _make_dir(path: Path) -> Path:
     return path
 
 
+def _private_dir(path: Path) -> Path:
+    """`path` as a directory of mode 0700 (created when missing), as the app image makes its volumes' mount
+    points (M5 Task 9)."""
+    path.mkdir(mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
 def _write_secrets(workdir: Path) -> dict[str, str]:
     """Write the secret files of the server and of every application role; return the role passwords."""
     passwords: dict[str, str] = {role: secrets.token_hex(24) for role in _PASSWORD_FILE}
@@ -169,12 +177,16 @@ def _write_secrets(workdir: Path) -> dict[str, str]:
     for pg_role, file_name in _PASSWORD_FILE.items():
         _write_secret(pgsecrets / file_name, passwords[pg_role], 0o444)
 
-    # What each application role is given: its required secrets and nothing else.
+    # What each application role is given: its required secrets and nothing else. The backup role (M5 Task 10)
+    # connects as the backup and the restore roles, with the server's own passwords.
     shared: dict[str, str] = {
         "db_app": passwords["app"],
         "db_migrator": passwords["migrator"],
+        "db_backup": passwords["backup"],
+        "db_restore": passwords["restore"],
         "session_secret": base64.b64encode(os.urandom(32)).decode("ascii"),
         "data_key": base64.b64encode(os.urandom(32)).decode("ascii"),
+        "restic_password": secrets.token_hex(24),
     }
     _make_dir(workdir / "secrets")
     for app_role in _APP_ROLES:
@@ -378,6 +390,12 @@ def server_env(
 
     The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret). Its
     docparse jobs' root (M2 Task 11) is the server's own directory, never the container's `/data/parse`.
+    Every role's deletion manifests and exports (M5 Task 9: `JOBHUNTER_MANIFESTS_DIR`,
+    `JOBHUNTER_EXPORTS_DIR`) and staging directory (M5 Task 10: `JOBHUNTER_STAGING_DIR`, the backup and
+    restore roles' staging, and their restic cache's default home) are the server's `manifests/`, `exports/`
+    and `staging/`, created here with mode 0700 as the images create their volumes' mount points: the
+    defaults under `/data` do not exist outside the images, and the in-process and child processes write
+    there.
     `embedder_url` is the embedder the role reaches (`JOBHUNTER_EMBEDDER_URL`): the session's fake embedder,
     as `make_config` and `proc_env` pass it (Task 22); without it the configuration's default stays.
     """
@@ -398,6 +416,9 @@ def server_env(
         "JOBHUNTER_DB_NAME": _DB_NAME,
         "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
         "JOBHUNTER_SECRETS_DIR": str(server.secrets_dir(role)),
+        "JOBHUNTER_MANIFESTS_DIR": str(_private_dir(server.workdir / "manifests")),
+        "JOBHUNTER_EXPORTS_DIR": str(_private_dir(server.workdir / "exports")),
+        "JOBHUNTER_STAGING_DIR": str(_private_dir(server.workdir / "staging")),
         **fake_sources,
         **embedder,
         **env,
@@ -415,11 +436,16 @@ def process_env(
     """The environment of a child process of `role` against `server`.
 
     It is the test process's environment without the variables the application reads (`JOBHUNTER_*`,
-    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` (with `embedder_url`) and `extra`. A
+    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`, `RESTIC_*`, and M5's `NTFY_TOPIC_URL`,
+    `HEALTHCHECKS_API_URL` and `AWS_DEFAULT_REGION`), plus `server_env` (with `embedder_url`) and `extra`. A
     worker child is in fake LLM mode too (M2 Task 11): it has no `anthropic_key`, and its gateway is built at
     its start, on the committed recordings (`FAKE_LLM_DIR`), so nothing it does can reach the network.
     """
-    inherited = {name: value for name, value in os.environ.items() if not name.startswith(ENV_PREFIXES)}
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(ENV_PREFIXES) and name not in ENV_NAMES
+    }
     fake_llm = (
         {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(FAKE_LLM_DIR)} if role == "worker" else {}
     )

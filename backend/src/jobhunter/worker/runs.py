@@ -37,6 +37,12 @@ The reconcilers `queued_runs` (a queued run without a live job: re-deferred once
 `failed('orphaned_queue')`) and `stale_data` (§17.5, §17.6) complete the set. Every time threshold uses the
 caller's clock (`ctx.now`), never the database's `now()`.
 
+**Cancellation** (§7.16.4, M5 Task 15): `cancel_active_runs` ends the `queued` and `running` collections
+`cancelled(<reason>)` under `active_config FOR UPDATE` (a source purge's admission, `SOURCE_PURGE_CANCEL`, and
+its replay's re-application; delete-everything's phase B, `DELETE_EVERYTHING_CANCEL`, M5 Task 16). A running
+attempt is closed `cancelled`; its execution's next owner write is
+refused, so it stops (`lost`) and writes nothing more.
+
 Every run that reaches a terminal status is counted in `RUNS` (and, when it started, timed in `RUN_DURATION`)
 by the owner of the transaction that ended it, once that transaction has committed (ruling T12-e): the
 functions that end a run inside a caller's transaction report a `RunEnd`, and the owner passes it to
@@ -94,6 +100,8 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
     from langgraph.types import Durability
 
+    from jobhunter.observability.deadman import DeadmanPinger
+
 # These thresholds compare times the database wrote (`heartbeat_at`, `queued_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
 # one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
@@ -111,6 +119,10 @@ RECURSION_LIMIT: Final = 200
 MAX_CONCURRENCY: Final = 4  # the graph's parallel tasks: the fetch fan-out (§9.2)
 
 REDEFERRED: Final = "redeferred"
+# The reasons a run ends `cancelled` with (§7.16.4, `cancel_active_runs`).
+CancelReason = Literal["source_purge", "delete_everything"]
+SOURCE_PURGE_CANCEL: Final[CancelReason] = "source_purge"
+DELETE_EVERYTHING_CANCEL: Final[CancelReason] = "delete_everything"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
 ORPHANED_QUEUE_ALERT: Final = "run.orphaned_queue"
 FAILED_ALERT: Final = "run.failed"
@@ -235,6 +247,11 @@ _ACTIVE_CONFIG = q(
 _ACTIVE_RUN = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
     "finished_at, status_reason FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running')"
+)
+# The active collections `cancel_active_runs` ends: every one, or those queued up to `:before`.
+_ACTIVE_TO_CANCEL = q(
+    "SELECT id, status, attempt_no FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running') "
+    "AND (CAST(:before AS timestamptz) IS NULL OR queued_at <= :before) ORDER BY id FOR UPDATE"
 )
 _RUN_BY_ID = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
@@ -480,6 +497,45 @@ async def begin_new_attempt(
     return following
 
 
+@dataclass(frozen=True)
+class CancelledRun:
+    """A run `cancel_active_runs` ended: its id and its end, for the transaction's owner to observe."""
+
+    run_id: int
+    end: RunEnd
+
+
+async def cancel_active_runs(
+    conn: AsyncConnection, *, reason: CancelReason, queued_at_or_before: datetime | None = None
+) -> list[CancelledRun]:
+    """End every `queued` or `running` collection run `cancelled(reason)` (§7.16.4: delete-everything, a
+    source purge), in id order, in the caller's transaction, which holds `active_config FOR UPDATE` (step 2);
+    only the runs queued at or before `queued_at_or_before` when it is given (a replay's re-application of a
+    source purge's admission keeps a later run). Each run row is locked `FOR UPDATE` (an owner row, step 5),
+    moved by its owner predicate (`attempt_no`), and a `running` run's current attempt is closed `cancelled`.
+    The running execution learns of it at its next owner write (its heartbeat is refused: `lost`). Returns
+    the runs it ended, for the caller to observe after its commit (`observe_run_ends`)."""
+    params = {"before": queued_at_or_before}
+    cancelled: list[CancelledRun] = []
+    for row in (await conn.execute(_ACTIVE_TO_CANCEL, params)).all():
+        run_id, attempt_no = int(row.id), int(row.attempt_no)
+        await transition(
+            conn,
+            _TABLE,
+            run_id,
+            [str(row.status)],
+            "cancelled",
+            reason=reason,
+            owner={"attempt_no": attempt_no},
+        )
+        if row.status == "running":
+            await conn.execute(_END_ATTEMPT, {"i": run_id, "a": attempt_no, "reason": "cancelled"})
+        duration = await _duration(conn, run_id) if row.status == "running" else None
+        cancelled.append(CancelledRun(run_id, RunEnd(status="cancelled", duration_s=duration)))
+        log.info("run_cancelled", run_id=run_id, attempt_no=attempt_no, status=str(row.status), reason=reason)
+    return cancelled
+
+
 async def annotate_run(conn: AsyncConnection, run_id: int, *, attempt_no: int, reason: str) -> bool:
     """Set the `status_reason` of a `queued` run at `attempt_no`, changing nothing else; `False` on no row.
 
@@ -686,12 +742,15 @@ async def _finalize(
     status: FinalStatus,
     reason: str | None,
     report: Mapping[str, JSONValue],
+    deadman: "DeadmanPinger | None" = None,
 ) -> None:
     """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it, a
     `failed_invariant` one `run.failed_invariant` (both critical, subject `run:<id>`).
 
     `FencedOut` is caught outside the transaction, which wrote nothing; the run's new owner records the
-    outcome. The run metrics are observed only once the transaction has committed (ruling T12-e).
+    outcome. The run metrics are observed only once the transaction has committed (ruling T12-e), and then
+    the dead-man's fast path runs (`deadman.after_run`, M5 Task 5: it never raises; the tick pings what it
+    misses).
     """
     try:
         async with engine.begin() as conn:
@@ -710,6 +769,8 @@ async def _finalize(
         return
     observe_run_ends([RunEnd(status=status, duration_s=duration)])
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
+    if deadman is not None:
+        await deadman.after_run(owner.run_id)
 
 
 # The report of a run the outcome reducer failed (§17.2 I7): its invariant result, no other section.
@@ -725,7 +786,9 @@ async def _redefer(engine: AsyncEngine, run_id: int, attempt_no: int) -> None:
     log.info("run_redeferred", run_id=run_id, attempt_no=attempt_no, deduplicated=job_id is None)
 
 
-async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception | None) -> None:
+async def _settle_raised(
+    engine: AsyncEngine, owner: RunOwner, error: Exception | None, *, deadman: "DeadmanPinger | None"
+) -> None:
     """The `raised` outcome of `owner`'s graph (see `execute_run`, step 3)."""
     async with engine.connect() as conn:
         completion = await run_completion(conn, owner.run_id, owner.attempt_no)
@@ -747,13 +810,18 @@ async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception 
             "run_outcome_conflict", run_id=owner.run_id, attempt_no=owner.attempt_no, work_id=error.work_id
         )
         await _finalize(
-            engine, owner, status="failed_invariant", reason="I7", report=_OUTCOME_CONFLICT_REPORT
+            engine,
+            owner,
+            status="failed_invariant",
+            reason="I7",
+            report=_OUTCOME_CONFLICT_REPORT,
+            deadman=deadman,
         )
     else:
         log.error(
             "run_graph_failed", run_id=owner.run_id, attempt_no=owner.attempt_no, error_class=error_class
         )
-        await _finalize(engine, owner, status="failed", reason="bug", report={})
+        await _finalize(engine, owner, status="failed", reason="bug", report={}, deadman=deadman)
 
 
 async def execute_run(
@@ -765,6 +833,7 @@ async def execute_run(
     epoch: int,
     heartbeat_period_s: float = 30.0,
     on_superseded: Callable[[], None] = lambda: None,
+    deadman: "DeadmanPinger | None" = None,
 ) -> Admission:
     """Admit and run attempt `attempt_no` of run `run_id` (the `run_collect` task body); its admission.
 
@@ -800,6 +869,9 @@ async def execute_run(
 
     The caller's own cancellation propagates (the graph is cancelled and awaited first) and nothing is
     written: the run's next owner (the stale-run reconciler or the takeover sweep) records the outcome.
+
+    `deadman` (M5 Task 5, the runtime's pinger) is handed to every end written here (`_finalize`), whose fast
+    path pings after the commit; the graph's own `finalize` node has the same pinger in its `CollectDeps`.
     """
     key: ExecKey = ("run", run_id)
     live = EXECUTIONS.get(key)
@@ -837,12 +909,19 @@ async def execute_run(
             case "lost":
                 await _observe_unobserved_end(engine, admitted)
             case "raised":
-                await _settle_raised(engine, admitted, outcome.error)
+                await _settle_raised(engine, admitted, outcome.error, deadman=deadman)
             case "returned":
                 async with engine.connect() as conn:
                     completion = await run_completion(conn, run_id, attempt_no)
                 if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
-                    await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+                    await _finalize(
+                        engine,
+                        admitted,
+                        status="succeeded",
+                        reason=None,
+                        report={"noop": True},
+                        deadman=deadman,
+                    )
     finally:
         _GRAPH_OBSERVED.discard((run_id, attempt_no))
     return admission

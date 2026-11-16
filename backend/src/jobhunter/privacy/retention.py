@@ -17,6 +17,18 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+`login_lockouts` (T19-4) deletes a login lockout that ended (`locked_until`) longer ago than the login
+attempts are kept, the `login_attempts` rule's window (`LOGIN_ATTEMPTS_KEPT`): a lockout row holds the client
+address, and an expired one otherwise goes only at the next sign-in or re-authentication from that address
+(`auth.throttle.active_lockout`). A global lockout it deletes resolves the open `auth.lockout` alert, as that
+sign-in would. It takes no throttle lock: an expired lockout decides no sign-in (`peek_lockout` and
+`active_lockout` read only live ones), and a new lock of the same scope waits for the row it deletes, then
+inserts one of its own.
+
+`operations` deletes an operation 30 days after it finished, except a purge operation whose deletion manifest
+is still `executing` (M5 Task 9, D7): a failed purge keeps its fence until it is retried, and the
+`purge_fences` reconciler re-queues a manifest only when it has no pending, running or failed operation.
+
 **The M1 rules** (Task 24), after `operations`; none deletes what the live pipeline still uses:
 - `raw_items`: 90 days by `created_at`; an observation keeps its provenance copy (`raw_item_id := NULL`). A
   `deferred('job_fenced')` item stays past the 90 days, as long as its request: a later run re-resolves it
@@ -81,6 +93,14 @@ body that the newest response still needs. The controller records this as a plan
   committed: no file is deleted under a protection set that a committed reactivation or reopening changed.
 - `cv_store_orphans`: a file of the CV store that no `cv_files.storage_path` names and that was written more
   than a day ago (its modification time): the file of an upload whose transaction rolled back (Task 9).
+- `exports` (M5 Task 17, Deviations 48 and 52; `privacy.export.retain_exports`, its steps each a transaction
+  of their own that starts with the epoch fence): a `ready` export past `expires_at` becomes `expired` with
+  `storage_path` NULL, its file removed after that commit; a `running` export whose operation is neither
+  `pending` nor `running` (lost without its failure hook) becomes `failed`, its files removed; an archive of
+  the exports directory written more than a day ago that no `ready` row names is removed, as
+  `cv_store_orphans` does; `expired`, `failed` and `purged` rows go 30 days after `expires_at`. Its window is
+  those 30 days. The directory is the worker's exports volume (`privacy.export.configure`, at its start);
+  a pass in a process that never configured it changes rows only.
 - `eval_runs`: a run that ended 13 months ago (`finished_at`, else `started_at`), except the latest
   completed run of each kind and a run still `running`; its calls go with it (`ON DELETE CASCADE`).
 - `profile_checkpoints`: a `profile-…` or `queries-…` thread whose operation, the one its name carries
@@ -123,8 +143,30 @@ body that the newest response still needs. The controller records this as a plan
   keys).
 The eval rows: `eval_case_results` and their calls go with `eval_runs` (cascade), and a `running` run is
 never deleted, so no call of a running run, nor the `dispatched` entry it holds, loses its row (Carry T19-d,
-the reason of `golden.delete_case_unless_running`). No M3 rule deletes a job, a revision or a profile version,
-so the synthetic rows of the golden set (Ruling T19-a) and the inputs of every golden case stay.
+the reason a golden case's deletion waits for the runs that include it, `golden.in_running_run`). No M3 rule
+deletes a job, a revision or a profile version, so the synthetic rows of the golden set (Ruling T19-a) and
+the inputs of every golden case stay.
+
+**The M5 rules**, after `score_history`; neither deletes anything itself:
+- `job_tombstones` (Task 13, §20.1 L6397) opens the tombstoning of the closed or stale root jobs whose
+  `availability_changed_at` lies 90 days back and that are not saved or applied and draw no active golden
+  case, with every job merged into them (M3 plan Task 23's exemption contract): at most 10 batches of 200
+  roots, each a fenced transaction of its own that commits the batch's deletion manifest, its `jobs` fence and
+  its `purge` operation (`privacy.kinds.job_tombstone`), which deletes them afterwards. It counts the roots it
+  fenced.
+- `profile_purges` (Task 14, §20.1, §20.2's profile purge, D11) opens the purge of each eligible profile
+  version: not synthetic, neither the active nor the previous version, its score history expired
+  (`retention.score_history_months`, read under the admission's lock), no active golden case and no feedback
+  naming it. Each is a fenced transaction of its own under `active_config FOR UPDATE` that cancels the
+  version's live proposal operations and commits its manifest, its `profile` fence and its `purge` operation
+  (`privacy.kinds.profile_purge`). It counts the versions it fenced.
+
+**The backup records** (M5 Task 24, §19.5), after `runs`: `backup_records` deletes the finished
+(`succeeded` or `failed`) `backup_runs`, then `backup_sets`, 13 months after `finished_at`, in one fenced
+transaction. A running row stays however old (the backup container's next start ends it), and so do the newest
+succeeded set (the backups' age reference, even when every set is older: backups that stopped working), the
+newest succeeded restore test (the restore tests' age reference, likewise; M5 Task 26) and a set that a kept
+run still names. It deletes rows only; restic's own retention is the backup container's prune.
 
 **Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
 bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
@@ -164,7 +206,6 @@ is logged: the database that would hold the outcome is the one that failed, so t
 rule: it is never caught as one.
 """
 
-import calendar
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -175,6 +216,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
+from jobhunter.auth import throttle
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
@@ -182,12 +224,15 @@ from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
 from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy import export
+from jobhunter.privacy.kinds import job_tombstone, profile_purge
+from jobhunter.privacy.retained import ENDED_TARGET_STATES, NEWEST_AND_PREVIOUS, months_before
 from jobhunter.profile.storage import CvStore
 from jobhunter.scoring import batches, targets
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.worker.epoch import fence_epoch
-from jobhunter.worker.tasks import delete_finished_jobs
+from jobhunter.worker.tasks import defer_in_tx, delete_finished_jobs
 
 
 @dataclass(frozen=True)
@@ -204,12 +249,15 @@ class RetentionRule:
 
 # 13 calendar months last 393 to 397 days; the longest bound keeps every row for at least 13 months.
 THIRTEEN_MONTHS: Final = timedelta(days=397)
+# How long a login attempt is kept, and an ended lockout of its address (T19-4).
+LOGIN_ATTEMPTS_KEPT: Final = timedelta(days=30)
 
 # In the order they run, which is also the order of the report.
 RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("api_idempotency", timedelta(0)),  # once expired (created + 7 days)
     RetentionRule("sessions", timedelta(days=1)),  # expiry + 1 day
-    RetentionRule("login_attempts", timedelta(days=30)),
+    RetentionRule("login_attempts", LOGIN_ATTEMPTS_KEPT),
+    RetentionRule("login_lockouts", LOGIN_ATTEMPTS_KEPT),  # once the lockout ended that long ago (T19-4)
     RetentionRule("alerts", timedelta(days=90)),  # after resolution
     RetentionRule("operations", timedelta(days=30)),  # after they finished
     RetentionRule("raw_items", timedelta(days=90)),
@@ -223,10 +271,18 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("draft_content", timedelta(days=30)),  # after the draft was confirmed, discarded or failed
     RetentionRule("cv_files", timedelta(days=30)),  # a discarded or failed draft's, an abandoned upload's
     RetentionRule("cv_store_orphans", timedelta(days=1)),  # after the file was written
+    # M5 Task 17: a `ready` export expires at `expires_at`; its terminal rows go this long after it
+    RetentionRule("exports", export.EXPORT_ROWS_KEPT),
     RetentionRule("eval_runs", THIRTEEN_MONTHS),
     # The M3 rules (Task 23). `score_history`'s window is the active settings'
     # `retention.score_history_months` calendar months after the target ended, read when the rule starts.
     RetentionRule("score_history", timedelta(0)),
+    # M5 Task 13: closed or stale jobs 90 days after `availability_changed_at`, tombstoned by a purge each
+    # batch opens (the rule fences them; the `purge` operation deletes them).
+    RetentionRule("job_tombstones", job_tombstone.TOMBSTONE_AFTER),
+    # M5 Task 14: an old profile version's content once its score history expired (the window is the active
+    # settings' `retention.score_history_months`, read under each admission's lock), by a purge per version.
+    RetentionRule("profile_purges", timedelta(0)),
     RetentionRule("cycle_threads", timedelta(days=14)),  # threads of the cycles that ended that long ago
     # A cycle's thread is found through its row, so never after a failed thread purge (Codex r1 #38).
     RetentionRule("score_cycles", THIRTEEN_MONTHS, depends_on=("cycle_threads",)),
@@ -237,6 +293,9 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("profile_checkpoints", timedelta(days=14)),  # threads of operations ended that long ago
     # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
     RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
+    # M5 Task 24: finished backup runs, then backup sets, 13 months after they finished; never the newest
+    # succeeded set.
+    RetentionRule("backup_records", THIRTEEN_MONTHS),
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
@@ -257,9 +316,12 @@ _DELETES: Final[dict[str, TextClause]] = {
     "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
     "login_attempts": q("DELETE FROM login_attempts WHERE at < :cutoff"),
     "alerts": q("DELETE FROM alerts WHERE resolved_at < :cutoff"),
+    # A purge operation of an `executing` manifest stays, however old (D7: its manifest is retried from it).
     "operations": q(
-        "DELETE FROM operations "
-        "WHERE status IN ('succeeded', 'failed', 'cancelled') AND finished_at < :cutoff"
+        "DELETE FROM operations o "
+        "WHERE o.status IN ('succeeded', 'failed', 'cancelled') AND o.finished_at < :cutoff "
+        "AND NOT (o.kind = 'purge' AND EXISTS (SELECT 1 FROM deletion_manifests m "
+        "WHERE m.status = 'executing' AND o.payload -> 'manifest_id' = to_jsonb(m.id)))"
     ),
     "raw_items": q("DELETE FROM raw_items WHERE created_at < :cutoff AND disposition <> 'deferred'"),
     "raw_bodies": q(
@@ -324,6 +386,25 @@ _DELETES: Final[dict[str, TextClause]] = {
         "AND NOT EXISTS (SELECT 1 FROM batch_submissions s WHERE s.bulk_operation_id = b.id)"
     ),
 }
+
+# `login_lockouts` (T19-4): the lockouts that ended before the cutoff, by scope.
+_ENDED_LOCKOUTS: Final = q("DELETE FROM login_lockouts WHERE locked_until < :cutoff RETURNING scope")
+
+# `backup_records` (M5 Task 24): the finished runs first, except the newest succeeded restore test (Task 26),
+# then the finished sets that no run left names (a restore test's `backup_set_id`), except the newest
+# succeeded set: the age references of the backups' health (`observability.backup_health`), whatever their
+# age.
+_BACKUP_RUNS: Final = q(
+    "DELETE FROM backup_runs r WHERE r.status IN ('succeeded', 'failed') AND r.finished_at < :cutoff "
+    "AND r.id IS DISTINCT FROM (SELECT n.id FROM backup_runs n WHERE n.kind = 'restore_test' "
+    "AND n.status = 'succeeded' ORDER BY n.finished_at DESC, n.id DESC LIMIT 1)"
+)
+_BACKUP_SETS: Final = q(
+    "DELETE FROM backup_sets s WHERE s.status IN ('succeeded', 'failed') AND s.finished_at < :cutoff "
+    "AND s.id IS DISTINCT FROM (SELECT n.id FROM backup_sets n WHERE n.status = 'succeeded' "
+    "ORDER BY n.finished_at DESC, n.id DESC LIMIT 1) "
+    "AND NOT EXISTS (SELECT 1 FROM backup_runs r WHERE r.backup_set_id = s.id)"
+)
 
 # The batch sizes ("Batches" in the module docstring).
 THREAD_BATCH: Final = 500
@@ -390,13 +471,7 @@ _PURGE_EXTRACT_OUTPUTS: Final = q(
 # newest and the previous confirmed drafts are the user's own: the adversarial seed's confirmed drafts name
 # synthetic versions (Ruling T19-a), newer than the user's but never activated.
 _PROTECTED_FILES: Final = q(
-    "WITH newest AS (SELECT d.id, d.confirmed_profile_version_id AS version FROM profile_drafts d "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1), "
-    "previous AS (SELECT d.confirmed_profile_version_id AS version FROM profile_drafts d JOIN newest n "
-    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version "
-    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
-    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1) "
+    f"WITH {NEWEST_AND_PREVIOUS} "  # noqa: S608 (`privacy.retained`'s constant, the profile purge's too)
     "SELECT v.cv_file_id FROM profile_versions v WHERE v.cv_file_id IS NOT NULL "
     "AND (v.id = CAST(:active AS bigint) OR v.id IN (SELECT version FROM newest) "
     "OR v.id IN (SELECT version FROM previous)) "
@@ -444,13 +519,7 @@ _ENDED_CYCLE_THREADS: Final = q(
 )
 # `score_history` (module docstring): the targets §20.1 lets go (L6304), ended in these states before the
 # cutoff; one page after `:after`, and a chunk's candidates `:ids` checked again under `active_config`.
-_ENDED_TARGET_STATES: Final = (
-    "published_accepted",
-    "published_contested",
-    *targets.RETRYABLE_STATES,
-    "expired_unscored",
-    "cancelled",
-)
+_ENDED_TARGET_STATES: Final = ENDED_TARGET_STATES
 _EXPIRED_HISTORY: Final = (
     "t.state = ANY(CAST(:states AS text[])) AND t.state_changed_at < :cutoff "  # noqa: S608
     "AND t.llm_tuple_id IS DISTINCT FROM (SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) "
@@ -488,6 +557,27 @@ async def _delete_rows(
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         return (await conn.execute(statement, dict(params))).rowcount
+
+
+async def _delete_lockouts(engine: AsyncEngine, cutoff: datetime, epoch: int) -> int:
+    """`login_lockouts` (module docstring), in one fenced transaction: the lockouts that ended before `cutoff`
+    deleted, and the `auth.lockout` alert resolved when the global one is among them; how many."""
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        scopes = list((await conn.execute(_ENDED_LOCKOUTS, {"cutoff": cutoff})).scalars())
+        if throttle.GLOBAL_SCOPE in scopes:
+            await resolve_alert(conn, code=throttle.LOCKOUT_ALERT_CODE, subject=throttle.GLOBAL_SCOPE)
+    return len(scopes)
+
+
+async def _delete_backup_records(engine: AsyncEngine, cutoff: datetime, epoch: int) -> int:
+    """`backup_records` (module docstring), in one fenced transaction: the runs, then the sets; the rows
+    deleted."""
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        runs = (await conn.execute(_BACKUP_RUNS, {"cutoff": cutoff})).rowcount
+        sets = (await conn.execute(_BACKUP_SETS, {"cutoff": cutoff})).rowcount
+    return runs + sets
 
 
 async def _delete_threads(saver: AsyncPostgresSaver, threads: Sequence[str]) -> None:
@@ -556,14 +646,6 @@ async def _purge_cycle_threads(
         after = int(batch[-1].id)
 
 
-def _months_before(t: datetime, months: int) -> datetime:
-    """`t` moved back `months` calendar months, its day clamped to the last of a shorter month (31 March less
-    one month is the last day of February)."""
-    year, month = divmod(t.year * 12 + t.month - 1 - months, 12)
-    month += 1
-    return t.replace(year=year, month=month, day=min(t.day, calendar.monthrange(year, month)[1]))
-
-
 async def _history_chunk(
     conn: AsyncConnection, page: Sequence[int], params: Mapping[str, object], now: datetime
 ) -> int:
@@ -592,7 +674,7 @@ async def _purge_score_history(engine: AsyncEngine, now: datetime, epoch: int) -
         months = (await active_settings(conn)).retention.score_history_months
     params: dict[str, object] = {
         "states": list(_ENDED_TARGET_STATES),
-        "cutoff": _months_before(now, months),
+        "cutoff": months_before(now, months),
         "listed_since": now - batches.RELEASED_LISTED_FOR,
     }
     deleted, after = 0, 0
@@ -754,6 +836,8 @@ async def _apply(
     epoch: int,
 ) -> int:
     cutoff = now - rule.window
+    if rule.name == "login_lockouts":
+        return await _delete_lockouts(engine, cutoff, epoch)
     if rule.name == "checkpoints":
         return await _purge_threads(engine, saver, cutoff, epoch)
     if rule.name == "profile_checkpoints":
@@ -766,12 +850,20 @@ async def _apply(
         return await _purge_cv_files(engine, cv_store, cutoff, now, epoch)
     if rule.name == "cv_store_orphans":
         return await _purge_orphans(engine, cv_store, cutoff, epoch)
+    if rule.name == "exports":
+        return await export.retain_exports(engine, now=now, epoch=epoch)
     if rule.name == "eval_runs":
         return await _delete_eval_runs(engine, cutoff, epoch)
     if rule.name == "score_history":
         return await _purge_score_history(engine, now, epoch)
+    if rule.name == "job_tombstones":
+        return await job_tombstone.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
+    if rule.name == "profile_purges":
+        return await profile_purge.open_due(engine, now=now, epoch=epoch, defer=defer_in_tx)
     if rule.name == "cycle_threads":
         return await _purge_cycle_threads(engine, saver, cutoff, epoch)
+    if rule.name == "backup_records":
+        return await _delete_backup_records(engine, cutoff, epoch)
     params: dict[str, object] = {"cutoff": cutoff}
     if rule.name == "batch_submissions":
         params["listed_since"] = now - batches.RELEASED_LISTED_FOR
@@ -821,9 +913,12 @@ async def run_retention_daily(
     rule name, `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
     `checkpoints`, `profile_checkpoints` and `cycle_threads` count threads, `cv_files` and `cv_store_orphans`
-    files, `score_history` targets. `queue` must be open; `cv_store` is the CV store whose files the two file
-    rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer the current worker
-    epoch: the pass stops before that write and writes nothing more (see "The epoch fence").
+    files, `score_history` targets, `job_tombstones` the root jobs whose tombstoning it opened,
+    `profile_purges` the versions whose purge it opened, `backup_records` the runs and sets it deleted.
+    `queue` must be open (`job_tombstones` and `profile_purges` defer their purges' jobs with
+    `defer_in_tx`); `cv_store` is the CV store whose files the two file rules delete. Raises `FencedOut`,
+    logged `retention_fenced`, once `epoch` is no longer the current worker epoch: the pass stops before that
+    write and writes nothing more (see "The epoch fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass

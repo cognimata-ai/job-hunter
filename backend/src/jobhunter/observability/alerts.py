@@ -1,44 +1,63 @@
 """Deduplicated alerts (spec §7.14, §17.6) and the open-alerts gauge.
 
 An alert is identified by `code` and `subject` (`dedup_key = "<code>:<subject>"`). While one is open, raising
-it again only counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial
-index `alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows.
+it again counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial index
+`alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows. A repeat with a
+higher severity escalates the open alert (M5 Task 2, O-ops O7; `catalogue.SEVERITIES` ranks them): it takes
+the new severity, message and context, and its `last_notified_at` and `acknowledged_at` are cleared so that
+the alert dispatcher, which pushes unacknowledged alerts only (§17.6 L5632), pushes the escalation at once:
+the user acknowledged the lower severity, not this one (controller ruling T2-1). A lower or equal severity
+changes nothing but the count; an acknowledgement stays. The severities and what each code does are
+`observability.catalogue`'s.
 
 `open_alert` opens one only when none is open, and counts no occurrence of an open one: for a state that a
 later check finds still true, not a new occurrence of it (a start that finds a key still missing).
 
-`acknowledge_alert` (M3 Task 13) stamps `acknowledged_at` on an open alert, once: the alert stays open, and an
-acknowledgement ends the score lane's pause on an unacknowledged `llm.reservation_bound_violated` or
-`llm.auth_failed` (`scoring.cycles.pause_reason`, Deviation 19).
+`acknowledge_alert` (M3 Task 13) stamps `acknowledged_at` on an open alert, once, and an acknowledgement ends
+the score lane's pause on an unacknowledged `llm.reservation_bound_violated` or `llm.auth_failed`
+(`scoring.cycles.pause_reason`, Deviation 19). The alert stays open, but one whose code is in
+`catalogue.RESOLVE_ON_ACK` (`llm.reservation_bound_violated`, §17.6 "manual acknowledgement") is resolved by
+it too, so its next occurrence opens a new row that pauses the lane and is pushed again (M5 Task 2, O-ops O6).
 
 `resolve_quiet_alerts` (M3 Task 18) resolves the open alerts of a code whose last occurrence is older than
-a given time: the quiet period after which a condition counts as cleared. `ever_raised` tells whether an alert
+a given time: the quiet period after which a condition counts as cleared. `open_subjects` (M5 Task 9) lists
+the subjects of a code's open alerts, read back from their keys, for a check that resolves every open alert
+whose condition no longer holds. `ever_raised` tells whether an alert
 was raised for a subject at all, open or resolved: an alert raised at most once per subject.
 
-All eight functions run on the caller's connection and leave the transaction to the caller: an alert is
+All nine functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Final, Literal
+from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.observability.catalogue import RESOLVE_ON_ACK, SEVERITIES, Severity
 from jobhunter.observability.metrics import ALERTS_OPEN
 from jobhunter.types import JSONValue
 
-Severity = Literal["info", "warn", "critical"]
-SEVERITIES: Final[tuple[Severity, ...]] = ("info", "warn", "critical")
-
+# A repeat's severity ranks above the open row's (`:ranks` is `SEVERITIES`, in rank order).
+_ESCALATES: Final = (
+    "array_position(CAST(:ranks AS text[]), EXCLUDED.severity) "
+    "> array_position(CAST(:ranks AS text[]), alerts.severity)"
+)
 # The conflict target repeats the index `alerts_open_dedup` of §7.14 exactly:
-# `(dedup_key) WHERE resolved_at IS NULL`.
+# `(dedup_key) WHERE resolved_at IS NULL`. Every assignment reads the row as it was before the update.
 _RAISE = q(
-    "INSERT INTO alerts (code, severity, dedup_key, message, context) "
+    "INSERT INTO alerts (code, severity, dedup_key, message, context) "  # noqa: S608 (constants)
     "VALUES (:code, :severity, :dedup_key, :message, :context) "
     "ON CONFLICT (dedup_key) WHERE resolved_at IS NULL "
-    "DO UPDATE SET occurrences = alerts.occurrences + 1, last_at = now() RETURNING id",
+    "DO UPDATE SET occurrences = alerts.occurrences + 1, last_at = now(), "
+    f"severity = CASE WHEN {_ESCALATES} THEN EXCLUDED.severity ELSE alerts.severity END, "
+    f"message = CASE WHEN {_ESCALATES} THEN EXCLUDED.message ELSE alerts.message END, "
+    f"context = CASE WHEN {_ESCALATES} THEN EXCLUDED.context ELSE alerts.context END, "
+    f"last_notified_at = CASE WHEN {_ESCALATES} THEN NULL ELSE alerts.last_notified_at END, "
+    f"acknowledged_at = CASE WHEN {_ESCALATES} THEN NULL ELSE alerts.acknowledged_at END "
+    "RETURNING id",
     jsonb=["context"],
 )
 _OPEN = q(
@@ -65,9 +84,15 @@ _RESOLVE_QUIET = q(
     "RETURNING id"
 )
 _EVER_RAISED = q("SELECT EXISTS (SELECT 1 FROM alerts WHERE dedup_key = :dedup_key)")
-# The first acknowledgement's time is kept: a repeated one changes nothing.
+# Every key of one code is `<code>:<subject>` (`_dedup_key`), so the subject follows the code and its colon.
+_OPEN_SUBJECTS = q(
+    "SELECT substr(dedup_key, length(code) + 2) FROM alerts WHERE code = :code AND resolved_at IS NULL"
+)
+# The first acknowledgement's time is kept: a repeated one changes nothing. A code of `RESOLVE_ON_ACK`
+# (`:resolve_on_ack`) is resolved at the same time.
 _ACKNOWLEDGE = q(
-    "UPDATE alerts SET acknowledged_at = coalesce(acknowledged_at, :now) "
+    "UPDATE alerts SET acknowledged_at = coalesce(acknowledged_at, :now), "
+    "resolved_at = CASE WHEN code = ANY(CAST(:resolve_on_ack AS text[])) THEN :now ELSE resolved_at END "
     "WHERE id = :id AND resolved_at IS NULL RETURNING acknowledged_at"
 )
 _OPEN_BY_SEVERITY = q(
@@ -90,8 +115,11 @@ async def raise_alert(
 ) -> int:
     """Open the alert `code`/`subject`, or count one more occurrence of the open one; returns its id.
 
-    The `severity`, `message` and `context` of the first raise stay: a repeat changes only `occurrences` and
-    `last_at`. `message` and `context` carry no PII (ids and counts only).
+    A repeat counts in `occurrences` and `last_at`. One with a higher `severity` than the open alert's
+    escalates it: the alert takes this `severity`, `message` and `context`, and `last_notified_at` and
+    `acknowledged_at` are cleared, so it is unacknowledged again and pushed at once; otherwise the open
+    alert's severity, message, context, notification and acknowledgement stay. It never de-escalates.
+    `message` and `context` carry no PII (ids and counts only).
     """
     result = await conn.execute(
         _RAISE,
@@ -101,6 +129,7 @@ async def raise_alert(
             "dedup_key": _dedup_key(code, subject),
             "message": message,
             "context": {} if context is None else dict(context),
+            "ranks": list(SEVERITIES),
         },
     )
     return int(result.scalar_one())
@@ -155,6 +184,11 @@ async def resolve_quiet_alerts(conn: AsyncConnection, *, code: str, since: datet
     return len((await conn.execute(_RESOLVE_QUIET, {"code": code, "since": since})).all())
 
 
+async def open_subjects(conn: AsyncConnection, *, code: str) -> list[str]:
+    """The subjects of the open alerts of `code`, in no particular order."""
+    return [str(subject) for subject in (await conn.execute(_OPEN_SUBJECTS, {"code": code})).scalars()]
+
+
 async def ever_raised(conn: AsyncConnection, *, code: str, subject: str) -> bool:
     """Whether the alert `code`/`subject` was ever raised, open or resolved: an alert raised at most once per
     subject (`admission.backlog_drain`, at most once a day, its subject the UTC date; M3 Task 18)."""
@@ -164,10 +198,10 @@ async def ever_raised(conn: AsyncConnection, *, code: str, subject: str) -> bool
 async def acknowledge_alert(conn: AsyncConnection, alert_id: int, *, now: datetime) -> datetime | None:
     """Acknowledge the open alert `alert_id` at `now` (module docstring); its `acknowledged_at`, or `None`
     when no open alert has that id (it does not exist or is resolved). An alert acknowledged before keeps its
-    first `acknowledged_at`, which a repeat returns."""
-    acknowledged: datetime | None = (
-        await conn.execute(_ACKNOWLEDGE, {"id": alert_id, "now": now})
-    ).scalar_one_or_none()
+    first `acknowledged_at`, which a repeat returns. An alert of `RESOLVE_ON_ACK` is resolved at `now` too, so
+    a repeat finds it resolved."""
+    params = {"id": alert_id, "now": now, "resolve_on_ack": sorted(RESOLVE_ON_ACK)}
+    acknowledged: datetime | None = (await conn.execute(_ACKNOWLEDGE, params)).scalar_one_or_none()
     return acknowledged
 
 

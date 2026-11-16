@@ -1,0 +1,88 @@
+# The compose test stack (plan M5 Tasks 21-28; spec §16.9, §18.2, §19.6, §19.8, §22; Deviation 41: these
+# cases run here, not in e2e.yml): the production compose file under the test overlay, on pull requests to main
+# and by hand. `PT`, `PB` and `S3` are the plan's command lines, as e2e.yml defines `DC`.
+#
+# The order: the dummy secrets of `.secrets/test` (scripts/test-secrets.sh as root; the stack fixtures create
+# the group 10010 when it is absent); the embedder's `fake` target, built once here as `jobhunter-embedder:e2e`
+# (JOBHUNTER_STACK_PREBUILT=embedder: the stack modules use it as it is and never build it); the stack modules
+# (C32, C37, C39, V20, V22, and N1 with the outside reach, JOBHUNTER_N1_OUTSIDE=1: a hosted runner has a
+# direct route out); the preceding release's app image, `jobhunter-app:prev` (scripts/build-prev-image.sh
+# reads the parent of the commit that added migration 0012, so the checkout fetches the whole history); the
+# upgrade-then-rollback and rotation drills as one module (each drill's fixture is function-scoped); and
+# the M5 acceptance smoke (scripts/smoke_m5.py, Task 33), which builds nothing and runs on the images the
+# stack modules and the drills built, from fresh projects it removes again at its end.
+# test_prod_network.py loads and deletes the nft table `inet jobhunter_egress` with `sudo -n nft`, the
+# runner image's nft (to verify at the first run). Every project goes with its volumes, its profiled services
+# (restore, the probes) and orphans included, as tests/support/prodstack.down_v removes them, and
+# `jobhunter-app:prev` is removed, in every case: each in a step of its own, so one failing leaves the next to
+# run.
+#
+# Supply chain as ci.yml: every action pinned to a full commit SHA (the release tag is the trailing comment),
+# uv to an exact version, the images to the digests of deploy/images.lock. No secret is referenced: the token
+# is read-only and the checkout does not keep it.
+name: Prod stack
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prodstack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prodstack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PT: >-
+        docker compose -p jobhunter-prodtest --env-file deploy/images.lock --env-file deploy/compose.test.env
+        -f deploy/compose.yaml -f deploy/compose.test.yaml
+      PB: >-
+        docker compose -p jobhunter-prodtest-b --env-file deploy/images.lock --env-file deploy/compose.test.env
+        -f deploy/compose.yaml -f deploy/compose.test.yaml
+      S3: docker compose -p jobhunter-s3stub --env-file deploy/images.lock -f deploy/compose.s3stub.yaml
+      # compose builds through buildx bake, which refuses the build_ca secret's /dev/null default (a hosted
+      # runner has no SSL_CERT_FILE) without a filesystem entitlement that compose cannot pass
+      BUILDX_BAKE_ENTITLEMENTS_FS: "0"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0 # build-prev-image.sh reads the parent of the commit that added 0012
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - name: The dummy secrets of the compose test stack
+        run: sudo scripts/test-secrets.sh
+      - name: The embedder's fake target, which the stack modules use as built
+        run: $PT build embedder
+      - name: The stack modules (C32, C37, C39, V20, V22, and N1 with the outside reach)
+        run: >-
+          JOBHUNTER_N1_OUTSIDE=1 JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q
+          tests/stack/test_backup_image.py tests/stack/test_prod_stack.py tests/stack/test_prod_network.py
+          tests/stack/test_prod_backup.py tests/stack/test_prod_restore.py
+      - name: The preceding release's app image, jobhunter-app:prev
+        run: scripts/build-prev-image.sh
+      - name: The drills (upgrade then rollback, rotation)
+        run: JOBHUNTER_STACK_PREBUILT=embedder uv run pytest -m stack -q tests/stack/test_prod_drills.py
+      - name: The M5 acceptance smoke (thirteen checks on the images built above; it removes its projects)
+        run: uv run python scripts/smoke_m5.py
+      - name: Remove PT and its volumes
+        if: always()
+        run: $PT --profile "*" down -v --remove-orphans
+      - name: Remove PB and its volumes
+        if: always()
+        run: $PB --profile "*" down -v --remove-orphans
+      - name: Remove the S3 stand-in and its volumes
+        if: always()
+        run: $S3 --profile "*" down -v --remove-orphans
+      # Task 27's drill leaves the image tagged; it is absent only when an earlier step failed before building it
+      - name: Remove jobhunter-app:prev
+        if: always()
+        run: if docker image inspect jobhunter-app:prev >/dev/null 2>&1; then docker image rm jobhunter-app:prev; fi

@@ -22,6 +22,7 @@ from jobhunter.graphs.score.nodes.claim import Claimed
 from jobhunter.scoring.admission import Picked
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.m3 import active_ids, insert_attempt, insert_cycle, insert_draft, insert_scoring_call
 from tests.support.scoring import (
@@ -91,10 +92,7 @@ async def test_the_claim_skips_fenced_and_backed_off_targets(
 ) -> None:
     fenced, backed_off, exhausted, free = pending_targets
     async with engine.begin() as conn:
-        await conn.execute(
-            sa.text("INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', :jobs, 1)"),
-            {"jobs": [fenced.job_id]},
-        )
+        await insert_test_fence(conn, kind="jobs", job_ids=[fenced.job_id])
         await conn.execute(
             sa.text("UPDATE score_targets SET not_before = :later WHERE id = :t"),
             {"later": utcnow() + timedelta(hours=1), "t": backed_off.target_id},

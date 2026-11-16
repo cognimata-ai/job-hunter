@@ -10,11 +10,14 @@ import pytest
 from jobhunter.config import (
     ALL_SECRETS,
     ROLE_SECRETS,
+    AppConfig,
+    ResticSettings,
     Role,
     StartupCheckFailed,
     load_config,
     run_startup_assertions,
 )
+from jobhunter.privacy.operator import FIELDS
 
 
 def b64(n: int, fill: bytes = b"k") -> bytes:
@@ -25,6 +28,7 @@ def write_secrets(d: Path, **files: bytes) -> Path:
     d.mkdir(exist_ok=True)
     for name, value in files.items():
         p = d / name
+        p.unlink(missing_ok=True)  # replaced, not edited: a non-root owner cannot write a 0440 file
         p.write_bytes(value)
         p.chmod(0o440)
     return d
@@ -38,7 +42,16 @@ BASE_ENV = {
     "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
 }
 API_SECRETS = {"session_secret": b64(32, b"s"), "data_key": b64(32, b"d"), "db_app": b"pw"}
+# M5 Task 5 (O5): a prod worker's ping URL ends in the check's uuid; a low-entropy stand-in.
+HC_PING_URL = "https://hc-ping.example/00000000-0000-4000-8000-000000000001"
 WORKER_SECRETS = {"data_key": b64(32), "db_app": b"pw"}
+
+
+def operator_env(tmp_path: Path) -> dict[str, str]:
+    """M5 follow-ups Task F1: a valid operator file, which a prod api needs (`operator_file`)."""
+    path = tmp_path / "operator.json"
+    path.write_text(json.dumps(dict.fromkeys(FIELDS, "x")), encoding="utf-8")
+    return {"JOBHUNTER_OPERATOR_FILE": str(path)}
 
 
 def check_of(role: Role, env: dict[str, str], secrets_dir: Path) -> str:
@@ -333,17 +346,135 @@ def test_tracing_with_all_langsmith_requirements_met_passes(
         "LANGSMITH_HIDE_OUTPUTS": "true",
         "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
     }
-    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)))
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
     # a legacy endpoint alias that is the EU endpoint too is fine
     env["LANGCHAIN_ENDPOINT"] = "https://eu.api.smith.langchain.com"
-    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **secrets)))
+
+
+# --- M5 Task 6 (O15, Q15): tracing needs its key from the secret file, one endpoint and no sampling --------
+
+TRACING_ENV = {
+    "LANGSMITH_TRACING": "true",
+    "LANGSMITH_HIDE_INPUTS": "true",
+    "LANGSMITH_HIDE_OUTPUTS": "true",
+    "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+}
+LANGSMITH_KEY = b"lsv2-test-key"  # a low-entropy stand-in: no secret scanner reads it as a key
+
+
+def langsmith_failure(
+    tmp_path: Path, env_extra: dict[str, str], secrets: dict[str, bytes]
+) -> StartupCheckFailed:
+    env = {**BASE_ENV, **TRACING_ENV, **env_extra}
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
+    return exc.value
+
+
+@pytest.mark.parametrize("key", [None, b"", b"\n"])
+def test_tracing_without_langsmith_key_is_refused(tmp_path: Path, key: bytes | None) -> None:
+    secrets = WORKER_SECRETS if key is None else {**WORKER_SECRETS, "langsmith_key": key}
+    failure = langsmith_failure(tmp_path, {}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", "tracing needs the langsmith_key secret")
+    # without tracing a worker needs no key (it is optional)
+    run_startup_assertions(load_config("worker", BASE_ENV, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_RUNS_ENDPOINTS", "LANGCHAIN_RUNS_ENDPOINTS"])
+@pytest.mark.parametrize("value", ['[{"api_url": "https://replica.example", "api_key": "x"}]', ""])
+def test_runs_endpoints_are_refused(tmp_path: Path, name: str, value: str) -> None:
+    """A write replica is a second destination the endpoint check never sees: set at all, it is refused, and
+    the detail names the variable, never its value."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: value}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+    assert "replica" not in str(failure)
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"])
+def test_api_key_variables_are_refused(tmp_path: Path, name: str) -> None:
+    """The key comes from the `langsmith_key` secret file only, never from the environment."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: "lsv2-env-key"}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+    assert "lsv2-env-key" not in str(failure)
+    both = langsmith_failure(tmp_path / "both", {"LANGSMITH_API_KEY": "a", "LANGCHAIN_API_KEY": "b"}, secrets)
+    assert both.detail == "tracing needs LANGCHAIN_API_KEY, LANGSMITH_API_KEY unset"
+
+
+@pytest.mark.parametrize("name", ["LANGSMITH_TRACING_SAMPLING_RATE", "LANGCHAIN_TRACING_SAMPLING_RATE"])
+@pytest.mark.parametrize("rate", ["0.25", "1.0"])
+def test_a_sampling_rate_is_refused(tmp_path: Path, name: str, rate: str) -> None:
+    """No sampling (Q15): every trace is sent, so no rate may be set, not even 1.0."""
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    failure = langsmith_failure(tmp_path, {name: rate}, secrets)
+    assert (failure.check, failure.detail) == ("langsmith_config", f"tracing needs {name} unset")
+
+
+def test_the_widened_langsmith_check_keeps_its_place_in_the_order(tmp_path: Path) -> None:
+    """The hide flags and the endpoint are checked first, then the key; and `langsmith_config` still comes
+    before the key material's checks."""
+    wrong_endpoint = {"LANGSMITH_ENDPOINT": "https://api.smith.langchain.com", "LANGSMITH_API_KEY": "x"}
+    failure = langsmith_failure(tmp_path, wrong_endpoint, WORKER_SECRETS)
+    assert (failure.check, failure.detail) == (
+        "langsmith_config",
+        "tracing needs a correct LANGSMITH_ENDPOINT",
+    )
+    short_key = {**WORKER_SECRETS, "data_key": b64(16)}
+    assert langsmith_failure(tmp_path / "t", {}, short_key).check == "langsmith_config"
+
+
+EXIT_VARS = ("LANGSMITH_USE_DAEMON", "LANGSMITH_DISABLE_RUN_COMPRESSION")
+
+
+@pytest.mark.parametrize(
+    ("values", "refused"),
+    [
+        ({}, ["LANGSMITH_USE_DAEMON", "LANGSMITH_DISABLE_RUN_COMPRESSION"]),
+        ({"LANGSMITH_USE_DAEMON": "true"}, ["LANGSMITH_DISABLE_RUN_COMPRESSION"]),
+        ({"LANGSMITH_DISABLE_RUN_COMPRESSION": "true"}, ["LANGSMITH_USE_DAEMON"]),
+        ({"LANGSMITH_USE_DAEMON": "True", "LANGSMITH_DISABLE_RUN_COMPRESSION": "1"}, list(EXIT_VARS)),
+        ({"LANGSMITH_USE_DAEMON": "", "LANGSMITH_DISABLE_RUN_COMPRESSION": "true"}, ["LANGSMITH_USE_DAEMON"]),
+    ],
+)
+def test_a_prod_worker_that_traces_needs_daemon_threads_and_no_compression(
+    tmp_path: Path, values: dict[str, str], refused: list[str]
+) -> None:
+    """Ruling T21-3 I3: the SDK's threads are daemons and its compression's pool is unused, so an unreachable
+    LangSmith never holds a prod worker's exit. `true` exactly: the SDK compares `USE_DAEMON` with it."""
+    env = {**BASE_ENV, **TRACING_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL, **values}
+    secrets = {**PROD_WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **secrets)))
+    assert (exc.value.check, exc.value.detail) == (
+        "langsmith_config",
+        f"tracing in prod needs {', '.join(refused)} true",
+    )
+    run_startup_assertions(
+        load_config(
+            "worker", {**env, **dict.fromkeys(EXIT_VARS, "true")}, write_secrets(tmp_path / "t", **secrets)
+        )
+    )
+
+
+def test_the_exit_settings_bind_a_prod_worker_that_traces_only(tmp_path: Path) -> None:
+    """Without tracing, or outside prod, neither variable is needed (no other role may trace: the api, for
+    one, is never given the key)."""
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    run_startup_assertions(load_config("worker", prod, write_secrets(tmp_path / "a", **PROD_WORKER_SECRETS)))
+    secrets = {**WORKER_SECRETS, "langsmith_key": LANGSMITH_KEY}
+    for env_name in ("dev", "test"):
+        env = {**BASE_ENV, **TRACING_ENV, "JOBHUNTER_ENV": env_name}
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / env_name, **secrets)))
 
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:
-    hc = {"healthchecks_ping_url": b"https://hc.example/ping/x", "healthchecks_api_key": b"k"}
-    cfg = load_config(
-        "worker", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "s", **WORKER_SECRETS, **hc)
-    )
+    hc = {"healthchecks_ping_url": HC_PING_URL.encode(), "healthchecks_api_key": b"k"}
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": "https://ntfy.example/jh-topic"}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS, **hc))
     run_startup_assertions(cfg)
 
 
@@ -497,7 +628,8 @@ def origin_failure(tmp_path: Path, env_name: str, origin: str) -> StartupCheckFa
 )
 def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name: str, origin: str) -> None:
     d = write_secrets(tmp_path / "s", **API_SECRETS)
-    cfg = load_config("api", {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin}, d)
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin, **operator_env(tmp_path)}
+    cfg = load_config("api", env, d)
     run_startup_assertions(cfg)
     assert cfg.public_origin == origin
 
@@ -705,6 +837,72 @@ def test_parse_jobs_dir_defaults_to_the_tmpfs_and_follows_the_environment(tmp_pa
     assert load_config("worker", env, secrets).parse_jobs_dir == tmp_path / "parse"
 
 
+# --- M5 Task 9: the deletion manifests' and the exports' volumes (R18) -------------------------------------
+
+
+def test_manifests_and_exports_dirs_default_to_the_volumes_and_follow_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    cfg = load_config("worker", BASE_ENV, secrets)
+    assert (cfg.manifests_dir, cfg.exports_dir) == (Path("/data/manifests"), Path("/data/exports"))
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_MANIFESTS_DIR": str(tmp_path / "manifests"),
+        "JOBHUNTER_EXPORTS_DIR": str(tmp_path / "exports"),
+    }
+    cfg = load_config("worker", env, secrets)
+    assert (cfg.manifests_dir, cfg.exports_dir) == (tmp_path / "manifests", tmp_path / "exports")
+
+
+# --- M5 Task 10: the backup container's staging directory and restic repository ----------------------------
+
+BACKUP_SECRETS = {"db_backup": b"b", "db_restore": b"r", "restic_password": b"p"}
+
+
+def test_staging_dir_and_restic_default_to_the_volume_and_no_repository(tmp_path: Path) -> None:
+    cfg = load_config("backup", BASE_ENV, write_secrets(tmp_path / "s", **BACKUP_SECRETS))
+    assert (cfg.staging_dir, cfg.restic) == (Path("/data/staging"), None)
+    # An empty repository variable is no repository either.
+    empty = load_config("backup", {**BASE_ENV, "RESTIC_REPOSITORY": ""}, tmp_path / "s")
+    assert empty.restic is None
+
+
+def test_restic_settings_follow_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **BACKUP_SECRETS)
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_STAGING_DIR": str(tmp_path / "staging"),
+        "RESTIC_REPOSITORY": "s3:https://s3.example.test/bucket",
+        "AWS_DEFAULT_REGION": "eu-central-1",
+    }
+    cfg = load_config("backup", env, secrets)
+    assert cfg.staging_dir == tmp_path / "staging"
+    assert cfg.restic == ResticSettings(
+        repository="s3:https://s3.example.test/bucket",
+        region="eu-central-1",
+        cache_dir=tmp_path / "staging" / ".restic-cache",  # the cache lives in the staging volume by default
+    )
+    elsewhere = load_config(
+        "restore",
+        {**env, "AWS_DEFAULT_REGION": "", "RESTIC_CACHE_DIR": str(tmp_path / "cache")},
+        write_secrets(tmp_path / "r", db_migrator=b"m", restic_password=b"p"),
+    )
+    assert elsewhere.restic == ResticSettings("s3:https://s3.example.test/bucket", None, tmp_path / "cache")
+
+
+def test_environ_keeps_restic_and_the_region_but_never_an_s3_key(tmp_path: Path) -> None:
+    env = {
+        **BASE_ENV,
+        "RESTIC_REPOSITORY": "/data/restic-repo",
+        "RESTIC_CACHE_DIR": "/var/cache/restic",
+        "AWS_DEFAULT_REGION": "eu-central-1",
+        # The S3 keys come from the secret files only (R13): never loaded from the environment.
+        "AWS_ACCESS_KEY_ID": "AKIDNOTAKEY",
+        "AWS_SECRET_ACCESS_KEY": "not-a-secret",
+    }
+    cfg = load_config("backup", env, write_secrets(tmp_path / "s", **BACKUP_SECRETS))
+    assert set(cfg.environ) == set(BASE_ENV) | {"RESTIC_REPOSITORY", "RESTIC_CACHE_DIR", "AWS_DEFAULT_REGION"}
+
+
 # --- M4 Task 19: the built SPA the api serves (`JOBHUNTER_SPA_DIR`) ---------------------------------------
 
 
@@ -732,5 +930,281 @@ def test_anthropic_log_debug_or_info_is_refused_in_prod(tmp_path: Path, value: s
 @pytest.mark.parametrize(("env_name", "value"), [("prod", "warning"), ("prod", ""), ("dev", "debug")])
 def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: str) -> None:
     # outside prod the app's logging setup holds the SDK's loggers at WARNING (tests/unit/test_redact.py)
-    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value}
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value, **operator_env(tmp_path)}
     run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))
+
+
+# --- M5 Task 4: the ntfy topic and the healthchecks Management API base (O4, Deviation 11) -----------------
+
+TOPIC_URL = "https://ntfy.example/jh-alerts-4f2a9c"
+PROD_WORKER_SECRETS = {
+    **WORKER_SECRETS,
+    "healthchecks_ping_url": HC_PING_URL.encode(),  # the uuid form (M5 Task 5, O5)
+    "healthchecks_api_key": b"k",
+}
+
+
+def test_ntfy_topic_url_and_healthchecks_api_url_are_loaded(tmp_path: Path) -> None:
+    from jobhunter.config import DEFAULT_HEALTHCHECKS_API_URL
+
+    assert DEFAULT_HEALTHCHECKS_API_URL == "https://healthchecks.io/api/v3"
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    bare = load_config("worker", BASE_ENV, secrets)
+    assert (bare.ntfy_topic_url, bare.healthchecks_api_url) == (None, DEFAULT_HEALTHCHECKS_API_URL)
+    # read by these exact names, which carry none of the prefixes
+    env = {**BASE_ENV, "NTFY_TOPIC_URL": TOPIC_URL, "HEALTHCHECKS_API_URL": "https://hc.example/api/v3"}
+    cfg = load_config("worker", env, secrets)
+    assert (cfg.ntfy_topic_url, cfg.healthchecks_api_url) == (TOPIC_URL, "https://hc.example/api/v3")
+    # an empty variable counts as unset; another spelling is not read
+    empty = load_config("worker", {**BASE_ENV, "NTFY_TOPIC_URL": "", "HEALTHCHECKS_API_URL": ""}, secrets)
+    assert (empty.ntfy_topic_url, empty.healthchecks_api_url) == (None, DEFAULT_HEALTHCHECKS_API_URL)
+    other = load_config("worker", {**BASE_ENV, "ntfy_topic_url": TOPIC_URL, "NTFY_TOPIC": TOPIC_URL}, secrets)
+    assert other.ntfy_topic_url is None and set(other.environ) == set(BASE_ENV)
+
+
+@pytest.mark.parametrize(
+    ("topic", "passes"),
+    [
+        (None, False),  # unset
+        ("http://ntfy.example/jh-alerts", False),  # not https
+        ("https:///jh-alerts", False),  # no host
+        ("ntfy.example/jh-alerts", False),  # no scheme
+        ("https://[::1/jh-alerts", False),  # not a URL at all
+        # fix round 1 (review M2): read as httpx reads it, so what passes, a push can be built from
+        ("https://ntfy.example:abc/jh-alerts", False),  # httpx.InvalidURL
+        ("https://ntfy.example:70000/jh-alerts", False),  # no such port
+        ("https://ntfy.example:0/jh-alerts", False),
+        (TOPIC_URL, True),
+        ("https://ntfy.example:8443/jh-alerts", True),
+        ("HTTPS://ntfy.example/jh-alerts", True),  # httpx lower-cases the scheme
+    ],
+)
+def test_ntfy_in_prod_requires_an_https_topic(tmp_path: Path, topic: str | None, passes: bool) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod"} | ({} if topic is None else {"NTFY_TOPIC_URL": topic})
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS))
+    if passes:
+        run_startup_assertions(cfg)
+        return
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(cfg)
+    assert (exc.value.check, exc.value.detail) == (
+        "ntfy_in_prod",
+        "a prod worker needs an https NTFY_TOPIC_URL",
+    )
+    assert topic is None or topic not in str(exc.value)  # names the variable, never its value
+
+
+def test_ntfy_in_prod_runs_after_healthchecks_in_prod_and_only_for_a_prod_worker(tmp_path: Path) -> None:
+    # a prod worker missing both: the healthchecks check comes first (O4)
+    assert check_of(
+        "worker", {**BASE_ENV, "JOBHUNTER_ENV": "prod"}, write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    ) == ("healthchecks_in_prod")
+    # a worker outside prod, and the api in prod, need no topic; an http one is fine outside prod
+    for env_name in ("dev", "test"):
+        env = {**BASE_ENV, "JOBHUNTER_ENV": env_name}
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+        env["NTFY_TOPIC_URL"] = "http://127.0.0.1:8090/jh-alerts"
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
+    run_startup_assertions(
+        load_config(
+            "api",
+            {**BASE_ENV, "JOBHUNTER_ENV": "prod", **operator_env(tmp_path)},
+            write_secrets(tmp_path / "a", **API_SECRETS),
+        )
+    )
+
+
+def test_the_topic_url_is_masked_in_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from jobhunter.config import startup_or_exit
+    from jobhunter.observability.logging import configure_logging, get_logger
+    from jobhunter.observability.redact import mask_text
+
+    topic = "https://ntfy.example/jhalertsprivate"  # no digit: the whole URL is what is registered
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    for name, value in {**BASE_ENV, "JOBHUNTER_SECRETS_DIR": str(d), "NTFY_TOPIC_URL": topic}.items():
+        monkeypatch.setenv(name, value)
+    assert mask_text(f"POST {topic}") == f"POST {topic}"  # no pattern knows it
+
+    cfg = startup_or_exit("worker")
+
+    assert cfg.ntfy_topic_url == topic
+    assert mask_text(f"POST {topic}") == "POST [SECRET]"
+    assert mask_text(f"POST {TOPIC_URL}") == f"POST {TOPIC_URL}"  # only the configured topic
+    buffer = io.StringIO()
+    configure_logging("INFO", stream=buffer)
+    try:
+        get_logger("jobhunter.test").info("ntfy_probe", url=topic, nested={"error": f"refused {topic}/json"})
+    finally:
+        configure_logging("INFO")
+    [line] = buffer.getvalue().splitlines()
+    event = json.loads(line)
+    assert (event["url"], event["nested"]) == ("[SECRET]", {"error": "refused [SECRET]/json"})
+    assert topic not in line
+
+
+# --- Fix round 1 (review M2): the ntfy token is sent as a header value -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "tök-token".encode(),  # not ASCII
+        b"tk test token",  # a space
+        b"tk-test\x01token",  # a control character
+        b"tk-test\r\nX-Injected: 1",  # a header line of its own
+        b"tk-test-token\x7f",  # DEL
+    ],
+)
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_the_ntfy_token_must_be_a_header_value(tmp_path: Path, token: bytes, env_name: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS, ntfy_token=token)
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, secrets))
+    assert (exc.value.check, exc.value.detail) == (
+        "ntfy_token_header_safe",
+        "ntfy_token must be visible ASCII, without spaces or control characters",
+    )
+    assert token.decode("utf-8", errors="replace").strip() not in str(exc.value)  # never the value
+
+
+@pytest.mark.parametrize("token", [b"tk-test-token", b"tk-test-token\n", b"  tk-test-token  ", b"\n"])
+def test_a_visible_ascii_ntfy_token_or_none_passes(tmp_path: Path, token: bytes) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = write_secrets(tmp_path / "s", **PROD_WORKER_SECRETS, ntfy_token=token)
+    run_startup_assertions(
+        load_config("worker", env, secrets)
+    )  # outer whitespace is stripped, as by the worker
+
+
+# --- M5 Task 5: the ping URL's form (O5) --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ping_url", "passes"),
+    [
+        (HC_PING_URL, True),
+        ("https://hc-ping.example:8443/ping/00000000-0000-4000-8000-000000000001", True),  # self-hosted
+        ("https://hc-ping.example/pingkeyxyz/collection", False),  # the slug form: no uuid to manage
+        ("https://hc-ping.example/00000000-0000-4000-8000-000000000001/fail", False),
+        ("http://hc-ping.example/00000000-0000-4000-8000-000000000001", False),  # not https
+        ("hc-ping.example/00000000-0000-4000-8000-000000000001", False),  # no scheme
+        ("https://[::1/00000000-0000-4000-8000-000000000001", False),  # not a URL at all
+    ],
+)
+def test_healthchecks_ping_url_form_refuses_a_slug_url_in_prod(
+    tmp_path: Path, ping_url: str, passes: bool
+) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "NTFY_TOPIC_URL": TOPIC_URL}
+    secrets = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": ping_url.encode()}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **secrets))
+    if passes:
+        run_startup_assertions(cfg)
+        return
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(cfg)
+    assert (exc.value.check, exc.value.detail) == (
+        "healthchecks_ping_url_form",
+        "healthchecks_ping_url must be an https URL that ends in the check's uuid",
+    )
+    assert ping_url not in str(exc.value) and "hc-ping" not in str(
+        exc.value
+    )  # the secret's name, never its value
+    # outside prod a worker starts with it (and without a dead-man: `observability.deadman`)
+    for env_name in ("dev", "test"):
+        other = load_config(
+            "worker", {**env, "JOBHUNTER_ENV": env_name}, write_secrets(tmp_path / "t", **secrets)
+        )
+        run_startup_assertions(other)
+
+
+def test_healthchecks_ping_url_form_comes_right_after_healthchecks_in_prod(tmp_path: Path) -> None:
+    """Part of §16.8 check 8 (O5): after the presence of both secrets, before `ntfy_in_prod`."""
+    slug = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": b"https://hc-ping.example/pingkeyxyz/collection"}
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod"}  # no NTFY_TOPIC_URL either
+    assert check_of("worker", prod, write_secrets(tmp_path / "s", **slug)) == "healthchecks_ping_url_form"
+    no_key = {k: v for k, v in slug.items() if k != "healthchecks_api_key"}
+    assert check_of("worker", prod, write_secrets(tmp_path / "t", **no_key)) == "healthchecks_in_prod"
+
+
+# --- M5 Task 5 pre-review fix (Ruling T5-3): where the API key goes -----------------------------------------
+
+# Refused wherever the key is set (fix round 1, Ruling T5-5: the scheme alone depends on the env).
+UNSAFE_API_URLS = (
+    "https:///api/v3",  # no host
+    "http:///api/v3",
+    "https://jh:jh@healthchecks.example/api/v3",  # user information
+    "http://jh@healthchecks.example/api/v3",  # a user alone
+    "https://healthchecks.example:0/api/v3",  # no such port
+    "http://healthchecks.example:70000/api/v3",
+    "https://healthchecks.example:abc/api/v3",  # httpx.InvalidURL
+    "healthchecks.example/api/v3",  # no scheme
+    "ftp://healthchecks.example/api/v3",  # no web URL
+)
+HTTP_API_URLS = ("http://healthchecks.example/api/v3", "http://stubsvc:8099/hc/api/v3")  # Task 21's stand-in
+
+
+def api_url_refusal(env_name: str) -> str:
+    scheme = "an https" if env_name == "prod" else "an http or https"
+    return (
+        f"HEALTHCHECKS_API_URL must be {scheme} URL with a host, a port from 1 to 65535 when one is given, "
+        "and no user information"
+    )
+
+
+def api_url_config(tmp_path: Path, env_name: str, api_url: str | None, *, key: bool = True) -> AppConfig:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "NTFY_TOPIC_URL": TOPIC_URL}
+    if api_url is not None:
+        env["HEALTHCHECKS_API_URL"] = api_url
+    secrets = PROD_WORKER_SECRETS if key else WORKER_SECRETS
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return load_config("worker", env, write_secrets(tmp_path / "s", **secrets))
+
+
+@pytest.mark.parametrize("api_url", UNSAFE_API_URLS)
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_healthchecks_api_url_safe_refuses_an_unsafe_url_where_the_key_goes(
+    tmp_path: Path, api_url: str, env_name: str
+) -> None:
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(api_url_config(tmp_path, env_name, api_url))
+    assert (exc.value.check, exc.value.detail) == ("healthchecks_api_url_safe", api_url_refusal(env_name))
+    assert api_url not in str(exc.value) and "healthchecks.example" not in str(exc.value)  # never the URL
+
+
+@pytest.mark.parametrize("api_url", HTTP_API_URLS)
+def test_an_http_api_url_passes_outside_prod_and_is_refused_in_prod(tmp_path: Path, api_url: str) -> None:
+    """Fix round 1, Ruling T5-5: the compose test stack runs `JOBHUNTER_ENV=test` with an http stand-in."""
+    for env_name in ("dev", "test"):
+        run_startup_assertions(api_url_config(tmp_path / env_name, env_name, api_url))
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(api_url_config(tmp_path / "prod", "prod", api_url))
+    assert (exc.value.check, exc.value.detail) == ("healthchecks_api_url_safe", api_url_refusal("prod"))
+    assert api_url not in str(exc.value) and "stubsvc" not in str(exc.value)
+
+
+@pytest.mark.parametrize("env_name", ["prod", "dev", "test"])
+def test_the_default_or_an_https_api_url_passes_and_without_the_key_nothing_is_checked(
+    tmp_path: Path, env_name: str
+) -> None:
+    run_startup_assertions(api_url_config(tmp_path / "default", env_name, None))  # healthchecks.io's v3 API
+    for n, api_url in enumerate(
+        ("https://healthchecks.example/api/v3", "https://healthchecks.example:8443/x")
+    ):
+        run_startup_assertions(api_url_config(tmp_path / f"https{n}", env_name, api_url))
+    if env_name == "prod":
+        return  # a prod worker needs the key (`healthchecks_in_prod`)
+    for n, api_url in enumerate(UNSAFE_API_URLS):  # the API URL is unused without the key: nothing to check
+        run_startup_assertions(api_url_config(tmp_path / f"nokey{n}", env_name, api_url, key=False))
+
+
+def test_healthchecks_api_url_safe_comes_right_after_the_ping_url_form(tmp_path: Path) -> None:
+    prod = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "HEALTHCHECKS_API_URL": "http://healthchecks.example/api/v3"}
+    slug = {**PROD_WORKER_SECRETS, "healthchecks_ping_url": b"https://hc-ping.example/pingkeyxyz/collection"}
+    assert check_of("worker", prod, write_secrets(tmp_path / "s", **slug)) == "healthchecks_ping_url_form"
+    # a right ping URL, an http API URL and no topic: the API URL is refused before the topic is checked
+    assert check_of("worker", prod, write_secrets(tmp_path / "t", **PROD_WORKER_SECRETS)) == (
+        "healthchecks_api_url_safe"
+    )

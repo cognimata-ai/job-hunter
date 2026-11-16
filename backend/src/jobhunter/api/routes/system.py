@@ -3,7 +3,8 @@ manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), needs attention and
 items (§14.2 L5040-5042; plan M4 Task 12); and `/api/ats-snapshots`' acknowledgement (L5044), for a
 logged-in session.
 
-- `GET /api/system/health`: readiness, runs, queues, the score lane, alerts, sizes and versions.
+- `GET /api/system/health`: readiness, runs, the backups, offsite manifests and restore tests, queues, the
+  score lane, alerts, sizes, versions and the LangSmith tracing state.
 - `GET /api/system/quota` → per provider its current window with the window's counted usage, its reserved,
   ambiguous and adjustment units and its bucket, `null` without a current window
   (`observability.lists.quota_summary`), in one read snapshot (`db.snapshot.read_snapshot`).
@@ -34,6 +35,16 @@ logged-in session.
   kept and fetched at most `RAW_BODY_TTL` ago; at most 500, lowest first), then `request_replay`, whose dedup
   key makes the same set reuse its live operation. `items` is how many ids it queued; none (also a running
   run's items only) is 409 `conflict_state`.
+
+- `POST /api/system/purges/{operation_id}/retry` → 202 `{operation_id, manifest_id}` (plan M5 Task 18, D6,
+  D8, Deviation 17; not keyed, as retry-apply): the retry of a failed purge, which Needs attention lists. In
+  one transaction: the operation must be a `purge` one (else 404 `not_found`), its manifest (its payload's)
+  `executing` (else 409 `conflict_state`), and none of its purge operations `pending` or `running`; then a
+  new `purge` operation with the same payload and dedup key, its job deferred (`create_operation`, whose
+  dedup refuses a second live one: 409 too, for a live one or a retry that raced this one). The failed one
+  stays as it is, and so does the manifest's fence: it stays active throughout (D6). The edge lets the retry
+  through delete-everything's `global` fence (`edge.fence_exempt`): it is the only recovery of a failed
+  delete-everything, whose fence stays.
 
 The second router, `ats_snapshots_router` (`/api/ats-snapshots`):
 - `POST /api/ats-snapshots/{snapshot_id}/acknowledge` → 200 `{snapshot_id, closed}`
@@ -71,18 +82,23 @@ from jobhunter.availability import snapshots
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
+from jobhunter.db.sql import q
 from jobhunter.embeddings import EmbedderClient
 from jobhunter.errors import DomainError
 from jobhunter.observability import attention, lists, status
 from jobhunter.observability.attention import AttentionOut
 from jobhunter.observability.health import SystemHealthOut, check_readiness, system_health
 from jobhunter.observability.lists import QuotaDetailOut
+from jobhunter.observability.logging import get_logger
 from jobhunter.observability.status import StatusOut
+from jobhunter.privacy.purge import manifest_id_of
 from jobhunter.quota.windows import Provider
 from jobhunter.scoring import cycles
 from jobhunter.scoring.admission import any_admissible
 from jobhunter.scoring.cycles import PauseReason
 from jobhunter.sources import replay
+from jobhunter.types import get_object
+from jobhunter.worker.operations import PURGE_KIND, create_operation
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
@@ -90,12 +106,18 @@ ats_snapshots_router = APIRouter(
     prefix="/api/ats-snapshots", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES
 )
 
+log = get_logger("jobhunter.api.system")
+
 SCORE_CYCLE_ROUTE: Final = "system.score_cycle"
 NO_PENDING: Final = "no_pending"
 _BIGINT_MAX: Final = 2**63 - 1
 
 RawId = Annotated[int, Field(ge=1, le=_BIGINT_MAX)]
 SnapshotId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of an ATS snapshot")]
+OperationId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a failed purge operation")]
+
+_OPERATION: Final = q("SELECT kind, payload, dedup_key FROM operations WHERE id = :i")
+_MANIFEST_STATUS: Final = q("SELECT status FROM deletion_manifests WHERE id = :m")
 
 
 class ScoreCycleQueuedOut(BaseModel):
@@ -130,6 +152,13 @@ class ReplayQueuedOut(BaseModel):
     items: int
 
 
+class PurgeRetryOut(BaseModel):
+    """The new purge operation, and the deletion it carries on."""
+
+    operation_id: int
+    manifest_id: int
+
+
 class SnapshotAcknowledgedOut(BaseModel):
     """The acknowledged snapshot and how many postings of its mass disappearance closed (0 for an event that
     is no longer open)."""
@@ -145,8 +174,10 @@ async def get_system_health(
     embedder: Annotated[EmbedderClient, Depends(get_embedder)],
     cfg: Annotated[AppConfig, Depends(get_config)],
 ) -> SystemHealthOut:
-    """Readiness, run ages and their state, queue depths, the score lane, open alerts, disk and table sizes,
-    versions, and the embedder's health and model id."""
+    """Readiness, run ages and their state, the latest backup set and the backup age state, the latest offsite
+    manifest shipment and the manifests not shipped yet, the latest restore test and its age state, queue
+    depths, the score lane, open alerts, disk and table sizes, versions, the embedder's health and model id,
+    and the LangSmith tracing state the worker published."""
     now = utcnow()
     # Readiness first, on a connection it returns before this route takes one: one pool connection at a time.
     readiness = await check_readiness(engine, code_head=code_head, now=now, embedder=embedder)
@@ -276,6 +307,61 @@ async def replay_raw_items(
             raise Problem(409, "conflict_state", "No listed raw item can be replayed")
         operation_id = await replay.request_replay(conn, raw_item_ids=queued, defer=defer_in_tx)
     return ReplayQueuedOut(operation_id=operation_id, items=len(queued))
+
+
+def _not_retried(reason: str, detail: str, **ids: int) -> Problem:
+    log.info("purge_retry_refused", reason=reason, **ids)
+    return Problem(409, "conflict_state", "The purge cannot be retried now", detail=detail)
+
+
+@router.post(
+    "/purges/{operation_id}/retry",
+    status_code=202,
+    response_model=PurgeRetryOut,
+    responses={
+        404: {"description": "No purge operation has the id (`not_found`)"},
+        409: {
+            "description": "The deletion is no longer in progress, or one of its purge operations is pending "
+            "or running (`conflict_state`)"
+        },
+        422: {"description": "Invalid path (`validation_failed`)"},
+        **CSRF_RESPONSES,
+    },
+)
+async def retry_purge(
+    operation_id: OperationId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> PurgeRetryOut:
+    """Retry a failed purge (202): a new purge operation carries its deletion on from where it stopped; the
+    deletion stays fenced meanwhile."""
+    async with engine.begin() as conn:
+        operation = (await conn.execute(_OPERATION, {"i": operation_id})).first()
+        if operation is None or operation.kind != PURGE_KIND:
+            raise Problem(404, "not_found", "Purge operation not found")
+        payload = get_object(operation.payload, "")
+        manifest_id = manifest_id_of(payload)
+        status = (
+            None
+            if manifest_id is None
+            else (await conn.execute(_MANIFEST_STATUS, {"m": manifest_id})).scalar()
+        )
+        if manifest_id is None or status != "executing":
+            raise _not_retried(
+                "not_executing", "the deletion is no longer in progress", operation_id=operation_id
+            )
+        retried, created = await create_operation(
+            conn, kind=PURGE_KIND, payload=payload, dedup_key=operation.dedup_key, defer=defer_in_tx
+        )
+        if not created:  # a live purge of the manifest holds its dedup key
+            raise _not_retried(
+                "purge_live", "a purge of this deletion is pending or running", operation_id=retried
+            )
+    log.info(
+        "purge_retry_requested",
+        operation_id=retried,
+        failed_operation_id=operation_id,
+        manifest_id=manifest_id,
+    )
+    return PurgeRetryOut(operation_id=retried, manifest_id=manifest_id)
 
 
 @ats_snapshots_router.post(

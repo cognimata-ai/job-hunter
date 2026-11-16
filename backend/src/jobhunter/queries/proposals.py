@@ -26,17 +26,27 @@ first 16 in model order, with `truncated`; a set that then has fewer than 6 item
 published set always meets §11.12, even when its only exploration item came after the 16th. Pure: the
 gazetteer is passed in, and the words of its large places are computed once per gazetteer.
 
-**The request** (`request_proposal`, in the caller's transaction): the profile version's row `FOR NO KEY
-UPDATE`, which serialises two requests for one version without blocking the foreign-key checks of other
-writers; then a `running` proposal of that version is returned as it is (`created=False`), with its live
-operation (recreated if none is live, so a running proposal is never left without one); otherwise a
-`query_proposals` row in `running` and its `propose_queries` operation (`KIND`), payload
-`{"proposal_id": id, "scope_version_id": <the active scope version>}` and dedup key `propose_queries:<id>`,
-with its job deferred by `defer`. The scope version is pinned with the request: every execution of the
-operation renders its prompt from that version's location labels and checks every output, a receipt's
-included, against them, so a scope saved between a crash and its reclaim never changes whether a paid answer
-is usable. The handler of that operation and its failure hook are `profile.operations`' (this module registers
-nothing).
+**The request** (`request_proposal`, in the caller's transaction). Its caller holds `active_config` (`FOR
+SHARE` at least, the lock schedule's step 2) from before it read which version to propose for, and passes the
+active version or the one its transaction activates (M5 Task 14, Deviation 54): the confirm and activation
+(`profile.activation`, `FOR UPDATE`) and the proposal route (`api.routes.profile`, `FOR SHARE`). Each refuses
+delete-everything's `global` fence right after that lock (`privacy.fences.refuse_under_global_fence`, 409
+`delete_everything_in_progress`), since a fence committed while it waited is a normal race, not a bug. A
+profile purge's admission holds `active_config FOR UPDATE` and cancels the version's live operations, and a
+version under its fence can be neither active nor activated (409 `profile_purge_in_progress`), so no proposal
+operation of a purgeable version is ever created after its admission. The request takes the profile version's
+row `FOR NO KEY UPDATE`, which serialises two requests for one version without blocking the foreign-key checks
+of other writers, then reads (after that lock) whether the version is purged or under an unreleased `profile`
+or `global` fence (`privacy.fences.version_fenced`): either is an `InvariantViolation`, nothing written, the
+guard of a future caller that forgets the rule (the callers refuse a `global` fence first). Then a `running`
+proposal of that version is returned as it is (`created=False`), with its live operation (recreated if none is
+live, so a running proposal is never left without one); otherwise a `query_proposals` row in `running` and its
+`propose_queries` operation (`KIND`), payload `{"proposal_id": id, "scope_version_id": <the active scope
+version>}` and dedup key `propose_queries:<id>`, with its job deferred by `defer`. The scope version is pinned
+with the request: every execution of the operation renders its prompt from that version's location labels and
+checks every output, a receipt's included, against them, so a scope saved between a crash and its reclaim
+never changes whether a paid answer is usable. The handler of that operation and its failure hook are
+`profile.operations`' (this module registers nothing).
 
 **The row** (`lock_proposal`, `publish`, `fail`, `end_obsolete`): every write runs after the owner row of the
 proposal's operation (§9.1: the owner row, then the domain rows). `publish` moves `running → ready` with
@@ -62,6 +72,7 @@ from jobhunter.geo.gazetteer import Gazetteer
 from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.normalize.text import fold
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import version_fenced
 from jobhunter.types import JSONValue
 from jobhunter.worker.operations import OperationContext, create_operation
 from jobhunter.worker.tasks import Deferrer
@@ -290,7 +301,7 @@ def validate_proposal(
 
 # --- the request and the row --------------------------------------------------------------------------------
 
-_LOCK_VERSION: Final = q("SELECT id FROM profile_versions WHERE id = :pv FOR NO KEY UPDATE")
+_LOCK_VERSION: Final = q("SELECT purged_at FROM profile_versions WHERE id = :pv FOR NO KEY UPDATE")
 _ACTIVE_SCOPE: Final = q("SELECT scope_version_id FROM active_config WHERE id = 1")
 _RUNNING: Final = q(
     "SELECT id FROM query_proposals WHERE profile_version_id = :pv AND status = 'running' ORDER BY id LIMIT 1"
@@ -328,9 +339,16 @@ async def request_proposal(
     conn: AsyncConnection, profile_version_id: int, *, defer: Deferrer | None
 ) -> tuple[int, int, bool]:
     """`(proposal_id, operation_id, created)`: the running proposal of the version, or a new one with its
-    operation (module docstring). `LookupError` for a version that does not exist."""
-    if (await conn.execute(_LOCK_VERSION, {"pv": profile_version_id})).first() is None:
+    operation (module docstring). The caller holds `active_config` and passes the active version or the one
+    it activates. `LookupError` for a version that does not exist, `InvariantViolation` for one purged or
+    fenced."""
+    version = (await conn.execute(_LOCK_VERSION, {"pv": profile_version_id})).first()
+    if version is None:
         raise LookupError(f"profile version {profile_version_id} does not exist")
+    if version.purged_at is not None or await version_fenced(conn, profile_version_id):
+        raise InvariantViolation(
+            f"profile version {profile_version_id} is purged or under a purge fence: no proposal is requested"
+        )
     running = (await conn.execute(_RUNNING, {"pv": profile_version_id})).scalar_one_or_none()
     if running is not None:
         operation_id, recreated = await _operation(conn, int(running), defer)

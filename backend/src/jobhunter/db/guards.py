@@ -6,6 +6,7 @@ raises `FencedOut`, having written nothing, when the work is no longer the calle
 
 `global_fence_active(conn)` is the one statement of "a `global` purge fence is active" (§20.2: a
 `purge_fences` row of kind `global` not yet released), which the owner checks and the pause guards read.
+`GLOBAL_FENCE_SQL` is its text, which `db.fence_guard`'s begin hook runs as a driver statement (M5 Task 8).
 """
 
 from collections.abc import Awaitable, Callable
@@ -17,9 +18,10 @@ from jobhunter.db.sql import q
 
 type Guard = Callable[[AsyncConnection], Awaitable[None]]
 
-_GLOBAL_FENCE: Final = q(
+GLOBAL_FENCE_SQL: Final = (
     "SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)"
 )
+_GLOBAL_FENCE: Final = q(GLOBAL_FENCE_SQL)
 
 
 async def global_fence_active(conn: AsyncConnection) -> bool:

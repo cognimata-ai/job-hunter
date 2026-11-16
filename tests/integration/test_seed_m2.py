@@ -145,13 +145,14 @@ async def test_an_upgrade_from_0006_keeps_the_v1_pointers_m2_set(fresh_pg_server
     assert one(fresh_pg_server, OTHER_POINTERS) == others  # the seed moved no pointer
 
 
-async def test_every_migrate_leaves_both_pointers_set(migrated, make_config) -> None:
+async def test_every_migrate_leaves_both_pointers_set(migrated, make_config, tmp_path) -> None:
     """Whatever a migrate starts from, it ends with both pointers naming the seeded rows. Since 0008 the
     columns refuse NULL, so the damage left to repair is a missing `active_config` row, which the seed inserts
     with both pointers set, to the shipped rubric v2 and prompt-schema version 2. (The autouse reset restores
     the shared database after.)"""
     one(migrated, "DELETE FROM active_config")
-    await run_migrate_async(make_config("migrate"), now=NOW)
+    # A manifest stream of its own: the shared server's holds whatever other tests left there.
+    await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)
     assert one(
         migrated, "SELECT rubric_version_id IS NULL, prompt_schema_version_id IS NULL FROM active_config"
     ) == (

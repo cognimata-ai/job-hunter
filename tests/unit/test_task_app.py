@@ -31,6 +31,7 @@ def test_reset_task_app_allows_a_fresh_task_app() -> None:
                 "batch_poll",  # M3 Task 17
                 "batch_reconcile_ambiguous",  # M3 Task 17
                 "canary_daily",  # M3 Task 20
+                "deadman_sync",  # M5 Task 5
             )
         )
     finally:
@@ -52,5 +53,22 @@ def test_the_batch_tasks_are_periodic_on_aux_with_their_queueing_locks() -> None
             job_task_name("batch_poll"): ("*/5 * * * *", "aux", "batch_poll"),
             job_task_name("batch_reconcile_ambiguous"): ("*/15 * * * *", "aux", "batch_reconcile_ambiguous"),
         }
+    finally:
+        _reset_task_app()
+
+
+def test_deadman_sync_is_periodic_on_aux_with_its_queueing_lock() -> None:
+    """M5 Task 5 (O-ops Q7): the dead-man check's period sync daily at `23 4 * * *` on `aux`, with the
+    queueing lock of its name, which the tick's defers share (one waiting job)."""
+    _reset_task_app()
+    try:
+        app = make_queue_app(_DSN)
+        periodic = {
+            name: (task.cron, task.task.queue, task.task.queueing_lock)
+            for (name, _), task in app.periodic_registry.periodic_tasks.items()
+        }
+        assert periodic[job_task_name("deadman_sync")] == ("23 4 * * *", "aux", "deadman_sync")
+        task = app.tasks[job_task_name("deadman_sync")]
+        assert (task.queue, task.lock, task.queueing_lock) == ("aux", None, "deadman_sync")
     finally:
         _reset_task_app()

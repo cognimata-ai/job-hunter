@@ -24,16 +24,19 @@ yet), and every write sets `updated_at = now` on the job and on every member it 
 (Ruling T22-a), not the database's. The merge's statements (`dedup.user_actions`) stay as they are.
 
 **The locks** (§3.3.3). First the job rows `FOR SHARE`, in id order, in one statement: the job and, for a
-group write, the members its group had when the statement started. Under that lock and before any write,
-the job is checked as the drawer checks it (`jobs.detail.ensure_job`: unknown, synthetic, fenced, without a
+group write, the members its group had when the statement started. Under that lock and before any write, the
+job is checked as the drawer checks it (`jobs.detail.ensure_job`: unknown, synthetic, fenced, without a
 current revision or merged raises `JobGone`, a merged job with its survivor). A merge holds both its jobs
 `FOR UPDATE`, so a PUT that meets one waits for it and, once it has committed, answers the merged job's 404
 having written nothing. The group is then read again: a member is written only while it is still a member,
 unmerged and held. A member that left in a race is skipped; one that joined meanwhile is not held and not
-written. Then the `user_job_actions` rows, one upsert each in job id order, so two writes of overlapping
-groups take them in the same order. A merge writes only the rows of the jobs it holds, so it never meets a
-PUT at these rows. Last comes `ranking.bump`, for every write but one whose only action is `seen_on_open`:
-opening a job does not bump (L1255), while any other write bumps once, whether or not a value changed.
+written. A group write is refused, having written nothing, when a member it would write is under a purge fence
+(checked after the lock, §20.2, M5 Task 8): 409 `conflict_state` with `detail = "purge_in_progress"`
+(`privacy.fences.purge_in_progress`). Then the `user_job_actions` rows, one upsert each in job id order, so
+two writes of overlapping groups take them in the same order. A merge writes only the rows of the jobs it
+holds, so it never meets a PUT at these rows. Last comes `ranking.bump`, for every write but one whose only
+action is `seen_on_open`: opening a job does not bump (L1255), while any other write bumps once, whether or
+not a value changed.
 
 The note is the user's own text: it is never logged, and `ActionsIn` and `UserActionsOut` keep it out of
 their repr. The line `job_actions_written` names the job, the members written, the fields given and whether
@@ -54,6 +57,7 @@ from jobhunter.dedup.representative import member_ids
 from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS
 from jobhunter.jobs.detail import UserActionsOut, ensure_job
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import fenced_jobs, purge_in_progress
 
 API_NOTE_LIMIT: Final = 2_000  # code points: one API edit (L2636); a merge may concatenate up to NOTE_LIMIT
 # The fields that write a member too with `apply_to_group`, and every field that is an action (L1255).
@@ -177,11 +181,15 @@ def _params(req: ActionsIn, job_id: int, *, own: bool, now: datetime) -> Mapping
 async def put_actions(conn: AsyncConnection, job_id: int, req: ActionsIn, *, now: datetime) -> ActionsOut:
     """Write `req` on job `job_id`, and on the other members of its active duplicate group with
     `apply_to_group`, in the caller's transaction (module docstring); the rows after the write. Raises
-    `JobGone` for a job without a detail, a merged one with its survivor, having written nothing."""
+    `JobGone` for a job without a detail, a merged one with its survivor, and the `purge_in_progress` refusal
+    for a group write with a fenced member, having written nothing."""
     group_wide = req.apply_to_group and any(getattr(req, name) is not None for name in GROUP_FIELDS)
     held = await _lock(conn, (job_id, *(await _members(conn, job_id) if group_wide else ())))
     await ensure_job(conn, job_id)
     members = [m for m in await _members(conn, job_id) if m in held and held[m] is None] if group_wide else []
+    if fenced := await fenced_jobs(conn, members):  # the members' rows are held: their fences now
+        log.info("job_actions_refused", job_id=job_id, member_ids=sorted(fenced), reason="purge_in_progress")
+        raise purge_in_progress()
     written: dict[int, UserActionsOut] = {}
     for target in sorted((job_id, *members)):
         params = _params(req, target, own=target == job_id, now=now)

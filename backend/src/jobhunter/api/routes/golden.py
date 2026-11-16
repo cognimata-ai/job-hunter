@@ -5,20 +5,30 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
 - `POST /api/jobs/{job_id}/feedback` (`{kind: label | wrong_score, label: good | ok | poor, comment?}`) → 201
   `{feedback_id, golden_case_id}`: `golden.record_feedback` (`active_config FOR SHARE`, then the job `FOR
   SHARE`), the score snapshot and the golden case of (revision, profile) upserted with the active scope. 409
-  `conflict_state` without a published result of the active tuple, 404 `not_found` for no such job. The
+  `conflict_state` without a published result of the active tuple, or with `detail = "purge_in_progress"`
+  for a job under a purge fence (M5 Task 8), 404 `not_found` for no such job. The
   comment is at most 2,000 characters and holds no NUL and no lone surrogate (422 at the model's edge,
   `models.clean_text`; M2 Deviation 44).
 - `GET /api/golden-cases?cursor&limit&active` → `{items, next_cursor}`: the cases by id ascending,
   keyset-paged with §14.3's signed cursor (`api.pagination`: sort `golden_cases.id`, `asc`,
   `last_key = [id]`, the filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list
   did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, title, company, label,
-  comment, profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `title` the case's
-  revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
-  list's one statement; `profile_version` the version's number).
-- `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
-  canary is 422 `validation_failed` (L4632), an unknown case 404.
-- `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
-  deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
+  comment, profile_version, scope_version, source, active, is_canary, deletion_manifest_id}`
+  (`golden.CaseRow`; `deletion_manifest_id` its open deletion manifest, null without one, M5 Task 33; `title`
+  the case's revision's, the job's for a revision without one, `company` the job's `company_display`, both
+  joined in the list's one statement; `profile_version` the version's number).
+- `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`, `active_config
+  FOR SHARE` first): a third canary is 422 `validation_failed` (L4632), an unknown case 404, activating a
+  case whose job is under a purge fence (M5 Task 8), or whose profile version is purged or fenced (M5 Task
+  14), and activating a case or making it a canary while its deletion is pending (M5 Task 33), 409
+  `conflict_state` with `detail = "purge_in_progress"`.
+- `DELETE /api/golden-cases/{id}` → 202 `{manifest_id}` (M5 Task 18, U8, Deviation 20): A0 of the case's
+  `golden_case_delete` purge (`privacy.kinds.golden_case.request_golden_case_delete`, `active_config FOR
+  UPDATE` first): the api has no manifests volume, so the worker writes the manifest's file and deletes the
+  case, its eval rows by cascade. 404 for no such case (`golden.CaseMissing`), 409 `conflict_state` with
+  `detail = "purge_in_progress"` while its deletion is pending (an `executing` manifest names it: no second
+  manifest, M5 Task 33), 409 `conflict_state` with `detail = "eval_run_running"` while a running eval run
+  includes it, and 409 `delete_everything_in_progress` under delete-everything's fence.
 - `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
   row alone; the golden case it upserted stays (Deviation 24). 404 `not_found` for no such feedback
   (`golden.FeedbackMissing` through `api.errors.domain_problem`).
@@ -35,15 +45,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem, domain_problem
+from jobhunter.api.errors import domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import GOLDEN_CASES_SORT, cursor_key, decode_id_cursor, list_page
+from jobhunter.api.routes.privacy import ManifestQueuedOut
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.privacy.kinds.golden_case import request_golden_case_delete
 from jobhunter.scoring import golden
 from jobhunter.scoring.golden import COMMENT_MAX_CHARS, CaseRow, CaseSource, FeedbackKind, Label
 from jobhunter.types import JSONValue
+from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
@@ -88,6 +101,10 @@ class GoldenCaseOut(BaseModel):
     source: CaseSource
     active: bool
     is_canary: bool
+    deletion_manifest_id: int | None = Field(
+        description="The case's open deletion manifest (its purge pending, waiting or failed), null without "
+        "one: the case cannot be deleted again, activated or made a canary meanwhile"
+    )
 
     @classmethod
     def of(cls, case: CaseRow) -> "GoldenCaseOut":
@@ -103,6 +120,7 @@ class GoldenCaseOut(BaseModel):
             source=case.source,
             active=case.active,
             is_canary=case.is_canary,
+            deletion_manifest_id=case.deletion_manifest_id,
         )
 
 
@@ -136,7 +154,8 @@ _NOT_FOUND: Final[dict[int | str, dict[str, Any]]] = {
     responses={
         404: {"description": "No such job (`not_found`)"},
         409: {
-            "description": "The job has no published score of the active tuple to label (`conflict_state`)"
+            "description": "The job has no published score of the active tuple to label (`conflict_state`), "
+            "or it is being purged (`conflict_state`, `purge_in_progress`)"
         },
         422: {
             "description": "Invalid body: a comment over 2,000 characters or holding a NUL or a lone "
@@ -203,6 +222,11 @@ async def list_golden_cases(
     response_model=GoldenCaseOut,
     responses={
         **_NOT_FOUND,
+        409: {
+            "description": "Activating a case whose job or profile version is being purged, or whose profile "
+            "version was purged, or activating a case or making it a canary while its deletion is pending "
+            "(`conflict_state`, detail `purge_in_progress`)"
+        },
         422: {"description": "Invalid body, or a third canary (`validation_failed`)"},
         **CSRF_RESPONSES,
         **BODY_LIMIT_RESPONSES,
@@ -221,23 +245,31 @@ async def set_golden_case_flags(
 
 @router.delete(
     "/api/golden-cases/{case_id}",
-    status_code=204,
-    response_class=Response,
+    status_code=202,
+    response_model=ManifestQueuedOut,
     responses={
         **_NOT_FOUND,
-        409: {"description": "A running eval run includes the case (`conflict_state`)"},
+        409: {
+            "description": "The case's deletion is pending (`conflict_state`, detail `purge_in_progress`), "
+            "or a running eval run includes it (`conflict_state`, detail `eval_run_running`)"
+        },
         422: {"description": "Invalid path (`validation_failed`)"},
         **CSRF_RESPONSES,
     },
 )
 async def delete_golden_case(
     case_id: CaseId, engine: Annotated[AsyncEngine, Depends(get_engine)]
-) -> Response:
-    """Delete a golden case and its eval rows (204); its job's inputs lose their retention exemption."""
-    async with engine.begin() as conn:
-        if not await golden.delete_case_unless_running(conn, case_id):
-            raise Problem(404, "not_found", "Golden case not found")
-    return Response(status_code=204)
+) -> ManifestQueuedOut:
+    """Delete a golden case and its eval rows (202): the deletion runs in the background, recorded in a
+    deletion manifest; its job's inputs lose their retention exemption."""
+    try:
+        async with engine.begin() as conn:
+            opened = await request_golden_case_delete(conn, case_id, now=utcnow(), defer=defer_in_tx)
+    except LookupError as exc:
+        if (problem := domain_problem(exc)) is None:
+            raise
+        raise problem from None
+    return ManifestQueuedOut(manifest_id=opened.manifest_id)
 
 
 @router.delete(

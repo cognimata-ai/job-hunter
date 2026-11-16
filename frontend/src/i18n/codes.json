@@ -1,10 +1,13 @@
 {
   "problem": [
     "budget_exhausted",
+    "confirmation_mismatch",
     "conflict_state",
     "csrf_failed",
+    "delete_everything_in_progress",
     "eval_gate_failed",
     "filtered_requires_force",
+    "gone",
     "idempotency_in_progress",
     "idempotency_key_required",
     "idempotency_key_reused",
@@ -12,6 +15,7 @@
     "invalid_cursor",
     "not_found",
     "profile_purge_in_progress",
+    "reauth_failed",
     "run_active",
     "stale_base_version",
     "throttled",
@@ -130,6 +134,9 @@
     "ats.mass_disappearance",
     "auth.lockout",
     "auth.totp_key_mismatch",
+    "backup.failed",
+    "backup.restore_test_failed",
+    "backup.stale",
     "batch.custom_id_anomaly",
     "batch.item_unprocessable",
     "batch.items_missing",
@@ -138,9 +145,12 @@
     "batch.submit_ambiguous_unresolved",
     "coverage.gap_abandoned",
     "coverage.too_broad",
+    "deadman.update_failed",
     "dedup.ambiguous_grouping",
     "dedup.field_conflict",
     "dedup.identity_conflict",
+    "docparse.leftover",
+    "embedder.checksum_mismatch",
     "embedder.unavailable",
     "eval.gate_failed",
     "llm.auth_failed",
@@ -152,7 +162,10 @@
     "llm.refusal_rate",
     "llm.reservation_bound_violated",
     "llm.unexpected_stop_reason",
+    "notify.delivery_failed",
     "operation.failed",
+    "privacy.manifest_unshipped",
+    "privacy.purge_failed",
     "profile.extract_generation_mismatch",
     "quota.ambiguous_attempt",
     "quota.exhausted",
@@ -182,12 +195,16 @@
     "source.auth_failed",
     "source.breaker_open",
     "source.contract_broken",
-    "source.not_found"
+    "source.not_found",
+    "system.disk_pressure",
+    "system.table_growth",
+    "worker.heartbeat_stale"
   ],
   "banner": [
     "applying_settings",
     "cap_reached",
     "critical_alerts",
+    "deletion_unshipped",
     "paid_search_paused",
     "rescoring",
     "reservation_bound_violated",
@@ -594,6 +611,7 @@
   ],
   "attention_section": [
     "broken_sources",
+    "failed_purges",
     "failed_targets",
     "identity_conflicts",
     "mass_disappearances",
@@ -650,6 +668,17 @@
     "ok",
     "warn"
   ],
+  "backup_age_state": [
+    "critical",
+    "grace",
+    "ok",
+    "warn"
+  ],
+  "restore_test_age_state": [
+    "none",
+    "ok",
+    "warn"
+  ],
   "queue": [
     "aux",
     "collect",
@@ -664,6 +693,9 @@
     "failed",
     "succeeded",
     "todo"
+  ],
+  "tracing_region": [
+    "eu"
   ],
   "ui_language": [
     "de",
@@ -721,7 +753,8 @@
       "unscorable_groups",
       "broken_sources",
       "paused_lane",
-      "scope_apply_failed"
+      "scope_apply_failed",
+      "failed_purges"
     ],
     "retryable_target_state": [
       "refused",

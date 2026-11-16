@@ -28,6 +28,10 @@ A login runs in phases, so that what it writes persists whatever the answer is (
 A TOTP secret that no configured data key opens (a misconfiguration) fails the login like a wrong code and
 raises the critical alert `auth.totp_key_mismatch` (subject `totp`), for a right and a wrong password alike.
 
+The checks the re-authentication of the privacy routes shares with the login live in `auth.credentials`
+(M5 Task 18, Ruling T18-3): the lockout pre-check, the TOTP secret's read, the success check of phase 2 and
+the alert above.
+
 A successful login replaces the session whose cookie the request carried (rotation, §16.4): that session is
 deleted in the transaction that creates the new one.
 
@@ -35,11 +39,11 @@ Every other failure is the same generic 401 `unauthenticated`. The client addres
 which uvicorn's proxy headers middleware sets from the trusted proxy's `X-Forwarded-For` only (§16.3, V20).
 The login is checked for `Origin` by the edge; it needs no `X-JH-Request` (§16.5).
 
-Logs carry the outcome and the client address only (ruling T16-b): never the username, password, TOTP code,
-token, cookie or username HMAC.
+Logs carry the outcome only (ruling T16-b; final review M1): never the client address, which the
+`login_attempts` row holds under its 30-day rule, and never the username, password, TOTP code, token, cookie
+or username HMAC.
 """
 
-import ipaddress
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -52,6 +56,7 @@ from starlette.responses import Response
 
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
 from jobhunter.api.deps import get_argon2_gate, get_config, get_engine, require_session
+from jobhunter.api.edge import client_address, throttled_problem
 from jobhunter.api.errors import Problem
 from jobhunter.api.openapi import (
     BODY_LIMIT_RESPONSES,
@@ -60,22 +65,23 @@ from jobhunter.api.openapi import (
     SESSION_RESPONSES,
 )
 from jobhunter.auth import sessions, throttle, totp, users
+from jobhunter.auth.credentials import (
+    credentials_hold,
+    lockout_in_force,
+    raise_totp_key_alert,
+    read_totp_secret,
+)
 from jobhunter.auth.passwords import check_password, dummy_verify, hash_password
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.crypto import DecryptError, data_keys
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.crypto import data_keys
 from jobhunter.observability.logging import get_logger
 
-# Where a request without a usable client address is counted: one shared bucket, so such clients cannot
-# escape the per-address throttle (uvicorn over TCP always has an address; a misconfiguration may not).
-UNKNOWN_CLIENT_IP: Final = "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
 INVALID_CREDENTIALS: Final = "Invalid credentials"
 TOTP_REQUIRED: Final = "TOTP code required"
 # What a login refused by the full Argon2 gate is told to wait: a slot frees within one verification or two.
 BUSY_RETRY_AFTER_S: Final = 1
-TOTP_KEY_ALERT_CODE: Final = "auth.totp_key_mismatch"
 
 router = APIRouter(prefix="/api/auth")
 log = get_logger("jobhunter.auth")
@@ -150,7 +156,8 @@ async def decide_login(
     2. a lockout in force → `Locked`, whatever the credentials (nothing is recorded);
     3. a success also needs the user row unchanged (`users.confirm_unchanged`: the hash, the TOTP state and
        the sealed secret) and, with TOTP, a step later than the last one used (`users.claim_totp_step`,
-       ruling T16-a): otherwise it counts as a failure;
+       ruling T16-a): otherwise it counts as a failure (`auth.credentials.credentials_hold`, which the
+       re-authentication of the privacy routes decides with too);
     4. `record_attempt`, which may lock out and raise `auth.lockout`; a failure → `Rejected`;
     5. a success stores the rehash (only over the verified hash), deletes the session of `previous_token`
        (rotation) and creates a new one → `Accepted`.
@@ -159,16 +166,12 @@ async def decide_login(
     retry_after = await throttle.active_lockout(conn, ip, now=now)
     if retry_after is not None:
         return Locked(retry_after)
-    success = (
-        credentials_ok
-        and verified_hash is not None
-        and await users.confirm_unchanged(
-            conn,
-            expected_hash=verified_hash,
-            totp_enabled=totp_step is not None,
-            totp_secret_enc=verified_totp_secret_enc,
-        )
-        and (totp_step is None or await users.claim_totp_step(conn, totp_step))
+    success = await credentials_hold(
+        conn,
+        credentials_ok=credentials_ok,
+        verified_hash=verified_hash,
+        totp_step=totp_step,
+        totp_secret_enc=verified_totp_secret_enc,
     )
     await throttle.record_attempt(conn, ip=ip, username_hmac=username_hmac, success=success, now=now)
     if not success:
@@ -182,15 +185,9 @@ async def decide_login(
 
 
 def client_ip(request: Request) -> str:
-    """The client address of `request` in canonical form (an IPv4-mapped IPv6 address as IPv4)."""
-    host = request.client.host if request.client is not None else None
-    try:
-        address = ipaddress.ip_address(host or "")
-    except ValueError:
-        return UNKNOWN_CLIENT_IP
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        return str(address.ipv4_mapped)
-    return str(address)
+    """The client address of `request` in canonical form (an IPv4-mapped IPv6 address as IPv4), or
+    `api.edge.UNKNOWN_CLIENT_IP`: the edge's own reading, so its login limit and this throttle key alike."""
+    return client_address(request.scope)
 
 
 @dataclass(frozen=True)
@@ -216,13 +213,7 @@ async def _verify_credentials(
     if user is None:
         await gate.run(dummy_verify, body.password)
         return _Verified(ok=False)
-    secret, key_mismatch = None, False
-    if user.totp_enabled:
-        try:
-            secret = users.totp_secret(user, keys=data_keys(cfg))
-        except DecryptError as exc:
-            log.error("totp_secret_unreadable", error_class=type(exc).__name__)
-            key_mismatch = True
+    secret, key_mismatch = read_totp_secret(user, keys=data_keys(cfg))
     ok, needs_rehash = await gate.run(check_password, user.password_hash, body.password)
     if not ok or key_mismatch:
         return _Verified(ok=False, totp_key_mismatch=key_mismatch)
@@ -241,31 +232,31 @@ async def _verify_credentials(
     )
 
 
-def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
-    log.warning("login", outcome=outcome, ip=ip)
-    return Problem(
-        429,
-        "throttled",
-        title,
-        headers={"Retry-After": str(retry_after_s)},
-        extra={"retry_after_s": retry_after_s},
-    )
-
-
-def _locked(ip: str, retry_after: timedelta) -> Problem:
+def lockout_problem(retry_after: timedelta) -> Problem:
+    """The 429 of a lockout in force for `retry_after` more (at least a second, rounded up); the privacy
+    routes' re-authentication answers it too (M5 Task 18)."""
     retry_after_s = max(1, math.ceil(retry_after.total_seconds()))
-    return _throttled(ip, outcome="locked", title="Too many failed logins", retry_after_s=retry_after_s)
+    return throttled_problem("Too many failed logins", retry_after_s=retry_after_s)
+
+
+def _throttled(*, outcome: str, title: str, retry_after_s: int) -> Problem:
+    log.warning("login", outcome=outcome)
+    return throttled_problem(title, retry_after_s=retry_after_s)
+
+
+def _locked(retry_after: timedelta) -> Problem:
+    log.warning("login", outcome="locked")
+    return lockout_problem(retry_after)
 
 
 async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) -> None:
     """The read-only lockout pre-check: raise the 429 of a lockout in force (nothing is recorded)."""
-    async with engine.connect() as conn:  # read-only, rolled back when the block ends
-        retry_after = await throttle.peek_lockout(conn, ip, now=now)
+    retry_after = await lockout_in_force(engine, ip, now=now)
     if retry_after is not None:
-        raise _locked(ip, retry_after)
+        raise _locked(retry_after)
 
 
-async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None, ip: str) -> None:
+async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None) -> None:
     """Raise 401 `totp_required` when TOTP is on and the login sent no `code` (nothing is recorded).
 
     It is given the code only, never the username or the password, and reads the single user's flag: its
@@ -277,7 +268,7 @@ async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None, ip
     async with engine.connect() as conn:  # read-only, rolled back when the block ends
         required = await users.totp_enabled_for_any(conn)
     if required:
-        log.info("login", outcome="totp_required", ip=ip)
+        log.info("login", outcome="totp_required")
         raise Problem(401, "totp_required", TOTP_REQUIRED)
 
 
@@ -307,7 +298,7 @@ async def login(
     now = utcnow()
     ip = client_ip(request)
     await _refuse_if_locked_out(engine, ip, now=now)  # phase 0
-    await _refuse_if_totp_code_missing(engine, body.totp, ip)  # before the gate: no Argon2, nothing recorded
+    await _refuse_if_totp_code_missing(engine, body.totp)  # before the gate: no Argon2, nothing recorded
     session_secret = cfg.secret_b64("session_secret")
     try:
         async with gate.slot():
@@ -315,7 +306,7 @@ async def login(
             verified = await _verify_credentials(engine, cfg, gate, body, at=now)
     except GateFull:
         raise _throttled(
-            ip, outcome="busy", title="Too many logins at once", retry_after_s=BUSY_RETRY_AFTER_S
+            outcome="busy", title="Too many logins at once", retry_after_s=BUSY_RETRY_AFTER_S
         ) from None
     async with engine.begin() as conn:
         outcome = await decide_login(
@@ -333,22 +324,16 @@ async def login(
             previous_token=request.cookies.get(sessions.SESSION_COOKIE),
         )
         if verified.totp_key_mismatch:  # after the throttle lock, the first statement (ruling T16-c)
-            await raise_alert(
-                conn,
-                code=TOTP_KEY_ALERT_CODE,
-                severity="critical",
-                subject="totp",
-                message="the TOTP secret does not open with the configured data keys",
-            )
+            await raise_totp_key_alert(conn)
     # Committed: the attempt, any lockout and alert, the rehash and the session persist from here on.
     match outcome:
         case Locked(retry_after=retry_after):
-            raise _locked(ip, retry_after)
+            raise _locked(retry_after)
         case Rejected():
-            log.warning("login", outcome="rejected", ip=ip)
+            log.warning("login", outcome="rejected")
             raise Problem(401, "unauthenticated", INVALID_CREDENTIALS)
         case Accepted(token=token):
-            log.info("login", outcome="accepted", ip=ip)
+            log.info("login", outcome="accepted")
             response = Response(status_code=204)
             response.headers.append("Set-Cookie", sessions.session_cookie(token))
             return response

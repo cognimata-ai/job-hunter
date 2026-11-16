@@ -10,6 +10,9 @@ was reclaimed, can never satisfy the predicate again, even within the same worke
 The ways out of `running`:
 - `finish_operation`: `succeeded`, or `failed` with an error code (the owner's write);
 - `requeue_operation`: back to `pending` with `attempts + 1` and a `not_before` (the owner's write);
+- `wait_operation`: back to `pending` with a `not_before` and an error code, `attempts` unchanged and never
+  `failed` (the owner's write, M5 Task 8): a handler waiting on a condition that has its own end (a purge in
+  progress, a running eval run), which a requeue every minute would fail after `MAX_OPERATION_ATTEMPTS`;
 - `reclaim_stale_operations` (the `operations` reconciler, heartbeat older than 3 min) and the `operations`
   takeover sweep (an older worker epoch): back to `pending` with `attempts + 1`, no reason;
 - `cancel_operation`: `cancelled` (delete-everything, a superseding purge or scope).
@@ -17,6 +20,12 @@ The ways out of `running`:
 A requeue or reclaim that reaches `MAX_OPERATION_ATTEMPTS` ends the row `failed('attempts_exhausted')`
 instead. Every permanent failure (a `failed` finish, or exhaustion) raises the `operation.failed` alert (warn,
 subject `operation:<id>`) exactly once, in the transaction that ends the row (§7.3; ruling T10-g).
+
+**The global fence** (§20.2, §20.4; M5 Task 8, P3, D15): while delete-everything's `global` purge fence
+stands, `claim_operation` claims no operation but a `purge`: it moves the row's `not_before` to the database's
+`now()` plus `GLOBAL_FENCE_RETRY`, spends no attempt and returns `None`, so an operation that waits out
+delete-everything never fails for it (M4 Ruling T12-b's drain ends here). The `operations` reconciler
+re-defers its job once that time has passed.
 
 **Failure hooks** (M2 plan Deviation 13). `register_operation_handler(kind, on_failed=hook)` registers a
 kind's hook in `FAILURE_HOOKS` (`HANDLERS` keeps the handlers only). Every permanent failure runs it right
@@ -34,18 +43,19 @@ runs after, so the `batch_submissions` tick reconciler recovers its rows in a fe
 (Codex r3 B2); a failed `create_targets_for_tuple` needs none (`missing_targets` requests it again).
 
 **Handler-side ends** (M2 Task 11). A handler, or a graph node it runs, ends its operation inside its own
-transaction with `OperationContext.finish_in` or `requeue_in`, so the last domain write and the operation's
-end commit together. Either records the end in the context's outcome holder, and `execute_operation`, which
-reads it once the handler has returned, then writes nothing more for that execution. Such a call must be
-part of a transaction that commits before the handler returns (an exception that rolls it back propagates,
-and the execution is then requeued as `bug` like any other raise). The context also carries the worker's
-`OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with `deps=None`. A handler records
-its progress (`operations.progress`, which the API polls) with `set_progress`, under the claim predicate like
-every owner write (M2 Task 18).
+transaction with `OperationContext.finish_in`, `requeue_in` or `wait_in` (M5 Task 8), so the last domain write
+and the operation's end commit together. Each records the end in the context's outcome holder, and
+`execute_operation`, which reads it once the handler has returned, then writes nothing more for that
+execution. Such a call must be part of a transaction that commits before the handler returns (an exception
+that rolls it back propagates, and the execution is then requeued as `bug` like any other raise). The context
+also carries the worker's `OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with
+`deps=None`. A handler records its progress (`operations.progress`, which the API polls) with `set_progress`,
+under the claim predicate like every owner write (M2 Task 18).
 
 **Execution locks** (M3 Task 14, Codex r3 B20). A kind of `OPERATION_LOCKS` runs its jobs under that
 procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side; `replay_raw_items`:
-`replay`, so two replays whose id sets overlap never resolve one item at once, M4 Task 12):
+`replay`, so two replays whose id sets overlap never resolve one item at once, M4 Task 12; `purge`: `purge`,
+one purge at a time, M5 Task 12):
 `defer_operation_job` reads the row's kind and passes the lock on every enqueue, the first one
 (`create_operation`), the `operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer
 alike.
@@ -73,6 +83,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.clock import utcnow
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
@@ -94,6 +105,7 @@ if TYPE_CHECKING:
     from jobhunter.graphs.score.deps import ScoreDeps
     from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.observability.deadman import DeadmanPinger
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
 
@@ -114,9 +126,10 @@ OperationKind = Literal[
 
 # The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue
 # (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4), and
-# so do the replays of rejected raw items (M4 Task 12, Ruling T12-c: overlapping id sets).
+# so do the replays of rejected raw items (M4 Task 12, Ruling T12-c: overlapping id sets) and the purges (M5
+# Task 12, D5: one purge at a time, so execution follows the manifests' UUIDv7 stream order).
 OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType(
-    {"batch_submit": "batch", "replay_raw_items": "replay"}
+    {"batch_submit": "batch", "replay_raw_items": "replay", "purge": "purge"}
 )
 MAX_OPERATION_ATTEMPTS: Final = 10
 # These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
@@ -132,6 +145,14 @@ REDEFER_BATCH: Final = 100
 # How long a requeued operation waits before it can be claimed again: after an unexpected handler error
 # (`bug`) or a refused local start (`already_executing`).
 RETRY_DELAY: Final = timedelta(minutes=1)
+# How long an operation the global fence kept from its claim waits before it is claimable again (module
+# docstring, The global fence).
+GLOBAL_FENCE_RETRY: Final = timedelta(minutes=1)
+# The one kind the global fence lets through: delete-everything's own (and every other purge's).
+PURGE_KIND: Final = "purge"
+# A purge operation's dedup key is this prefix and its manifest's uuid: A0's (`privacy.purge.open_purge`), the
+# `purge_fences` reconciler's and the retry route's operations of one manifest share it (M5 Task 12).
+PURGE_DEDUP_PREFIX: Final = "purge:"
 
 FAILED_ALERT_CODE: Final = "operation.failed"
 # The error code of an operation that a requeue or reclaim took past its last attempt.
@@ -165,6 +186,9 @@ class OperationDeps:
     the engine, the gateway, the clock and the gateway's monotonic clock), which the `eval_run` handler scores
     its cases with; `batches_client` is the process's Message Batches client (`WorkerRuntime.batches_client`),
     which the `batch_submit` handler creates its batch with. Neither handler builds its own (Ruling P33).
+    `deadman` is the process's dead-man pinger (`WorkerRuntime.deadman`, M5 Task 5), `None` without one: with
+    the Batches client, a live purge's external effects (`privacy.purge.LiveEffects`, M5 Task 12, Deviation
+    56). It is last and optional, so a test that builds the dependencies without it has none.
     """
 
     cfg: "AppConfig"
@@ -176,14 +200,16 @@ class OperationDeps:
     clock: Callable[[], datetime]
     score_steps: "ScoreDeps"
     batches_client: "BatchesClient"
+    deadman: "DeadmanPinger | None" = None
 
 
 @dataclass(frozen=True)
 class OperationEnd:
-    """How a handler ended its operation in its own transaction: `finished` (`succeeded` or `failed`) or
-    `requeued` (`pending`, or `failed` when that was its last attempt)."""
+    """How a handler ended its operation in its own transaction: `finished` (`succeeded` or `failed`),
+    `requeued` (`pending`, or `failed` when that was its last attempt) or `waited` (`pending`, no attempt
+    spent)."""
 
-    kind: Literal["finished", "requeued"]
+    kind: Literal["finished", "requeued", "waited"]
     status: Literal["succeeded", "failed", "pending"]
     error_code: str | None
 
@@ -228,6 +254,13 @@ class OperationContext:
         more."""
         status = await requeue_operation(conn, self.claim, error_code=error_code, not_before=not_before)
         self._outcome.end = OperationEnd("requeued", status, error_code)
+
+    async def wait_in(self, conn: AsyncConnection, *, error_code: str, not_before: datetime) -> None:
+        """Give the claimed operation back until `not_before` in the caller's transaction without spending an
+        attempt (`wait_operation`), for a wait on a condition that has its own end; `execute_operation`
+        writes nothing more."""
+        await wait_operation(conn, self.claim, error_code=error_code, not_before=not_before)
+        self._outcome.end = OperationEnd("waited", "pending", error_code)
 
 
 OperationHandler = Callable[[OperationContext], Awaitable[None]]
@@ -340,6 +373,8 @@ _CLAIMABLE = q(
     "SELECT kind, payload, attempts FROM operations "
     "WHERE id = :i AND status = 'pending' AND (not_before IS NULL OR not_before <= now()) FOR UPDATE"
 )
+# The global fence's postponement (module docstring): the status stays `pending`, so no transition.
+_POSTPONE = q("UPDATE operations SET not_before = now() + :retry WHERE id = :i")
 _HEARTBEAT = q(
     "UPDATE operations SET heartbeat_at = now() "
     "WHERE id = :i AND claim_id = :c AND status = 'running' RETURNING id"
@@ -421,16 +456,22 @@ async def defer_operation_job(conn: AsyncConnection, defer: Deferrer, operation_
 
 async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:
     """Claim a `pending` operation whose `not_before` has passed, with a fresh `claim_id`; `None` otherwise
-    (absent, not `pending`, not due, or claimed meanwhile).
+    (absent, not `pending`, not due, claimed meanwhile, or kept back by the global fence).
 
     `pending → running` sets the claim, the worker `epoch` and the first heartbeat in one statement. Raises
     `FencedOut`, having written nothing, when `epoch` is no longer the current worker epoch
     (`epoch.fence_epoch`, the first statement, before the row is locked; plan Deviation 18): a superseded
-    worker claims nothing, and its caller re-defers the job.
+    worker claims nothing, and its caller re-defers the job. While delete-everything's `global` fence stands,
+    an operation of any kind but `purge` is not claimed: its `not_before` moves to `now() +
+    GLOBAL_FENCE_RETRY`, its attempts stay as they are, and `None` is returned (module docstring, The global
+    fence).
     """
     await fence_epoch(conn, epoch)
     row = (await conn.execute(_CLAIMABLE, {"i": operation_id})).first()
     if row is None:
+        return None
+    if row.kind != PURGE_KIND and await global_fence_active(conn):
+        await conn.execute(_POSTPONE, {"i": operation_id, "retry": GLOBAL_FENCE_RETRY})
         return None
     claim_id = uuid4()
     try:
@@ -602,6 +643,28 @@ async def requeue_operation(
         raise FencedOut("operation") from exc
 
 
+async def wait_operation(
+    conn: AsyncConnection, claim: OperationClaim, *, error_code: str, not_before: datetime
+) -> None:
+    """Give the claimed operation back, `running → pending` with `not_before` and `error_code`, its attempts
+    unchanged and never `failed` (module docstring): the handler-side form of the global fence's claim rule,
+    for a wait on a condition that has its own end. Raises `FencedOut`, having written nothing, when `claim`
+    no longer owns the row."""
+    try:
+        await transition(
+            conn,
+            _TABLE,
+            claim.operation_id,
+            ["running"],
+            "pending",
+            reason=error_code,
+            owner={"claim_id": claim.claim_id},
+            set_={"not_before": not_before},
+        )
+    except TransitionConflict as exc:
+        raise FencedOut("operation") from exc
+
+
 async def cancel_operation(conn: AsyncConnection, operation_id: int, *, reason: str) -> bool:
     """End a `pending` or `running` operation `cancelled(reason)`; `False` when it had already ended.
 
@@ -739,11 +802,14 @@ async def _invoke(handler: OperationHandler, ctx: OperationContext) -> None:
 
 
 def _log_handler_end(operation_id: int, end: OperationEnd) -> None:
-    """The log line of an end the handler wrote itself (`finish_in`, `requeue_in`), once it has returned."""
+    """The log line of an end the handler wrote itself (`finish_in`, `requeue_in`, `wait_in`), once it has
+    returned."""
     if end.kind == "finished":
         log.info(
             "operation_finished", operation_id=operation_id, status=end.status, error_code=end.error_code
         )
+    elif end.kind == "waited":
+        log.info("operation_waiting", operation_id=operation_id, error_code=end.error_code)
     else:
         log.info(
             "operation_requeued", operation_id=operation_id, error_code=end.error_code, status=end.status
@@ -778,9 +844,9 @@ async def execute_operation(
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
        the handler swallowed, or `FencedOut`) returns with no further owner write; `raised` requeues with
        `error_code='bug'` and `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`, unless the
-       handler already ended the operation itself (`finish_in`, `requeue_in`: the context's outcome holder),
-       which is then only logged, with no further write. A local execution that is still live for the
-       operation (`AlreadyExecuting`) requeues the new claim as `already_executing`.
+       handler already ended the operation itself (`finish_in`, `requeue_in`, `wait_in`: the context's
+       outcome holder), which is then only logged, with no further write. A local execution that is still
+       live for the operation (`AlreadyExecuting`) requeues the new claim as `already_executing`.
 
     Finish and requeue each run in a transaction of their own; their `FencedOut` is caught outside it, and the
     fenced transaction wrote nothing, because its `transition()` is its first write. The caller's own

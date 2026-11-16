@@ -2,6 +2,9 @@
 
 `create_app()` builds the FastAPI app, its routers, exception handlers, per-session rate limiter
 (`SessionRateLimiter`) and Argon2 admission gate (`argon2_gate.Argon2Gate`), and wraps it in `EdgeMiddleware`.
+The app's engine, the lifespan's or an injected one, gets the write guard of delete-everything's `global`
+fence (`db.fence_guard.install_fence_guard`, M5 Task 8): every transaction a guarded request begins on it
+reads the fence first (the edge sets the guard; `api.edge`, step 4). No route checks that fence itself.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
 (`startup_or_exit("api")`, then the task app, the log level, the engine, the code head, the embedder client
 and, outside the test env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the
@@ -11,12 +14,22 @@ engine.
 The SPA (M4 Task 19) is `api.state.spa`, an `api.static.SpaFiles` on `cfg.spa_dir`, set with the rest of the
 state: the 404 handler of `api.errors` offers it what no route matched, so it is no Mount.
 
+The privacy statement's operator details (M5 follow-ups Task F1) are `api.state.operator`, read once from
+`cfg.operator_file` with the rest of the state (`privacy.operator.at_start`; `None` outside prod without a
+valid file), so a changed file applies after `restart api`.
+
 The embedder client (Task 22) is an `embeddings.EmbedderClient` on `cfg.embedder_url`, which readiness and
 system health probe. The lifespan's HTTP client is closed when the lifespan ends. An injected app (tests) gets
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
 after its answer, so the client holds none open.
 
-The Argon2 gate's thread pool is the first thing the lifespan's end closes (`Argon2Gate.close`, M0
+The heartbeat watch (M5 Task 3, `observability.heartbeat_watch`) is a task of the lifespan, kept as
+`api.state.heartbeat_watch`: it raises and resolves `worker.heartbeat_stale` on the lifespan's engine, at the
+clock `jobhunter.clock.utcnow`, which no request does (a GET handler never writes, §16.5). It is the first
+thing the lifespan's end stops: its stop event is set, and a pass still running is waited for, at most
+`WATCH_STOP_S`, then cancelled. An injected app (tests) runs no watch.
+
+The Argon2 gate's thread pool is the next thing the lifespan's end closes (`Argon2Gate.close`, M0
 Carry-forward 7): a computation still running is waited for, so the threads end with the app.
 
 The gazetteer (M2 Task 22) is loaded by the first `/api/geo/places` request, in a worker thread, and kept on
@@ -60,6 +73,7 @@ from jobhunter.api.routes import (
     health,
     jobs,
     labelling,
+    privacy,
     profile,
     profile_review,
     queries,
@@ -71,16 +85,25 @@ from jobhunter.api.routes import (
     watchlist,
 )
 from jobhunter.api.static import SpaFiles
+from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
+from jobhunter.db.fence_guard import install_fence_guard
 from jobhunter.db.session import make_engine
 from jobhunter.embeddings import EmbedderClient, make_http_client
-from jobhunter.observability.logging import configure_logging
+from jobhunter.observability.heartbeat_watch import watch_heartbeat
+from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.privacy import operator
+from jobhunter.privacy.operator import OperatorDetails
 from jobhunter.worker.tasks import make_queue_app
 
 METRICS_PORT: Final = 8001
 ENGINE_POOL_SIZE: Final = 10
+# How long the lifespan's end waits for a heartbeat-watch pass still running before it cancels it.
+WATCH_STOP_S: Final = 5.0
+
+log = get_logger("jobhunter.api.app")
 
 
 class SessionRateLimiter:
@@ -143,13 +166,26 @@ class JobHunterApp:
         await self._edge(scope, receive, send)
 
 
+async def _stop_watch(watch: asyncio.Task[None], stop: asyncio.Event) -> None:
+    """Stop the heartbeat watch: `stop` set, then the task awaited, a pass still running for at most
+    `WATCH_STOP_S`, after which it is cancelled (its transaction rolls back)."""
+    stop.set()
+    try:
+        await asyncio.wait_for(watch, WATCH_STOP_S)
+    except TimeoutError:
+        log.warning("heartbeat_watch_stop_timeout", waited_s=WATCH_STOP_S)
+
+
 @asynccontextmanager
 async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
     cfg = startup_or_exit("api")
     queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: from the config the lifespan loads
     configure_logging(cfg.log_level)  # ruling T14-b
     engine = make_engine(cfg, pool_size=ENGINE_POOL_SIZE)
+    install_fence_guard(engine)
     embedder_http: httpx.AsyncClient | None = None
+    watch: asyncio.Task[None] | None = None
+    stop_watch = asyncio.Event()
     try:
         api.state.code_head = code_head()
         if cfg.env != "test":
@@ -160,21 +196,35 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
         api.state.queue = queue
         api.state.embedder = EmbedderClient(cfg.embedder_url, embedder_http)
         api.state.spa = SpaFiles(cfg.spa_dir)
+        api.state.operator = _operator_details(cfg)
+        watch = asyncio.create_task(
+            watch_heartbeat(engine, clock=utcnow, stop=stop_watch), name="heartbeat_watch"
+        )
+        api.state.heartbeat_watch = watch
         yield
     finally:
         try:
-            gate = getattr(api.state, "argon2_gate", None)
-            if isinstance(gate, Argon2Gate):  # `create_app` made it; a running computation is waited for
-                gate.close()
+            if watch is not None:
+                await _stop_watch(watch, stop_watch)
         finally:
             try:
-                await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
+                gate = getattr(api.state, "argon2_gate", None)
+                if isinstance(gate, Argon2Gate):  # `create_app` made it; a running computation is waited for
+                    gate.close()
             finally:
                 try:
-                    if embedder_http is not None:
-                        await embedder_http.aclose()
+                    await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
                 finally:
-                    await engine.dispose()
+                    try:
+                        if embedder_http is not None:
+                            await embedder_http.aclose()
+                    finally:
+                        await engine.dispose()
+
+
+def _operator_details(cfg: AppConfig) -> OperatorDetails | None:
+    """The operator details the api serves for its whole run (`privacy.operator.at_start`)."""
+    return operator.at_start(cfg.operator_file, prod=cfg.env == "prod")
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:
@@ -231,6 +281,7 @@ def create_app(
     api.include_router(labelling.router)
     api.include_router(alerts.router)
     api.include_router(cycles.router)
+    api.include_router(privacy.router)
     api.include_router(docs.router)
     for router in extra_routers:
         api.include_router(router)
@@ -239,12 +290,14 @@ def create_app(
     api.state.gazetteer = None  # loaded by the first `/api/geo/places` request (`deps.get_gazetteer`)
     api.state.gazetteer_lock = asyncio.Lock()
     if cfg is not None and engine is not None:
+        install_fence_guard(engine)
         api.state.cfg = cfg
         api.state.engine = engine
         api.state.code_head = code_head()
         api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
         api.state.embedder = EmbedderClient(cfg.embedder_url, make_http_client())
         api.state.spa = SpaFiles(cfg.spa_dir)
+        api.state.operator = _operator_details(cfg)
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 

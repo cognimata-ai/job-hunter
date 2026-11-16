@@ -118,6 +118,18 @@ describe("the routes", () => {
     }
   });
 
+  it("scroll a fresh load of the settings to the part its hash names, once the session is read", async () => {
+    // The router scrolls to a hash when the route renders, which a fresh load does behind the session read's
+    // spinner, before the part exists (plan M5 Task 33, the visual pass).
+    fakeApi({ signedIn: true });
+    const scrolled = vi.spyOn(Element.prototype, "scrollIntoView");
+    at("/settings#privacy-statement");
+    expect(await screen.findByRole("heading", { level: 2, name: en["privacy_statement.title"] })).toBeTruthy();
+    await waitFor(() => {
+      expect(scrolled.mock.contexts.map((element) => (element as Element).id)).toContain("privacy-statement");
+    });
+  });
+
   it("render the login bare at any case of its path", async () => {
     const api = fakeApi({ signedIn: true });
     const app = at("/Login");

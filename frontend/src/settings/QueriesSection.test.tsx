@@ -6,6 +6,7 @@ import en from "../i18n/en.json";
 import { type FakeApi, cellStats, fakeApi, json, problem, queryRow, requestsTo, settingsRead } from "../test/api";
 import { dryRunPayloads, formOf, renderSettings, saves } from "../test/settings";
 import { QUERIES_KEY } from "./queriesApi";
+import tables from "./tables.module.css";
 
 type Settings = components["schemas"]["Settings"];
 type SettingsOut = components["schemas"]["SettingsOut"];
@@ -573,6 +574,12 @@ describe("QueriesSection", () => {
     const cells = within(row).getAllByRole("cell");
     expect(cells).toHaveLength(11);
     expect(cells.every((cell) => cell.getAttribute("role") === "cell")).toBe(true);
+    // M5 follow-ups Task F5 (c): its box is the shared scroll box and a cards container at every width, so the table
+    // reads as cards wherever the box is narrower than 60rem (E14 measures it at 761 and 961 px)
+    const box = grid.parentElement;
+    expect(tables.scroll && tables.boxCards).toBeTruthy();
+    expect(box?.classList.contains(tables.scroll)).toBe(true);
+    expect(box?.classList.contains(tables.boxCards)).toBe(true);
   });
 
   it("binds the source switches, the quota limits and the stale period to the draft", async () => {

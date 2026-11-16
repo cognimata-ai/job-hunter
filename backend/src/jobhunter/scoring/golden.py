@@ -19,6 +19,22 @@ title), the company key of its company and its ad language. A title, company or 
 material revision, so these never drift from the case; a fact neither holds (the provider's structured
 seniority) is unknown, which every hard filter passes (positive evidence only).
 
+**Refusals** are `jobhunter.errors.Refusal`s (M4 Carry-forward 3): domain code never raises the api's
+`Problem`. A user's write that meets a job under a purge fence (`record_feedback`, and `set_flags` activating
+a case) is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (`privacy.fences`, §20.2, M5 Task
+8), after the job's row is taken `FOR SHARE`; a job gone since counts as fenced. `set_flags` also refuses to
+activate a case whose profile version is purged or fenced (M5 Task 14), read under `active_config FOR SHARE`,
+its first lock. The deletion of a case a running eval run includes is refused with 409 `conflict_state`,
+`detail = "eval_run_running"` (`eval_run_running`, M5 Task 12): `lock_case`, `in_running_run` and `case_job`
+are shared with the golden-case purge (`privacy.kinds.golden_case`).
+
+**A pending deletion** (plan M5 Task 33, Ruling T33-15): a case whose `golden_case_delete` manifest is open
+(`executing`: its purge pending, waiting or failed; `pending_deletion`) is not deleted again (the golden-case
+purge's request refuses it) and is neither activated nor made a canary (`set_flags`), each with 409
+`conflict_state`, `detail = "purge_in_progress"`, as a second source purge or delete-everything is refused;
+deactivating it stays allowed. The listed case names that manifest (`CaseRow.deletion_manifest_id`). The
+kind has no fence that names its case (Deviation 53), so this read stands in for one.
+
 Nothing here logs content: ids, labels, sources and counts only.
 """
 
@@ -32,15 +48,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.api.errors import Problem
 from jobhunter.db.seed import content_hash, ensure_hashed
 from jobhunter.db.sql import q
-from jobhunter.errors import DomainError
+from jobhunter.errors import DomainError, Refusal
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.language import detect_language
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import fenced_jobs, lock_unfenced_jobs, purge_in_progress, version_fenced
 from jobhunter.profile.contacts import strip_contacts
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.det_results import det_facts_from_inputs, det_inputs
@@ -212,6 +228,11 @@ _CURRENT: Final = q(
     "JOIN llm_results r ON r.id = cs.llm_result_id JOIN det_results d ON d.id = cs.det_result_id "
     "WHERE cs.job_id = :j"
 )
+# The sources the revision's lineage names (§20.5): with the instance's `det_inputs` sources, what a label's
+# scores derive from, recorded in its snapshot (final fix C2).
+_REVISION_SOURCES: Final = q(
+    "SELECT DISTINCT source_id FROM job_revision_sources WHERE job_revision_id = :revision ORDER BY source_id"
+)
 _INSERT_FEEDBACK: Final = q(
     "INSERT INTO score_feedback (job_id, job_revision_id, profile_version_id, llm_result_id, det_result_id, "
     "score_snapshot, kind, label, comment, created_at) VALUES (:job, :revision, :profile, :result, :det, "
@@ -253,15 +274,15 @@ def snapshot_sources(snapshot: JSONValue) -> list[str]:
     return sorted(found)
 
 
-def _comment_problem(comment: str | None) -> Problem | None:
+def _comment_refusal(comment: str | None) -> Refusal | None:
     if comment is None:
         return None
     if len(comment) > COMMENT_MAX_CHARS:
-        return Problem(
+        return Refusal(
             422, "validation_failed", "Invalid comment", detail="A comment has at most 2,000 characters."
         )
     if (why := unstorable(comment)) is not None:
-        return Problem(422, "validation_failed", "Invalid comment", detail=why)
+        return Refusal(422, "validation_failed", "Invalid comment", detail=why)
     return None
 
 
@@ -277,24 +298,29 @@ async def record_feedback(
     """Record a label or a "wrong score" of job `job_id` in the caller's transaction (§14.2 L4977, §11.13
     L4610; Deviation 21).
 
-    Lock order: `active_config FOR SHARE`, then the job `FOR SHARE`. The job's current published result of the
-    active tuple and its instance under the active scope (`current_scores`) are snapshotted into
-    `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's ids, the scope and the instance), and the
-    golden case of (revision, the tuple's profile) is upserted with the active scope, the instance's
-    `det_inputs` as its frozen snapshot and their source ids, `source = 'week1'` for a label and `'feedback'`
-    for a "wrong score" (an update keeps the case's source). No published result is a 409 `conflict_state`
-    (so is every job with no profile active: `active_config` holds a profile exactly when it holds a tuple,
-    and `current_scores` reads the active tuple's targets);
-    a comment longer than 2,000 characters or holding a NUL or a lone surrogate a 422, both before any
-    write."""
-    if (problem := _comment_problem(comment)) is not None:
-        raise problem
+    Lock order: `active_config FOR SHARE`, then the job `FOR SHARE`, whose purge fences are checked next: a
+    fenced job is refused with 409 `conflict_state`, `detail = "purge_in_progress"` (module docstring). The
+    job's current published result of the active tuple and its instance under the active scope
+    (`current_scores`) are snapshotted into `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's
+    ids, the scope and the instance, and `sources`: every source the revision's lineage or the instance's
+    `det_inputs` names, sorted, so a source purge finds the label after retention has nulled its foreign keys,
+    final fix C2), and the golden case of (revision, the tuple's profile) is upserted with
+    the active scope, the instance's `det_inputs` as its frozen snapshot and their source ids,
+    `source = 'week1'` for a label and `'feedback'` for a "wrong score" (an update keeps the case's source).
+    No published result is a 409 `conflict_state` (so is every job with no profile active: `active_config`
+    holds a profile exactly when it holds a tuple, and `current_scores` reads the active tuple's targets); a
+    comment longer than 2,000 characters or holding a NUL or a lone surrogate a 422, both before any write."""
+    if (refusal := _comment_refusal(comment)) is not None:
+        raise refusal
     pointers = (await conn.execute(_LOCK_CONFIG)).one()
     if (await conn.execute(_LOCK_JOB, {"j": job_id})).first() is None:
-        raise Problem(404, "not_found", "Job not found")
+        raise Refusal(404, "not_found", "Job not found")
+    if await fenced_jobs(conn, [job_id]):
+        log.info("golden_feedback_refused", job_id=job_id, reason="purge_in_progress")
+        raise purge_in_progress()
     row = (await conn.execute(_CURRENT, {"j": job_id})).first()
     if row is None or row.llm_result_id is None or row.det_result_id is None:
-        raise Problem(
+        raise Refusal(
             409, "conflict_state", "No score to label", detail="The job has no published score to label yet."
         )
     snapshot: dict[str, JSONValue] = {
@@ -310,6 +336,9 @@ async def record_feedback(
         "scope_version_id": int(row.scope_version_id),
         "det_result_id": int(row.det_result_id),
     }
+    lineage = (await conn.execute(_REVISION_SOURCES, {"revision": int(row.job_revision_id)})).scalars()
+    sources = sorted({str(source) for source in lineage} | set(snapshot_sources(row.det_inputs)))
+    snapshot["sources"] = list[JSONValue](sources)
     common = {"revision": int(row.job_revision_id), "profile": int(row.profile_version_id), "now": now}
     feedback_id = int(
         (
@@ -398,14 +427,25 @@ class CaseRow:
     source: CaseSource
     active: bool
     is_canary: bool
+    deletion_manifest_id: int | None  # its open `golden_case_delete` manifest (`pending_deletion`)
 
 
+# The request key of a golden-case deletion's manifest (`privacy.kinds.golden_case.REQUEST_KEY`).
+DELETION_REQUEST_KEY: Final = "golden_case_id"
+# The open deletion manifest of case `g`: `executing` (`deletion_manifests_open` serves the status), the
+# oldest when, against the rule, there were two.
+_OPEN_DELETION: Final = (
+    "(SELECT m.id FROM deletion_manifests m "  # noqa: S608 (the module's constants)
+    "WHERE m.kind = 'golden_case_delete' AND m.status = 'executing' "
+    f"AND m.request -> '{DELETION_REQUEST_KEY}' = to_jsonb(g.id) ORDER BY m.id LIMIT 1)"
+)
 # A case's revision is retention-exempt and its job is never deleted while the revision exists, so both are
 # always there; the revision's material names the title the case was labelled on (`llm_input ->> 'title'`).
 _CASE_COLUMNS: Final = (
     "g.id, r.job_id, coalesce(r.llm_input ->> 'title', j.title) AS title, j.company_display AS company, "
     "g.label, g.comment, v.version_no AS profile_version, "
-    "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary "
+    "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary, "
+    f"{_OPEN_DELETION} AS deletion_manifest_id "
     "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id JOIN jobs j ON j.id = r.job_id "
     "JOIN profile_versions v ON v.id = g.profile_version_id"
 )
@@ -415,13 +455,29 @@ _LIST: Final = q(
 )
 _ONE: Final = q(f"SELECT {_CASE_COLUMNS} WHERE g.id = :i")
 _LOCK_CASE: Final = q("SELECT active, is_canary FROM golden_cases WHERE id = :i FOR UPDATE")
-# A running eval run includes the case (`delete_case_unless_running`): it has a call naming the case, or its
+_PENDING_DELETION: Final = q(f"SELECT {_OPEN_DELETION} FROM golden_cases g WHERE g.id = :i")  # noqa: S608
+# The job of a case's revision (a plain read: the golden-case purge then takes the job's row `FOR UPDATE`).
+_CASE_JOB: Final = q(
+    "SELECT r.job_id FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id WHERE g.id = :i"
+)
+# The case's job and its profile version, whether purged (plain reads after `set_flags`' `active_config`
+# lock: then its job's row `FOR SHARE`).
+_CASE_VERSION: Final = q(
+    "SELECT r.job_id, g.profile_version_id, v.purged_at IS NOT NULL AS purged FROM golden_cases g "
+    "JOIN job_revisions r ON r.id = g.job_revision_id JOIN profile_versions v ON v.id = g.profile_version_id "
+    "WHERE g.id = :i"
+)
+# A running eval run includes the case (`in_running_run`): it has a call naming the case, or its
 # kind selects it (a golden run every active case, a canary run every active canary; `eval_runner`'s list).
-_IN_RUNNING_RUN: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM eval_runs r WHERE r.status = 'running' AND ("
+_INCLUDES_CASE: Final = (
+    "r.status = 'running' AND ("
     "EXISTS (SELECT 1 FROM llm_calls c WHERE c.eval_run_id = r.id AND c.golden_case_id = :i) "
     "OR (CAST(:active AS boolean) AND (r.kind = 'golden' "
-    "OR (r.kind = 'canary' AND CAST(:canary AS boolean))))))"
+    "OR (r.kind = 'canary' AND CAST(:canary AS boolean)))))"
+)
+_IN_RUNNING_RUN: Final = q(f"SELECT EXISTS (SELECT 1 FROM eval_runs r WHERE {_INCLUDES_CASE})")  # noqa: S608
+_RUNNING_RUNS_INCLUDING: Final = q(
+    f"SELECT r.id FROM eval_runs r WHERE {_INCLUDES_CASE} ORDER BY r.id"  # noqa: S608 (the module's constant)
 )
 _DELETE: Final = q("DELETE FROM golden_cases WHERE id = :i RETURNING id")
 _CANARY_LOCK: Final = q("SELECT pg_advisory_xact_lock(CAST(:namespace AS integer), 0)")
@@ -430,6 +486,68 @@ _SET_FLAGS: Final = q(
     "UPDATE golden_cases SET active = coalesce(CAST(:active AS boolean), active), "
     "is_canary = coalesce(CAST(:canary AS boolean), is_canary), updated_at = :now WHERE id = :i RETURNING id"
 )
+
+
+EVAL_RUN_RUNNING: Final = "eval_run_running"  # the refusal's detail, and a waiting purge's error code
+
+
+class CaseMissing(LookupError):
+    """No `golden_cases` row has the id (its message names the id only)."""
+
+    def __init__(self, case_id: int) -> None:
+        super().__init__(f"golden_cases {case_id}: no such case")
+        self.case_id = case_id
+
+
+@dataclass(frozen=True)
+class CaseFlags:
+    """The flags of a locked case that decide whether a running eval run includes it."""
+
+    active: bool
+    is_canary: bool
+
+
+def eval_run_running() -> Refusal:
+    """The refusal of a deletion of a case a running eval run includes (409 `conflict_state`, detail
+    `eval_run_running`; Carry T19-d)."""
+    return Refusal(
+        409, "conflict_state", "The golden case is part of a running eval run", detail=EVAL_RUN_RUNNING
+    )
+
+
+async def lock_case(conn: AsyncConnection, case_id: int) -> CaseFlags | None:
+    """The case's row `FOR UPDATE` (a call an eval run reserves for it meanwhile, whose foreign key takes
+    `FOR KEY SHARE`, waits for the caller's transaction); its flags, `None` when there is no such case."""
+    case = (await conn.execute(_LOCK_CASE, {"i": case_id})).first()
+    return None if case is None else CaseFlags(active=bool(case.active), is_canary=bool(case.is_canary))
+
+
+async def in_running_run(conn: AsyncConnection, case_id: int, flags: CaseFlags) -> bool:
+    """Whether a `running` eval run includes the case: one of its calls names it, or its kind selects it (a
+    golden run every active case, a canary run every active canary; `eval_runner`'s list)."""
+    params = {"i": case_id, "active": flags.active, "canary": flags.is_canary}
+    return bool((await conn.execute(_IN_RUNNING_RUN, params)).scalar_one())
+
+
+async def running_runs_including(conn: AsyncConnection, case_id: int, flags: CaseFlags) -> list[int]:
+    """The `running` eval runs that include the case (`in_running_run`'s predicate), by id."""
+    params = {"i": case_id, "active": flags.active, "canary": flags.is_canary}
+    return [int(i) for i in (await conn.execute(_RUNNING_RUNS_INCLUDING, params)).scalars()]
+
+
+async def pending_deletion(conn: AsyncConnection, case_id: int) -> int | None:
+    """The id of the case's open `golden_case_delete` manifest (module docstring), `None` when it has none or
+    there is no such case. A plain read: the golden-case purge's request reads it under the case's row lock
+    and `active_config FOR UPDATE`, `set_flags` after its `active_config FOR SHARE`, so a request committing
+    meanwhile is seen."""
+    manifest_id = (await conn.execute(_PENDING_DELETION, {"i": case_id})).scalar_one_or_none()
+    return None if manifest_id is None else int(manifest_id)
+
+
+async def case_job(conn: AsyncConnection, case_id: int) -> int | None:
+    """The job of the case's revision (a plain read), `None` when there is no such case."""
+    job_id = (await conn.execute(_CASE_JOB, {"i": case_id})).scalar_one_or_none()
+    return None if job_id is None else int(job_id)
 
 
 def _case(row: Row[Any]) -> CaseRow:
@@ -445,6 +563,7 @@ def _case(row: Row[Any]) -> CaseRow:
         source=row.source,
         active=bool(row.active),
         is_canary=bool(row.is_canary),
+        deletion_manifest_id=None if row.deletion_manifest_id is None else int(row.deletion_manifest_id),
     )
 
 
@@ -459,36 +578,13 @@ async def list_cases(
 
 async def delete_case(conn: AsyncConnection, case_id: int) -> bool:
     """Delete golden case `case_id` and, by cascade, its `eval_case_results` and eval calls; `False` when it
-    did not exist. The job's inputs lose their retention exemption at once (§20.1); the deletion manifest of
-    §14.2 L4979 is M5's (Deviation 21). A running eval run skips a case deleted meanwhile (`eval_runner`)."""
+    did not exist. The job's inputs lose their retention exemption at once (§20.1). The user's deletion is the
+    golden-case purge (`privacy.kinds.golden_case`, M5 Tasks 12 and 18), whose phase B calls this once no
+    running eval run includes the case. A running eval run skips a case deleted meanwhile (`eval_runner`)."""
     deleted = (await conn.execute(_DELETE, {"i": case_id})).first() is not None
     if deleted:
         log.info("golden_case_deleted", golden_case_id=case_id)
     return deleted
-
-
-async def delete_case_unless_running(conn: AsyncConnection, case_id: int) -> bool:
-    """The user's deletion of golden case `case_id` (`DELETE /api/golden-cases/{id}`): `delete_case`, refused
-    with a 409 `conflict_state` while a `running` eval run includes the case, nothing deleted (Carry T19-d:
-    the cascade would remove an in-flight call row and leave its ledger entry `dispatched` for good); `False`
-    when it did not exist. A run includes it when one of its calls names it, or when its kind selects it (a
-    golden run every active case, a canary run every active canary). The case row is locked `FOR UPDATE`
-    first, so a call a run reserves for it meanwhile (its foreign key's `FOR KEY SHARE`) waits for this
-    transaction: after a refusal it goes on, after a deletion it fails, and the runner skips the case as
-    deleted."""
-    case = (await conn.execute(_LOCK_CASE, {"i": case_id})).first()
-    if case is None:
-        return False
-    params = {"i": case_id, "active": case.active, "canary": case.is_canary}
-    if (await conn.execute(_IN_RUNNING_RUN, params)).scalar_one():
-        log.info("golden_case_delete_refused", golden_case_id=case_id, reason="eval_run_running")
-        raise Problem(
-            409,
-            "conflict_state",
-            "The golden case is part of a running eval run",
-            detail="delete it once the eval run has ended",
-        )
-    return await delete_case(conn, case_id)
 
 
 async def set_flags(
@@ -497,14 +593,49 @@ async def set_flags(
     """Set the case's `active` and `is_canary` flags (`None` keeps one) in the caller's transaction, its
     `updated_at` to `now` (the caller's clock); the case.
 
-    At most `MAX_CANARIES` cases are canaries (L4632): making a third one a canary is a 422
-    `validation_failed`; the check and the write are serialised by an advisory transaction lock, so two
-    concurrent requests cannot both pass it. An unknown case is a 404."""
+    Its first statement takes `active_config FOR SHARE` (step 2 of the lock schedule, before the canary lock
+    and the job row; M5 Task 14, Deviation 25): a profile purge's admission holds it `FOR UPDATE` while it
+    reads its version's eligibility, which an active case on the version spoils, so an activation either
+    commits before that read or waits for the admission and then meets its fence. At most `MAX_CANARIES`
+    cases are canaries (L4632): making a third one a canary is a 422 `validation_failed`; the check and the
+    write are serialised by an advisory transaction lock, so two concurrent requests cannot both pass it. An
+    unknown case is a 404. Activating a case (`active=True`) refuses, with 409 `conflict_state`, `detail =
+    "purge_in_progress"` (module docstring): a case whose profile version is purged or under an unreleased
+    `profile` or `global` fence (`privacy.fences.version_fenced`, read after the `active_config` lock); then
+    it takes its job's row `FOR SHARE` (step 4) and refuses a job under a purge fence, or one gone. A case
+    deactivated or made a canary is not activated, so neither is refused by those. Activating a case or
+    making it a canary is refused the same way while its deletion is pending (`pending_deletion`, read after
+    the `active_config` lock; module docstring); deactivating it, or making it no canary, is not."""
+    await conn.execute(_LOCK_CONFIG)  # step 2, the first lock
+    if (active or is_canary) and (manifest_id := await pending_deletion(conn, case_id)) is not None:
+        log.info(
+            "golden_case_flags_refused",
+            golden_case_id=case_id,
+            reason="deletion_pending",
+            manifest_id=manifest_id,
+        )
+        raise purge_in_progress()
+    if active:
+        case = (await conn.execute(_CASE_VERSION, {"i": case_id})).first()
+        if case is None:
+            raise Refusal(404, "not_found", "Golden case not found")
+        version = int(case.profile_version_id)
+        if case.purged or await version_fenced(conn, version):
+            log.info(
+                "golden_case_activation_refused",
+                golden_case_id=case_id,
+                reason="profile_purge",
+                version_id=version,
+            )
+            raise purge_in_progress()
+        if not await lock_unfenced_jobs(conn, [int(case.job_id)]):
+            log.info("golden_case_activation_refused", golden_case_id=case_id, reason="purge_in_progress")
+            raise purge_in_progress()
     if is_canary:
         await conn.execute(_CANARY_LOCK, {"namespace": CANARY_LOCK_NAMESPACE})
         others = int((await conn.execute(_OTHER_CANARIES, {"i": case_id})).scalar_one())
         if others >= MAX_CANARIES:
-            raise Problem(
+            raise Refusal(
                 422,
                 "validation_failed",
                 "Too many canaries",
@@ -513,7 +644,7 @@ async def set_flags(
     params = {"i": case_id, "active": active, "canary": is_canary, "now": now}
     updated = await conn.execute(_SET_FLAGS, params)
     if updated.first() is None:
-        raise Problem(404, "not_found", "Golden case not found")
+        raise Refusal(404, "not_found", "Golden case not found")
     log.info("golden_case_flags_set", golden_case_id=case_id, active=active, is_canary=is_canary)
     return _case((await conn.execute(_ONE, {"i": case_id})).one())
 

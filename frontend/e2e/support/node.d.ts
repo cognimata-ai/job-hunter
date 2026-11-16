@@ -25,6 +25,15 @@ declare module "node:child_process" {
   export function spawn(command: string, args: readonly string[], options?: SpawnOptions): ChildProcess;
 }
 
+declare module "node:fs" {
+  export function existsSync(path: string): boolean;
+}
+
+declare module "node:fs/promises" {
+  /** A file's bytes (a Buffer, which is a Uint8Array). */
+  export function readFile(path: string): Promise<Uint8Array>;
+}
+
 declare module "node:url" {
   export function fileURLToPath(url: string | URL): string;
 }

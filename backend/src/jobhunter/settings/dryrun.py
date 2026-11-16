@@ -117,9 +117,10 @@ _ACTIVE_PAYLOAD: Final = q(
     "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
     "WHERE a.id = 1"
 )
-# Retained jobs (tombstones are M5's) that a re-score would create targets for: unmerged, with a current
-# revision, not an adversarial golden case (§12.6, `create_targets_for_tuple`'s `targets.RETAINED_JOB_SQL`,
-# Codex r1 #32).
+# Retained jobs that a re-score would create targets for: unmerged, with a current revision, not an
+# adversarial golden case (§12.6, `create_targets_for_tuple`'s `targets.RETAINED_JOB_SQL`, Codex r1 #32).
+# A tombstoned job needs no clause of its own (C10, M5 Task 13): tombstoning deletes the job row, so it no
+# longer exists to be counted; its `job_tombstones` row names no revision.
 _RETAINED_CURRENT_REVISIONS: Final = q(
     "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL "
     "AND NOT synthetic_eval"

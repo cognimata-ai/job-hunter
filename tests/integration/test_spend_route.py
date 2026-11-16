@@ -39,6 +39,7 @@ from tests.support.m3 import (
     insert_submission,
     insert_target,
 )
+from tests.support.purges import Purger
 from tests.support.scoring import activate_score_tuple
 
 pytestmark = pytest.mark.integration
@@ -290,11 +291,12 @@ async def test_with_history_c_hat_and_the_critic_rate_are_the_tuple_s_and_the_bu
 
 
 async def test_eval_spend_is_reported_apart_from_live_scoring_and_outlives_its_case(
-    logged_in_client, engine, eval_owner, now
+    logged_in_client, engine, eval_owner, now, purger: Purger, current_epoch: int
 ) -> None:
     """Carry T19-d: an eval case's calls are non-scoring tries of the eval run; they never join the live
     scoring rows of the same model, effort and role, and once the case is deleted (its call rows go with it by
-    cascade) their ledger entries still count, in the eval spend, never as a row with no effort."""
+    cascade) their ledger entries still count, in the eval spend, never as a row with no effort. Since M5 Task
+    18 the deletion answers 202 with its manifest and the worker's purge deletes the case."""
     async with engine.begin() as conn:
         tuple_id = await activate_score_tuple(conn)
         job = await insert_job(conn)
@@ -346,7 +348,18 @@ async def test_eval_spend_is_reported_apart_from_live_scoring_and_outlives_its_c
             {"r": run},
         )
     r = await logged_in_client.delete(f"/api/golden-cases/{case.id}")
-    assert r.status_code == 204, r.text
+    assert r.status_code == 202, r.text
+    async with engine.connect() as conn:
+        (operation_id,) = (
+            await conn.execute(
+                sa.text(
+                    "SELECT id FROM operations WHERE kind = 'purge' "
+                    "AND payload -> 'manifest_id' = to_jsonb(CAST(:m AS bigint))"
+                ),
+                {"m": r.json()["manifest_id"]},
+            )
+        ).one()
+    await purger.run(operation_id)
     async with engine.connect() as conn:
         calls = (
             await conn.execute(sa.text("SELECT count(*) FROM llm_calls WHERE eval_run_id = :r"), {"r": run})

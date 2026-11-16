@@ -1,8 +1,8 @@
 # check=skip=InvalidDefaultArgInFrom
 
 # The embedder image (spec §2.1 U3, §3.2, §19.1): the `embedder` dependency group in /opt/venv, the model files of
-# embedder/model.lock in /opt/model, and app.py, health.py and model.lock in /app. It holds no jobhunter code,
-# runs as 10004:10004 and writes nothing at run time (the service runs read-only).
+# embedder/model.lock in /opt/model, and app.py, health.py and model.lock in /app. It holds no jobhunter code
+# and no pip, runs as 10004:10004 and writes nothing at run time (the service runs read-only).
 #
 # PYTHON_IMAGE and UV_IMAGE are the digest-pinned references of deploy/images.lock, as for the app image; the
 # build context is the repository root:
@@ -55,7 +55,11 @@ RUN --mount=type=secret,id=build_ca,required=false \
 FROM ${PYTHON_IMAGE} AS fake
 COPY --from=build /opt/venv /opt/venv
 COPY embedder/app.py embedder/health.py embedder/model.lock /app/
-RUN chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
+# The base image's pip goes, as in the app and docparse images (M5 Task 29, follow-ups Task F2): nothing runs
+# it (uv installs the venv in the build stage), and the image scan flags the packages it vendors.
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info \
+        /usr/local/bin/pip* \
+    && chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 ORT_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /
@@ -67,7 +71,11 @@ FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
 COPY --from=model /opt/model /opt/model
 COPY embedder/app.py embedder/health.py embedder/model.lock /app/
-RUN chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
+# The base image's pip goes, as in the app and docparse images (M5 Task 29, follow-ups Task F2): nothing runs
+# it (uv installs the venv in the build stage), and the image scan flags the packages it vendors.
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info \
+        /usr/local/bin/pip* \
+    && chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
 # onnxruntime's Microsoft telemetry off, the Hugging Face hub offline and without telemetry (app.py's
 # RUNTIME_ENV, which OnnxModel sets again before its imports)
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 ORT_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 \

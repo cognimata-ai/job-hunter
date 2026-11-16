@@ -1,9 +1,9 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
 // can end, the session, settings, header-status, Jobs-list, facets, places, profile, spend, quota, query, query
 // stats, watchlist, golden-run and shipped-version reads, the System section's reads (needs attention, runs,
-// score cycles, alerts by status, golden cases, health), the settings dry-run, the logout, the login's answers
-// in the order a test gives them, and any other route a test answers itself (`routes`). A route is matched by
-// its path alone; the query string is the request's `search`.
+// score cycles, alerts by status, golden cases, health), the deletion manifests (the list and each one), the
+// exports in use, the privacy statement's operator values, the settings dry-run, the logout, the login's answers in the order a test gives them, and any other route a test
+// answers itself (`routes`). A route is matched by its path alone; the query string is the request's `search`.
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
@@ -37,6 +37,9 @@ type ScoreCyclesPageOut = components["schemas"]["ScoreCyclesPageOut"];
 type AlertOut = components["schemas"]["AlertOut"];
 type GoldenCaseOut = components["schemas"]["GoldenCaseOut"];
 type SystemHealthOut = components["schemas"]["SystemHealthOut"];
+type ManifestOut = components["schemas"]["ManifestOut"];
+type OperatorOut = components["schemas"]["OperatorOut"];
+type ExportListedOut = components["schemas"]["ExportListedOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -802,6 +805,7 @@ export function attentionOut(overrides: Partial<AttentionOut> = {}): AttentionOu
     broken_sources: none,
     paused_lane: null,
     scope_apply_failed: null,
+    failed_purges: none,
     ...overrides,
   };
 }
@@ -850,7 +854,8 @@ export function cyclesPage(items: ScoreCycleOut[] = [], next_cursor: string | nu
   return { items, next_cursor };
 }
 
-/** An open warning: the provider reports less remaining quota than the ledger counts. */
+/** An open warning the user resolves (manual), never pushed yet: the provider reports less remaining quota than
+ * the ledger counts. */
 export function alertRow(overrides: Partial<AlertOut> = {}): AlertOut {
   return {
     id: 3,
@@ -864,6 +869,9 @@ export function alertRow(overrides: Partial<AlertOut> = {}): AlertOut {
     acknowledged_at: null,
     resolved_at: null,
     status: "open",
+    last_notified_at: null,
+    notify_failures: 0,
+    manual: true,
     ...overrides,
   };
 }
@@ -882,6 +890,7 @@ export function goldenCase(overrides: Partial<GoldenCaseOut> = {}): GoldenCaseOu
     source: "week1",
     active: true,
     is_canary: false,
+    deletion_manifest_id: null,
     ...overrides,
   };
 }
@@ -932,6 +941,30 @@ export function healthOut(overrides: Partial<SystemHealthOut> = {}): SystemHealt
       langgraph: "1.2.15",
     },
     embedder: { ok: true, model_id: "embedder-model@abc/fp32", checksum_ok: true },
+    langsmith: null,
+    backups: {
+      latest_set: { id: 12, status: "succeeded", finished_at: "2026-11-10T01:40:00Z", age_s: 30_000 },
+      backup_age_state: "ok",
+      latest_shipment: { id: 4, shipped_at: "2026-11-10T02:12:00Z", manifests: 3 },
+      unshipped_manifests: 0,
+      oldest_unshipped_completed_at: null,
+      latest_restore_test: { id: 3, status: "succeeded", finished_at: "2026-11-01T03:00:00Z", age_s: 777_600 },
+      restore_test_age_state: "ok",
+    },
+    ...overrides,
+  };
+}
+
+/** A delete-everything manifest requested at 05:00 UTC on 3 Nov 2026, completed at 05:10 and shipped at 05:15. */
+export function manifestOut(overrides: Partial<ManifestOut> = {}): ManifestOut {
+  return {
+    id: 1,
+    kind: "delete_everything",
+    status: "shipped",
+    created_at: "2026-11-03T05:00:00Z",
+    completed_at: "2026-11-03T05:10:00Z",
+    shipped_at: "2026-11-03T05:15:00Z",
+    deleted_golden_case_ids: [],
     ...overrides,
   };
 }
@@ -1015,6 +1048,13 @@ export interface FakeApi {
   goldenCases: GoldenCaseOut[];
   /** What `GET /api/system/health` answers. */
   health: SystemHealthOut;
+  /** The deletion manifests, newest first: `GET /api/privacy/manifests` lists them, `GET …/{id}` answers one
+   * (none, by default). */
+  manifests: ManifestOut[];
+  /** What `GET /api/privacy/operator` answers (all null, a server without an operator file, by default). */
+  operator: OperatorOut;
+  /** The exports in use `GET /api/privacy/exports` lists (none, by default). */
+  exports: ExportListedOut[];
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -1054,6 +1094,9 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     alerts: [],
     goldenCases: [],
     health: healthOut(),
+    manifests: [],
+    operator: { operator: null, contact: null, controller: null, vps_provider: null, s3_provider: null },
+    exports: [],
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -1151,6 +1194,20 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/system/health") {
       return Promise.resolve(json(api.health));
+    }
+    if (method === "GET" && path === "/api/privacy/manifests") {
+      return Promise.resolve(json({ items: api.manifests, next_cursor: null }));
+    }
+    const manifestId = /^\/api\/privacy\/manifests\/(\d+)$/.exec(path)?.[1];
+    if (method === "GET" && manifestId !== undefined) {
+      const manifest = api.manifests.find((m) => m.id === Number(manifestId));
+      return Promise.resolve(manifest === undefined ? problem(404, "not_found") : json(manifest));
+    }
+    if (method === "GET" && path === "/api/privacy/operator") {
+      return Promise.resolve(json(api.operator));
+    }
+    if (method === "GET" && path === "/api/privacy/exports") {
+      return Promise.resolve(json({ items: api.exports }));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;

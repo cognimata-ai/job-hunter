@@ -601,10 +601,11 @@ async def test_score_individually_sets_the_flag_of_a_member_without_a_target(
     assert (await swept_of(engine, later["other"])).state == "deferred_duplicate"
 
 
-async def test_acknowledge_alert_lifts_the_pause_and_keeps_the_alert_open(
+async def test_acknowledge_alert_lifts_the_pause_and_resolves_the_bound_violation(
     engine: AsyncEngine, tuple_id: int, now: datetime
 ) -> None:
-    # Ruling P13: the score-lane pause of an unacknowledged bound violation ends with its acknowledgement
+    # Ruling P13: the score-lane pause of an unacknowledged bound violation ends with its acknowledgement,
+    # which also resolves it (§17.6 "manual acknowledgement"; plan M5 Task 2, `catalogue.RESOLVE_ON_ACK`)
     async with engine.begin() as conn:
         alert = await raise_alert(
             conn,
@@ -619,15 +620,14 @@ async def test_acknowledge_alert_lifts_the_pause_and_keeps_the_alert_open(
         assert await acknowledge_alert(conn, alert, now=now) == now
     async with engine.begin() as conn:
         assert await cycles.pause_reason(conn, fake_llm=True, now=now) is None
-        assert await acknowledge_alert(conn, alert, now=now + timedelta(minutes=1)) == now  # the first kept
         row = (
             await conn.execute(
                 sa.text("SELECT acknowledged_at, resolved_at FROM alerts WHERE id = :a"), {"a": alert}
             )
         ).one()
-        assert (row.acknowledged_at, row.resolved_at) == (now, None)
-        await conn.execute(sa.text("UPDATE alerts SET resolved_at = now() WHERE id = :a"), {"a": alert})
-        assert await acknowledge_alert(conn, alert, now=now) is None  # resolved: nothing to acknowledge
+        assert (row.acknowledged_at, row.resolved_at) == (now, now)
+        # resolved: nothing to acknowledge
+        assert await acknowledge_alert(conn, alert, now=now + timedelta(minutes=1)) is None
         assert await acknowledge_alert(conn, 10**12, now=now) is None
 
 

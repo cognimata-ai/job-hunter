@@ -1,0 +1,24 @@
+# The site of both Caddyfiles (spec §19.1, §16.3, §16.6; plan M5 Task 21, Deviation 34): one source for the
+# security headers, imported into the site block of deploy/Caddyfile and deploy/Caddyfile.test.
+#
+# - The proxy overwrites X-Forwarded-For with the client's own address, so a client-supplied value never
+#   passes; the api trusts that header from this Caddy (172.30.0.2) only (§16.3).
+# - The headers are §16.6's, the ones the api's edge mirrors (api/edge.py SECURITY_HEADERS), and the Server
+#   header is removed. A deletion makes Caddy apply the whole block as the response is written, so each header
+#   replaces the api's copy: one value each.
+# - No `log` directive: Caddy keeps no access log, since client addresses are personal data. The Caddyfiles'
+#   global `log default` drops the client's address and headers from the error lines Caddy still writes.
+encode zstd gzip
+reverse_proxy api:8000 {
+	header_up X-Forwarded-For {remote_host}
+}
+header {
+	Strict-Transport-Security "max-age=63072000; includeSubDomains"
+	Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+	X-Content-Type-Options "nosniff"
+	Referrer-Policy "no-referrer"
+	Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+	Cross-Origin-Opener-Policy "same-origin"
+	Cross-Origin-Resource-Policy "same-origin"
+	-Server
+}

@@ -3,11 +3,11 @@
 #
 #   scripts/dev-secrets.sh [dir]        dir defaults to .secrets/dev in the repository root (git-ignored)
 #
-# Each missing secret is a new random value: `openssl rand -base64 32` for session_secret and data_key,
-# `openssl rand -hex 24` for the database passwords. The worker's anthropic_key is the value of
-# JOBHUNTER_ANTHROPIC_API_KEY when it is set, else an empty file: compose needs the file to exist, and the
-# worker reads an empty one as no key (its LLM calls then fail llm_not_configured; M2 Task 23). The value is
-# written by a shell builtin, so it never appears in a command line. A file gets group 10010
+# Each missing secret is a new random value: `openssl rand -base64 32` for session_secret, data_key and the
+# shipper's restic_password (M5 Task 10), `openssl rand -hex 24` for the database passwords. The worker's
+# anthropic_key is the value of JOBHUNTER_ANTHROPIC_API_KEY when it is set, else an empty file: compose needs
+# the file to exist, and the worker reads an empty one as no key (its LLM calls then fail llm_not_configured;
+# M2 Task 23). The value is written by a shell builtin, so it never appears in a command line. A file gets group 10010
 # (jobhunter-secrets) and mode 0440 before it appears under its name, so it is never readable by anyone else,
 # and the directory gets group 10010 and mode 0750. An existing secret is never overwritten: a key given once
 # anthropic_key exists is not written, and the script prints `kept anthropic_key (remove it to set a key)`.
@@ -61,7 +61,7 @@ create() {
     echo "dev-secrets: $outcome $name"
 }
 
-for name in session_secret data_key; do
+for name in session_secret data_key restic_password; do
     create "$name" openssl rand -base64 32
 done
 for name in pg_bootstrap db_app db_migrator db_backup db_restore; do

@@ -1,0 +1,45 @@
+# The S3 stand-in of the compose test stack (plan M5 Task 21; `S3`): versitygw on a local POSIX directory, a
+# project of its own, so it outlives the test project's `down -v` as offsite storage outlives a lost VPS:
+#
+#   docker compose -p jobhunter-s3stub --env-file deploy/images.lock -f deploy/compose.s3stub.yaml up -d --wait
+#
+# It is started first and removed last (tests/support/prodstack.py): it creates the network `jobhunter-s3net`,
+# which compose.test.yaml's backup and restore join as an external one, and on which they reach it as
+# `http://s3stub:7070`. Its root credentials are public test constants, the ones scripts/test-secrets.sh writes
+# as the S3 secrets; the flags and variables are versitygw v1.9.0's own (`versitygw --help`): `--port`,
+# `--health`, and ROOT_ACCESS_KEY_ID and ROOT_SECRET_ACCESS_KEY for `--access` and `--secret`.
+#
+# It runs as root (`user: "0:0"`), so the owner of its new volume does not depend on the image's default user:
+# the volume's mount point is not in the image, so Docker creates it root-owned, and root writes there with
+# every capability dropped, as its owner.
+name: jobhunter-s3stub
+
+services:
+  s3stub:
+    image: "${versitygw:?}"
+    user: "0:0"
+    command: ["--port", ":7070", "--health", "/health", "posix", "/data"]
+    environment:
+      ROOT_ACCESS_KEY_ID: jobhunter-test
+      ROOT_SECRET_ACCESS_KEY: jobhunter-test-secret-0000000000
+    volumes: [s3data:/data]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [s3net]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7070/health"]
+      interval: 10s
+      start_period: 30s
+      start_interval: 1s
+    logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
+    mem_limit: 256m
+    restart: unless-stopped
+
+networks:
+  s3net:
+    name: jobhunter-s3net
+
+volumes:
+  s3data: {}

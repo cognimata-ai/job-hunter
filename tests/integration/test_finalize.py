@@ -52,6 +52,7 @@ from tests.support.collect import (
     source_cell,
     supersede,
 )
+from tests.support.fences import insert_test_fence
 from tests.support.m2 import insert_profile_chain
 from tests.support.pg import pg_rows
 from tests.support.quota import insert_window, jsearch_window, seeded_run_settings
@@ -280,7 +281,7 @@ async def test_partial_and_invariant_failures(
     # (e) a `deferred('job_fenced')` item does not fail I1: a board job fenced, its posting sighted again
     async with engine.begin() as c:
         job = (await c.execute(BOARD_JOB, {"s": DEFAULT_BOARD[0], "k": DEFAULT_BOARD[1]})).scalar_one()
-        await c.execute(FENCE_JOB, {"jobs": [job]})
+        await insert_test_fence(c, kind="jobs", job_ids=[job])
     rid = await run_to_the_end(engine, collect_deps)
     status, reason, report = await run_end(engine, rid)
     assert report["sources"][await board_key(engine)]["items"].get("deferred") == 1
@@ -302,9 +303,6 @@ BREACH = sa.text(
 BOARD_JOB = sa.text(
     "SELECT p.job_id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
     "WHERE i.source_id = :s AND i.instance_key = :k ORDER BY p.id LIMIT 1"
-)
-FENCE_JOB = sa.text(
-    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1)"
 )
 
 
@@ -449,13 +447,14 @@ async def test_i5_is_evaluated_against_the_runs_own_tuple(engine, current_epoch)
 
 async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, current_epoch) -> None:
     """(e) at the function level: a `deferred('job_fenced')` item of the run keeps I1, and the partial
-    conditions of the run are read from its rows."""
+    conditions of the run are read from its rows. The run's one revision is the fenced job's: I6 leaves it out
+    while the fence stands (M5 Task 8 fix round 1) and counts it once the fence is released."""
     owner = await queued_run(engine)
     first = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
     assert await resolved(engine, owner, first) == "linked"
     async with engine.begin() as c:
         job = (await c.execute(sa.text("SELECT job_id FROM postings WHERE native_id = 'H'"))).scalar_one()
-        await c.execute(FENCE_JOB, {"jobs": [job]})
+        fence = await insert_test_fence(c, kind="jobs", job_ids=[job])
     again = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
     assert await resolved(engine, owner, again) == "deferred"
     async with engine.connect() as c:
@@ -467,11 +466,23 @@ async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, 
         assert [r.code for r in results.values()] == ["I1", "I2", "I3", "I4", "I5", "I6", "I7"]
         assert results["I1"].ok and results["I1"].detail == {"responses": 2, "mismatched": 0, "pending": 0}
         assert results["I2"].ok and results["I4"].ok and results["I5"].detail == {"llm_tuple_id": None}
-        # the run's one revision awaits its embedding: I6 counts it, and it is the run's one partial cause
-        assert results["I6"] == InvariantResult("I6", False, {"awaiting": 1})
-        assert await partial_conditions(c, owner.run_id, revisions=revisions) == ["awaiting_embedding"]
+        # the run's one revision awaits its embedding, but its job is fenced: no batch takes it, so I6 and
+        # the partial conditions leave it out
+        assert results["I6"] == InvariantResult("I6", True, {"awaiting": 0})
+        assert await partial_conditions(c, owner.run_id, revisions=revisions) == []
         failed = await check_invariants(c, owner.run_id, outcome_conflicts=2, revisions=revisions)
         assert failed[-1] == InvariantResult("I7", False, {"conflicts": 2})
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE purge_fences SET released_at = now() WHERE id = :f"), {"f": fence})
+    async with engine.connect() as c:
+        # released: I6 counts it, and it is the run's one partial cause
+        revisions = await run_revisions(c, owner.run_id)
+        results = {
+            r.code: r
+            for r in await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
+        }
+        assert results["I6"] == InvariantResult("I6", False, {"awaiting": 1})
+        assert await partial_conditions(c, owner.run_id, revisions=revisions) == ["awaiting_embedding"]
 
 
 # --- Task 24 (Task 23 review, addendum 10): `run.orphaned_queue` resolves on the next success (§17.6) ------

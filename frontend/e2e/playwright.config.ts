@@ -4,7 +4,8 @@
 // - `first-use`: the empty stack, before any setup (the session cookie, E1, E2, E19);
 // - `stack-setup`: the deterministic setup (`scripts/e2e_setup.py`). A `globalSetup` runs before every spec, so
 //   the setup that must follow E2's empty state is a project of its own;
-// - `scenarios`: the scenario specs on the set-up stack (Tasks 33 and 34).
+// - `scenarios`: the scenario specs on the set-up stack (Tasks 33 and 34), and E18 (plan M5 Task 30), whose
+//   delete-everything leaves nothing for a later spec: one worker runs the files in name order, so `20-` is last.
 // `globalSetup` waits for the stack, creates the smoke user and saves its session (`AUTH_STATE`). The report
 // goes to frontend/playwright-report and the test output (traces, screenshots) to frontend/test-results, both
 // git-ignored; a reporter's relative `outputFolder` resolves against this file's directory.
@@ -13,8 +14,13 @@
 // recorded (a failure keeps its screenshot and page snapshot); a local run keeps a failed test's trace, which
 // holds the stack's credentials and never leaves the machine. `npm run e2e:sentinel` checks what CI keeps.
 import { defineConfig } from "@playwright/test";
+import { existsSync } from "node:fs";
 import process from "node:process";
 import { AUTH_STATE } from "./support/paths";
+
+// A dev container's pre-installed Chromium, whose revision need not be the one this Playwright version names
+// (M5 follow-ups, Ruling FU-6); a CI runner installs its own (e2e.yml), and has no such file.
+const DEV_CHROMIUM = "/opt/pw-browsers/chromium";
 
 export default defineConfig({
   testDir: ".",
@@ -28,6 +34,7 @@ export default defineConfig({
     trace: process.env.CI ? "off" : "retain-on-failure",
     screenshot: "only-on-failure",
     locale: "en-GB",
+    launchOptions: existsSync(DEV_CHROMIUM) ? { executablePath: DEV_CHROMIUM } : {},
   },
   reporter: [["list"], ["html", { open: "never", outputFolder: "../playwright-report" }]],
   globalSetup: "./global-setup.ts",
@@ -44,7 +51,7 @@ export default defineConfig({
     },
     {
       name: "scenarios",
-      testMatch: /[\\/]specs[\\/](0[4-9]|1[0-9])-[^\\/]+\.spec\.ts$/,
+      testMatch: /[\\/]specs[\\/](0[4-9]|1[0-9]|20)-[^\\/]+\.spec\.ts$/,
       dependencies: ["stack-setup"],
       use: { storageState: AUTH_STATE },
     },

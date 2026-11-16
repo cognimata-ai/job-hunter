@@ -160,7 +160,12 @@ PAID_RUN_KEY: Final = "smoke-m3-run-paid-0001"
 # The run embeds every revision it creates (about 330 here) on the dev embedder at about 0.55 docs/s
 # (smoke_m1's COLLECT_WITHIN_S): some 10 minutes.
 COLLECT_WITHIN_S: Final = 1200
-TARGETS_WITHIN_S: Final = 120
+# Similarity is set by the `awaiting_embedding` pass of `reconcile_heavy` (every 10 minutes, skipped while
+# a run is running: `worker/embedding_reconcile.py`), so the run's end can wait up to one period for it.
+TARGETS_WITHIN_S: Final = 720
+# The states `scoring.similarity._FILL` never sets a similarity on (pinned by the test): a target the first
+# periodic cycle published before the pass keeps `similarity` NULL, which the unscored section never reads.
+UNFILLED_STATES: Final = "('published_accepted', 'published_contested', 'cancelled')"
 # A current revision of a retained job (`jobs j`), as `scoring.targets.RETAINED_JOB_SQL` (pinned by the test).
 RETAINED_JOB_SQL: Final = (
     "j.merged_into_job_id IS NULL AND j.current_revision_id IS NOT NULL AND NOT j.synthetic_eval"
@@ -175,7 +180,8 @@ SELECT coalesce((SELECT status FROM operations WHERE kind = 'create_targets_for_
   (SELECT count(*) FROM jobs j JOIN score_targets t ON t.job_revision_id = j.current_revision_id
     AND t.llm_tuple_id = {{tuple}} WHERE {RETAINED_JOB_SQL}),
   (SELECT count(*) FROM jobs j JOIN score_targets t ON t.job_revision_id = j.current_revision_id
-    AND t.llm_tuple_id = {{tuple}} WHERE {RETAINED_JOB_SQL} AND t.similarity IS NULL)"""  # noqa: S608
+    AND t.llm_tuple_id = {{tuple}} WHERE {RETAINED_JOB_SQL} AND t.similarity IS NULL
+    AND t.state NOT IN {UNFILLED_STATES})"""  # noqa: S608
 
 # Check 10: the bucket's clock a month back (the module docstring; Ruling T28-f), the month's row only, and
 # neither its counters nor the ledger. The precedent is M0's `UPDATE_SLOT_DUE` (scripts/smoke_m0.py), which

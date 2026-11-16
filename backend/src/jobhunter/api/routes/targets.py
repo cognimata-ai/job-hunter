@@ -11,12 +11,14 @@ the handler, so the key's row rolls back with the rest and a retry with the key 
   (the job's current-revision target of the active tuple to `pending` with its override and lane `score_now`,
   then the `score_now` cycle requested; a running cycle's next claim round, or the waiting job, serves it).
   404 `not_found` for a job without a target of the active tuple, a synthetic golden-case job among them
-  (Carry T19-d: `targets.score_now` finds none for it); 409
+  (Carry T19-d: `targets.score_now` finds none for it), and for a job under a purge fence, as its detail
+  answers it (§20.2, M5 Task 8); 409
   `filtered_requires_force` for a filtered-out target without `force`, `budget_exhausted` when the month's
   scoring headroom is below one attempt's first reservation, `conflict_state` for a target being scored,
   batched, published or cancelled.
 - `POST /api/targets/{target_id}/retry` → 202 `{target_id, state}`: `targets.retry` of a `refused` or
-  `failed_*` target (the Retry edge: its charged attempts reset); 404 `not_found`, 409 `conflict_state`.
+  `failed_*` target (the Retry edge: its charged attempts reset); 404 `not_found` (no such target, or one of a
+  job under a purge fence), 409 `conflict_state`.
 - `POST /api/batches/{submission_id}/release` (`{confirm: true}`) → 202 `{submission_id, state:
   "released", reserved_usd}`: `batches.release` of a releasable submission (`batches.RELEASABLE_SQL` at the
   route's `now`: a `submit_ambiguous` one, or, plan M4 Task 16, a `submitted` one whose
@@ -168,7 +170,10 @@ async def _idempotent(
     response_model=TargetMovedOut,
     responses={
         **_KEY_RESPONSES,
-        404: {"description": "No target of the active tuple for the job (`not_found`)"},
+        404: {
+            "description": "No target of the active tuple for the job, or the job is being purged "
+            "(`not_found`)"
+        },
         409: {
             "description": "The job is filtered out and `force` is not set (`filtered_requires_force`), the "
             "month's scoring budget is exhausted (`budget_exhausted`), the target is being scored, batched, "
@@ -205,7 +210,7 @@ async def score_now(
     response_model=TargetMovedOut,
     responses={
         **_KEY_RESPONSES,
-        404: {"description": "No such target (`not_found`)"},
+        404: {"description": "No such target, or its job is being purged (`not_found`)"},
         409: {"description": f"The target is not refused or failed (`conflict_state`), or {_IN_PROGRESS}"},
         422: {"description": f"Invalid path (`validation_failed`), or {_KEY_REUSED}"},
         **CSRF_RESPONSES,

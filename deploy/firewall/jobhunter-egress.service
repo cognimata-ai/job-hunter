@@ -1,0 +1,17 @@
+# The loader of the egress rule deploy/firewall/docker-user.nft (spec §16.9; plan M5 Task 22, Deviation 35,
+# Ruling T22-3). It is ordered before Docker: `Before=` orders the two units and does not require this one, so
+# Docker starts even when the rule fails to load (`systemctl status jobhunter-egress` shows it). The api and
+# docparse have no route out regardless; the rule is defence in depth. scripts/host-setup.sh installs it into
+# /etc/systemd/system and enables it; stopping the unit deletes the rule's table.
+[Unit]
+Description=jobhunter egress rule (nft table inet jobhunter_egress)
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /opt/jobhunter/deploy/firewall/docker-user.nft
+ExecStop=/usr/sbin/nft delete table inet jobhunter_egress
+
+[Install]
+WantedBy=multi-user.target

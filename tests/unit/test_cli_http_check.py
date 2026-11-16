@@ -88,7 +88,9 @@ def test_the_probe_loads_neither_the_api_nor_the_database_stack() -> None:
         "import sys\n"
         "from jobhunter.cli import main\n"
         "assert main(['http-check', 'http://127.0.0.1:1/healthz']) == 1\n"
-        "heavy = ('fastapi', 'sqlalchemy', 'jobhunter.api', 'procrastinate')\n"
+        # neither LangSmith nor langchain either: `main` leaves the probe out of `disable_tracing` for that
+        # (`UNTRACEABLE_PROBES`, M5 Task 6, Ruling T6-9)
+        "heavy = ('fastapi', 'sqlalchemy', 'jobhunter.api', 'procrastinate', 'langsmith', 'langchain_core')\n"
         "loaded = [m for m in heavy if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )

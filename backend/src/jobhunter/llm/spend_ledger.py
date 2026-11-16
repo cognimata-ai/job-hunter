@@ -48,9 +48,13 @@ reservation is charged in full with `evidence='reservation_bound_violated'` and 
 already moved to `ambiguous` settles late through §7.16.7's `ambiguous → billed | not_billed` (plan Deviation
 24); one already `billed` or `not_billed` is left alone (`llm_settle_duplicate`). A score attempt's
 `cost_usd` follows each try at what it counts (billed its cost, ambiguous its reservation, L3911). The
-provider metadata it writes is made storable first (`storable_outcome`). `settle` updates no metric: it
-returns the figures (`SettleFigures`), and the gateway records them after its transaction has committed
-(`record_settlement_metrics`), so a rolled-back settlement is never counted.
+provider metadata it writes is made storable first (`storable_outcome`). The call's `output_json` is set by
+SQL only while its `content_purged_at` is NULL (M5 Task 14, Deviation 54): the expression is evaluated on the
+row the update locks, and again on the newest version after a lock wait, so a profile purge's redaction that
+committed first wins whatever the settlement read, and a response that arrives after it settles its usage,
+cost and ledger state but stores no content (logged `llm_settle_output_redacted`, ids only). `settle` updates
+no metric: it returns the figures (`SettleFigures`), and the gateway records them after its transaction has
+committed (`record_settlement_metrics`), so a rolled-back settlement is never counted.
 
 **The cap reached** (§6.9.4): `raise_cap_reached` raises `llm.cap_reached` once per month (the month row's
 `cap_reached_alerted_at`, never cleared); `resolve_cap_reached` and `resolve_stale_cap_alerts` resolve it.
@@ -63,6 +67,18 @@ rows. None of them locks or writes.
 **Receipts** (`receipts`, plan Task 13, Deviation 26): the newest `completed` call of each logical call of an
 operation, which a resumed or reclaimed execution reuses instead of paying again (§9.1);
 `last_call_of_attempt` is a score attempt's newest call of one purpose. Both carry the try's `max_tokens`.
+
+**Purges** (§20.2, §20.4; plan M5 Task 11, G04). A purge that deletes `llm_calls` rows keeps their ledger
+rows, and every later reader of an online entry joins its call (`_ENTRY`, `_UNSETTLED`), so an online entry
+left `reserved` or `dispatched` when its call goes could never be settled or recovered. The purge settles them
+first, in its own transaction: `lock_for_purge(conn, ledger_ids, *, now)` takes their month rows in ascending
+order and their funded bulk rows in id order (steps 6 and 7, before the purge's target rows), and
+`settle_for_purge(conn, ledger_ids, rows, *, now) -> PurgeSettled(released, ambiguous)`, once the purge has
+cancelled their targets, releases a `reserved` one (`not_billed('never_dispatched')`) and makes a
+`dispatched` one `ambiguous`. A batch item's entry is its submission's, settled by the purge itself
+(`privacy.deletion_graph`). `settle` and `release_never_dispatched` of an entry whose call is gone find its
+ledger row alone, settled by the purge: a no-op logged `llm_settle_call_purged` (the error
+`llm_entry_stranded` for a row found alone still `reserved` or `dispatched`: G04 breached elsewhere).
 
 **Reconcilers.** `llm_ledger_unsettled` (tick, plan Deviation 5) fails the abandoned `eval_runs` (no live
 `eval_run` operation and, for a run that never had one, more than an hour old; M3 Task 19), releases
@@ -148,6 +164,7 @@ BATCH_REFUND_EVIDENCE: Final = frozenset(
 # The `input_refs` keys `reserve` writes itself.
 _RESERVED_REFS: Final = frozenset({"owner", "deadline_s"})
 _CAP_SUBJECT: Final = "budget"
+_LOGGED_IDS: Final = 20  # the ledger ids a log line names, at most
 _ZERO: Final = Decimal(0)
 
 CallStatus = Literal["completed", "error", "ambiguous"]
@@ -586,6 +603,12 @@ _ENTRY = q(
     "c.status AS call_status, c.attempt_id, c.input_refs FROM llm_spend_ledger l "
     "JOIN llm_calls c ON c.spend_ledger_id = l.id WHERE l.id = :id AND l.kind = 'request'"
 )
+# The ledger row alone, read when `_ENTRY` finds none: a row without its call is one whose call a purge
+# deleted (§20.2: the ledger rows stay), settled by that purge first (`settle_for_purge`, M5 Task 11).
+_ENTRY_ALONE = q(
+    "SELECT id, budget_month, purpose, state, reserved_usd, settled_usd FROM llm_spend_ledger "
+    "WHERE id = :id AND kind = 'request'"
+)
 # The bulk operation's allocation (§6.9.3), step 7 of the schedule: locked after the month row, before the
 # ledger rows. `FOR NO KEY UPDATE`, the lock its `spent_usd` update takes: it serialises the allocation's
 # writers and leaves the FK checks of the rows that reference the operation (targets, submissions, ledger
@@ -693,12 +716,49 @@ class _Entry:
         return max(RECOVERY_AFTER, timedelta(seconds=deadline_s) + DEADLINE_GRACE)
 
 
-async def _reserved_entry(conn: AsyncConnection, res: Reservation) -> _Entry:
-    """The entry of `res`; a `LookupError` without one, a `ValueError` for a reservation that does not
-    describe it (another call or month): nothing is changed on another month's counters."""
+@dataclass(frozen=True)
+class _Alone:
+    """A ledger row whose `llm_calls` row a purge deleted (§20.2), as `settle` and `release_never_dispatched`
+    read it: the purge settled it first (M5 Task 11), so they write nothing."""
+
+    id: int
+    month: date
+    purpose: Purpose
+    state: str
+    reserved_usd: Decimal
+    settled_usd: Decimal | None
+
+
+def _log_alone(entry: _Alone, outcome: str) -> None:
+    """A settlement or release that found its ledger row alone writes nothing (a late response never crashes
+    its caller). A purge settled the row first: `llm_settle_call_purged` (info). A row still `reserved` or
+    `dispatched` lost its call to another deleter unsettled, a breach of G04 that no reader can find again:
+    the error `llm_entry_stranded`."""
+    if entry.state in ("reserved", "dispatched"):
+        log.error("llm_entry_stranded", ledger_id=entry.id, state=entry.state, outcome=outcome)
+    else:
+        log.info("llm_settle_call_purged", ledger_id=entry.id, state=entry.state, outcome=outcome)
+
+
+async def _reserved_entry(conn: AsyncConnection, res: Reservation) -> _Entry | _Alone:
+    """The entry of `res`, or its ledger row alone (`_Alone`) when a purge deleted its call; a `LookupError`
+    without a ledger row, a `ValueError` for a reservation that does not describe it (another call or month):
+    nothing is changed on another month's counters."""
     entry = await _entry(conn, res.ledger_id)
     if entry is None:
-        raise LookupError(f"no llm_spend_ledger request {res.ledger_id}")
+        alone = (await conn.execute(_ENTRY_ALONE, {"id": res.ledger_id})).first()
+        if alone is None:
+            raise LookupError(f"no llm_spend_ledger request {res.ledger_id}")
+        if alone.budget_month != res.month:
+            raise ValueError(f"reservation {res.ledger_id} does not match its ledger row")
+        return _Alone(
+            id=int(alone.id),
+            month=alone.budget_month,
+            purpose=alone.purpose,
+            state=str(alone.state),
+            reserved_usd=alone.reserved_usd,
+            settled_usd=alone.settled_usd,
+        )
     if (entry.call_id, entry.month) != (res.llm_call_id, res.month):
         raise ValueError(f"reservation {res.ledger_id} does not match its ledger row")
     return entry
@@ -1265,15 +1325,107 @@ async def release_never_dispatched(conn: AsyncConnection, res: Reservation, *, n
     """Release a try that was never dispatched (its dispatch marker was fenced), under the month lock:
     `not_billed('never_dispatched')`, the call `cancelled` and the counters (and a funded entry's allocation)
     adjusted. A try that is no longer `reserved` is left as it is, with nothing written (logged
-    `llm_release_skipped`)."""
+    `llm_release_skipped`), and so is one whose call a purge deleted (logged `llm_settle_call_purged`: the
+    purge released it first, `settle_for_purge`; the error `llm_entry_stranded` for one still unsettled)."""
     p = await current_params(conn)
     row = await _lock_row(conn, res.month)
     entry = await _reserved_entry(conn, res)
+    if isinstance(entry, _Alone):
+        _log_alone(entry, "not_billed")
+        return
     budget.accrue_row(row, p, now)  # stored with the counters by `_release`
     if entry.state != "reserved" or not await _release(conn, entry, row, now=now):
         log.info("llm_release_skipped", ledger_id=res.ledger_id, state=entry.state)
         return
     log.info("llm_try_released", ledger_id=res.ledger_id, reserved_usd=str(entry.reserved_usd))
+
+
+# ---- purges (§20.2, §20.4; plan M5 Task 11) ----------------------------------------------------------------
+
+# The months and the funding bulk operations of a purge's entries, and those bulk rows in id order (step 7).
+_PURGE_ACCOUNTS = q(
+    "SELECT DISTINCT budget_month, bulk_operation_id FROM llm_spend_ledger "
+    "WHERE id = ANY(CAST(:ids AS bigint[])) AND kind = 'request'"
+)
+_LOCK_BULKS = q(
+    "SELECT id FROM bulk_operations WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR NO KEY UPDATE"
+)
+
+
+@dataclass(frozen=True)
+class PurgeSettled:
+    """What `settle_for_purge` moved: the `reserved` entries released (`not_billed('never_dispatched')`) and
+    the `dispatched` ones made `ambiguous`."""
+
+    released: int
+    ambiguous: int
+
+
+async def lock_for_purge(
+    conn: AsyncConnection, ledger_ids: Sequence[int], *, now: datetime
+) -> dict[date, BudgetRow]:
+    """The accounts of the entries `ledger_ids` a purge settles (§20.4, M5 Task 11), in the caller's
+    transaction, which holds `active_config FOR SHARE` (step 2) already: their month rows in ascending order
+    (`lock_month`, step 6: each accrued to `now` and stored), then the bulk rows of the funded ones in id
+    order (step 7). Returns the locked month rows by month, which `settle_for_purge` counts on: a row is
+    current until another writer of it in the same transaction (`settle`, `release_never_dispatched`), after
+    which a second call reads them again (the locks are held already)."""
+    ids = sorted(set(ledger_ids))
+    if not ids:
+        return {}
+    p = await current_params(conn)
+    accounts = (await conn.execute(_PURGE_ACCOUNTS, {"ids": ids})).all()
+    rows = {
+        month: await lock_month(conn, month, p, now=now)
+        for month in sorted({account.budget_month for account in accounts})
+    }
+    bulk_ids = sorted({int(a.bulk_operation_id) for a in accounts if a.bulk_operation_id is not None})
+    if bulk_ids:
+        await conn.execute(_LOCK_BULKS, {"ids": bulk_ids})
+    return rows
+
+
+async def settle_for_purge(
+    conn: AsyncConnection,
+    ledger_ids: Sequence[int],
+    rows: Mapping[date, BudgetRow],
+    *,
+    now: datetime,
+) -> PurgeSettled:
+    """Settle the online entries `ledger_ids` whose `llm_calls` rows a purge is about to delete (§20.4, M5
+    Task 11, G04), in the caller's transaction, under the month and bulk rows `lock_for_purge` took (`rows`,
+    current): each read again here, in id order. A `reserved` entry → `not_billed('never_dispatched')` with
+    its call `cancelled` (`_release`: the month's counters `-r`, a funded entry's allocation credited `r`); a
+    `dispatched` one → `ambiguous` with its call (`_mark_ambiguous`: counted at its reservation, as
+    `ledger_unsettled` would count it); any other state, and an entry whose call is gone already, is left as
+    it is. Every later reader of an online entry joins its call, so an entry left unsettled when its call goes
+    could never be settled or recovered. The caller has cancelled the entries' owners first (their targets),
+    so no dispatch marker moves an entry meanwhile. A batch item's entry is its submission's: a `ValueError`
+    (`privacy.deletion_graph` settles those)."""
+    ids = sorted(set(ledger_ids))
+    released = ambiguous = 0
+    for ledger_id in ids:
+        entry = await _entry(conn, ledger_id)
+        if entry is None:
+            continue
+        if entry.batch:
+            raise ValueError(f"llm_spend_ledger {entry.id} is a batch item's: its submission's to settle")
+        if entry.state == "reserved":
+            row = rows.get(entry.month)
+            if row is None:
+                raise ValueError(f"the month of llm_spend_ledger {entry.id} is not locked (lock_for_purge)")
+            released += await _release(conn, entry, row, now=now)
+        elif entry.state == "dispatched":
+            await _mark_ambiguous(conn, entry, now=now)
+            ambiguous += 1
+    if released or ambiguous:
+        log.info(
+            "llm_entries_settled_for_purge",
+            released=released,
+            ambiguous=ambiguous,
+            ledger_ids=ids[:_LOGGED_IDS],
+        )
+    return PurgeSettled(released, ambiguous)
 
 
 # ---- settlement (§6.9.1 counter table, §10.7) -------------------------------------------------------------
@@ -1471,7 +1623,7 @@ def _check_settlement(
 
 
 async def _figures(
-    conn: AsyncConnection, entry: _Entry, row: BudgetRow, p: BudgetParams, counted_at: Decimal
+    conn: AsyncConnection, entry: _Entry | _Alone, row: BudgetRow, p: BudgetParams, counted_at: Decimal
 ) -> SettleFigures:
     spend = await spend_totals(conn, entry.month)
     return SettleFigures(
@@ -1489,7 +1641,7 @@ async def _figures(
     )
 
 
-def _counted_at(entry: _Entry) -> Decimal:
+def _counted_at(entry: _Entry | _Alone) -> Decimal:
     """What a settled entry counts at: billed its cost, not billed 0, ambiguous its reservation."""
     if entry.state == "ambiguous":
         return entry.reserved_usd
@@ -1517,14 +1669,19 @@ async def settle(
     An entry the reconciler moved to `ambiguous` meanwhile settles late (`ambiguous → billed | not_billed`,
     its call `ambiguous → completed | error`, plan Deviation 24) with the same counter change. An entry
     already `billed` or `not_billed` (or `ambiguous` again) is left as it is and logged
-    `llm_settle_duplicate`; a `reserved` one is a `ValueError` (release it). Returns the figures for the
-    metrics (no metric here).
+    `llm_settle_duplicate`; a `reserved` one is a `ValueError` (release it). An entry whose call a purge
+    deleted (a purged target's late response, or a late batch line) is found alone, already settled by the
+    purge (`settle_for_purge`): nothing is written, logged `llm_settle_call_purged`, never a `LookupError`;
+    one found alone still `reserved` or `dispatched` (another deleter left it unsettled, G04) is the error
+    `llm_entry_stranded`, and nothing is written either.
+    Returns the figures for the metrics (no metric here).
 
     The counter change goes to the bucket, or for a funded entry to its operation's `spent_usd` under the bulk
     row (locked after the month row, before the ledger rows), in full also above `budget_usd` (L1164). A
     score call's attempt `cost_usd` moves by what the try now counts at minus what it counted before (L3911):
     `+ s` billed, `+ r` ambiguous, `+ (s - r)` late billed, `- r` late not billed. The call's provider
-    metadata is written storable (`storable_outcome`).
+    metadata is written storable (`storable_outcome`), and its output only while no purge redacted it
+    (`content_purged_at` NULL, read on the row the update locks; module docstring).
     """
     _check_settlement(res, outcome, evidence, usage, call)
     call = storable_outcome(call)
@@ -1532,6 +1689,9 @@ async def settle(
     row = await _lock_row(conn, res.month)  # the month lock; the accrual is stored with the counters below
     entry = await _reserved_entry(conn, res)
     budget.accrue_row(row, p, now)
+    if isinstance(entry, _Alone):  # a purge deleted its call, having settled it first (M5 Task 11)
+        _log_alone(entry, outcome)
+        return await _figures(conn, entry, row, p, _counted_at(entry))  # nothing written
     if entry.state in ("billed", "not_billed") or (entry.state == "ambiguous" and outcome == "ambiguous"):
         log.warning("llm_settle_duplicate", ledger_id=entry.id, state=entry.state, outcome=outcome)
         return await _figures(conn, entry, row, p, _counted_at(entry))  # nothing written
@@ -1555,14 +1715,7 @@ async def settle(
     await transition(
         conn, "llm_spend_ledger", entry.id, [entry.state], outcome, reason=reason, set_=entry_set
     )
-    await transition(
-        conn,
-        "llm_calls",
-        entry.call_id,
-        [entry.call_status],
-        call.status,
-        set_=_call_set(call, usage, cost, entry, now),
-    )
+    await _settle_call(conn, entry, call, _call_set(call, usage, cost, entry, now))
     delta = budget.settlement_delta(outcome, entry.reserved_usd, cost)
     budget.apply_count(row, delta, entry.purpose_class, bucket=entry.bucketed)
     await _save(conn, row, now)
@@ -1583,9 +1736,40 @@ async def settle(
     return await _figures(conn, entry, row, p, counted_at)
 
 
+# The call's output, set only while no purge has redacted the call (M5 Task 14, Deviation 54): evaluated on
+# the row the update locks, and again on its newest version after a lock wait, so a redaction that committed
+# first wins whatever the settlement read before it.
+_OUTPUT_UNLESS_REDACTED: Final = "CASE WHEN t.content_purged_at IS NULL THEN CAST(:output_json AS jsonb) END"
+
+
+async def _settle_call(
+    conn: AsyncConnection, entry: _Entry, call: CallOutcome, values: Mapping[str, object]
+) -> None:
+    """The call row's settlement, `values` and the output unless the call is redacted (module docstring,
+    "Settlement"); `TransitionConflict` when the call is no longer in the state the entry was read with."""
+    output = None if call.output_json is None else dict(call.output_json)
+    moved = await transition_where(
+        conn,
+        "llm_calls",
+        [entry.call_status],
+        call.status,
+        where="t.id = :call_id",
+        params={"call_id": entry.call_id, "output_json": output},
+        set_=values,
+        set_sql={"output_json": _OUTPUT_UNLESS_REDACTED},
+        jsonb=["output_json"],
+        returning=("id", "content_purged_at"),
+    )
+    if not moved:
+        raise TransitionConflict("llm_calls", entry.call_id, call.status)
+    if output is not None and moved[0]["content_purged_at"] is not None:
+        log.info("llm_settle_output_redacted", ledger_id=entry.id, llm_call_id=entry.call_id)
+
+
 def _call_set(
     call: CallOutcome, usage: Usage | None, cost: Decimal | None, entry: _Entry, now: datetime
 ) -> dict[str, object]:
+    """The call row's settled columns but its output (`_settle_call` sets that)."""
     values: dict[str, object] = {
         "model_served": call.model_served,
         "http_status": call.http_status,
@@ -1593,7 +1777,6 @@ def _call_set(
         "stop_reason": call.stop_reason,
         "refusal_category": call.refusal_category,
         "provider_request_id": call.provider_request_id,
-        "output_json": None if call.output_json is None else dict(call.output_json),
         "first_event_at": call.first_event_at,
         "ended_at": now,
         "cost_usd": entry.reserved_usd if cost is None else cost,

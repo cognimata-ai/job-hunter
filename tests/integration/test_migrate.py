@@ -3,18 +3,28 @@ import json
 import subprocess
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.db.alembic_runner import code_head
-from jobhunter.db.migrate import MIGRATE_ORDER, apply_explicit_grants, run_migrate, run_migrate_async
+from alembic import command
+from jobhunter.db.alembic_runner import alembic_config, code_head
+from jobhunter.db.compat import chain_compat, record_compat
+from jobhunter.db.migrate import (
+    BACKUP_GRANT_TABLES,
+    MIGRATE_ORDER,
+    apply_explicit_grants,
+    run_migrate,
+    run_migrate_async,
+)
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.db.session import make_engine
 from jobhunter.graphs.checkpointer import setup_checkpointer
 from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v2
 from jobhunter.scoring.rubric import load_rubric
 
-from tests.support.pg import PgRole, PgServer, pg_one
+from tests.support.pg import PgRole, PgServer, pg_one, pg_rows
 
 pytestmark = pytest.mark.integration
 NOW = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
@@ -36,7 +46,7 @@ async def test_first_install_order_and_artifacts(fresh_pg_server, make_config) -
         "replay",
     ]
     assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
-    assert code_head() == "0009_m4_ui"
+    assert code_head() == "0012_m5_unship_manifest"
     for t in ("procrastinate_jobs", "checkpoints", "checkpoint_writes", "checkpoint_blobs"):
         assert one(fresh_pg_server, f"SELECT to_regclass('{t}') IS NOT NULL") == (True,)
     assert one(fresh_pg_server, "SELECT count(*) FROM procrastinate_jobs", role="app") == (0,)
@@ -63,6 +73,44 @@ def test_sync_wrapper_refuses_a_running_loop(make_config, monkeypatch) -> None:
     # `asyncio.run` inside a loop raises a similar error, but only after the coroutine was created: the
     # explicit check must come first, so that no coroutine exists and nothing can start.
     assert calls == []
+
+
+def test_the_sync_wrapper_passes_the_flags_through(make_config, monkeypatch) -> None:
+    import jobhunter.db.migrate as migrate_module
+
+    cfg = make_config("migrate", JOBHUNTER_DB_PORT="1")  # nothing listens there: the run itself is replaced
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def recorder(*args: object, **kwargs: object) -> list[str]:
+        calls.append((args, kwargs))
+        return ["reconstruct_and_advance", "alembic"]
+
+    monkeypatch.setattr(migrate_module, "run_migrate_async", recorder)
+    flags: dict[str, object] = {
+        "now": NOW,
+        "steps": frozenset({"sequences", "alembic"}),
+        "database": "jobhunter_restore_test",
+        "manifest_dir": Path("/scratch/manifests"),
+        "cv_dir": Path("/scratch/cv"),
+        "exports_dir": Path("/scratch/exports"),
+        "db_role": "restore",
+    }
+    assert run_migrate(cfg, **flags) == ["reconstruct_and_advance", "alembic"]  # type: ignore[arg-type]
+    assert calls == [((cfg,), flags)]
+    # Without flags, every one is passed as its default.
+    run_migrate(cfg)
+    assert calls[1] == (
+        (cfg,),
+        {
+            "now": None,
+            "steps": None,
+            "database": None,
+            "manifest_dir": None,
+            "cv_dir": None,
+            "exports_dir": None,
+            "db_role": None,
+        },
+    )
 
 
 async def test_seed_values(fresh_pg_server, make_config) -> None:
@@ -109,6 +157,8 @@ async def test_seed_values(fresh_pg_server, make_config) -> None:
         datetime(2026, 10, 16, 10, tzinfo=UTC),
     )
     assert one(fresh_pg_server, "SELECT generation FROM ranking_state") == (0,)
+    # the dead-man state's single row, nothing applied yet (M5 Task 1; Task 5 syncs it)
+    assert one(fresh_pg_server, "SELECT * FROM deadman_state") == (1, *(None,) * 8)
 
 
 async def test_seed_hashes_are_the_content_hash_of_the_stored_payloads(fresh_pg_server, make_config) -> None:
@@ -198,7 +248,7 @@ COUNTS = (
     ],
 )
 async def test_stored_settings_v1_is_frozen_when_a_packaged_default_changes(
-    migrated, make_config, monkeypatch, section, key, value
+    migrated, make_config, monkeypatch, section, key, value, tmp_path
 ) -> None:
     """A release that edits `settings_v1.json` must not break or grow an installed database."""
     import jobhunter.db.seed as seed_module
@@ -208,7 +258,7 @@ async def test_stored_settings_v1_is_frozen_when_a_packaged_default_changes(
     changed = load_settings_v1()
     get_object(changed, section)[key] = value
     monkeypatch.setattr(seed_module, "load_settings_v1", lambda: changed)
-    await run_migrate_async(make_config("migrate"), now=NOW)  # exits normally
+    await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)  # exits normally
     assert one(migrated, COUNTS) == before  # no new rows, in particular no orphaned derived row
 
 
@@ -311,7 +361,7 @@ def test_a_failing_migrate_logs_migrate_failed_and_chains_no_loop_error(make_con
 
 
 async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
-    migrated, make_config, monkeypatch
+    migrated, make_config, monkeypatch, tmp_path
 ) -> None:
     import jobhunter.db.migrate as migrate_module
     from structlog.testing import capture_logs
@@ -322,7 +372,7 @@ async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
     monkeypatch.setattr(migrate_module, "upgrade_head", broken)
     cfg = make_config("migrate")
     with capture_logs() as logs, pytest.raises(ValueError, match="private detail"):
-        await run_migrate_async(cfg, now=NOW)
+        await run_migrate_async(cfg, now=NOW, manifest_dir=tmp_path)
     (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
     assert (failed["step"], failed["error_type"]) == ("alembic", "ValueError")
     assert "private detail" not in repr(logs) and cfg.secret("db_migrator").decode() not in repr(logs)
@@ -331,18 +381,46 @@ async def test_a_failing_step_logs_its_name_and_class_only_and_stops_the_run(
     assert one(migrated, ADVISORY_LOCKS) == (0,)  # and the lock was released
 
 
-async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_config) -> None:
+async def test_a_mis_declared_floor_fails_before_the_schema_moves(
+    migrated, make_config, monkeypatch, tmp_path
+) -> None:
+    import jobhunter.db.compat as compat_module
+    import jobhunter.db.migrate as migrate_module
+    from structlog.testing import capture_logs
+
+    # a chain whose one revision names a floor outside it
+    misdeclared = ModuleType("fake_misdeclared")
+    vars(misdeclared).update(revision="b", down_revision=None, compat_floor="a")
+    monkeypatch.setattr(compat_module, "chain_modules", lambda: [misdeclared])
+    upgrades: list[str] = []  # a marker per call, never the DSN (it holds the password)
+    monkeypatch.setattr(migrate_module, "upgrade_head", lambda dsn: upgrades.append("upgrade_head"))
+    recorded = pg_rows(migrated, "migrator", COMPAT)
+    with capture_logs() as logs, pytest.raises(ValueError, match="b: compat_floor 'a'"):
+        await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)
+    assert upgrades == []  # Alembic never ran
+    (failed,) = [e for e in logs if e["event"] == "migrate_failed"]
+    assert (failed["step"], failed["error_type"]) == ("alembic", "ValueError")
+    assert pg_rows(migrated, "migrator", COMPAT) == recorded
+
+
+async def test_steps_are_logged_in_order_and_without_the_dsn(migrated, make_config, tmp_path) -> None:
     from structlog.testing import capture_logs
 
     cfg = make_config("migrate")
-    with capture_logs() as logs:
-        assert await run_migrate_async(cfg, now=NOW) == list(MIGRATE_ORDER)
+    with capture_logs() as logs:  # a stream of its own: the shared server's holds whatever others left there
+        assert await run_migrate_async(cfg, now=NOW, manifest_dir=tmp_path) == list(MIGRATE_ORDER)
     steps = [entry["step"] for entry in logs if entry["event"] == "migrate_step"]
     assert steps == list(MIGRATE_ORDER)
-    noops = {entry["step"]: entry["reason"] for entry in logs if entry["event"] == "migrate_step_noop"}
-    assert noops == dict.fromkeys(
-        ("reconstruct_and_advance", "advance_again", "replay"), "manifest_stream_arrives_in_M5"
-    )
+    # Steps 1, 3 and 5 end with the identity advancement (M5 Task 23); step 7 replays the manifest stream
+    # (M5 Task 25), which holds nothing here.
+    advancing = [entry["step"] for entry in logs if entry["event"] == "migrate_identities_advanced"]
+    assert advancing == ["reconstruct_and_advance", "advance_again", "queue_and_checkpointer"]
+    replayed = [
+        (entry["step"], entry["replayed"], entry["pending_completed"], entry["rebuilt_jobs"])
+        for entry in logs
+        if entry["event"] == "migrate_replayed"
+    ]
+    assert replayed == [("replay", 0, 0, 0)]
     assert cfg.secret("db_migrator").decode() not in repr(logs)
 
 
@@ -362,21 +440,27 @@ def test_cli_migrate_installs_and_logs_json_without_the_password(fresh_pg_server
     assert one(fresh_pg_server, "SELECT count(*) FROM settings_versions") == (1,)
 
 
-async def test_grants_step_skips_absent_tables(migrated) -> None:
+async def test_grants_step_grants_on_every_backup_table_of_the_migrated_schema(migrated) -> None:
     from jobhunter.db.session import make_null_engine
 
     engine = make_null_engine(migrated.dsn("migrator", driver="sqlalchemy"))
     async with engine.begin() as conn:
-        assert await apply_explicit_grants(conn) == []
+        assert await apply_explicit_grants(conn) == list(BACKUP_GRANT_TABLES)  # 0010 creates all four
     await engine.dispose()
 
 
-async def test_grants_step_grants_the_backup_role_on_the_tables_that_exist(
-    fresh_pg_server, make_config
-) -> None:
+async def test_grants_step_skips_absent_tables_and_grants_on_the_tables_that_exist(fresh_pg_server) -> None:
     from jobhunter.db.session import make_null_engine
 
-    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
+    # The 0009 schema has none of the four tables: two stand-ins of the right names are created after it.
+    dsn = fresh_pg_server.dsn("migrator", driver="sqlalchemy")
+    await asyncio.to_thread(command.upgrade, alembic_config(dsn), "0009_m4_ui")
+    engine = make_null_engine(dsn)
+    try:
+        async with engine.begin() as conn:
+            assert await apply_explicit_grants(conn) == []
+    finally:
+        await engine.dispose()
     one(fresh_pg_server, "CREATE TABLE backup_sets (id int PRIMARY KEY)")
     one(fresh_pg_server, "CREATE TABLE manifest_shipments (id int PRIMARY KEY)")
     backup_privileges = (
@@ -394,6 +478,111 @@ async def test_grants_step_grants_the_backup_role_on_the_tables_that_exist(
     finally:
         await engine.dispose()
     assert one(fresh_pg_server, backup_privileges) == (True, True, False, True)
+
+
+# The columns of `deletion_manifests` the backup role may update, and whether each of the backup and the
+# application role may execute `unship_manifest`.
+_UNSHIP_PRIVILEGES = (
+    "SELECT ARRAY(SELECT attname::text FROM pg_attribute "
+    "WHERE attrelid = 'public.deletion_manifests'::regclass AND attnum > 0 AND NOT attisdropped "
+    "AND has_column_privilege('jobhunter_backup', attrelid, attnum, 'UPDATE') ORDER BY 1), "
+    "has_function_privilege('jobhunter_backup', 'public.unship_manifest(bigint)', 'EXECUTE'), "
+    "has_function_privilege('jobhunter_app', 'public.unship_manifest(bigint)', 'EXECUTE')"
+)
+
+
+async def test_grants_step_takes_the_backup_roles_update_of_the_manifests_back(
+    fresh_pg_server, make_config
+) -> None:
+    """The release before 0012 granted the backup role UPDATE of four columns of `deletion_manifests` (final
+    fix D1), and a rollback to it grants them again; a restore (`--no-acl`) leaves `unship_manifest`
+    executable by PUBLIC. Every `migrate` of this code revokes that UPDATE and leaves the function executable
+    by the backup role alone (final fix E2), idempotently."""
+    from jobhunter.db.session import make_null_engine
+
+    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
+    assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == ([], True, False)
+    for statement in (
+        "GRANT UPDATE (status, completed_at, shipped_at, shipment_id) ON deletion_manifests "
+        "TO jobhunter_backup",
+        "REVOKE EXECUTE ON FUNCTION unship_manifest(bigint) FROM jobhunter_backup",
+        "GRANT EXECUTE ON FUNCTION unship_manifest(bigint) TO PUBLIC",
+    ):
+        one(fresh_pg_server, statement)
+    assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == (
+        ["completed_at", "shipment_id", "shipped_at", "status"],
+        True,
+        True,
+    )
+    engine = make_null_engine(fresh_pg_server.dsn("migrator", driver="sqlalchemy"))
+    try:
+        for _ in range(2):  # idempotent
+            async with engine.begin() as conn:
+                assert await apply_explicit_grants(conn) == list(BACKUP_GRANT_TABLES)
+            assert one(fresh_pg_server, _UNSHIP_PRIVILEGES) == ([], True, False)
+    finally:
+        await engine.dispose()
+
+
+# The ten revisions up to M5's first, base first.
+CHAIN_TO_M5 = [
+    "0001_m0_baseline",
+    "0002_m0_transition_matrix",
+    "0003_m0_transition_matrix_grants",
+    "0004_m0_totp_replay",
+    "0005_m1_collection",
+    "0006_m2_llm_profile_settings",
+    "0007_m2_draft_text_edits",
+    "0008_m3_scoring",
+    "0009_m4_ui",
+    "0010_m5_operations",
+]
+# Every recorded row with its row version: a write that changes nothing would still give a new `xmin`.
+COMPAT = (
+    "SELECT revision, compat_floor, destructive, recorded_at, CAST(xmin AS text) "
+    "FROM schema_compat ORDER BY 1"
+)
+
+
+async def test_migrate_records_schema_compat_for_the_whole_chain(migrated, make_config, tmp_path) -> None:
+    recorded = pg_rows(migrated, "migrator", COMPAT)
+    assert [row[:3] for row in recorded] == [
+        (i.revision, i.compat_floor, i.destructive) for i in chain_compat()
+    ]
+    assert [row[0] for row in recorded[: len(CHAIN_TO_M5)]] == CHAIN_TO_M5
+    assert [row[:3] for row in recorded[:9]] == [(r, r, False) for r in CHAIN_TO_M5[:9]]
+    assert recorded[9][:3] == ("0010_m5_operations", "0009_m4_ui", False)
+    await run_migrate_async(make_config("migrate"), now=NOW, manifest_dir=tmp_path)  # changes nothing
+    assert pg_rows(migrated, "migrator", COMPAT) == recorded
+
+
+async def test_record_compat_writes_only_what_changed(migrated) -> None:
+    from jobhunter.db.session import make_null_engine
+
+    engine = make_null_engine(migrated.dsn("migrator", driver="sqlalchemy"))
+    try:
+        async with engine.connect() as conn:
+            assert await record_compat(conn) == 0  # every row is as the chain says
+            await conn.execute(sa.text("DELETE FROM schema_compat WHERE revision = '0001_m0_baseline'"))
+            await conn.execute(
+                sa.text("UPDATE schema_compat SET destructive = true WHERE revision = '0010_m5_operations'")
+            )
+            # a revision this code does not know (a newer release's, after a rollback) is kept as it is
+            await conn.execute(
+                sa.text("INSERT INTO schema_compat VALUES ('0099_later', '0010_m5_operations', true, now())")
+            )
+            assert await record_compat(conn) == 2
+            rows = await conn.execute(
+                sa.text("SELECT revision, compat_floor, destructive FROM schema_compat")
+            )
+            recorded = {row.revision: (row.compat_floor, row.destructive) for row in rows}
+            assert recorded == {
+                **{i.revision: (i.compat_floor, i.destructive) for i in chain_compat()},
+                "0099_later": ("0010_m5_operations", True),
+            }
+            await conn.rollback()
+    finally:
+        await engine.dispose()
 
 
 async def test_checkpointer_setup_is_idempotent(migrated) -> None:

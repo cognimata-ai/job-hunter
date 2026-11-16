@@ -23,10 +23,10 @@ from typing import Any, Final
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.errors import Problem
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import content_hash
 from jobhunter.embeddings import _COUNT_AWAITING, _NEXT_BATCH, _NO_TIME_BOUND, _START
+from jobhunter.errors import Refusal
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import filters, golden
 from jobhunter.scoring.eval_fixtures import adversarial_dir
@@ -48,6 +48,10 @@ _INSTANCE: Final = sa.text("SELECT * FROM det_results WHERE id = :i")
 _RESULT: Final = sa.text("SELECT * FROM llm_results WHERE id = :i")
 _ACTIVE: Final = sa.text("SELECT profile_version_id, scope_version_id FROM active_config WHERE id = 1")
 HOUR: Final = timedelta(hours=1)
+# A lineage row: the revision's title drawn from Adzuna (no posting named: lineage survives its posting).
+_LINEAGE: Final = sa.text(
+    "INSERT INTO job_revision_sources (job_revision_id, field, source_id) VALUES (:r, 'title', 'adzuna')"
+)
 
 
 async def one(engine: AsyncEngine, statement: sa.TextClause, row_id: int) -> Any:
@@ -62,8 +66,11 @@ async def feedback(engine: AsyncEngine, job_id: int, **kwargs: Any) -> golden.Fe
 
 
 async def test_a_label_writes_the_score_snapshot_and_upserts_the_case(engine: AsyncEngine) -> None:
+    """The snapshot records the sources its scores derive from (final fix C2): the revision's lineage and the
+    instance's `det_inputs`, so a source purge finds it after retention has nulled its foreign keys."""
     async with engine.begin() as conn:
         scored = await scored_job(conn)
+        await conn.execute(_LINEAGE, {"r": scored.job.revision_id})
     made = await feedback(engine, scored.job.job_id)
     row = await one(engine, _FEEDBACK, made.feedback_id)
     instance = await one(engine, _INSTANCE, scored.det_result_id)
@@ -88,6 +95,7 @@ async def test_a_label_writes_the_score_snapshot_and_upserts_the_case(engine: As
         "model_policy_id": result.model_policy_id,
         "scope_version_id": scored.scope_version_id,
         "det_result_id": scored.det_result_id,
+        "sources": sorted({"adzuna", *scored.sources}),
     }
     case = await one(engine, _CASE, made.golden_case_id)
     async with engine.connect() as conn:
@@ -137,7 +145,7 @@ async def test_with_no_profile_active_there_is_no_score_to_label(engine: AsyncEn
         await conn.execute(
             sa.text("UPDATE active_config SET profile_version_id = NULL, llm_tuple_id = NULL WHERE id = 1")
         )
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, scored.job.job_id)
     assert (refused.value.status, refused.value.code) == (409, "conflict_state")
     async with engine.connect() as conn:
@@ -149,7 +157,7 @@ async def test_feedback_without_a_published_result_is_conflict_state(engine: Asy
     async with engine.begin() as conn:
         await activate_score_tuple(conn)
         job = await insert_job(conn)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, job.job_id)
     assert (refused.value.status, refused.value.code) == (409, "conflict_state")
     async with engine.connect() as conn:
@@ -161,7 +169,7 @@ async def test_feedback_without_a_published_result_is_conflict_state(engine: Asy
 async def test_an_unstorable_comment_is_refused_before_any_write(engine: AsyncEngine, comment: str) -> None:
     async with engine.begin() as conn:
         scored = await scored_job(conn)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         await feedback(engine, scored.job.job_id, comment=comment)
     assert (refused.value.status, refused.value.code) == (422, "validation_failed")
 
@@ -232,7 +240,7 @@ async def test_set_flags_allows_two_canaries_and_refuses_a_third(engine: AsyncEn
         made = await golden.set_flags(conn, second.id, active=None, is_canary=True, now=NOW + HOUR)
     assert (made.id, made.is_canary, made.active) == (second.id, True, True)
     assert (await one(engine, _CASE, second.id)).updated_at == NOW + HOUR  # the caller's clock (item 7)
-    with pytest.raises(Problem) as refused:
+    with pytest.raises(Refusal) as refused:
         async with engine.begin() as conn:
             await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)
     assert (refused.value.status, refused.value.code) == (422, "validation_failed")
@@ -243,7 +251,7 @@ async def test_set_flags_allows_two_canaries_and_refuses_a_third(engine: AsyncEn
         assert (again.is_canary, again.active) == (True, False)
         await golden.set_flags(conn, first.id, active=None, is_canary=False, now=NOW)
         assert (await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)).is_canary
-    with pytest.raises(Problem) as missing:
+    with pytest.raises(Refusal) as missing:
         async with engine.begin() as conn:
             await golden.set_flags(conn, 10**12, active=True, is_canary=None, now=NOW)
     assert missing.value.status == 404

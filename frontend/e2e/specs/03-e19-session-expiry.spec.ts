@@ -48,7 +48,10 @@ test("E19: an expired session redirects to the login and back to the same URL", 
   const refused = page.waitForResponse(
     (response) => new URL(response.url()).pathname.startsWith("/api/") && response.status() === 401,
   );
-  await posted.getByRole("radio", { name: en["filters.posted.14d"] }).check();
+  // A click, not `check()`: the click's 401 sends the page to the login, which removes the radio, and `check()`
+  // reads the radio's state back after its click, so it would race that redirect. The navigation is asserted
+  // below, and the radio's checked state after the sign-in.
+  await posted.getByRole("radio", { name: en["filters.posted.14d"] }).click();
   await refused;
   await expect(page).toHaveURL(/\/login\?redirect=/);
   const kept = redirectOf(page);

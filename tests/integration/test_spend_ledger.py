@@ -2,6 +2,7 @@
 row, the counter table, cap edits, the month boundary, the owner fence and the two reconcilers."""
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -35,6 +36,7 @@ from jobhunter.llm.spend_ledger import (
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import ctx
+from tests.support.fences import insert_test_fence
 from tests.support.llm import (
     USAGE,
     budget_rows,
@@ -625,6 +627,49 @@ async def test_unstorable_provider_metadata_is_replaced_and_the_settlement_commi
     assert event["fields"] == ["model_served", "stop_reason", "provider_request_id"]
 
 
+_REDACT_CALL = sa.text(
+    "UPDATE llm_calls SET output_json = NULL, content_purged_at = :t WHERE id = :c "
+    "RETURNING content_purged_at"
+)
+_CALL_CONTENT = sa.text(
+    "SELECT status, output_json, content_purged_at, output_tokens, cost_usd FROM llm_calls WHERE id = :c"
+)
+
+
+@pytest.mark.parametrize("before", ["dispatched", "ambiguous"])
+async def test_a_redacted_call_settles_its_usage_and_cost_but_never_its_output(
+    engine, op_owner, caplog, before
+) -> None:
+    """Deviation 54: a call whose output a purge redacted (`content_purged_at` set) settles as any other, its
+    usage, cost and ledger state written, but `output_json` is set by SQL only while the marker is NULL, on
+    the row the update locks: a response that arrives after the redaction, on time or after the reconciler
+    made the try `ambiguous`, stores no content. The unredacted call beside it keeps its output."""
+    caplog.set_level(logging.INFO)
+    t = utcnow()
+    kw = reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000, purpose="propose_queries", deadline_s=300)
+    res = await dispatched(engine, kw)
+    kept = await dispatched(engine, {**kw, "logical_call_no": 2})
+    if before == "ambiguous":
+        async with engine.begin() as conn:
+            ambiguous = spend_ledger.CallOutcome("ambiguous")
+            await settle(conn, res, outcome="ambiguous", evidence=None, usage=None, call=ambiguous, now=t)
+    async with engine.begin() as conn:
+        redacted_at = (await conn.execute(_REDACT_CALL, {"t": t, "c": res.llm_call_id})).scalar_one()
+    for each in (res, kept):
+        await billed(engine, each, now=t + MINUTE)
+    async with engine.connect() as conn:
+        call = (await conn.execute(_CALL_CONTENT, {"c": res.llm_call_id})).one()
+        other = (await conn.execute(_CALL_CONTENT, {"c": kept.llm_call_id})).one()
+    assert (call.status, call.output_json, call.content_purged_at) == ("completed", None, redacted_at)
+    assert (call.output_tokens, call.cost_usd) == (USAGE.output_tokens, Decimal("0.008"))
+    row = await ledger_row(engine, res.ledger_id)
+    assert (row.state, row.settled_usd) == ("billed", Decimal("0.008"))
+    assert (other.output_json, other.content_purged_at) == ({"synthetic": True}, None)
+    (event,) = logged(caplog, "llm_settle_output_redacted")
+    assert (event["ledger_id"], event["llm_call_id"]) == (res.ledger_id, res.llm_call_id)
+    assert await drift(engine, res.month) is None
+
+
 async def test_the_call_records_its_owner_and_deadline(engine, op_owner) -> None:
     t = utcnow()
     res = await reserved(
@@ -686,7 +731,7 @@ async def test_a_global_purge_fence_refuses_reservations_and_dispatch_markers(en
     t = utcnow()
     res = await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
     async with engine.begin() as conn:
-        await conn.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)"))
+        await insert_test_fence(conn, kind="global")
     with pytest.raises(FencedOut) as fenced:
         await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
     assert fenced.value.owner == "purge_fence"

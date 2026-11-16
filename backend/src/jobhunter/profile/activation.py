@@ -5,8 +5,12 @@
 its profile in the caller's **one transaction**, and returns the response `(status, body)`. The route takes
 `active_config` `FOR UPDATE` first and runs it inside `run_idempotent` (`api.routes.profile`). In order:
 
-1. `active_config` `FOR UPDATE` (a no-op under the route's lock), then the draft `FOR UPDATE`; no such draft
-   is 404 `not_found`, and so is a draft the adversarial seed confirmed for a synthetic profile (Carry T19-d).
+1. `active_config` `FOR UPDATE` (a no-op under the route's lock), then delete-everything's `global` fence
+   read after that lock (`privacy.fences.refuse_under_global_fence`: 409 `delete_everything_in_progress`; M5
+   Task 14). A confirm whose transaction began before that fence committed passed the write guard, and then
+   waited for the lock that delete-everything's admission holds; it refuses here, before `request_proposal`
+   (step 10) could meet the fence as a broken invariant. Then the draft `FOR UPDATE`; no such draft is 404
+   `not_found`, and so is a draft the adversarial seed confirmed for a synthetic profile (Carry T19-d).
 2. A draft already `confirmed` returns `(201, confirm_response)`: the body its confirm stored, whatever key
    the request carries and whichever profile is active now (Deviation 2). Nothing is written, and the ranking
    generation stays (R21-4).
@@ -101,6 +105,7 @@ from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import InvariantViolation, Refusal, RefusalField
 from jobhunter.faults import afault_point
 from jobhunter.llm.schemas.profile import ConfirmedProfile
+from jobhunter.privacy.fences import refuse_under_global_fence
 from jobhunter.profile import estimate, vectors
 from jobhunter.profile.contacts import scan_value
 from jobhunter.profile.validate import validate_profile, validate_user_entered
@@ -295,6 +300,7 @@ async def confirm_draft(
     """Confirm draft `draft_id` and activate its profile in the caller's transaction (module docstring); the
     response `(status, body)`. An activation's ids are appended to `activated` when it is given."""
     active = (await conn.execute(_LOCK_ACTIVE)).one()
+    await refuse_under_global_fence(conn)  # a fence committed while this waited for the lock (step 1)
     draft = (await conn.execute(_LOCK_DRAFT, {"d": draft_id})).first()
     if draft is None:
         raise draft_not_found()

@@ -2,12 +2,27 @@
 
 import argparse
 import sys
-from collections.abc import Sequence
-from typing import Final, get_args
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, cast, get_args
 
-from jobhunter.config import Role, load_config, startup_or_exit
+from jobhunter.config import DbRole, Role, load_config, startup_or_exit
+
+if TYPE_CHECKING:  # the module loads procrastinate, langgraph and alembic: `main` imports it when it runs
+    from jobhunter.db.migrate import StepGroup
 
 HTTP_CHECK_TIMEOUT_S: Final = 3
+# The container healthchecks, which `main` leaves out of `disable_tracing` (M5 Task 6, Ruling T6-9): they
+# import neither langchain nor langsmith, so they cannot trace, and loading the SDK only to switch it off
+# would cost each of them about a quarter of a second, every few seconds. Their import guard tests pin that
+# they load neither; a probe that comes to load one leaves this set.
+UNTRACEABLE_PROBES: Final = frozenset({"http-check", "worker-health"})
+# `migrate --db-role`: the role a `migrate` starts as, whose secrets hold that login. The restore test runs in
+# the backup container, as `jobhunter_restore` (§19.5), whose password is one of the backup role's secrets.
+MIGRATE_CONFIG_ROLES: Final[Mapping[DbRole, Role]] = MappingProxyType(
+    {"migrator": "migrate", "restore": "backup"}
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -17,7 +32,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "startup-check", help="run the startup assertions of a role (exit 78 when one fails)"
     )
     startup_check.add_argument("--role", required=True, choices=get_args(Role))
-    commands.add_parser("migrate", help="bring the database to the code head and seed the defaults (§19.3)")
+    _add_migrate_command(commands)
+    _add_manifests_command(commands)
     _add_api_command(commands)
     commands.add_parser(
         "worker",
@@ -60,7 +76,82 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_golden_commands(commands)
     _add_eval_commands(commands)
+    _add_ops_commands(commands)
+    _add_backup_commands(commands)
+    _add_restore_commands(commands)
+    _add_crypto_commands(commands)
+    _add_retention_commands(commands)
     return parser
+
+
+def _step_groups(text: str) -> "frozenset[StepGroup]":
+    """`--steps`: comma-separated step groups, each one of `db.migrate.STEP_GROUPS`."""
+    # Imported here: the migrate module loads procrastinate, langgraph and alembic (see `main`).
+    from jobhunter.db.migrate import STEP_GROUPS
+
+    groups = {part.strip() for part in text.split(",")}
+    if unknown := sorted(groups - set(STEP_GROUPS)):
+        raise argparse.ArgumentTypeError(
+            f"unknown step groups {unknown}; choose from {', '.join(STEP_GROUPS)}"
+        )
+    return cast("frozenset[StepGroup]", frozenset(groups))
+
+
+def _add_migrate_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    migrate = commands.add_parser(
+        "migrate", help="bring the database to the code head and seed the defaults (§19.3)"
+    )
+    migrate.add_argument(
+        "--database",
+        metavar="DB",
+        help="the database to migrate (default JOBHUNTER_DB_NAME), e.g. a scratch one",
+    )
+    migrate.add_argument(
+        "--steps",
+        type=_step_groups,
+        metavar="GROUPS",
+        help="run only these comma-separated step groups: sequences (steps 1 and 3), alembic (step 2), "
+        "replay (step 7); default: all seven steps",
+    )
+    migrate.add_argument(
+        "--manifest-dir",
+        type=Path,
+        metavar="DIR",
+        help="the deletion-manifest stream (default JOBHUNTER_MANIFESTS_DIR)",
+    )
+    migrate.add_argument(
+        "--cv-dir",
+        type=Path,
+        metavar="DIR",
+        help="the CV store the replay removes files from (default JOBHUNTER_CV_STORE_DIR)",
+    )
+    migrate.add_argument(
+        "--exports-dir",
+        type=Path,
+        metavar="DIR",
+        help="the export archives the replay removes (default JOBHUNTER_EXPORTS_DIR, the mounted volume)",
+    )
+    migrate.add_argument(
+        "--db-role",
+        choices=tuple(MIGRATE_CONFIG_ROLES),
+        default="migrator",
+        help="the login: migrator (default) or restore (the restore test, with the backup role's secrets)",
+    )
+
+
+def _add_manifests_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    manifests = commands.add_parser("manifests", help="the deletion-manifest stream (§19.5)")
+    manifests_commands = manifests.add_subparsers(dest="manifests_command", required=True)
+    replay = manifests_commands.add_parser(
+        "replay",
+        help="migrate steps 1, 3 and 7 alone: advance the identities, then replay the stream (§19.5)",
+    )
+    replay.add_argument(
+        "--manifest-dir",
+        type=Path,
+        metavar="DIR",
+        help="the deletion-manifest stream (default JOBHUNTER_MANIFESTS_DIR)",
+    )
 
 
 def _add_api_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -143,6 +234,124 @@ def _add_eval_commands(commands: "argparse._SubParsersAction[argparse.ArgumentPa
     transport.add_argument("--fake", action="store_true", help="the run is requested on the fake transport")
 
 
+def _interval_hours(text: str) -> int:
+    """`ops deadman-sync --interval-hours`: whole hours within `schedule_state`'s range, 1 to 168 (§3.4)."""
+    try:
+        hours = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("a whole number of hours") from None
+    if not 1 <= hours <= 168:
+        raise argparse.ArgumentTypeError("from 1 to 168 hours")
+    return hours
+
+
+def _add_ops_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    ops = commands.add_parser(
+        "ops",
+        help="the deployment's checks of ntfy and healthchecks (V15), as the worker; never print a secret",
+    )
+    ops_commands = ops.add_subparsers(dest="ops_command", required=True)
+    ops_commands.add_parser(
+        "notify-test",
+        help='push one test notification to NTFY_TOPIC_URL; print {"sent": true} or the error code',
+    )
+    sync = ops_commands.add_parser(
+        "deadman-sync",
+        help="apply the schedule's period to the dead-man check (healthchecks), under its lock",
+    )
+    sync.add_argument(
+        "--show", action="store_true", help="print the check's timeout, grace and pause as read back"
+    )
+    sync.add_argument(
+        "--interval-hours",
+        type=_interval_hours,
+        metavar="N",
+        help="the period to apply when no database is reachable (before it exists), 1 to 168",
+    )
+
+
+def _add_backup_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    backup = commands.add_parser(
+        "backup", help="the backup container's jobs (§19.5), as the backup role; never print a secret"
+    )
+    backup_commands = backup.add_subparsers(dest="backup_command", required=True)
+    backup_commands.add_parser(
+        "init",
+        help='initialise the restic repository unless it exists; print {"created": true|false} (run once)',
+    )
+    backup_commands.add_parser(
+        "ship", help="ship the deletion manifests to the restic repository unless they are unchanged"
+    )
+    backup_commands.add_parser(
+        "set", help='take one backup set from one exported snapshot (§19.5); print {"set_id": N}'
+    )
+    backup_commands.add_parser(
+        "prune", help="forget the backup sets beyond the daily, weekly and monthly counts kept, and prune"
+    )
+    backup_commands.add_parser(
+        "restore-test",
+        help="restore the latest set into a scratch database as the restore role, replay and verify it; "
+        'record the run (§19.5); print {"run_id": N}',
+    )
+    backup_commands.add_parser(
+        "scheduler",
+        help="the backup service's command: run the set, ship, prune and restore-test jobs on their crons "
+        "until SIGTERM",
+    )
+
+
+def _set_id(text: str) -> int:
+    """`--set`: a backup set's id, a whole number of at least 1."""
+    if not (text.isascii() and text.isdigit() and int(text) >= 1):
+        raise argparse.ArgumentTypeError("a backup set's id, a whole number of at least 1")
+    return int(text)
+
+
+def _add_restore_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    restore = commands.add_parser(
+        "restore", help="the disaster restore (§19.5), in the restore container; never print a secret"
+    )
+    restore_commands = restore.add_subparsers(dest="restore_command", required=True)
+    run = restore_commands.add_parser(
+        "run",
+        help="restore the manifest stream (the union of every manifests snapshot) and a backup set into the "
+        "empty database and volumes, migrate, replay and verify (the restore service's command)",
+    )
+    run.add_argument(
+        "--set", type=_set_id, metavar="ID", help="the backup set to restore (default: the latest)"
+    )
+    verify = restore_commands.add_parser(
+        "verify", help="check a restored database: before the replay (restored) or after it (replayed)"
+    )
+    verify.add_argument("--set", type=_set_id, metavar="ID", required=True, help="the backup set restored")
+    verify.add_argument("--phase", required=True, choices=["restored", "replayed"])
+    verify.add_argument("--database", metavar="DB", help="the database to check (default JOBHUNTER_DB_NAME)")
+
+
+def _add_crypto_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    crypto = commands.add_parser("crypto", help="the data key (§16.8), as the worker; never print a key")
+    crypto_commands = crypto.add_subparsers(dest="crypto_command", required=True)
+    crypto_commands.add_parser(
+        "rotate",
+        help="re-encrypt every ciphertext under data_key_previous with data_key, resumably, then count what "
+        "remains by key id; exit 0 when only data_key remains, 3 when other old keys remain, 2 without a "
+        "previous key, 1 when a ciphertext under data_key_previous remains (restart api and worker, run "
+        "again) or one cannot be rotated",
+    )
+
+
+def _add_retention_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    retention = commands.add_parser(
+        "retention", help="the retention pass (§20.1), as the worker; prints counts only"
+    )
+    retention_commands = retention.add_subparsers(dest="retention_command", required=True)
+    retention_commands.add_parser(
+        "run",
+        help="run the nightly retention pass once now, fenced by the current worker epoch as the worker's "
+        'own pass is; print {"counts": {rule: count}}, -1 for a rule that failed (exit 1)',
+    )
+
+
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     fixtures = commands.add_parser("fixtures", help="source fixture tooling (§18.4)")
     fixtures_commands = fixtures.add_subparsers(dest="fixtures_command", required=True)
@@ -197,15 +406,47 @@ def _http_check(url: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command != "worker" and args.command not in UNTRACEABLE_PROBES:
+        # Only the worker traces (§17.8; M5 Task 6, Ruling T6-8): any other command, the api and a worker-role
+        # command such as `schema-dry-run` among them, runs untraced whatever its environment says. Imported
+        # here, like each command's own modules.
+        from jobhunter.observability.langsmith import disable_tracing
+
+        disable_tracing()
     if args.command == "startup-check":
         startup_or_exit(args.role)
         return 0
     if args.command == "migrate":
         # Imported here: migrate pulls in procrastinate, langgraph and alembic, which `startup-check` (the
         # healthcheck path of every container) must not load.
-        from jobhunter.db.migrate import run_migrate
+        from jobhunter.db.migrate import SchemaAheadIncompatible, run_migrate
 
-        run_migrate(startup_or_exit("migrate"))
+        db_role: DbRole = args.db_role
+        try:
+            run_migrate(
+                startup_or_exit(MIGRATE_CONFIG_ROLES[db_role]),
+                steps=args.steps,
+                database=args.database,
+                manifest_dir=args.manifest_dir,
+                cv_dir=args.cv_dir,
+                exports_dir=args.exports_dir,
+                db_role=db_role,
+            )
+        except SchemaAheadIncompatible:
+            return 1  # logged (`migrate_schema_ahead_incompatible`): the RUNBOOK rolls back by restore
+        return 0
+    if args.command == "manifests":
+        # Imported here, like `migrate`: `manifests replay` is its steps 1, 3 and 7 (§19.4), as the migrator.
+        from jobhunter.db.migrate import SchemaAheadIncompatible, run_migrate
+
+        try:
+            run_migrate(
+                startup_or_exit("migrate"),
+                steps=frozenset({"sequences", "replay"}),
+                manifest_dir=args.manifest_dir,
+            )
+        except SchemaAheadIncompatible:
+            return 1  # logged, as for `migrate`
         return 0
     if args.command == "api":
         # Imported here: the api command needs uvicorn, and the app it serves FastAPI and the database layer.
@@ -248,6 +489,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_golden import run_eval_command
 
         return run_eval_command(args)
+    if args.command == "ops":
+        # Imported here: the ops commands need httpx, the database layer and the worker's dead-man module.
+        from jobhunter.cli_ops import run_ops_command
+
+        return run_ops_command(args)
+    if args.command == "backup":
+        # Imported here: the backup commands need the restic wrapper, the shipper and the database layer.
+        from jobhunter.cli_backup import run_backup_command
+
+        return run_backup_command(args)
+    if args.command == "restore":
+        # Imported here, like `backup`: the restore needs the restic wrapper, migrate and the database layer.
+        from jobhunter.cli_backup import run_restore_command, run_restore_verify_command
+
+        if args.restore_command == "verify":
+            return run_restore_verify_command(args)
+        return run_restore_command(args)
+    if args.command == "crypto":
+        # Imported here: the rotation needs the database layer, the CV store and the export format.
+        from jobhunter.crypto_rotate import run_rotate_command
+
+        return run_rotate_command(args)
+    if args.command == "retention":
+        # Imported here: the pass needs the database layer, procrastinate, the checkpointer and the CV store.
+        from jobhunter.cli_retention import run_retention_command
+
+        return run_retention_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING, Final, Literal
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.observability.alerts import Severity, open_alert, raise_alert, resolve_alert
+from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
+from jobhunter.observability.catalogue import Severity
 from jobhunter.sources.base import MISSING_SECRET, Billing
 
 if TYPE_CHECKING:

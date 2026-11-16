@@ -35,9 +35,30 @@ export interface paths {
         put?: never;
         /**
          * Acknowledge
-         * @description Acknowledge an open alert; it stays open (200).
+         * @description Acknowledge an open alert (200). It stays open, unless its code is resolved by its acknowledgement
+         *     (`llm.reservation_bound_violated`): then it is resolved too, and its next occurrence opens a new alert.
          */
         post: operations["acknowledge_api_alerts__alert_id__ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/alerts/{alert_id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve
+         * @description Resolve an alert that does not resolve itself (200); one resolved already is answered as it is.
+         */
+        post: operations["resolve_api_alerts__alert_id__resolve_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -304,7 +325,8 @@ export interface paths {
         post?: never;
         /**
          * Delete Golden Case
-         * @description Delete a golden case and its eval rows (204); its job's inputs lose their retention exemption.
+         * @description Delete a golden case and its eval rows (202): the deletion runs in the background, recorded in a
+         *     deletion manifest; its job's inputs lose their retention exemption.
          */
         delete: operations["delete_golden_case_api_golden_cases__case_id__delete"];
         options?: never;
@@ -516,6 +538,170 @@ export interface paths {
         get: operations["get_labelling_queue_api_labelling_queue_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/delete-everything": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delete Everything
+         * @description Delete all your data but your account (202): the deletion runs in the background and logs you out when
+         *     it completes; it is done once its record is confirmed offsite.
+         */
+        post: operations["delete_everything_api_privacy_delete_everything_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Export
+         * @description Export your data (202): a zip of your profile versions, CV files, settings, jobs, scores, feedback,
+         *     golden cases and runs, encrypted at rest and available for 7 days.
+         */
+        post: operations["post_export_api_privacy_export_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Exports
+         * @description The exports in use, newest first: the one being made and the ready ones until they expire (at most
+         *     5).
+         */
+        get: operations["list_exports_api_privacy_exports_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/exports/{export_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Export
+         * @description An export's state, or with `download=1` its zip, decrypted as it is sent.
+         */
+        get: operations["get_export_api_privacy_exports__export_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/manifests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Manifests
+         * @description The deletions, newest first, keyset-paged.
+         */
+        get: operations["list_manifests_api_privacy_manifests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/manifests/{manifest_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Manifest
+         * @description A deletion: its state, done only once `shipped`.
+         */
+        get: operations["get_manifest_api_privacy_manifests__manifest_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/operator": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Operator
+         * @description The privacy statement's operator values, which take the place of its placeholders.
+         */
+        get: operations["get_operator_api_privacy_operator_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/purge-source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Purge Source
+         * @description Purge all data of the Adzuna source (202), as its agreement's end requires: the source is disabled at
+         *     once, and the purge runs in the background; it is done once its record is confirmed offsite.
+         */
+        post: operations["purge_source_api_privacy_purge_source_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1156,8 +1342,10 @@ export interface paths {
         };
         /**
          * Get System Health
-         * @description Readiness, run ages and their state, queue depths, the score lane, open alerts, disk and table sizes,
-         *     versions, and the embedder's health and model id.
+         * @description Readiness, run ages and their state, the latest backup set and the backup age state, the latest offsite
+         *     manifest shipment and the manifests not shipped yet, the latest restore test and its age state, queue
+         *     depths, the score lane, open alerts, disk and table sizes, versions, the embedder's health and model id,
+         *     and the LangSmith tracing state the worker published.
          */
         get: operations["get_system_health_api_system_health_get"];
         put?: never;
@@ -1184,6 +1372,27 @@ export interface paths {
         get: operations["get_needs_attention_api_system_needs_attention_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/purges/{operation_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Purge
+         * @description Retry a failed purge (202): a new purge operation carries its deletion on from where it stopped; the
+         *     deletion stays fenced meanwhile.
+         */
+        post: operations["retry_purge_api_system_purges__operation_id__retry_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1603,7 +1812,9 @@ export interface components {
         /**
          * AlertOut
          * @description An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
-         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback.
+         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback. `last_notified_at` is
+         *     when it was last pushed (null while it never was), `notify_failures` how often its push failed for good;
+         *     `manual` says whether the user resolves it, since its code does not resolve itself.
          */
         AlertOut: {
             /** Acknowledged At */
@@ -1626,8 +1837,14 @@ export interface components {
              * Format: date-time
              */
             last_at: string;
+            /** Last Notified At */
+            last_notified_at: string | null;
+            /** Manual */
+            manual: boolean;
             /** Message */
             message: string;
+            /** Notify Failures */
+            notify_failures: number;
             /** Occurrences */
             occurrences: number;
             /** Resolved At */
@@ -1672,10 +1889,11 @@ export interface components {
         /**
          * AttentionOut
          * @description What needs the user: each list section's full count and at most 50 of its items, the score lane's
-         *     acknowledgeable pause and a failed scope apply (each null when there is none).
+         *     acknowledgeable pause, a failed scope apply (each null when there is none) and the failed purges.
          */
         AttentionOut: {
             broken_sources: components["schemas"]["BrokenSourcesSectionOut"];
+            failed_purges: components["schemas"]["FailedPurgesSectionOut"];
             failed_targets: components["schemas"]["FailedTargetsSectionOut"];
             identity_conflicts: components["schemas"]["IdentityConflictsSectionOut"];
             mass_disappearances: components["schemas"]["MassDisappearancesSectionOut"];
@@ -1687,6 +1905,57 @@ export interface components {
             unscorable_groups: components["schemas"]["UnscorableGroupsSectionOut"];
         };
         /**
+         * BackupRunOut
+         * @description A backup set or a restore test: its status, when it finished and its age in seconds (both null while it
+         *     runs).
+         */
+        BackupRunOut: {
+            /** Age S */
+            age_s: number | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "succeeded" | "failed";
+        };
+        /**
+         * BackupStateOut
+         * @description The backups, the offsite manifests and the restore tests. Ages are seconds at the time of the request.
+         *
+         *     - `latest_set`: the newest backup set, whatever its status; `null` before the first.
+         *     - `backup_age_state`: the age of the newest succeeded set: `warn` past 36 hours, `critical` past 72;
+         *       before the first one, `grace` until 48 hours after install, then measured from install.
+         *     - `latest_shipment`: the newest manifest shipment and the number of manifests it shipped.
+         *     - `unshipped_manifests`: the deletion manifests completed and not shipped yet;
+         *       `oldest_unshipped_completed_at` is when the oldest of them completed.
+         *     - `latest_restore_test`: the newest restore test, whatever its status.
+         *     - `restore_test_age_state`: the age of the newest succeeded restore test: `warn` past 35 days, `none`
+         *       without one.
+         */
+        BackupStateOut: {
+            /**
+             * Backup Age State
+             * @enum {string}
+             */
+            backup_age_state: "ok" | "warn" | "critical" | "grace";
+            latest_restore_test: components["schemas"]["BackupRunOut"] | null;
+            latest_set: components["schemas"]["BackupRunOut"] | null;
+            latest_shipment: components["schemas"]["ManifestShipmentOut"] | null;
+            /** Oldest Unshipped Completed At */
+            oldest_unshipped_completed_at: string | null;
+            /**
+             * Restore Test Age State
+             * @enum {string}
+             */
+            restore_test_age_state: "ok" | "warn" | "none";
+            /** Unshipped Manifests */
+            unshipped_manifests: number;
+        };
+        /**
          * BannerOut
          * @description A banner: a client shows it by its `code`, with `params` (JSON values; instants as ISO 8601 UTC
          *     strings).
@@ -1696,7 +1965,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "stale_data" | "cap_reached" | "reservation_bound_violated" | "scoring_paused" | "critical_alerts" | "paid_search_paused" | "scope_not_applied" | "applying_settings" | "rescoring";
+            code: "stale_data" | "cap_reached" | "reservation_bound_violated" | "scoring_paused" | "critical_alerts" | "paid_search_paused" | "scope_not_applied" | "deletion_unshipped" | "applying_settings" | "rescoring";
             /** Params */
             params: {
                 [key: string]: components["schemas"]["JsonValue"];
@@ -2000,6 +2269,27 @@ export interface components {
         CvTextIn: {
             /** Text */
             text: string;
+        };
+        /**
+         * DeleteEverythingIn
+         * @description Delete everything: the phrase `DELETE EVERYTHING`, the password and, with TOTP on, a code.
+         */
+        DeleteEverythingIn: {
+            /**
+             * Confirm
+             * @description Exactly `DELETE EVERYTHING`
+             */
+            confirm: string;
+            /**
+             * Password
+             * @description The user's password
+             */
+            password: string;
+            /**
+             * Totp
+             * @description The six-digit code of the authenticator app, needed when TOTP is on; an empty string counts as no code
+             */
+            totp?: string | null;
         };
         /** DescriptionOut */
         DescriptionOut: {
@@ -2355,6 +2645,74 @@ export interface components {
             /** Max Tokens Retry */
             max_tokens_retry: number;
         };
+        /**
+         * ExportIn
+         * @description An export request has nothing to say: no body, or an empty object.
+         */
+        ExportIn: Record<string, never>;
+        /**
+         * ExportListedOut
+         * @description An export in use: being made, or ready to download until `expires_at`. Its size and its zip are the
+         *     export's own read.
+         */
+        ExportListedOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready";
+        };
+        /**
+         * ExportOut
+         * @description An export: its state, when it was requested and until when it can be downloaded, and the size of its
+         *     zip once it is ready.
+         */
+        ExportOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Size Bytes
+             * @description The size of the zip in bytes; null until the export is ready
+             */
+            size_bytes: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready" | "failed" | "expired" | "purged";
+        };
+        /** ExportQueuedOut */
+        ExportQueuedOut: {
+            /** Export Id */
+            export_id: number;
+        };
+        /** ExportsOut */
+        ExportsOut: {
+            /** Items */
+            items: components["schemas"]["ExportListedOut"][];
+        };
         /** ExtractingOut */
         ExtractingOut: {
             /**
@@ -2372,6 +2730,41 @@ export interface components {
             companies: components["schemas"]["CompanyFacetOut"][];
             /** Sources */
             sources: components["schemas"]["SourceFacetOut"][];
+        };
+        /**
+         * FailedPurgeOut
+         * @description A deletion whose purge failed or has no operation: its manifest, its kind and when it was requested,
+         *     and its newest purge operation (null without one), which Retry takes, with its error code and attempts.
+         */
+        FailedPurgeOut: {
+            /** Attempts */
+            attempts: number;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "delete_everything" | "source_purge" | "profile_purge" | "retention_purge" | "job_tombstone" | "golden_case_delete";
+            /** Last Error Code */
+            last_error_code: string | null;
+            /** Manifest Id */
+            manifest_id: number;
+            /** Operation Id */
+            operation_id: number | null;
+        };
+        /**
+         * FailedPurgesSectionOut
+         * @description The deletions whose purge failed: how many, and the 50 requested last.
+         */
+        FailedPurgesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["FailedPurgeOut"][];
         };
         /**
          * FailedTargetOut
@@ -2498,6 +2891,11 @@ export interface components {
              * @description The job's company, as the job list shows it
              */
             company: string;
+            /**
+             * Deletion Manifest Id
+             * @description The case's open deletion manifest (its purge pending, waiting or failed), null without one: the case cannot be deleted again, activated or made a canary meanwhile
+             */
+            deletion_manifest_id: number | null;
             /** Id */
             id: number;
             /** Is Canary */
@@ -3214,6 +3612,69 @@ export interface components {
             username: string;
         };
         /**
+         * ManifestOut
+         * @description A deletion: its kind and state (done only once `shipped`, its record confirmed offsite), when it was
+         *     requested, completed and shipped, and the golden cases a source purge deletes.
+         */
+        ManifestOut: {
+            /** Completed At */
+            completed_at: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Deleted Golden Case Ids
+             * @description The golden cases a source purge deletes, once it has computed what it deletes; empty for any other kind
+             */
+            deleted_golden_case_ids: number[];
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "delete_everything" | "source_purge" | "profile_purge" | "retention_purge" | "job_tombstone" | "golden_case_delete";
+            /** Shipped At */
+            shipped_at: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "executing" | "completed" | "shipped";
+        };
+        /**
+         * ManifestQueuedOut
+         * @description The deletion manifest the request opened; the worker carries the deletion out.
+         */
+        ManifestQueuedOut: {
+            /** Manifest Id */
+            manifest_id: number;
+        };
+        /**
+         * ManifestShipmentOut
+         * @description A shipment of deletion manifests to the offsite repository, and how many manifests it shipped.
+         */
+        ManifestShipmentOut: {
+            /** Id */
+            id: number;
+            /** Manifests */
+            manifests: number;
+            /**
+             * Shipped At
+             * Format: date-time
+             */
+            shipped_at: string;
+        };
+        /** ManifestsPageOut */
+        ManifestsPageOut: {
+            /** Items */
+            items: components["schemas"]["ManifestOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
          * MassDisappearanceOut
          * @description An unconfirmed mass disappearance of a board, by its opening snapshot: the postings absent from it
          *     against the board's active count before it.
@@ -3375,6 +3836,38 @@ export interface components {
             status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready";
         };
         /**
+         * OperatorOut
+         * @description The privacy statement's operator values, from the deployment's operator file: each a string, or all
+         *     null when the server has no operator file (outside production).
+         */
+        OperatorOut: {
+            /**
+             * Contact
+             * @description Where to send a privacy concern
+             */
+            contact: string | null;
+            /**
+             * Controller
+             * @description The controller of the personal data
+             */
+            controller: string | null;
+            /**
+             * Operator
+             * @description Who operates the deployment
+             */
+            operator: string | null;
+            /**
+             * S3 Provider
+             * @description The provider of the offsite backups
+             */
+            s3_provider: string | null;
+            /**
+             * Vps Provider
+             * @description The provider of the server
+             */
+            vps_provider: string | null;
+        };
+        /**
          * PaidSearchOut
          * @description Whether paid search is paused (JSearch exhausted and SerpApi unable to fall back), until when and
          *     why.
@@ -3502,7 +3995,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
+            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "delete_everything_in_progress" | "confirmation_mismatch" | "reauth_failed" | "gone" | "internal";
             /**
              * Detail
              * @default null
@@ -3643,6 +4136,43 @@ export interface components {
             target_title: string;
             /** Text */
             text: string;
+        };
+        /**
+         * PurgeRetryOut
+         * @description The new purge operation, and the deletion it carries on.
+         */
+        PurgeRetryOut: {
+            /** Manifest Id */
+            manifest_id: number;
+            /** Operation Id */
+            operation_id: number;
+        };
+        /**
+         * PurgeSourceIn
+         * @description Purge a source's data: the source, the phrase `PURGE ADZUNA`, the password and, with TOTP on, a
+         *     code.
+         */
+        PurgeSourceIn: {
+            /**
+             * Confirm
+             * @description Exactly `PURGE ADZUNA`
+             */
+            confirm: string;
+            /**
+             * Password
+             * @description The user's password
+             */
+            password: string;
+            /**
+             * Source
+             * @constant
+             */
+            source: "adzuna";
+            /**
+             * Totp
+             * @description The six-digit code of the authenticator app, needed when TOTP is on; an empty string counts as no code
+             */
+            totp?: string | null;
         };
         /**
          * QuarantinedBatchOut
@@ -5012,13 +5542,19 @@ export interface components {
          *     - `scoring`: the score lane.
          *     - `table_bytes`: the size of every table of the `public` schema, in bytes.
          *     - `embedder`: the embedder's health as the readiness check read it.
+         *     - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when
+         *       the worker's heartbeat goes stale.
+         *     - `backups`: the backups, the offsite manifests and the restore tests, with the age states of the
+         *       backups and of the restore tests.
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
+            backups: components["schemas"]["BackupStateOut"];
             /** Database Bytes */
             database_bytes: number;
             disk: components["schemas"]["DiskUsage"];
             embedder: components["schemas"]["EmbedderOut"];
+            langsmith: components["schemas"]["TracingStateOut"] | null;
             /** Last Fully Successful Run Age S */
             last_fully_successful_run_age_s: number | null;
             last_run: components["schemas"]["RunOut"] | null;
@@ -5103,6 +5639,17 @@ export interface components {
             removed: components["schemas"]["SpanOut"][];
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
+        };
+        /**
+         * TracingStateOut
+         * @description The tracing state the worker published at its start: whether it sends traces to LangSmith (inputs and
+         *     outputs hidden), and the region it sends them to (`eu`; `null` when it does not trace).
+         */
+        TracingStateOut: {
+            /** Region */
+            region: "eu" | null;
+            /** Tracing */
+            tracing: boolean;
         };
         /**
          * UnackedAlertsOut
@@ -5526,6 +6073,92 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    resolve_api_alerts__alert_id__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an alert */
+                alert_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No alert with this id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The alert resolves itself when its condition clears (`not_manual`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid path (`validation_failed`) */
             422: {
                 headers: {
@@ -5594,7 +6227,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The snapshot is no mass disappearance (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The snapshot is no mass disappearance (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5836,7 +6469,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The submission cannot be released now (`conflict_state` with detail `not_releasable`): it is neither quarantined nor a submitted batch whose retrieval still fails more than 1 h past its expiry with its alert open, or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The submission cannot be released now (`conflict_state` with detail `not_releasable`): it is neither quarantined nor a submitted batch whose retrieval still fails more than 1 h past its expiry with its alert open, or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5922,7 +6555,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The group is not active or has no representative (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The group is not active or has no representative (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5994,7 +6627,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The job is not a member of the group (`not_found`) */
+            /** @description The job is not a member of the group, or it is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6003,7 +6636,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description A concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6093,7 +6726,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The group is not active or the job is not its member (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The group is not active or the job is not its member (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6232,6 +6865,15 @@ export interface operations {
             };
             /** @description No such label or wrong score (`not_found`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6385,11 +7027,13 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            204: {
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ManifestQueuedOut"];
+                };
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
@@ -6418,7 +7062,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A running eval run includes the case (`conflict_state`) */
+            /** @description The case's deletion is pending (`conflict_state`, detail `purge_in_progress`), or a running eval run includes it (`conflict_state`, detail `eval_run_running`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6492,6 +7136,15 @@ export interface operations {
             };
             /** @description No such golden case (`not_found`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Activating a case whose job or profile version is being purged, or whose profile version was purged, or activating a case or making it a canary while its deletion is pending (`conflict_state`, detail `purge_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6580,7 +7233,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The conflict is not open (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The conflict is not open (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6940,6 +7593,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description With `apply_to_group`, a member of the job's group is being purged (`conflict_state`, detail `purge_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
             413: {
                 headers: {
@@ -7021,7 +7683,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The job has no published score of the active tuple to label (`conflict_state`) */
+            /** @description The job has no published score of the active tuple to label (`conflict_state`), or it is being purged (`conflict_state`, `purge_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7185,7 +7847,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No target of the active tuple for the job (`not_found`) */
+            /** @description No target of the active tuple for the job, or the job is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -7194,7 +7856,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The job is filtered out and `force` is not set (`filtered_requires_force`), the month's scoring budget is exhausted (`budget_exhausted`), the target is being scored, batched, published or cancelled (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The job is filtered out and `force` is not set (`filtered_requires_force`), the month's scoring budget is exhausted (`budget_exhausted`), the target is being scored, batched, published or cancelled (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7284,7 +7946,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The event is an unmerge, is reversed already or is no longer the latest state of its jobs (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            /** @description The event is an unmerge, is reversed already or is no longer the latest state of its jobs (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7361,6 +8023,549 @@ export interface operations {
                 };
             };
             /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_everything_api_privacy_delete_everything_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteEverythingIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestQueuedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`), or the password or the TOTP code is wrong (`reauth_failed`, counted as a failed login) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Everything is already being deleted (`conflict_state`, detail `purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), a phrase other than `DELETE EVERYTHING` (`confirmation_mismatch`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session, or too many failed logins from this address or in all (`throttled`, with `retry_after_s`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    post_export_api_privacy_export_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ExportIn"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportQueuedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description An export is already running (`conflict_state`, detail `export_running`), everything is being deleted (`delete_everything_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A body other than an empty object (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_exports_api_privacy_exports_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_export_api_privacy_exports__export_id__get: {
+        parameters: {
+            query?: {
+                /** @description Download the zip of a ready export */
+                download?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The id of an export */
+                export_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The export's state; with `download=1`, its zip */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportOut"];
+                    "application/zip": string;
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such export (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A download of an export that is not ready, or that failed (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A download of an export that expired or was deleted by a purge (`gone`) */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or query (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_manifests_api_privacy_manifests_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid query (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_manifest_api_privacy_manifests__manifest_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a deletion manifest */
+                manifest_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such deletion (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_operator_api_privacy_operator_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperatorOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    purge_source_api_privacy_purge_source_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PurgeSourceIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestQueuedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`), or the password or the TOTP code is wrong (`reauth_failed`, counted as a failed login) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Everything is being deleted (`delete_everything_in_progress`), the source is already being purged (`conflict_state`, detail `purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), the source is the only one enabled (`validation_failed` on `payload.sources.enabled`: enable another source first), a phrase other than `PURGE ADZUNA` (`confirmation_mismatch`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session, or too many failed logins from this address or in all (`throttled`, with `retry_after_s`) */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7460,7 +8665,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A draft is being extracted (`conflict_state`) */
+            /** @description A draft is being extracted (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7538,7 +8743,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A draft is being extracted (`conflict_state`) */
+            /** @description A draft is being extracted (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7687,7 +8892,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not ready (`conflict_state`) */
+            /** @description The draft is not ready (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7788,7 +8993,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not ready or its stored profile no longer fits the schema (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The draft is not ready or its stored profile no longer fits the schema (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7872,7 +9077,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not in text review, ready or failed (`conflict_state`) */
+            /** @description The draft is not in text review, ready or failed (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8023,7 +9228,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not failed, the mode is not admitted for it or its input was purged (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The draft is not failed, the mode is not admitted for it or its input was purged (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8113,7 +9318,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not in text review or ready, or has no text (`conflict_state`) */
+            /** @description The draft is not in text review or ready, or has no text (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8210,7 +9415,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not in text review (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The draft is not in text review (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8286,7 +9491,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No active profile (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description No active profile (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8452,7 +9657,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A live query has this text (`conflict_state`, with its `query_id`), or the proposal is not ready (`conflict_state`) */
+            /** @description A live query has this text (`conflict_state`, with its `query_id`), or the proposal is not ready (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8580,7 +9785,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A live query has the new text (`conflict_state`, with its `query_id`) */
+            /** @description A live query has the new text (`conflict_state`, with its `query_id`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8731,7 +9936,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A request with this key is still running (`idempotency_in_progress`) */
+            /** @description A request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -8977,7 +10182,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The base is not the active version (`stale_base_version`), the model policy has no passed live schema dry-run of a (schema, model) pair it needs (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The base is not the active version (`stale_base_version`), the model policy has no passed live schema dry-run of a (schema, model) pair it needs (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9048,6 +10253,15 @@ export interface operations {
             };
             /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9185,7 +10399,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9383,7 +10597,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9516,7 +10730,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The active settings version's scope is already the active scope, or an `apply_scope` operation is live (`conflict_state`) */
+            /** @description The active settings version's scope is already the active scope, or an `apply_scope` operation is live (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9731,6 +10945,83 @@ export interface operations {
             };
         };
     };
+    retry_purge_api_system_purges__operation_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a failed purge operation */
+                operation_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PurgeRetryOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No purge operation has the id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The deletion is no longer in progress, or one of its purge operations is pending or running (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_quota_api_system_quota_get: {
         parameters: {
             query?: never;
@@ -9820,7 +11111,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description None of the listed items can be replayed, for example while their run still runs (`conflict_state`) */
+            /** @description None of the listed items can be replayed, for example while their run still runs (`conflict_state`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9905,7 +11196,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description A request with this key is still running (`idempotency_in_progress`) */
+            /** @description A request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10060,7 +11351,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No such target (`not_found`) */
+            /** @description No such target, or its job is being purged (`not_found`) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10069,7 +11360,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The target is not refused or failed (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The target is not refused or failed (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10176,7 +11467,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The board is already on the watchlist (`conflict_state`, with the company's `watchlist_company_id`) */
+            /** @description The board is already on the watchlist (`conflict_state`, with the company's `watchlist_company_id`). Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10254,6 +11545,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
             413: {
                 headers: {
@@ -10322,6 +11622,15 @@ export interface operations {
             };
             /** @description No such watchlist company (`not_found`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Everything is being deleted: no change is accepted until the deletion completes (`delete_everything_in_progress`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

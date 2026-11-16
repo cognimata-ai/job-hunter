@@ -46,8 +46,8 @@ from jobhunter.llm.schemas import profile as profile_schema
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.normalize.titles import SENIORITY_LADDER
-from jobhunter.observability import alerts as observability_alerts
-from jobhunter.observability import attention, health
+from jobhunter.observability import attention, backup_health, health
+from jobhunter.observability import catalogue as alert_catalogue
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus, CycleStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
@@ -199,6 +199,10 @@ DYNAMIC_SITES: Final[dict[tuple[str, str], Callable[[], set[str]]]] = {
     ("jobhunter.llm.cache_monitor", "write_alerts"): lambda: constructor_codes(
         "jobhunter.llm.cache_monitor", "CacheAlert"
     ),
+    # `for failure in _FAILURES`: a failed backup set's, a failed restore test's (plan M5 Task 7)
+    ("jobhunter.observability.backup_health", "_judge_failures"): lambda: {
+        failure.code for failure in backup_health._FAILURES
+    },
 }
 
 
@@ -515,9 +519,14 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "cycle_trigger": lambda: literal_values(CycleTrigger),
     "cycle_status": lambda: literal_values(CycleStatus),
     "golden_source": lambda: literal_values(CaseSource),
-    "alert_severity": lambda: literal_values(observability_alerts.Severity),
+    "alert_severity": lambda: literal_values(alert_catalogue.Severity),
     "readiness": lambda: literal_values(health.ReadinessCode),
     "run_age_state": lambda: literal_values(health.RunAgeState),
+    # the health panel's backup and restore-test age states (plan M5 Task 7)
+    "backup_age_state": lambda: literal_values(backup_health.BackupAgeState),
+    "restore_test_age_state": lambda: literal_values(backup_health.RestoreTestAgeState),
+    # the region of the worker's tracing state (plan M5 Task 7, fix round 1)
+    "tracing_region": lambda: literal_values(health.TracingRegion),
     "queue": lambda: set(QUEUES),
     "queue_status": lambda: {status.value for status in QueueJobStatus},
     "ui_language": lambda: literal_values(settings_model.Display.model_fields["ui_language"].annotation),
@@ -575,6 +584,8 @@ SYSTEM_REUSED: Final[dict[str, Callable[[], set[str]]]] = {
     "pause": lambda: literal_values(attention.PausedReason),
     "group_unscorable": lambda: literal_values(attention.UnscorableReason),
     "instance_health": lambda: literal_values(attention.BrokenHealth),
+    # a backup set's and a restore test's status in the health panel (plan M5 Task 7)
+    "run_status": lambda: literal_values(backup_health.BackupStatus),
 }
 
 
@@ -672,12 +683,11 @@ def test_the_system_section_s_reused_namespaces_cover_their_literals(
     assert not missing, f"codes.json[{namespace}] lacks {missing}"
 
 
-def test_the_attention_sections_have_no_failed_purges_section() -> None:
-    """Needs attention shows one block per section of `AttentionOut` (their order is
-    `order.attention_section`, held by `test_each_order_is_its_backend_order_of_its_namespace`), and none for
-    failed purges (U1)."""
-    sections = list(attention.AttentionOut.model_fields)
-    assert not [name for name in sections if "purge" in name], sections
+def test_the_attention_sections_include_failed_purges() -> None:
+    """Needs attention has one section per field of `AttentionOut` (their order is `order.attention_section`,
+    held by `test_each_order_is_its_backend_order_of_its_namespace`); M5 Task 18 adds the failed purges, which
+    U1 had deferred to M5 (preflight F41)."""
+    assert "failed_purges" in attention.AttentionOut.model_fields
 
 
 def test_a_role_s_seniority_is_the_profile_s_and_unspecified(catalogue: dict[str, Any]) -> None:

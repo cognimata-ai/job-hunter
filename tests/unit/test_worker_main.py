@@ -2,9 +2,10 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
+from jobhunter.errors import WORKER_EPOCH, FencedOut
 from jobhunter.worker.main import exit_unless_lock_held
 
 from tests.support.clock import FakeClock
@@ -91,7 +92,15 @@ def test_a_lock_timeout_is_recognised_through_sqlalchemy_and_through_procrastina
 class World:
     """Fakes for every collaborator of `worker_main` that does I/O; `events` records what they did."""
 
-    def __init__(self, monkeypatch, tmp_path, *, fake_llm: bool = True) -> None:
+    def __init__(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        fake_llm: bool = True,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> None:
         from contextlib import asynccontextmanager
 
         from jobhunter.config import load_config
@@ -172,7 +181,11 @@ class World:
             async def close_async(self) -> None:
                 events.append("queue_close")
 
-            async def run_worker_async(self, **options: object) -> None:
+            def run_worker_async(self, **options: object) -> Awaitable[None]:
+                world.loops.append(str(options["name"]))  # made: from here on this loop may run
+                return self._run_worker(**options)
+
+            async def _run_worker(self, **options: object) -> None:
                 world.runtimes.append(options["additional_context"]["runtime"])  # type: ignore[index]
                 if options["name"] == "jh-tick":  # this loop asks for the shutdown, as a SIGTERM would
                     options["additional_context"]["runtime"].shutdown.requested.set()  # type: ignore[index]
@@ -197,14 +210,17 @@ class World:
             return 3, {}
 
         def fake_build_collect_graph(saver: object, deps: object) -> object:
+            world.built.append(("collect", "tracing_install" in events))
             world.deps.append(deps)
             return object()
 
         def fake_build_profile_graphs(saver: object, deps: object) -> object:
+            world.built.append(("profile", "tracing_install" in events))
             world.profile_deps.append(deps)
             return world.profile_graphs
 
         def fake_build_score_graphs(deps: object) -> object:
+            world.built.append(("score", "tracing_install" in events))
             world.score_deps.append(deps)
             return world.score_graphs
 
@@ -243,11 +259,37 @@ class World:
             from jobhunter.errors import FencedOut
 
             world.fenced.append(epoch)
+            world.last_fenced = conn
             if world.superseded:
                 raise FencedOut(owner=world.fence_owner)
 
+        # M5 Task 6 (Ruling T6-2): step 7 installs tracing before any graph is built (the real install:
+        # tracing is off in these configurations, so it only returns the state), step 8 publishes that state.
+        from jobhunter.observability import langsmith
+
+        real_install = langsmith.install_tracing
+
+        def recording_install(cfg: object) -> object:
+            events.append("tracing_install")
+            return real_install(cfg)  # type: ignore[arg-type]
+
+        async def fake_publish(conn: object, state: object) -> None:
+            events.append("tracing_publish")
+            world.loops_at_publish.append(len(world.loops))
+            world.publish_fenced.append(conn is world.last_fenced)  # its transaction's own fence came first
+            if world.publish_error is not None:
+                raise world.publish_error
+            world.published.append(state)
+
+        self.built: list[tuple[str, bool]] = []  # each graph build, and whether tracing was installed by then
+        self.loops: list[str] = []  # each worker loop made, in order
+        self.published: list[object] = []  # the tracing states step 8 published
+        self.loops_at_publish: list[int] = []  # how many loops had been made when it published
+        self.publish_fenced: list[bool] = []  # whether the publish's connection was the one fenced last
+        self.last_fenced: object = None  # the connection of the last fence (a new one per transaction)
+        self.publish_error: Exception | None = None  # what the publish raises, if anything
         self.synced: list[object] = []
-        self.fenced: list[int] = []  # the epochs step 8's guard fenced
+        self.fenced: list[int] = []  # the epochs step 8's guards fenced
         self.superseded = False  # a newer worker took over before step 8
         self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
         self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
@@ -262,6 +304,18 @@ class World:
         monkeypatch.setattr(LLMGateway, "settle_in_flight", recording_settle_in_flight)
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
+        # M5 Task 17: step 4's exports volume (the real configuration, its process-wide state restored on
+        # teardown), recorded so that its place before the takeover sweep is pinned.
+        from jobhunter.privacy import export
+
+        real_export_configure = export.configure
+
+        def recording_export_configure(cfg: object) -> None:
+            events.append("export_configure")
+            real_export_configure(cfg)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(export, "_volume", export._volume)  # restored on teardown
+        monkeypatch.setattr(export, "configure", recording_export_configure)
 
         for name, fake in {
             "LockSession": FakeLockSession,
@@ -279,28 +333,31 @@ class World:
             "make_clients": recording_make_clients,
             "sync_instances": fake_sync_instances,
             "fence_epoch": fake_fence_epoch,
+            "install_tracing": recording_install,
+            "publish_tracing_state": fake_publish,
         }.items():
             monkeypatch.setattr(main, name, fake)
-        secrets = tmp_path / "secrets"
-        secrets.mkdir()
-        for name, value in (("db_app", "pw"), ("data_key", "a" * 43 + "=")):
-            (secrets / name).write_text(value)
-            (secrets / name).chmod(0o440)
+        secrets_dir = tmp_path / "secrets"
+        secrets_dir.mkdir()
+        for name, value in (("db_app", "pw"), ("data_key", "a" * 43 + "="), *(secrets or {}).items()):
+            (secrets_dir / name).write_text(value)
+            (secrets_dir / name).chmod(0o440)
         # Task 11: the gateway is on the fake LLM transport (this worker has no `anthropic_key`), and the
         # parse root and the CV store are the test's own. Task 23: without `fake_llm`, a worker with neither
         # the key nor the fake (its gateway is not configured).
         self.parse_root = tmp_path / "parse"
         self.parse_root.mkdir()
         fake_env = {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(tmp_path / "anthropic")}
-        env = {
+        worker_env = {
             "JOBHUNTER_ENV": "test",
             "JOBHUNTER_DB_NAME": "jobhunter",
             "JOBHUNTER_DB_HOST": "unused",
             **(fake_env if fake_llm else {}),
             "JOBHUNTER_PARSE_JOBS_DIR": str(self.parse_root),
             "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv"),
+            **(env or {}),
         }
-        self.cfg = load_config("worker", env, secrets)
+        self.cfg = load_config("worker", worker_env, secrets_dir)
 
 
 # The executions are cancelled first, then the gateway's tries still in flight settle (`llm_tries`), before
@@ -324,13 +381,16 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
         "make_clients",
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -368,15 +428,31 @@ async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_in
     assert world.clients and all(client.is_closed for client in world.clients.values())  # type: ignore[attr-defined]
 
 
-async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
-    monkeypatch, tmp_path
-) -> None:
-    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed."""
+async def test_step_4_configures_the_exports_volume_before_the_takeover_sweep(monkeypatch, tmp_path) -> None:
+    """M5 Task 17 (fix round 1, M2): the exports volume of the `export` failure hook is configured in step 4,
+    after the registering imports and before `claim_epoch_and_sweep`, whose takeover sweep can end an export
+    operation `failed` and so run that hook; it is the configuration's exports directory."""
+    from jobhunter.privacy import export
     from jobhunter.worker.main import worker_main
 
     world = World(monkeypatch, tmp_path)
     assert await worker_main(world.cfg) == 0
-    assert world.fenced == [3] and world.synced == [world.cfg]
+    events = world.events
+    assert events.count("export_configure") == 1
+    assert events.index("lock_acquire") < events.index("export_configure") < events.index("claim")
+    assert export._volume == world.cfg.exports_dir
+
+
+async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
+    monkeypatch, tmp_path
+) -> None:
+    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed; so is
+    the first statement of the tracing state's publish (M5 Task 6, Ruling T6-2)."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    assert world.fenced == [3, 3] and world.synced == [world.cfg]
 
 
 async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_70(
@@ -395,8 +471,10 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
@@ -404,7 +482,7 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
         "sync_instances",
         *TEARDOWN,
     ]
-    assert world.synced == [] and world.runtimes == []
+    assert world.synced == [] and world.runtimes == [] and world.published == []
     [event] = logged(caplog, "worker_superseded_at_start")
     assert (event["epoch"], event["exit_code"], event["level"]) == (3, 70, "critical")
     assert logged(caplog, "worker_failed") == []
@@ -475,6 +553,7 @@ async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exi
     assert await worker_main(world.cfg) == 0
     assert world.events[world.events.index("sync_instances") :] == [
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -607,13 +686,16 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
     assert world.events == [
         "lock_connect",
         "lock_acquire",
+        "export_configure",
         "claim",
         "watchdog_start",
+        "tracing_install",
         "queue_open",
         "saver_open",
         "http_configure",
         "make_clients",
         "sync_instances",
+        "tracing_publish",
         "reconcile_start",
         *TEARDOWN,
     ]
@@ -623,6 +705,358 @@ async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_n
     [event] = logged(caplog, "llm_not_configured")
     assert event["level"] == "warning"
     assert runtime.gateway.http_client.is_closed
+
+
+# --- M5 Task 4: the alert dispatcher runs beside the queue loops when ntfy is configured -------------------
+
+NTFY_TOPIC = "https://ntfy.test/jh-alerts-4f2a9c"
+NTFY_ENV = {"NTFY_TOPIC_URL": NTFY_TOPIC, "JOBHUNTER_PUBLIC_ORIGIN": "https://jobs.example.test"}
+NTFY_TOKEN = "tk-test-token"  # a low-entropy stand-in: no secret scanner reads it as a key
+
+
+def fake_dispatchers(
+    monkeypatch, world: World, *, ends_by_itself: bool = False, stops: bool = True
+) -> list[Any]:
+    """`AlertDispatcher` as `worker_main` builds and runs it; each one made is returned in the list. Its
+    `run` records its start and its stop; with `ends_by_itself` it returns at once, as a loop whose fence
+    refused the worker's epoch does; without `stops` it ignores its stop event until it is cancelled."""
+    from jobhunter.worker import main
+
+    made: list[Any] = []
+
+    class FakeDispatcher:
+        def __init__(
+            self, engine: object, client: object, *, epoch: int, clock: object, sleep: object
+        ) -> None:
+            self.engine, self.client, self.epoch, self.clock, self.sleep = engine, client, epoch, clock, sleep
+            made.append(self)
+
+        async def run(self, stop: asyncio.Event) -> None:
+            world.events.append("dispatcher_run")
+            if ends_by_itself:
+                return
+            try:
+                await (stop.wait() if stops else asyncio.get_running_loop().create_future())
+            except asyncio.CancelledError:
+                world.events.append("dispatcher_cancelled")
+                raise
+            world.events.append("dispatcher_stop")
+
+    monkeypatch.setattr(main, "AlertDispatcher", FakeDispatcher)
+    return made
+
+
+START = [
+    "lock_connect",
+    "lock_acquire",
+    "export_configure",
+    "claim",
+    "watchdog_start",
+    "tracing_install",
+    "queue_open",
+    "saver_open",
+    "http_configure",
+    "make_clients",
+    "sync_instances",
+    "tracing_publish",
+    "reconcile_start",
+]
+
+
+async def test_without_a_topic_url_no_dispatcher_runs_and_ntfy_disabled_is_logged_once(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    made = fake_dispatchers(monkeypatch, world)
+    assert world.cfg.ntfy_topic_url is None
+    assert await worker_main(world.cfg) == 0
+    assert made == [] and world.events == [*START, *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    assert isinstance(runtime, WorkerRuntime) and runtime.dispatcher is None
+    [event] = logged(caplog, "ntfy_disabled")
+    assert event["level"] == "info"
+
+
+async def test_with_a_topic_url_the_dispatcher_runs_beside_the_loops_and_stops_first(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.clock import utcnow
+    from jobhunter.observability.ntfy import NtfyClient
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV, secrets={"ntfy_token": f"{NTFY_TOKEN}\n"})
+    made = fake_dispatchers(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    # step 10 starts it with the loops; the teardown stops it before anything else
+    assert world.events == [*START, "dispatcher_run", "dispatcher_stop", *TEARDOWN]
+    [dispatcher] = made
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and runtime.dispatcher is made[0]
+    assert (dispatcher.engine, dispatcher.epoch, dispatcher.clock, dispatcher.sleep) == (
+        runtime.engine,
+        3,  # the claimed epoch
+        utcnow,
+        asyncio.sleep,
+    )
+    client = dispatcher.client
+    assert isinstance(client, NtfyClient)
+    assert (client._topic_url, client._token, client._public_origin) == (
+        NTFY_TOPIC,
+        NTFY_TOKEN,
+        "https://jobs.example.test",
+    )
+    assert client._http.headers["User-Agent"] == world.cfg.http_user_agent
+    assert client._http.is_closed  # closed by the teardown
+    assert logged(caplog, "ntfy_disabled") == []
+
+
+async def test_without_the_token_the_dispatcher_sends_no_authorization(monkeypatch, tmp_path) -> None:
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV, secrets={"ntfy_token": ""})  # empty: absent
+    made = fake_dispatchers(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    [dispatcher] = made
+    assert dispatcher.client._token is None
+
+
+async def test_a_dispatcher_that_ends_by_itself_requests_the_stop_of_a_superseded_worker(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Its loop ends only when a fence refused the worker's epoch (Ruling T24-a): the worker then stops
+    itself, as a fenced task body does. (It starts before the queue loops, whose fake asks for the stop
+    without a log line.)"""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV)
+    fake_dispatchers(monkeypatch, world, ends_by_itself=True)
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [*START, "dispatcher_run", *TEARDOWN]
+    [event] = logged(caplog, "shutdown_requested")
+    assert (event["level"], event["reason"]) == ("warning", "epoch_superseded")
+
+
+async def test_a_dispatcher_that_does_not_stop_is_cancelled_within_its_bound(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Mid-pass (a backoff sleep or a push) the loop does not see its stop event: the teardown waits at most
+    `DISPATCHER_STOP_S`, 1 s of the stop's deadline (Ruling T4-4), then cancels it, and the rest of the
+    teardown runs. The wait the step is given is recorded; the test then waits 10 ms of it, not the second."""
+    from jobhunter.worker import main
+    from jobhunter.worker.shutdown import TEARDOWN_S
+
+    assert main.DISPATCHER_STOP_S == 1.0 and main.DISPATCHER_STOP_S < TEARDOWN_S
+    given: list[float] = []
+    real = main._WorkerProcess._stop_dispatcher
+
+    async def recorded(process: Any, timeout_s: float, deadline: Any) -> None:
+        given.append(timeout_s)
+        await real(process, min(timeout_s, 0.01), deadline)
+
+    monkeypatch.setattr(main._WorkerProcess, "_stop_dispatcher", recorded)
+    world = World(monkeypatch, tmp_path, env=NTFY_ENV)
+    fake_dispatchers(monkeypatch, world, stops=False)
+    assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 0
+    assert given == [main.DISPATCHER_STOP_S]  # the full stop budget is left: the bound is the 1 s
+    assert world.events == [*START, "dispatcher_run", "dispatcher_cancelled", *TEARDOWN]
+    assert logged(caplog, "worker_teardown_failed") == []
+
+
+# --- M5 Task 5: one dead-man pinger for the run ends, the tick and the sync, when both secrets are set ------
+
+HC_PING_URL = "https://hc-ping.test/00000000-0000-4000-8000-000000000001"  # low-entropy stand-ins
+HC_SECRETS = {"healthchecks_ping_url": f"{HC_PING_URL}\n", "healthchecks_api_key": "hc-test-key\n"}
+
+
+@pytest.mark.parametrize(
+    ("secrets", "reason"),
+    [
+        ({}, "not_configured"),
+        ({"healthchecks_ping_url": HC_SECRETS["healthchecks_ping_url"]}, "not_configured"),
+        ({"healthchecks_api_key": HC_SECRETS["healthchecks_api_key"]}, "not_configured"),
+        (
+            {**HC_SECRETS, "healthchecks_ping_url": "https://hc-ping.test/pingkeyxyz/collection"},
+            "ping_url_form",
+        ),
+    ],
+)
+async def test_without_both_healthchecks_secrets_no_pinger_is_built_and_deadman_disabled_is_logged_once(
+    monkeypatch, tmp_path, caplog, secrets: dict[str, str], reason: str
+) -> None:
+    """O-ops Q8: dev and test have no dead-man, and say so once at start (a slug ping URL, which a prod
+    worker's startup refuses, is no dead-man either outside prod)."""
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, secrets=secrets)
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [*START, *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    [deps] = world.deps
+    assert isinstance(runtime, WorkerRuntime) and isinstance(deps, CollectDeps)
+    assert runtime.deadman is None and deps.deadman is None
+    assert runtime.operation_deps.deadman is None  # M5 Task 12: a live purge has no pinger either
+    assert [cast(Any, ctx).deadman for ctx in world.contexts] == [None]  # the start cadence's
+    [event] = logged(caplog, "deadman_disabled")
+    assert (event["level"], event["reason"]) == ("info", reason)
+    assert "hc-ping" not in caplog.text and "hc-test-key" not in caplog.text
+
+
+async def test_with_both_secrets_one_pinger_serves_the_run_ends_the_tick_and_the_sync(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.clock import utcnow
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.observability.deadman import DeadmanPinger, HealthchecksClient
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    env = {"HEALTHCHECKS_API_URL": "https://healthchecks.test/api/v3"}
+    world = World(monkeypatch, tmp_path, env=env, secrets=HC_SECRETS)
+    armed = fake_arming(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    # step 8 arms its watermark after the source sync, before the start reconcilers and every loop
+    assert world.events == [*START[:-1], "deadman_arm", "reconcile_start", *TEARDOWN]
+    [runtime, *_] = world.runtimes
+    [deps] = world.deps
+    assert isinstance(runtime, WorkerRuntime) and isinstance(runtime.deadman, DeadmanPinger)
+    assert isinstance(deps, CollectDeps)
+    pinger = runtime.deadman
+    # the graph's `finalize` node, `run_collect`'s `_finalize`, the reconcilers and `deadman_sync` share it
+    assert deps.deadman is pinger and [cast(Any, ctx).deadman for ctx in world.contexts] == [pinger]
+    assert runtime.operation_deps.deadman is pinger  # M5 Task 12: a live purge's effects (Deviation 56)
+    assert (pinger._engine, pinger._epoch, pinger._clock) == (runtime.engine, 3, utcnow)
+    client = pinger._client
+    assert isinstance(client, HealthchecksClient)
+    assert (client._ping_url, client._api_url, client._api_key) == (
+        HC_PING_URL,
+        "https://healthchecks.test/api/v3",
+        "hc-test-key",
+    )
+    assert client._http.headers["User-Agent"] == world.cfg.http_user_agent
+    assert client._http.is_closed  # closed by the teardown
+    assert logged(caplog, "deadman_disabled") == []
+    assert armed == [pinger]
+
+
+def fake_arming(monkeypatch, world: World, *, raises: Exception | None = None) -> list[Any]:
+    """`DeadmanPinger.arm` as step 8 calls it, on `world`'s fake engine: each pinger it armed, in the list,
+    and `deadman_arm` among the events; it raises `raises` when one is given."""
+    from jobhunter.observability.deadman import DeadmanPinger
+
+    armed: list[Any] = []
+
+    async def arm(pinger: Any) -> int | None:
+        world.events.append("deadman_arm")
+        armed.append(pinger)
+        if raises is not None:
+            raise raises
+        return None
+
+    monkeypatch.setattr(DeadmanPinger, "arm", arm)
+    return armed
+
+
+async def test_a_worker_without_a_pinger_arms_nothing(monkeypatch, tmp_path) -> None:
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    armed = fake_arming(monkeypatch, world)
+    assert await worker_main(world.cfg) == 0
+    assert armed == [] and world.events == [*START, *TEARDOWN]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code", "event"),
+    [
+        (FencedOut(owner=WORKER_EPOCH), 70, "worker_superseded_at_start"),  # a newer worker took over
+        (OSError("detail that must not be logged"), 1, "worker_failed"),  # the database failed
+    ],
+)
+async def test_an_arming_that_fails_takes_the_source_sync_s_failure_path(
+    monkeypatch, tmp_path, caplog, refusal: Exception, code: int, event: str
+) -> None:
+    """Ruling T5-2: the arming is fenced by this worker's epoch like the source sync beside it; a refusal ends
+    the start as the sync's does (exit 70), any other error fails it (exit 1), before any loop starts."""
+    from jobhunter.worker.main import worker_main
+
+    env = {"HEALTHCHECKS_API_URL": "https://healthchecks.test/api/v3"}
+    world = World(monkeypatch, tmp_path, env=env, secrets=HC_SECRETS)
+    fake_arming(monkeypatch, world, raises=refusal)
+    assert await worker_main(world.cfg) == code
+    assert world.events == [*START[:-1], "deadman_arm", *TEARDOWN]  # no start reconciler, no loop
+    assert len(logged(caplog, event)) == 1
+    assert "must not be logged" not in caplog.text
+
+
+# --- M5 Task 6: tracing installed before any graph is built, its state published before any loop -----------
+
+
+async def test_tracing_is_installed_before_every_graph_build_and_published_before_every_loop(
+    monkeypatch, tmp_path
+) -> None:
+    """Ruling T6-2: step 7 installs LangSmith's process-wide client before it builds a graph (the profile,
+    score and collection graphs); step 8 publishes the state the install returned, after the source sync, in
+    a transaction fenced by this worker's epoch, before any worker loop is made."""
+    from jobhunter.observability.langsmith import TracingState
+    from jobhunter.worker import main
+    from jobhunter.worker.tasks import QUEUES
+
+    world = World(monkeypatch, tmp_path)
+    state = TracingState(tracing=True, region="eu")
+    installed: list[object] = []
+
+    def install(cfg: object) -> TracingState:
+        world.events.append("tracing_install")
+        installed.append(cfg)
+        return state
+
+    monkeypatch.setattr(main, "install_tracing", install)
+    assert await main.worker_main(world.cfg) == 0
+    assert world.events == [*START, *TEARDOWN]
+    assert installed == [world.cfg]
+    assert world.built == [("profile", True), ("score", True), ("collect", True)]
+    assert world.published == [state] and world.fenced == [3, 3] and world.publish_fenced == [True]
+    assert world.loops_at_publish == [0] and world.loops == [f"jh-{name}" for name in QUEUES]
+
+
+async def test_a_worker_without_tracing_publishes_that_it_does_not_trace(monkeypatch, tmp_path) -> None:
+    """The real install on a configuration without tracing: no client, and the state says so (the api shows
+    it rather than nothing)."""
+    from jobhunter.observability.langsmith import TracingState
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    assert world.published == [TracingState(tracing=False, region=None)]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code", "event"),
+    [
+        (FencedOut(owner=WORKER_EPOCH), 70, "worker_superseded_at_start"),  # a newer worker took over
+        (OSError("detail that must not be logged"), 1, "worker_failed"),  # the database failed
+    ],
+)
+async def test_a_publish_that_fails_takes_the_source_sync_s_failure_path(
+    monkeypatch, tmp_path, caplog, refusal: Exception, code: int, event: str
+) -> None:
+    """Ruling T6-2: a fence that refuses the publish's transaction ends the start as the sync's does (exit
+    70), any other error fails it (exit 1); no start reconciler and no loop runs."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.publish_error = refusal
+    assert await worker_main(world.cfg) == code
+    assert world.events == [*START[:-1], *TEARDOWN]  # the publish is the last step it reached
+    assert world.published == [] and world.loops == []
+    assert len(logged(caplog, event)) == 1
+    assert "must not be logged" not in caplog.text
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(
@@ -743,6 +1177,16 @@ M3_RECONCILERS = {
     "scoring_drift": ["heavy"],
     "batch_submissions": ["tick"],
 }
+# M5 Task 5: the dead-man switch's durable path, registered by `observability.deadman` (O-ops Q6, O10); M5
+# Task 7: the backup alerts and age gauge, registered by `observability.backup_health` (O1, Deviation 12); M5
+# Task 9: the manifests' shipping (every tick, Deviation 43) and the purge fences' watch (D7), registered by
+# `privacy.reconcilers`.
+M5_RECONCILERS = {
+    "deadman_ping": ["tick"],
+    "backup_health": ["heavy"],
+    "manifest_shipping": ["tick"],
+    "purge_fences": ["heavy"],
+}
 # The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
 # the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
 # import in `test_the_registering_modules_list_every_m3_module`).
@@ -763,28 +1207,34 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     """The final pin of M3 (Task 27; M2 fix round 1, Minor 5, made it a fresh interpreter): one that imports
     ONLY `worker.main._REGISTERING_MODULES` (step 4, before the takeover; never `worker.main` itself, whose
     imports would register most of it anyway) holds exactly:
-    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set);
+    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set),
+      and M5's `deadman_ping` (Task 5, `observability.deadman`), `backup_health` (Task 7) and
+      `manifest_shipping` and `purge_fences` (Task 9, `privacy.reconcilers`);
     - the five takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, Task
       16's `batch_submissions`), each run in a fenced transaction of its own since Task 27;
     - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
       19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, and M3's
       `create_targets_for_tuple` (Task 14, `scoring.targets`), `batch_submit` (Task 16,
-      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`), and M4's
-      `replay_raw_items` (M4 Task 12, `sources.replay`);
-    - the failure hooks of the two profile phases, of the query proposal and of `eval_run` only (written in
+      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`), M4's
+      `replay_raw_items` (M4 Task 12, `sources.replay`) and M5's `purge` (Task 12, `privacy.purge`) and
+      `export` (Task 17, `privacy.export`);
+    - the failure hooks of the two profile phases, of the query proposal and of `eval_run` (written in
       `worker.operations`, Ruling P39; `embed_profile` drives no domain row; `batch_submit`'s cleanup needs
       `active_config`, which its reconciler takes, Codex r3 B2; `create_targets_for_tuple` is re-requested
-      by `missing_targets`);
+      by `missing_targets`), and M5's `purge` (`privacy.purge.purge_failed`: its manifest's
+      `privacy.purge_failed` at once, M5 Task 12) and `export` (`privacy.export.export_failed`: its export
+      `failed` and its files removed, M5 Task 17, Deviation 52) only;
     - the `bulk_operations` reconciler's one active step, Task 16's `rerequest` (Ruling T16-d);
     - the one gauge refresh `metrics_refresh` runs, Task 18's `score_lane`;
     - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14;
-      M4's `replay_raw_items` under `replay`, M4 Task 12).
+      M4's `replay_raw_items` under `replay`, M4 Task 12; M5's `purge` under `purge`, one at a time, M5 Task
+      12).
     `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`,
     which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS},
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS, **M5_RECONCILERS},
         "sweeps": ["batch_submissions", "operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",
@@ -792,17 +1242,26 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "create_targets_for_tuple",
             "embed_profile",
             "eval_run",
+            "export",
             "extract_profile",
             "extract_profile_text",
             "propose_queries",
+            "purge",
             "replay_raw_items",
             "watchlist_validate",
         ],
-        "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries"],
+        "failure_hooks": [
+            "eval_run",
+            "export",
+            "extract_profile",
+            "extract_profile_text",
+            "propose_queries",
+            "purge",
+        ],
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "gauge_refreshes": ["score_lane"],
         # M3 Task 14 (Codex r3 B20): `defer_operation_job` reads it at every enqueue
-        "operation_locks": {"batch_submit": "batch", "replay_raw_items": "replay"},
+        "operation_locks": {"batch_submit": "batch", "replay_raw_items": "replay", "purge": "purge"},
         "main_imported": False,
     }
 

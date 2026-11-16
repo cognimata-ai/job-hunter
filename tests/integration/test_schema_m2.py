@@ -615,8 +615,9 @@ async def _call(c: AsyncConnection) -> int:
     return (await insert_llm_call(c))[1]
 
 
-async def _proposal(c: AsyncConnection) -> int:
-    return await insert_proposal(c, (await insert_profile_chain(c)).profile_version_id)
+async def _purged_proposal(c: AsyncConnection) -> int:
+    # M5 gives `purged` its edges in (the profile purge, from every state); none leads out of it
+    return await insert_proposal(c, (await insert_profile_chain(c)).profile_version_id, "purged")
 
 
 @pytest.mark.parametrize(
@@ -630,7 +631,7 @@ async def _proposal(c: AsyncConnection) -> int:
             "SET status = 'completed', stop_reason = 'end_turn', output_tokens = 1",
             "reserved -> completed",
         ),
-        ("query_proposals", _proposal, "SET status = 'purged'", "running -> purged"),
+        ("query_proposals", _purged_proposal, "SET status = 'running'", "purged -> running"),
         (
             "eval_runs",
             lambda c: insert_eval_run(c, "completed"),

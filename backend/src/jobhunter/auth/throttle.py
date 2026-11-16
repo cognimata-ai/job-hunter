@@ -44,7 +44,9 @@ LOCKOUT_ALERT_CODE: Final = "auth.lockout"
 GLOBAL_SCOPE: Final = "global"
 
 _SERIALIZE = q("SELECT pg_advisory_xact_lock(CAST(:key AS bigint))")
-# An expired lockout is deleted when it is next looked at; an expired global one resolves its alert then.
+# An expired lockout is deleted when it is next looked at; an expired global one resolves its alert then. One
+# that ended longer ago than the login attempts are kept goes with the daily retention rule `login_lockouts`
+# (`privacy.retention`, T19-4), which resolves that alert too.
 _DELETE_EXPIRED = q(
     "DELETE FROM login_lockouts WHERE scope IN ('global', :ip_scope) AND locked_until <= :now RETURNING scope"
 )
@@ -60,11 +62,13 @@ _IP_FAILURES = q(
     "SELECT count(*) FROM login_attempts WHERE ip = CAST(:ip AS inet) AND NOT success AND at > :since"
 )
 _ALL_FAILURES = q("SELECT count(*) FROM login_attempts WHERE NOT success AND at > :since")
-# A lockout is only ever extended, never shortened.
+# A lockout is only ever extended, never shortened. Every lock or renewal takes a new `generation` (the
+# column's identity, M5 plan Deviation 16): the table has no other identity, parent or `created_at` that a
+# deletion manifest could bound it by, and its key holds an address.
 _LOCK_OUT = q(
     "INSERT INTO login_lockouts (scope, locked_until, reason) VALUES (:scope, :locked_until, :reason) "
     "ON CONFLICT (scope) DO UPDATE SET locked_until = GREATEST(login_lockouts.locked_until, "
-    "EXCLUDED.locked_until), reason = EXCLUDED.reason"
+    "EXCLUDED.locked_until), reason = EXCLUDED.reason, generation = DEFAULT"
 )
 _UNLOCK_ALL = q("DELETE FROM login_lockouts")
 

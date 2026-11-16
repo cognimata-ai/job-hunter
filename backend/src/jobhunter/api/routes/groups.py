@@ -12,10 +12,14 @@ group's membership); `resolve_conflict(separate)` changes nothing the list shows
 - `POST /api/duplicate-groups/{group_id}/split {job_id}` → 200 `GroupOut`: `groups.split_member`, then the
   group read by `jobs.groups.group_view` in a fresh read snapshot after the write's commit, so the bump stays
   the write's last statement. The answer is committed state and may include a later concurrent change; the
-  group a split dissolved is answered too (`status = "dissolved"`, no member).
+  group a split dissolved is answered too (`status = "dissolved"`, no member). The snapshot begins outside
+  the write guard (`db.snapshot`), so the answer follows the commit even when delete-everything's fence
+  committed in between (M5 Task 8). A group with a member under a purge fence is not split: 409
+  `conflict_state` with `detail = "purge_in_progress"` (`privacy.fences.purge_in_progress`).
 - `POST /api/duplicate-groups/{group_id}/score-individually {job_id}` → 200 `GroupOut`, read the same way:
   `targets.score_individually` at the request's time; a `ScoreNowRefused` is the problem score-now answers
-  for it (`api.routes.targets.refused_problem`, the one mapping).
+  for it (`api.routes.targets.refused_problem`, the one mapping): a member under a purge fence is 404, as its
+  detail answers it (M5 Task 8).
 - `POST /api/duplicate-groups/{group_id}/confirm` → 202 `{job_id}`: `groups.confirm_group`, the
   representative every other member was merged into.
 - `POST /api/jobs/{job_id}/unmerge {merge_event_id}` → 202 `{unmerge_event_id}`: first the route's own check,
@@ -148,8 +152,8 @@ _GROUP_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     responses={
         **_GROUP_RESPONSES,
         409: {
-            "description": "The group is not active or the job is not its member (`conflict_state`), or "
-            + _RETRYABLE
+            "description": "The group is not active or the job is not its member (`conflict_state`), a "
+            "member is being purged (`conflict_state`, `purge_in_progress`), or " + _RETRYABLE
         },
         422: {"description": _INVALID},
         **CSRF_RESPONSES,
@@ -174,7 +178,7 @@ async def split_member(
     "/api/duplicate-groups/{group_id}/score-individually",
     response_model=GroupOut,
     responses={
-        404: {"description": "The job is not a member of the group (`not_found`)"},
+        404: {"description": "The job is not a member of the group, or it is being purged (`not_found`)"},
         409: {"description": _RETRYABLE_ONLY},
         422: {"description": _INVALID},
         **CSRF_RESPONSES,

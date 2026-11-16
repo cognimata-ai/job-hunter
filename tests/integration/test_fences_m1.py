@@ -2,6 +2,8 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.db.sql import FOREIGN_KEY_VIOLATION, PgErrorInfo, pg_error
 
+from tests.support.fences import insert_test_fence
+
 pytestmark = pytest.mark.integration
 
 JOB = (
@@ -42,15 +44,8 @@ async def test_source_fence_matches_posting_lineage_and_stored_set(engine) -> No
             ),
             {"r": rev},
         )  # b: a revision whose lineage names the source
-        fence = (
-            await c.execute(
-                sa.text(
-                    "INSERT INTO purge_fences (kind, source_id, job_ids, manifest_id) "
-                    "VALUES ('source','adzuna',ARRAY[:c]::bigint[],1) RETURNING id"
-                ),
-                {"c": job_c},
-            )
-        ).scalar_one()  # c: in the stored affected set only
+        # c: in the stored affected set only
+        fence = await insert_test_fence(c, kind="source", source_id="adzuna", job_ids=[job_c])
         assert [await fenced(j) for j in (job_a, job_b, job_c)] == [True, True, True]
         other = (await c.execute(sa.text(JOB))).scalar_one()  # `jobs.source_ids` alone does not fence
         assert await fenced(other) is False
@@ -59,10 +54,6 @@ async def test_source_fence_matches_posting_lineage_and_stored_set(engine) -> No
         # purge_fences.source_id -> sources (M0 Deviation 1)
         with pytest.raises(sa.exc.IntegrityError) as bad:
             async with c.begin_nested():
-                await c.execute(
-                    sa.text(
-                        "INSERT INTO purge_fences (kind, source_id, manifest_id) VALUES ('source','nope',1)"
-                    )
-                )
+                await insert_test_fence(c, kind="source", source_id="nope")
     # The exact foreign key, through M0's helper: no other constraint refused the row.
     assert pg_error(bad.value) == PgErrorInfo(FOREIGN_KEY_VIOLATION, "purge_fences_source_id_fkey")

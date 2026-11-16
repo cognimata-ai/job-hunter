@@ -8,7 +8,20 @@ submission state machine is `scoring.batches`, the decision of one item `scoring
 retrieved first and `messages.batches.cancel` sent only while it is `in_progress` (a `canceling` one has an
 accepted cancel already, an ended one nothing to cancel), up to `CANCEL_TRIES` (3) times, then logged; the
 handler sends it right after `record_created`'s commit, and `batch_poll` again on every pass while the
-submission is `submitted` and its batch in progress.
+submission is `submitted` and its batch in progress. A failed retrieval sends nothing: the next poll retries.
+The check and the cancel's tries with their logs are `_cancel_while_in_progress`, which the purge's sender
+shares.
+
+**The purge's cancel** (`send_purge_cancel`, M5 Task 16, §20.4 step 2: "3 tries, then logged"):
+delete-everything deletes the submission row right after, so no poll will retry, and the sender is bounded
+on its own. Each try retrieves the batch; a failed retrieval or a client that is not configured
+(`LLMNotConfigured`) is one failed try, waited after with the injected `sleep` (`PURGE_CANCEL_BACKOFF_S`,
+never `asyncio.sleep` in a test). A batch no longer `in_progress` (`canceling`: a cancel was accepted already;
+`ended`) is success with nothing sent. One that is goes to `_cancel_while_in_progress`, whose `CANCEL_TRIES`
+cancels are the tries of the send itself, each rejected one a failed try, its `batch_cancel_gave_up` logged
+after the last. After `tries` failed retrievals it logs `batch_cancel_gave_up` (submission and provider ids)
+and returns `False`; the caller deletes the row all the same: the reservations stay counted, and the provider
+ends the batch within 24 hours.
 
 **The poll** (`poll`, the body of `batch_poll`, every 5 min on `aux`, L3958), for every `submitted` and
 `ended` submission, and every `released` one with a provider id (a lost batch the user released, plan M4 Task
@@ -38,8 +51,13 @@ consecutive failed passes the item is given up: the critical `batch.item_unproce
 submission, ids only), then the missing-item path in a fresh transaction (when that raises too, the alert
 stays and the next pass tries again); the worker's `FencedOut` and a cancellation propagate. When the stream
 was read to its end, every line named an item of the submission and no item failed, `finalize_results` runs; a
-line naming no item of ours raises the critical `batch.custom_id_anomaly` (with the count of foreign lines;
-the items such a stream lacks are not measured) and completes nothing; a cut stream completes nothing and
+line naming no item of the submission is `purged` when a `purged_batch_items` row names `(submission_id,
+custom_id)` (M5 Task 11, Deviation 13: a purge deleted that item, `privacy.deletion_graph`): skipped, nothing
+stored, accounted for (the completion runs as if it were ours), counted in `PollReport.purged` and logged
+`batch_results_purged`; so is a line whose item a purge deleted during the pass (its processing finds it gone,
+or waited for the purge's job lock), on the same evidence. Any other line naming no item of ours raises the
+critical `batch.custom_id_anomaly` (with the count of foreign lines; the items such a stream lacks are not
+measured) and completes nothing; a cut stream completes nothing and
 decides no item `missing` (L3961): the next poll reads it again, and every item already decided replays its
 stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot validate,
 `BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
@@ -75,7 +93,7 @@ handler share it; M3 Task 27) and does nothing without a configured one.
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import Final
@@ -96,6 +114,7 @@ from jobhunter.llm.batches import (
     BatchStatus,
     ItemResult,
 )
+from jobhunter.llm.errors import LLMNotConfigured
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
@@ -112,6 +131,8 @@ AFTER_COMPLETION_COMMIT: Final = "batch.after_completion_commit"
 AFTER_MISSING_ITEM: Final = "batch.after_missing_item"
 AFTER_RECONCILE_COMMIT: Final = "batch.after_reconcile_commit"
 CANCEL_TRIES: Final = 3  # L6443: `messages.batches.cancel` after the commit, 3 tries, then logged
+# The purge's sender's waits after its first and its second failed try (module docstring).
+PURGE_CANCEL_BACKOFF_S: Final = (1.0, 5.0)
 # Carry T16-g: the passes whose result stream stays unreadable before its unread items are decided missing
 # (an hour at `batch_poll`'s five-minute cadence).
 RESULTS_UNREADABLE_PASSES: Final = 12
@@ -155,6 +176,10 @@ _ENDED: Final = q(
 )
 _STATE_OF: Final = q("SELECT state FROM batch_submissions WHERE id = :s")
 _ITEMS_OF: Final = q("SELECT id, target_id, attempt_no, custom_id FROM batch_items WHERE submission_id = :s")
+# The purge evidence (M5 Task 11, Deviation 13): the custom ids of the submission's items a purge deleted, and
+# whether one line is one of them.
+_PURGED_OF: Final = q("SELECT custom_id FROM purged_batch_items WHERE submission_id = :s")
+_PURGED_LINE: Final = q("SELECT 1 FROM purged_batch_items WHERE submission_id = :s AND custom_id = :c")
 _AWAITING: Final = q(
     "SELECT id, target_id, attempt_no, custom_id FROM batch_items "
     "WHERE submission_id = :s AND processed_at IS NULL ORDER BY id"
@@ -217,6 +242,18 @@ async def cancel_requested(
                 status=failure.status,
             )
             return False
+    return await _cancel_while_in_progress(
+        client, provider_batch_id, submission_id=submission_id, status=status
+    )
+
+
+async def _cancel_while_in_progress(
+    client: BatchesClient, provider_batch_id: str, *, submission_id: int, status: BatchStatus
+) -> bool:
+    """The cancel of a batch retrieved as `status` (module docstring): nothing sent unless it is
+    `in_progress` (`batch_cancel_not_sent`, `False`), else `messages.batches.cancel` up to `CANCEL_TRIES`
+    times (`batch_cancel_failed` per rejection, `batch_cancel_sent` once accepted, `batch_cancel_gave_up`
+    after the last); whether one was accepted."""
     if status.processing_status != "in_progress":
         log.info(
             "batch_cancel_not_sent",
@@ -246,6 +283,49 @@ async def cancel_requested(
             tries=tries,
         )
         return True
+    log.error("batch_cancel_gave_up", submission_id=submission_id, provider_batch_id=provider_batch_id)
+    return False
+
+
+async def send_purge_cancel(
+    client: BatchesClient,
+    provider_batch_id: str,
+    *,
+    submission_id: int,
+    tries: int = CANCEL_TRIES,
+    sleep: Callable[[float], Awaitable[None]],
+) -> bool:
+    """Delete-everything's bounded provider cancel of a recorded request (module docstring, "The purge's
+    cancel"): `True` once a cancel is accepted or the batch no longer runs, `False` after `tries` failed tries
+    (`batch_cancel_gave_up` logged, or the cancels' own gave-up). The caller holds no transaction."""
+    for attempt in range(1, tries + 1):
+        try:
+            status = await client.retrieve(provider_batch_id)
+        except (BatchApiError, LLMNotConfigured) as failure:
+            error_class = (
+                failure.error_class if isinstance(failure, BatchApiError) else type(failure).__name__
+            )
+            log.warning(
+                "batch_purge_cancel_retrieve_failed",
+                submission_id=submission_id,
+                provider_batch_id=provider_batch_id,
+                tries=attempt,
+                error_class=error_class,
+            )
+            if attempt < tries:
+                await sleep(PURGE_CANCEL_BACKOFF_S[min(attempt, len(PURGE_CANCEL_BACKOFF_S)) - 1])
+            continue
+        if status.processing_status != "in_progress":
+            log.info(
+                "batch_purge_cancel_not_needed",
+                submission_id=submission_id,
+                provider_batch_id=provider_batch_id,
+                processing_status=status.processing_status,
+            )
+            return True
+        return await _cancel_while_in_progress(
+            client, provider_batch_id, submission_id=submission_id, status=status
+        )
     log.error("batch_cancel_gave_up", submission_id=submission_id, provider_batch_id=provider_batch_id)
     return False
 
@@ -293,11 +373,47 @@ async def items_of(conn: AsyncConnection, submission_id: int) -> dict[str, batch
     }
 
 
+async def purged_custom_ids(conn: AsyncConnection, submission_id: int) -> frozenset[str]:
+    """The `custom_id`s of the submission's items a purge deleted (`purged_batch_items`, M5 Task 11): the
+    positive evidence on which a line of no item is `purged`, never foreign."""
+    return frozenset(str(c) for c in (await conn.execute(_PURGED_OF, {"s": submission_id})).scalars())
+
+
+async def _purged_line(engine: AsyncEngine, submission_id: int, custom_id: str) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.execute(_PURGED_LINE, {"s": submission_id, "c": custom_id})
+        return found.first() is not None
+
+
+async def _purged_since(engine: AsyncEngine, submission_id: int, item_id: int, custom_id: str) -> bool:
+    """Whether the purge evidence names the line of an item whose processing raised (`_process`); `False`
+    when the evidence cannot be read (logged with its class only), so the item is a failed one of the pass
+    and the error never ends it (Ruling T17-a)."""
+    try:
+        return await _purged_line(engine, submission_id, custom_id)
+    except Exception as exc:  # noqa: BLE001 - Ruling T17-a: the item is failed, the pass goes on; logged
+        log.warning(
+            "batch_purge_evidence_unread",
+            submission_id=submission_id,
+            item_id=item_id,
+            error_class=type(exc).__name__,
+        )
+        return False
+
+
 @dataclass(frozen=True)
 class _Failed:
     """An item whose processing raised this pass (Ruling T17-a): the error's class only."""
 
     error_class: str
+
+
+@dataclass(frozen=True)
+class _Purged:
+    """An item a purge deleted while this pass processed it (M5 Task 11): its line is `purged`."""
+
+
+_PURGED: Final = _Purged()
 
 
 async def _process(
@@ -308,11 +424,13 @@ async def _process(
     *,
     now: datetime,
     epoch: int | None,
-) -> batch_items.Decision | _Failed:
+) -> batch_items.Decision | _Failed | _Purged:
     """One item in a transaction of its own (never two: Codex r6 B1), fenced by the worker epoch. Ruling
     T17-a: an unexpected error of the item is logged with its class only and returned as `_Failed`, its
     transaction rolled back, so the caller goes on with the next item; a fence (`FencedOut`, the worker's or
-    the owner's) and a cancellation propagate."""
+    the owner's) and a cancellation propagate. An item a purge deleted after the caller read it (M5 Task 11:
+    its processing found it gone, or waited for the purge's job lock) is `_Purged` when the purge evidence
+    names its line."""
     try:
         async with engine.begin() as conn:
             if epoch is not None:
@@ -323,6 +441,9 @@ async def _process(
     except FencedOut:
         raise
     except Exception as exc:  # noqa: BLE001 - Ruling T17-a: one item's error must not stop the lane; logged, counted
+        if await _purged_since(engine, submission.id, item.id, result.custom_id):
+            log.info("batch_item_purged", submission_id=submission.id, item_id=item.id)
+            return _PURGED
         failed = _Failed(type(exc).__name__)
         log.error(
             "batch_item_failed",
@@ -339,7 +460,8 @@ async def _process(
 @dataclass(frozen=True)
 class _Streamed:
     """What one read of a submission's results did: the items it decided now, its follow-ups, the lines that
-    named no item of ours, whether the stream was read to its end, and the class of an unreadable line."""
+    named no item of ours (`foreign`) and those of items a purge deleted (`purged`, M5 Task 11), whether the
+    stream was read to its end, and the class of an unreadable line."""
 
     decided: int = 0
     followups: int = 0
@@ -348,6 +470,7 @@ class _Streamed:
     unreadable: str | None = None
     failed: tuple[tuple[str, batch_items.Item, str], ...] = ()  # (custom_id, item, error class), this pass
     processed: frozenset[int] = frozenset()  # the items decided, or found decided, this pass
+    purged: int = 0
 
 
 async def _stream(
@@ -362,17 +485,25 @@ async def _stream(
     buffered whole)."""
     async with engine.connect() as conn:
         items = await items_of(conn, ended.submission.id)
-    decided = followups = foreign = 0
+        purged_ids = await purged_custom_ids(conn, ended.submission.id)
+    decided = followups = foreign = purged = 0
     failed: list[tuple[str, batch_items.Item, str]] = []
     processed: set[int] = set()
     try:
         stream = await client.results(ended.provider_batch_id)
         async for line in stream:
             item = items.get(line.custom_id)
-            if item is None:
-                foreign += 1
+            if item is None:  # no item of ours: a purged one's on positive evidence only, else foreign
+                if line.custom_id in purged_ids:
+                    purged += 1
+                else:
+                    foreign += 1
                 continue
             decision = await _process(engine, ended.submission, item, line, now=now, epoch=epoch)
+            if isinstance(decision, _Purged):  # dealt with: out of `failed_items` too
+                processed.add(item.id)
+                purged += 1
+                continue
             if isinstance(decision, _Failed):
                 failed.append((line.custom_id, item, decision.error_class))
                 continue
@@ -390,8 +521,12 @@ async def _stream(
             unreadable=failure.unreadable,
         )
         unreadable = failure.error_class if failure.unreadable else None
-        return _Streamed(decided, followups, foreign, False, unreadable, tuple(failed), frozenset(processed))
-    return _Streamed(decided, followups, foreign, stream.complete, None, tuple(failed), frozenset(processed))
+        return _Streamed(
+            decided, followups, foreign, False, unreadable, tuple(failed), frozenset(processed), purged
+        )
+    return _Streamed(
+        decided, followups, foreign, stream.complete, None, tuple(failed), frozenset(processed), purged
+    )
 
 
 @dataclass(frozen=True)
@@ -433,6 +568,8 @@ async def finalize_results(
             await _item_unprocessable(engine, submission_id, item.id, epoch=epoch)
             continue
         decided.add(item.id)
+        if isinstance(decision, _Purged):  # deleted by a purge since it was read: nothing left to decide
+            continue
         missing += not decision.replayed
         await afault_point(AFTER_MISSING_ITEM)
     left = {item_id: n for item_id, n in ended.failed_items.items() if item_id not in decided}
@@ -548,6 +685,8 @@ async def process_results(
         async with engine.begin() as conn:
             await fence_epoch(conn, epoch)
             await cycles.request_cycle(conn, trigger="batch_followup", defer=defer)
+    if streamed.purged:  # accounted for: the lines of items a purge deleted (M5 Task 11)
+        log.info("batch_results_purged", submission_id=submission_id, purged=streamed.purged)
     if streamed.foreign:
         await custom_id_anomaly(engine, submission_id, epoch=epoch, foreign=streamed.foreign)
         return streamed, None
@@ -718,7 +857,7 @@ async def custom_id_anomaly(
 @dataclass(frozen=True)
 class PollReport:
     """What one poll did: the submissions it looked at, the cancels it sent, the batches it found ended, the
-    items it decided, their follow-ups, and the submissions it reconciled."""
+    items it decided, their follow-ups, the submissions it reconciled, and the lines it skipped as purged."""
 
     polled: int = 0
     cancels: int = 0
@@ -726,6 +865,7 @@ class PollReport:
     decided: int = 0
     followups: int = 0
     reconciled: int = 0
+    purged: int = 0  # the lines of items a purge deleted (M5 Task 11)
 
 
 async def _retrieve(
@@ -834,6 +974,7 @@ async def poll(
             decided=report.decided + streamed.decided + (0 if finalized is None else finalized.missing),
             followups=report.followups + streamed.followups,
             reconciled=report.reconciled + (finalized is not None and finalized.reconciled),
+            purged=report.purged + streamed.purged,
         )
     if rows:
         log.info("batch_polled", **asdict(report))

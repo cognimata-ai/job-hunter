@@ -6,6 +6,11 @@
 // appear, new to the draft, each with "I understand"; Save stays disabled until each is ticked, then answers 201.
 // At the end one save through the API restores the interval and the query entries read at the start: the forty
 // stay, unretired, and are not enabled (a live query the settings do not list is disabled).
+// With the forty in the table, at 761 and 961 px (just above the narrow screens' breakpoint, and beside the page's
+// navigation) nothing scrolls sideways: neither the page nor the queries table's box, which reads as cards there;
+// and every settings table's scroll box is positioned, so a visually hidden head stays inside it (M5 follow-ups
+// Task F5 (c), Rulings FU-12 (3) and FU-13). The set-up stack has a table in each of the four sections checked
+// (`CHECKED`); the golden set's is checked when it has cases.
 import type { components } from "../../src/api/schema";
 import { expectNoSeriousA11yViolations } from "../support/a11y";
 import { answerTo, type ApiContext, apiContext, getJson } from "../support/api";
@@ -17,10 +22,32 @@ type QueryListOut = components["schemas"]["QueryListOut"];
 
 const QUERIES = 40; // the settings' most query entries
 const INTERVAL_HOURS = 1;
+/** The widths at which the queries table once scrolled sideways, and the page with it. */
+const NARROW_WIDTHS = [761, 961] as const;
+const NARROW_HEIGHT = 800;
+/** The sections whose table the set-up stack always shows (the queries, the setup's boards, its runs and cycles). */
+const CHECKED = ["queries", "watchlist", "runs", "score-cycles"];
 
 /** The `n`-th query's fixed text (1 to 40). */
 function queryText(n: number): string {
   return `e2e warning query ${String(n).padStart(2, "0")}`;
+}
+
+/** How far the page and the queries table's box scroll sideways (-1 for no box), the sections of the settings
+ * tables found, and those whose table's scroll box is not positioned; run in the page. */
+function sideways(): { page: number; queries: number; checked: string[]; unpositioned: string[] } {
+  const root = document.documentElement;
+  const box = document.querySelector("#queries table")?.parentElement ?? null;
+  const tables = [...document.querySelectorAll("#queries table, #watchlist table, #runs table, #score-cycles table, #golden-set table")];
+  const section = (table: Element) => table.closest("section[id]")?.id ?? "?";
+  return {
+    page: root.scrollWidth - root.clientWidth,
+    queries: box === null ? -1 : box.scrollWidth - box.clientWidth,
+    checked: tables.map(section),
+    unpositioned: tables
+      .filter((table) => table.parentElement === null || getComputedStyle(table.parentElement).position === "static")
+      .map(section),
+  };
 }
 
 /** The forty queries' ids, in order: each created, or the live one of its text. */
@@ -65,6 +92,16 @@ test("E14: forty queries at a 1 h interval raise warnings, and Save waits for ea
       const queries = page.getByRole("region", { name: en["settings.section.queries"] });
       for (let n = 1; n <= QUERIES; n++) {
         await queries.getByRole("checkbox", { name: filled(en["settings_queries.enable"], { text: queryText(n) }), exact: true }).check();
+      }
+      const viewport = page.viewportSize();
+      for (const width of NARROW_WIDTHS) {
+        await page.setViewportSize({ width, height: NARROW_HEIGHT });
+        await expect
+          .poll(() => page.evaluate(sideways), { message: `nothing scrolls sideways at ${String(width)} px` })
+          .toEqual({ page: 0, queries: 0, checked: expect.arrayContaining(CHECKED), unpositioned: [] });
+      }
+      if (viewport !== null) {
+        await page.setViewportSize(viewport);
       }
       const schedule = page.getByRole("region", { name: en["settings.section.schedule"] });
       await schedule.getByLabel(en["settings_schedule.interval"], { exact: true }).fill(String(INTERVAL_HOURS));

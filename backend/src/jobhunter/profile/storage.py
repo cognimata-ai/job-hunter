@@ -15,7 +15,14 @@ which no web root serves:
   rule, Task 23: a file no `cv_files` row names); any other entry of the root is not the store's;
 - `encrypt_text(text, keys, *, cv_file_id)` and `decrypt_text(blob, keys, *, cv_file_id)` seal a CV text for
   its `cv_files` row (`raw_text_enc`: a pasted text, or the text docparse extracted) with the associated data
-  `b"cv_text:%d" % cv_file_id`, so a text moved to another row does not open. A text never becomes a file.
+  `b"cv_text:%d" % cv_file_id`, so a text moved to another row does not open. A text never becomes a file;
+- `header(storage_path)` reads a stored file's first `crypto.HEADER_BYTES` (`crypto.blob_key_id` names its
+  key), `None` when it is gone: the backup set's key ids and the data-key rotation read it (M5 Tasks 24, 28);
+- `reseal(storage_path, keys)` seals a stored file again under `keys[0]`, in place, with its own associated
+  data, for the data-key rotation: by `replace_file`, which writes `<name>.rotate` (created exclusively, mode
+  0600, flushed to the disk), renames it over the file and flushes the directory, and removes the `.rotate`
+  file when it fails. A process killed meanwhile leaves it; `remove_replace_leftovers` removes such files,
+  in the CV store and in the exports directory, whose archives the rotation replaces the same way.
 
 The file work is synchronous: a file is at most 10 MiB (§12.1), and a write the caller awaits cannot outlive
 the exception path that removes it, as a write in a thread could. Nothing here logs: a caller logs the name's
@@ -26,11 +33,11 @@ import hashlib
 import os
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import BinaryIO, Final
 
 from jobhunter import crypto
 
@@ -39,6 +46,9 @@ FILE_AAD_PREFIX: Final = b"cv_file:"
 # A name `write` makes: a UUID4 in its canonical form, then `.bin`.
 _STORAGE_NAME: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.bin")
 _CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+# `replace_file`'s temporary file: `<name>.rotate` beside the file it replaces.
+REPLACE_SUFFIX: Final = ".rotate"
 
 
 @dataclass(frozen=True)
@@ -86,7 +96,7 @@ class CvStore:
                 out.write(blob)
                 out.flush()
                 os.fsync(out.fileno())
-            _fsync_directory(self.root)
+            fsync_directory(self.root)
         except BaseException:
             path.unlink(missing_ok=True)
             raise
@@ -95,6 +105,28 @@ class CvStore:
     def read(self, storage_path: str, keys: Sequence[bytes]) -> bytes:
         """The plaintext of a stored file; `crypto.DecryptError` when no key of `keys` opens it."""
         return crypto.decrypt(keys, self._path(storage_path).read_bytes(), aad=_file_aad(storage_path))
+
+    def header(self, storage_path: str) -> bytes | None:
+        """The first `crypto.HEADER_BYTES` of a stored file (fewer for a shorter one), or `None` when it is
+        gone (retention may race to it)."""
+        try:
+            fd = os.open(self._path(storage_path), _READ_FLAGS)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as file:
+            return file.read(crypto.HEADER_BYTES)
+
+    def reseal(self, storage_path: str, keys: Sequence[bytes]) -> None:
+        """Seal a stored file again under `keys[0]`, in place (`replace_file`); it opens with any of `keys`.
+        `crypto.DecryptError` when none does, the file left as it was."""
+        if not keys:
+            raise ValueError("resealing a CV file needs a data key")
+        blob = crypto.encrypt(keys[0], self.read(storage_path, keys), aad=_file_aad(storage_path))
+
+        def write(out: BinaryIO) -> None:
+            out.write(blob)
+
+        replace_file(self._path(storage_path), write)
 
     def delete(self, storage_path: str) -> None:
         """Remove a stored file; one that is already gone is fine."""
@@ -128,8 +160,45 @@ class CvStore:
         return crypto.decrypt(keys, blob, aad=_text_aad(cv_file_id)).decode("utf-8")
 
 
-def _fsync_directory(directory: Path) -> None:
-    """Flush the directory entry of a new file, so a row that names it never outlives it in a power loss."""
+def replace_file(path: Path, write: Callable[[BinaryIO], None]) -> None:
+    """Replace `path` with what `write` writes (module docstring, `reseal`): `<path>.rotate` created
+    exclusively with mode 0600, flushed to the disk, renamed over `path`, the directory flushed. A failure
+    removes the `.rotate` file; `path` is then as it was."""
+    temporary = path.with_name(path.name + REPLACE_SUFFIX)
+    fd = os.open(temporary, _CREATE_FLAGS, FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            os.fchmod(out.fileno(), FILE_MODE)  # whatever the umask
+            write(out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+
+
+def remove_replace_leftovers(directory: Path) -> int:
+    """Remove the `.rotate` files that a process killed inside `replace_file` left in `directory` (a missing
+    directory has none); how many."""
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if entry.name.endswith(REPLACE_SUFFIX) and entry.is_file(follow_symlinks=False):
+            Path(entry.path).unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        fsync_directory(directory)
+    return removed
+
+
+def fsync_directory(directory: Path) -> None:
+    """Flush `directory`'s entries (a new file, a rename) to the disk, so a row that names a file never
+    outlives it in a power loss. The deletion manifests' writer shares it (`privacy.manifests`, M5 Task 9)."""
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         os.fsync(fd)

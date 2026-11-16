@@ -1,16 +1,17 @@
 // The System section's data (spec §14.2, §15.7, §17.5; plan M4 Task 31, resolutions d and e): Needs attention and
-// its actions, the run history, the score cycles, the alerts and their acknowledgement, the golden set and its
-// flags, and the detailed health.
+// its actions, the run history, the score cycles, the alerts with their acknowledgement and resolution, the golden
+// set and its flags, and the detailed health.
 //
 // - **The lists** are keyset-paged (`{items, next_cursor}`, §14.3): the first page is read when the list shows,
 //   Load more reads the next one. A refused cursor (400 `invalid_cursor`, a cursor of an older key) starts the list
-//   again from its first page, silently.
+//   again from its first page, silently. A list may be read in the background and polled (`PagedOptions`, the
+//   deletions of Privacy & data): a poll reads every loaded page again, each from the fresh page before's cursor.
 // - **The actions of Needs attention** (`observability/attention.py`, `api/routes/system.py`, `groups.py`,
 //   `targets.py`, `alerts.py`) each read Needs attention and the header's status again once they are answered
 //   (and the health, whose figures they move); a refusal is the caller's to show at its item. Of these routes the
 //   batch release and the target retry take an `Idempotency-Key` (§14.1; `api/routes/targets.py`: "Each route
 //   needs an `Idempotency-Key`"), each keyed per action (`useKeyedMutation`); the replay, the resolve, the closure,
-//   the acknowledgement and the retry-apply are not keyed.
+//   the acknowledgement and the retry-apply are not keyed, nor is an alert's resolution (plan M5 Task 2).
 // - **The golden set's writes** read the set again, and the golden runs' gate, which counts its active cases.
 //
 // Each write tells its own failure (`meta.ownToast`): its item shows the problem, so no transient toast is raised
@@ -45,6 +46,7 @@ type TargetMovedOut = components["schemas"]["TargetMovedOut"];
 type ReleasedOut = components["schemas"]["ReleasedOut"];
 type SnapshotAcknowledgedOut = components["schemas"]["SnapshotAcknowledgedOut"];
 type AcknowledgedOut = components["schemas"]["AcknowledgedOut"];
+type ManifestQueuedOut = components["schemas"]["ManifestQueuedOut"];
 export type Decision = components["schemas"]["ResolveIn"]["decision"];
 export type GoldenFlags = components["schemas"]["FlagsIn"];
 
@@ -81,7 +83,20 @@ export interface PagedList<T> {
   loadMore: () => void;
 }
 
-function usePaged<T>(queryKey: QueryKey, path: string, params: Record<string, string>): PagedList<T> {
+/** How a paged list is read besides its pages. */
+export interface PagedOptions<T> {
+  /** Every read is a background one (`X-JH-Background: 1`): a poll never extends the session. */
+  background?: boolean;
+  /** How long until the loaded pages are read again, decided from their rows; `false` for not again. */
+  pollMs?: (items: T[]) => number | false;
+}
+
+export function usePaged<T>(
+  queryKey: QueryKey,
+  path: string,
+  params: Record<string, string>,
+  { background = false, pollMs }: PagedOptions<T> = {},
+): PagedList<T> {
   const queryClient = useQueryClient();
   const query = useInfiniteQuery<Page<T>, ProblemError, InfiniteData<Page<T>>, QueryKey, string | null>({
     queryKey,
@@ -90,10 +105,11 @@ function usePaged<T>(queryKey: QueryKey, path: string, params: Record<string, st
       if (pageParam !== null) {
         search.set("cursor", pageParam);
       }
-      return apiSend<Page<T>>(`${path}?${search.toString()}`, { signal });
+      return apiSend<Page<T>>(`${path}?${search.toString()}`, { signal, background });
     },
     initialPageParam: null,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
+    refetchInterval: pollMs === undefined ? undefined : (q) => pollMs(q.state.data?.pages.flatMap((page) => page.items) ?? []),
   });
   const cursorRefused = query.isFetchNextPageError && isProblem(query.error, "invalid_cursor");
   useEffect(() => {
@@ -246,6 +262,24 @@ export function useAckAlert(): UseMutationResult<AcknowledgedOut, ProblemError, 
   });
 }
 
+/** Resolve an alert the user resolves (`POST /api/alerts/{id}/resolve`, not keyed: a repeat answers the resolved
+ * alert): the alerts' tabs read again too. They are read again after a 404 (the alert is gone) or a 409
+ * `not_manual` (the alert resolves itself) as well, since either says the row shown is out of date; the refusal
+ * itself is the caller's to show. */
+export function useResolveAlert(): UseMutationResult<AlertOut, ProblemError, number> {
+  const refresh = useRefresh(ALERTS_KEY);
+  return useMutation({
+    mutationFn: (alertId: number) => apiSend<AlertOut>(`/api/alerts/${String(alertId)}/resolve`, { method: "POST" }),
+    meta: OWN,
+    onSuccess: refresh,
+    onError: (error) => {
+      if (isProblem(error, "not_found") || isProblem(error, "conflict_state")) {
+        refresh();
+      }
+    },
+  });
+}
+
 /** After the scope's retry-apply (`system/api.ts` `useRetryApply`): Needs attention and the health read again. */
 export function useAfterRetryApply(): () => void {
   return useRefresh();
@@ -278,11 +312,12 @@ export function useSetGoldenFlags(): UseMutationResult<GoldenCaseOut, ProblemErr
   });
 }
 
-/** Delete a golden case and its eval rows (`DELETE /api/golden-cases/{id}`, 204). */
-export function useDeleteGoldenCase(): UseMutationResult<undefined, ProblemError, number> {
+/** Delete a golden case and its eval rows (`DELETE /api/golden-cases/{id}`, 202 `{manifest_id}`: the worker
+ * deletes it under a deletion manifest, plan M5 Deviation 20). */
+export function useDeleteGoldenCase(): UseMutationResult<ManifestQueuedOut, ProblemError, number> {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (caseId: number) => apiSend<undefined>(`/api/golden-cases/${String(caseId)}`, { method: "DELETE" }),
+    mutationFn: (caseId: number) => apiSend<ManifestQueuedOut>(`/api/golden-cases/${String(caseId)}`, { method: "DELETE" }),
     meta: OWN,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: GOLDEN_KEY });

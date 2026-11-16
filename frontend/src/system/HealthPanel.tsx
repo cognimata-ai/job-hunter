@@ -1,10 +1,13 @@
 // System → Health (spec §17.5; plan M4 Task 31, resolution e): `GET /api/system/health` as it gives it, in
-// definition lists: readiness (with the embedder), the runs and the collection's freshness, the worker's queues,
+// definition lists: readiness (with the embedder and the worker's tracing state, plan M5 Task 7), the runs and the
+// collection's freshness, the backups (the latest set, the backup age state, the latest offsite manifest shipment,
+// the manifests not shipped yet and the latest restore test with its age state; M5 Task 7), the worker's queues,
 // the score lane, the month's LLM spend, the quota windows, the open alerts, the sizes (disk, database, tables) and
 // the versions. Ages and sizes use `Intl.NumberFormat`'s units (`useUnits`); versions and the embedder's model id
 // are shown verbatim in `<code>`, as are the table names (identifiers). Every closed set goes through its
-// namespace: `readiness`, `run_status`, `run_age_state`, `queue`, `queue_status`, `pause`, `window_state`,
-// `alert_severity`.
+// namespace: `readiness`, `run_status` (a backup set's and a restore test's status too), `run_age_state`,
+// `backup_age_state`, `restore_test_age_state`, `tracing_region`, `queue`, `queue_status`, `pause`, `window_state`,
+// `alert_severity`. A `warn` or `critical` age state, and a failed set or restore test, take their tone.
 import type { TFunction } from "i18next";
 import { type ReactNode, useId } from "react";
 import { useTranslation } from "react-i18next";
@@ -22,6 +25,9 @@ import { useUnits } from "./units";
 
 type Versions = components["schemas"]["Versions"];
 type Severity = keyof SystemHealthOut["alerts_open"];
+type Backups = SystemHealthOut["backups"];
+type BackupRun = components["schemas"]["BackupRunOut"];
+type Tone = "ok" | "warn" | "critical";
 
 /** The largest tables shown before "All n tables". */
 const TOP_TABLES = 5;
@@ -48,7 +54,7 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function Entry({ term, children, tone }: { term: ReactNode; children: ReactNode; tone?: "ok" | "warn" | "critical" }) {
+function Entry({ term, children, tone }: { term: ReactNode; children: ReactNode; tone?: Tone }) {
   return (
     <div className={styles.entry}>
       <dt className={styles.term}>{term}</dt>
@@ -59,6 +65,69 @@ function Entry({ term, children, tone }: { term: ReactNode; children: ReactNode;
 
 function ago(t: TFunction, age: number | null, duration: (s: number) => string): string {
   return age === null ? t("value.none") : t("health.ago", { age: duration(age) });
+}
+
+/** The tone of an age state: `warn` and `critical` their own, any other none. */
+function stateTone(state: string): Tone | undefined {
+  return state === "critical" ? "critical" : state === "warn" ? "warn" : undefined;
+}
+
+/** The tracing state the worker published: off until it published one; its region through `tracing_region`. */
+function tracing(t: TFunction, serverText: ReturnType<typeof useServerText>, state: SystemHealthOut["langsmith"]): string {
+  if (state === null || !state.tracing) {
+    return t("health.tracing_off");
+  }
+  return state.region === null
+    ? t("health.tracing_on")
+    : t("health.tracing_on_region", { region: serverText("tracing_region", state.region) });
+}
+
+function BackupsGroup({ backups }: { backups: Backups }) {
+  const { t } = useTranslation();
+  const serverText = useServerText();
+  const format = useFormat();
+  const units = useUnits();
+  const run = (r: BackupRun | null) => {
+    if (r === null) {
+      return t("value.none");
+    }
+    const status = serverText("run_status", r.status);
+    return r.age_s === null
+      ? t("health.backup_unfinished", { id: String(r.id), status })
+      : t("health.backup_value", { id: String(r.id), status, age: units.duration(r.age_s) });
+  };
+  const runTone = (r: BackupRun | null): Tone | undefined => (r?.status === "failed" ? "critical" : undefined);
+  const shipment = backups.latest_shipment;
+  const oldest = backups.oldest_unshipped_completed_at;
+  return (
+    <Group title={t("health.backups")}>
+      <Entry term={t("health.latest_set")} tone={runTone(backups.latest_set)}>{run(backups.latest_set)}</Entry>
+      <Entry term={t("health.backup_age")} tone={stateTone(backups.backup_age_state)}>
+        {serverText("backup_age_state", backups.backup_age_state)}
+      </Entry>
+      <Entry term={t("health.latest_shipment")}>
+        {shipment === null
+          ? t("value.none")
+          : t("health.shipment_value", {
+              id: String(shipment.id),
+              count: shipment.manifests,
+              value: format.number(shipment.manifests),
+              time: format.dayMonthTime(shipment.shipped_at),
+            })}
+      </Entry>
+      <Entry term={t("health.unshipped")}>
+        {oldest === null
+          ? format.number(backups.unshipped_manifests)
+          : t("health.unshipped_value", { value: format.number(backups.unshipped_manifests), time: format.dayMonthTime(oldest) })}
+      </Entry>
+      <Entry term={t("health.latest_restore_test")} tone={runTone(backups.latest_restore_test)}>
+        {run(backups.latest_restore_test)}
+      </Entry>
+      <Entry term={t("health.restore_test_age")} tone={stateTone(backups.restore_test_age_state)}>
+        {serverText("restore_test_age_state", backups.restore_test_age_state)}
+      </Entry>
+    </Group>
+  );
 }
 
 function Health({ health }: { health: SystemHealthOut }) {
@@ -72,7 +141,6 @@ function Health({ health }: { health: SystemHealthOut }) {
   const tableRow = ([name, bytes]: [string, number]) => (
     <Entry key={name} term={<code className={styles.code}>{name}</code>}>{units.bytes(bytes)}</Entry>
   );
-  const ageTone = health.run_age_state === "critical" ? "critical" : health.run_age_state === "warn" ? "warn" : undefined;
   return (
     <div className={styles.groups}>
       <Group title={t("health.readiness")}>
@@ -88,6 +156,7 @@ function Health({ health }: { health: SystemHealthOut }) {
         <Entry term={t("health.embedder_model")}>
           {embedder.model_id === null ? t("value.none") : <code className={styles.code}>{embedder.model_id}</code>}
         </Entry>
+        <Entry term={t("health.tracing")}>{tracing(t, serverText, health.langsmith)}</Entry>
       </Group>
 
       <Group title={t("health.runs")}>
@@ -102,8 +171,10 @@ function Health({ health }: { health: SystemHealthOut }) {
         </Entry>
         <Entry term={t("health.last_success")}>{ago(t, health.last_successful_run_age_s, units.duration)}</Entry>
         <Entry term={t("health.last_full_success")}>{ago(t, health.last_fully_successful_run_age_s, units.duration)}</Entry>
-        <Entry term={t("health.run_age")} tone={ageTone}>{serverText("run_age_state", health.run_age_state)}</Entry>
+        <Entry term={t("health.run_age")} tone={stateTone(health.run_age_state)}>{serverText("run_age_state", health.run_age_state)}</Entry>
       </Group>
+
+      <BackupsGroup backups={health.backups} />
 
       <Group title={t("health.queues")}>
         {Object.entries(health.queue_depths).map(([queue, statuses]) => (

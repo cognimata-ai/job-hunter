@@ -21,7 +21,7 @@ registry), where the `assert_transition` trigger checks them, row by row, as def
 
 import enum
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
@@ -44,7 +44,9 @@ class TransitionSpec:
     `changed_at` maps a to-state to the column that records entering it. `owner_cols` are the columns an
     ownership predicate may test. `clear_on_exit` maps a state to the columns set to NULL when a row leaves it
     for another state. `settable` are the other columns a caller may assign in the same update (`set_`); the
-    columns the helper manages itself are not among them.
+    columns the helper manages itself are not among them. `first_entry_kept` are to-states whose changed-at
+    column keeps the time of the row's first entry when the row enters them again (a column that is still
+    `NULL` is set then).
     """
 
     table: str
@@ -55,12 +57,15 @@ class TransitionSpec:
     clear_on_exit: Mapping[str, tuple[str, ...]]
     allowed: frozenset[tuple[str, str]]
     settable: frozenset[str] = frozenset()
+    first_entry_kept: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         states = {state for edge in self.allowed for state in edge}
         unknown = (set(self.changed_at) | set(self.clear_on_exit)) - states
         if unknown:
             raise ValueError(f"{self.table}: states {sorted(unknown)} are in no allowed edge")
+        if unstamped := self.first_entry_kept - set(self.changed_at):
+            raise ValueError(f"{self.table}: states {sorted(unstamped)} have no changed-at column to keep")
         managed = {self.state_col, *self.changed_at.values()}
         if self.reason_col is not None:
             managed.add(self.reason_col)
@@ -510,7 +515,9 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                 }
             ),
         ),
-        # §7.5. The `purged` status (items removed, §20.2) has no edge in this milestone.
+        # §7.5. `purged` (items removed, §20.2) is M5's profile purge (Task 14): from every state, with the
+        # items set to NULL in the same update (`set_={"items": None}`; a `ready` proposal keeps its items
+        # until it leaves `ready`).
         "query_proposals": TransitionSpec(
             table="query_proposals",
             state_col="status",
@@ -518,7 +525,15 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
             changed_at=MappingProxyType({}),
             owner_cols=frozenset(),
             clear_on_exit=MappingProxyType({}),
-            allowed=frozenset({("running", "ready"), ("running", "failed")}),
+            allowed=frozenset(
+                {
+                    ("running", "ready"),
+                    ("running", "failed"),
+                    ("running", "purged"),
+                    ("ready", "purged"),
+                    ("failed", "purged"),
+                }
+            ),
             settable=frozenset({"items", "llm_call_id"}),
         ),
         # §7.13. §7.16 has no `eval_runs` machine either: a run is `running` until it finishes or fails.
@@ -699,6 +714,79 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
             allowed=frozenset(("awaiting", result) for result in _ITEM_RESULTS),
             settable=frozenset({"llm_call_id", "stop_reason"}),
         ),
+        # §7.14 (M5). A manifest's file is written and its deletes run (`executing`), it is complete with
+        # the file's hash, then shipped with the shipment that holds it; the §7.14 CHECKs pair each state
+        # with its columns. No owner columns: the purge holds its operation's claim. `shipped -> completed`
+        # is the prune's alone, when the receipt that shipped it names a snapshot restic no longer lists
+        # (§19.5 Retention, final fix D1): the shipment is cleared and the completion keeps its time, so
+        # `privacy.manifest_unshipped` judges it from its completion. The prune takes it through
+        # `unship_manifest` (migration 0012, final fix E2), which makes these assignments in SQL: the
+        # backup role holds no UPDATE on the table.
+        "deletion_manifests": TransitionSpec(
+            table="deletion_manifests",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({"completed": "completed_at", "shipped": "shipped_at"}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({"shipped": ("shipped_at", "shipment_id")}),
+            allowed=frozenset(
+                {("executing", "completed"), ("completed", "shipped"), ("shipped", "completed")}
+            ),
+            settable=frozenset({"file_sha256", "scope", "shipment_id", "replay_log"}),
+            first_entry_kept=frozenset({"completed"}),
+        ),
+        # §7.14 (M5, D9). An export is built (`running`, one at a time: `exports_one_running`), then served
+        # until it expires; a purge removes it in either state. No changed-at column.
+        "exports": TransitionSpec(
+            table="exports",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("running", "ready"),
+                    ("running", "failed"),
+                    ("running", "purged"),
+                    ("ready", "expired"),
+                    ("ready", "purged"),
+                }
+            ),
+            settable=frozenset({"storage_path", "sha256", "size_bytes", "purge_generation"}),
+        ),
+        # §7.14, §19.5 (M5). A backup set and a prune or restore-test run are `running` until they end; the
+        # error is the reason.
+        "backup_sets": TransitionSpec(
+            table="backup_sets",
+            state_col="status",
+            reason_col="error",
+            changed_at=MappingProxyType(dict.fromkeys(("succeeded", "failed"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "succeeded"), ("running", "failed")}),
+            settable=frozenset(
+                {
+                    "restic_snapshot_id",
+                    "dump_sha256",
+                    "dump_bytes",
+                    "db_snapshot_at",
+                    "manifest_count",
+                    "row_counts",
+                    "cv_file_count",
+                }
+            ),
+        ),
+        "backup_runs": TransitionSpec(
+            table="backup_runs",
+            state_col="status",
+            reason_col="error",
+            changed_at=MappingProxyType(dict.fromkeys(("succeeded", "failed"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "succeeded"), ("running", "failed")}),
+            settable=frozenset({"report"}),
+        ),
     }
 )
 
@@ -791,7 +879,8 @@ def _assignments(
     - The new state, and the reason when `reason` is given: a text, or `CLEAR_REASON` for `NULL`. Without one
       (`None`) the reason column keeps whatever it held.
     - The changed-at column of `to_state`, unless the row is already in `to_state` (a self-edge keeps the
-      time of the first entry).
+      time of the first entry), or `to_state` is one of `first_entry_kept`, whose column keeps the time it
+      holds (`coalesce`).
     - `NULL` for the `cleared` columns.
     - The `set_` columns. A value that is a SQL expression is rendered as it is, a mapping or a list is bound
       as JSONB, anything else as an ordinary parameter.
@@ -804,7 +893,9 @@ def _assignments(
     if reason is not None and spec.reason_col is not None:
         assignments[spec.reason_col] = sa.null() if reason is CLEAR_REASON else reason
     changed_at = spec.changed_at.get(to_state)
-    if changed_at is not None:
+    if changed_at is not None and to_state in spec.first_entry_kept:
+        assignments[changed_at] = sa.func.coalesce(target.c[changed_at], sa.func.now())
+    elif changed_at is not None:
         assignments[changed_at] = (
             sa.case((state == to_state, target.c[changed_at]), else_=sa.func.now())
             if to_state in from_states
@@ -949,6 +1040,7 @@ async def transition_where(
     set_sql: Mapping[str, str] | None = None,
     from_sql: str | None = None,
     returning: Sequence[str] = ("id",),
+    jsonb: Collection[str] = (),
 ) -> list[RowMapping]:
     """Move every row of `table` in one of `from_states` that `where` selects to `to_state`; return them.
 
@@ -966,6 +1058,9 @@ async def transition_where(
       (`gen_random_uuid()`, `t.attempt_no + 1`, `a.lane`, `:epoch`); `set_` maps one to a value, as in
       `transition()`.
     - `returning` names columns of `t`.
+    - `jsonb` names keys of `params` bound as JSONB, as `db.sql.q`'s `jsonb` does (a mapping or a list as
+      JSON, `None` as SQL NULL, never a JSON `null`), for static SQL that reads them with
+      `CAST(:name AS jsonb)` (M5 Task 14: `spend_ledger.settle`'s output, set only on an unredacted call).
 
     A cast is written `CAST(:name AS type)`: `sa.text` does not recognise `:name::type` as a bind. The
     assignments bind the to-state, a text reason and the `set_` values under their column names, and the
@@ -975,13 +1070,15 @@ async def transition_where(
     table or edge, a reason without a reason column, a column that is not settable or that the transition
     clears, whether in `set_` or in `set_sql`), a column in both `set_` and `set_sql`, an empty `where`, a
     `:name` of `where`, `from_sql` or `set_sql` that `params` does not give and a key of `params` that none of
-    them binds, a `:name::type` cast, a bind name that collides with the assignments', and a `returning` name
-    that is not a column name. Zero rows is not an error: the caller reads the list. The `assert_transition`
-    trigger still checks every row.
+    them binds, a `:name::type` cast, a bind name that collides with the assignments', a `returning` name
+    that is not a column name, and a `jsonb` name that is no key of `params`. Zero rows is not an error: the
+    caller reads the list. The `assert_transition` trigger still checks every row.
     """
     spec = _spec(table)
     set_ = set_ or {}
     set_sql = set_sql or {}
+    if untyped := sorted(set(jsonb) - set(params)):
+        raise ValueError(f"{table}: {untyped} in jsonb have no value in params")
     if both := set(set_) & set(set_sql):
         raise ValueError(f"{table}: {sorted(both)} are assigned by both set_ and set_sql")
     cleared = _validate(spec, from_states, to_state, reason, {}, {**set_, **set_sql})
@@ -1006,12 +1103,15 @@ async def transition_where(
     columns = ", ".join(f"t.{name}" for name in returning)
     predicate = f"t.{spec.state_col} = ANY(:{_FROM_BIND}) AND ({where})"
     # The registry's identifiers and the caller's static SQL, checked above; every value is a bind.
+    typed = [sa.bindparam(name, params[name], type_=JSONB(none_as_null=True)) for name in sorted(set(jsonb))]
+    plain = {name: value for name, value in params.items() if name not in jsonb}
     statement = sa.text(
         f"UPDATE {spec.table} AS t SET {set_list}{source} WHERE {predicate} RETURNING {columns}"  # noqa: S608
     ).bindparams(
         *emitted,
         sa.bindparam(_FROM_BIND, list(from_states), type_=ARRAY(sa.Text)),
-        **params,
+        *typed,
+        **plain,
     )
     return list((await conn.execute(statement)).mappings())
 

@@ -8,14 +8,12 @@ import { type SubmitEvent, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { apiFetch, isProblem, type ProblemError } from "../api/client";
 import { safeRedirect, SESSION_KEY } from "../api/session";
+import { throttleWait } from "../api/throttle";
 import { ProblemBox } from "../components/ProblemBox";
 import { browserLanguage } from "../i18n/index";
 import styles from "./LoginPage.module.css";
 
 const TOTP_CODE = /^\d{6}$/;
-// The login gate's busy answer carries `retry_after_s: 1`. A lockout's is `max(1, ceil(seconds left))`, so a
-// lockout with one second left reads as busy too; either way the right advice is "in a moment".
-const BUSY_RETRY_AFTER_S = 1;
 
 interface LoginIn {
   username: string;
@@ -33,15 +31,17 @@ type MessageKey =
   | "login.busy"
   | "problem.throttled";
 
+/** A busy gate or a lockout, as `throttleWait` reads its wait. */
 function throttledMessage(error: ProblemError): Message {
-  const seconds = error.extra.retry_after_s;
-  if (typeof seconds !== "number") {
-    return { kind: "error", key: "problem.throttled" };
+  const wait = throttleWait(error);
+  switch (wait.kind) {
+    case "busy":
+      return { kind: "error", key: "login.busy" };
+    case "minutes":
+      return { kind: "error", key: "login.throttled", minutes: wait.minutes };
+    case "unknown":
+      return { kind: "error", key: "problem.throttled" };
   }
-  if (seconds <= BUSY_RETRY_AFTER_S) {
-    return { kind: "error", key: "login.busy" };
-  }
-  return { kind: "error", key: "login.throttled", minutes: Math.ceil(seconds / 60) };
 }
 
 export function LoginPage() {

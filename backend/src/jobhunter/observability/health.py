@@ -3,8 +3,12 @@
 `check_readiness` answers; it never raises (ruling T14-e). Its probes, in this order:
 - `db`: a connection and `SELECT 1` within `DB_TIMEOUT_S`. When that fails, nothing else of the database is
   probed.
-- `migrations`: `alembic_version` holds exactly the code head.
-- `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old.
+- `migrations`: the schema is one this code runs on (`db.compat.schema_state`, M5 Task 27):
+  `alembic_version` holds exactly the code head (`current`), or a newer head whose recorded floor this code
+  knows and that is not destructive (`ahead_compatible`, a rollback to this release). `behind` and
+  `ahead_incompatible` fail, with the state as the `reason`.
+- `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old
+  (`heartbeats.heartbeat_fresh` over `heartbeats.HEARTBEAT_AGE_SQL`, which the api's heartbeat watch shares).
 - `embedder` (Task 22): the embedder's `/health` within `embeddings.HEALTH_TIMEOUT_S` is `ok`, with its
   checksum verified (`EmbedderClient.health`: an embedder this code can use). It runs beside the database's
   probes, so one slow component does not add to the other's time, and it is reported after them. A caller
@@ -26,11 +30,15 @@ gave no usable answer, `unusable` for another model or dimension). Never an exce
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), each provider's quota
 window at `now` (`quota_health`, the header status's view), the LLM spend of the month (`llm_spend`, plan
-Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions and the
-embedder's health (with its model id) as the readiness check read it. Run ages are reported, never readiness
-gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs` and the run lists
-(`observability.lists`); every select of one either names `RUN_COLUMNS`, its fields, or fills a
-`worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks too.
+Task 16), the score lane (`scoring_health`, M3 Task 18), disk and database sizes, the versions, the
+embedder's health (with its model id) as the readiness check read it, the LangSmith tracing state the
+last worker published at its start (`tracing_state`, M5 Task 6, Q17: the api has no LangSmith configuration
+of its own; `null` until a worker published one, and kept when its heartbeat goes stale) and the backups, the
+offsite manifests and the restore tests (`backup_health.backup_state`, M5 Task 7, in every env). Run and
+backup ages are reported, never readiness gates. `RunOut` is the api's view of a run row, shared with
+`POST /api/runs` and the run lists (`observability.lists`); every select of one either names `RUN_COLUMNS`,
+its fields, or fills a `worker.runs.RunRow`, whose required `status_reason` the validation of `RunOut` checks
+too.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
 save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
@@ -50,7 +58,7 @@ import asyncio
 import functools
 import platform
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -63,14 +71,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
-from jobhunter.api.models import DecimalOut, usd_micro
+from jobhunter.db.compat import SchemaState, schema_state
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
-from jobhunter.heartbeats import HEARTBEAT_STALE_S
+from jobhunter.heartbeats import HEARTBEAT_AGE_SQL, heartbeat_fresh
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, BudgetRow
 from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability.alerts import refresh_alert_gauge
+from jobhunter.observability.backup_health import BackupStateOut, backup_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.quota.dryrun import live_windows
@@ -79,22 +88,25 @@ from jobhunter.quota.windows import Provider, Window, WindowState
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.cycles import PauseReason
+from jobhunter.wire import DecimalOut, usd_micro
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]
+# The schema states `migrations` passes (module docstring).
+READY_SCHEMA_STATES: Final[frozenset[SchemaState]] = frozenset({"current", "ahead_compatible"})
 
 DB_TIMEOUT_S: Final = 2.0
 # The client-side bound of the schema probes together; each one also has the server-side statement timeout.
 PROBES_TIMEOUT_S: Final = 2 * DB_TIMEOUT_S
 PROBE_STATEMENT_TIMEOUT: Final = "2s"
-HEARTBEAT_STALE: Final = timedelta(seconds=HEARTBEAT_STALE_S)
 
 _PING: Final = q("SELECT 1")
 # `is_local`: for this transaction only, so the pooled connection gets its default back with the rollback.
 _SET_STATEMENT_TIMEOUT: Final = q("SELECT set_config('statement_timeout', :timeout, true)")
-_MIGRATION_VERSIONS: Final = q("SELECT version_num FROM alembic_version")
-# The database clock, which also wrote `heartbeat_at`: the verdict `jobhunter worker-health` reaches too.
-_HEARTBEAT_AGE: Final = q("SELECT now() - heartbeat_at FROM worker_heartbeat WHERE id = 1")
+_HEARTBEAT_AGE: Final = q(HEARTBEAT_AGE_SQL)
+# What the worker published at its start (`observability.langsmith.publish_tracing_state`); before that, no
+# row or NULL.
+_TRACING_STATE: Final = q("SELECT tracing FROM worker_heartbeat WHERE id = 1")
 
 log = get_logger("jobhunter.observability.health")
 
@@ -128,35 +140,47 @@ def _log_failed(
     )
 
 
-async def _rows(
-    conn: AsyncConnection, probe: ReadinessCode, statement: TextClause
-) -> Sequence[sa.Row[Any]] | None:
-    """The rows of `statement`, run in a savepoint; `None` (logged) when it failed with a database error."""
+async def _in_savepoint[T](
+    conn: AsyncConnection, probe: ReadinessCode, read: Callable[[AsyncConnection], Awaitable[T]]
+) -> T | None:
+    """What `read` returns, run in a savepoint; `None` (logged) when it failed with a database error."""
     try:
         async with conn.begin_nested():
-            rows = (await conn.execute(statement)).all()
+            return await read(conn)
     except sa.exc.DBAPIError as exc:
         if exc.connection_invalidated:
             raise _ConnectionLost(exc) from exc
         _log_failed(probe, exc)
         return None
-    return rows
+
+
+async def _rows(
+    conn: AsyncConnection, probe: ReadinessCode, statement: TextClause
+) -> Sequence[sa.Row[Any]] | None:
+    """The rows of `statement`, run in a savepoint; `None` (logged) when it failed with a database error."""
+
+    async def read(c: AsyncConnection) -> Sequence[sa.Row[Any]]:
+        return (await c.execute(statement)).all()
+
+    return await _in_savepoint(conn, probe, read)
 
 
 async def _schema_probes(conn: AsyncConnection, code_head: str) -> list[ReadinessCode]:
     failing: list[ReadinessCode] = []
 
-    versions = await _rows(conn, "migrations", _MIGRATION_VERSIONS)
-    if versions is None:
+    state = await _in_savepoint(conn, "migrations", functools.partial(schema_state, code_head=code_head))
+    if state is None:
         failing.append("migrations")
-    elif [row[0] for row in versions] != [code_head]:
-        _log_failed("migrations", reason="no_revision" if not versions else "revision_mismatch")
+    elif state not in READY_SCHEMA_STATES:
+        _log_failed("migrations", reason=state)
         failing.append("migrations")
 
+    # The database clock, which also wrote `heartbeat_at`: the verdict `jobhunter worker-health` reaches too,
+    # and the api's heartbeat watch (`heartbeats.heartbeat_fresh`, the one rule).
     heartbeat = await _rows(conn, "worker_heartbeat", _HEARTBEAT_AGE)
     if heartbeat is None:
         failing.append("worker_heartbeat")
-    elif not heartbeat or heartbeat[0][0] > HEARTBEAT_STALE:
+    elif not heartbeat or not heartbeat_fresh(heartbeat[0][0]):
         _log_failed("worker_heartbeat", reason="no_heartbeat" if not heartbeat else "stale")
         failing.append("worker_heartbeat")
 
@@ -485,8 +509,26 @@ async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool
     )
 
 
-# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes` and the
-# caller's readiness report (`EmbedderOut`).
+# The LangSmith regions a worker can trace to (§17.8: the EU endpoint only); the SPA shows each by its code.
+TracingRegion = Literal["eu"]
+
+
+class TracingStateOut(BaseModel):
+    """The tracing state the worker published at its start: whether it sends traces to LangSmith (inputs and
+    outputs hidden), and the region it sends them to (`eu`; `null` when it does not trace)."""
+
+    tracing: bool
+    region: TracingRegion | None
+
+
+async def tracing_state(conn: AsyncConnection) -> TracingStateOut | None:
+    """The last published tracing state, `None` before a worker published one (module docstring)."""
+    stored = (await conn.execute(_TRACING_STATE)).scalar_one_or_none()
+    return None if stored is None else TracingStateOut.model_validate(stored)
+
+
+# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes`,
+# `tracing_state`, `backup_health.backup_state` and the caller's readiness report (`EmbedderOut`).
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -501,6 +543,10 @@ class SystemHealthOut(BaseModel):
     - `scoring`: the score lane.
     - `table_bytes`: the size of every table of the `public` schema, in bytes.
     - `embedder`: the embedder's health as the readiness check read it.
+    - `langsmith`: the tracing state the worker published at its start, `null` until one did; it stays when
+      the worker's heartbeat goes stale.
+    - `backups`: the backups, the offsite manifests and the restore tests, with the age states of the
+      backups and of the restore tests.
     """
 
     ready: ReadyState
@@ -519,6 +565,8 @@ class SystemHealthOut(BaseModel):
     table_bytes: dict[str, int]
     versions: Versions
     embedder: EmbedderOut
+    langsmith: TracingStateOut | None
+    backups: BackupStateOut
 
 
 @dataclass(frozen=True)
@@ -628,4 +676,6 @@ async def system_health(
         table_bytes=await refresh_table_bytes(conn),
         versions=_versions(),
         embedder=EmbedderOut(ok=embedder.ok, model_id=embedder.model_id, checksum_ok=embedder.checksum_ok),
+        langsmith=await tracing_state(conn),
+        backups=await backup_state(conn, now=now),
     )

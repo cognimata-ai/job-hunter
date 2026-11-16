@@ -17,6 +17,8 @@ produced (or to none, for an item that failed normalisation).
 **`recompute_job_availability`** reuses `merge.derive_from_postings`, the one place a job's availability is
 derived: the best state of its postings by `JOB_ORDER`, `jobs.availability_changed_at := now()` when it
 changes. It returns whether a list column changed; the caller bumps the ranking once, as its last statement.
+A job whose availability changes to `closed` has its `dedup.ambiguous_grouping` alert resolved there (M5
+Task 3).
 
 **Locks.** `lock_posting_jobs` takes the jobs of a set of postings, with their duplicate-group co-members, in
 ONE ordered `FOR UPDATE` statement (`merge.lock_jobs`, Ruling T18-c), in a savepoint per round: the postings'
@@ -156,8 +158,9 @@ async def apply_membership(conn: AsyncConnection, posting_id: int, *, taken_at: 
 
 async def recompute_job_availability(conn: AsyncConnection, job_id: int) -> bool:
     """The job's availability from its postings (`merge.derive_from_postings`: the best by `JOB_ORDER`,
-    `availability_changed_at` set when it changes), in the caller's transaction, which holds the job row.
-    `True` when it (or the job's first sighting) changed: the caller then bumps the ranking, last."""
+    `availability_changed_at` set when it changes, a job that closed has its `dedup.ambiguous_grouping` alert
+    resolved), in the caller's transaction, which holds the job row. `True` when it (or the job's first
+    sighting) changed: the caller then bumps the ranking, last."""
     return (await merge.derive_from_postings(conn, job_id)).changed
 
 

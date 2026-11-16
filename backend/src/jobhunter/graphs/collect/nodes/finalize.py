@@ -8,7 +8,8 @@ with the run's end) and the gaps older than the ad age (`coverage.abandon_old_ga
 alerts, the report (`build_report`) and, last, `runs.finalize_run`. A lost owner raises `FencedOut`, which
 propagates having written nothing: the attempt is lost and the run's next owner ends it. After the commit
 the end is observed (`runs.observe_graph_end` with `finalize_run`'s duration, ruling T12-e) and logged
-`run_finished`. The dead-man ping of §17.7 arrives in M5 (plan Deviation 12).
+`run_finished`; then the dead-man's fast path pings the check (§17.7, M5 Task 5: `deps.deadman.after_run`,
+never inside the commit, never raising into the node; the tick's `deadman_ping` sends what it misses).
 
 **Durable rows only** (Task 23, carry 1). Every invariant, partial cause and report section (but the report's
 `revisions.targets`, node 9's own counts, `report.targets_section`) is counted from the tables, never from the
@@ -36,7 +37,8 @@ from one of the run's snapshots (below).
   jobs (`enqueue_targets.RUN_JOB_SQL`) that is retained and unfenced has a live target of the tuple
   (`targets.NEEDS_TARGET_SQL` is false), detail `{"llm_tuple_id", "revisions", "missing"}`;
 - I6: the run's revisions still `awaiting_embedding`, counted (`{"awaiting": n}`): never a failure, the
-  partial cause `awaiting_embedding`;
+  partial cause `awaiting_embedding`. A revision of a job under a purge fence is not counted (M5 Task 8 fix
+  round 1, `embeddings.AWAITING_UNFENCED_SQL`): no batch takes it while the fence stands;
 - I7: the outcome reducer saw no conflict. A conflict raises outside any node and never reaches this node
   (`execute_run` ends that run `failed_invariant('I7')`), so the node checks `outcome_conflicts == 0`.
 
@@ -66,7 +68,7 @@ from typing import Final, Literal, cast, get_args
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.embeddings import NOT_SYNTHETIC_REVISION_SQL
+from jobhunter.embeddings import AWAITING_UNFENCED_SQL, NOT_SYNTHETIC_REVISION_SQL
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
@@ -177,7 +179,8 @@ _I5 = q(
 # The run's revisions: the user's jobs' only (a synthetic golden-case job's are never embedded, Ruling T19-a).
 _REVISIONS = q(
     "SELECT count(*) AS created, count(*) FILTER (WHERE r.embedding_status = 'embedded') AS embedded, "  # noqa: S608
-    "count(*) FILTER (WHERE r.embedding_status = 'awaiting_embedding') AS awaiting FROM job_revisions r "
+    "count(*) FILTER (WHERE r.embedding_status = 'awaiting_embedding' "
+    f"AND {AWAITING_UNFENCED_SQL}) AS awaiting FROM job_revisions r "
     f"WHERE r.created_at >= (SELECT started_at FROM runs WHERE id = :run) AND {NOT_SYNTHETIC_REVISION_SQL}"
 )
 _PARTIAL = q(
@@ -417,6 +420,8 @@ async def finalize_from_graph(deps: CollectDeps, owner: RunOwner, state: Collect
         duration = await finalize_run(conn, owner, status=status, reason=reason, report=report)
     observe_graph_end(owner, RunEnd(status=status, duration_s=duration))
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
+    if deps.deadman is not None:  # after the commit, and after the end is counted (M5 Task 5)
+        await deps.deadman.after_run(owner.run_id)
     return status
 
 

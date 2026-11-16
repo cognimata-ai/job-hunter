@@ -11,6 +11,8 @@ import structlog
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from tests.support.fixtures import fresh_heartbeat
+
 pytestmark = pytest.mark.integration
 HEADERS = {
     "strict-transport-security": "max-age=63072000; includeSubDomains",
@@ -32,16 +34,6 @@ def assert_edge(r: httpx.Response) -> None:
     )
     if r.headers.get("content-type") == "application/problem+json":
         assert r.json()["request_id"] == r.headers["x-request-id"]
-
-
-async def fresh_heartbeat(engine) -> None:
-    async with engine.begin() as c:
-        await c.execute(
-            sa.text(
-                "INSERT INTO worker_heartbeat VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now()) "
-                "ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()"
-            )
-        )
 
 
 async def test_healthz(api_client) -> None:
@@ -67,13 +59,16 @@ async def test_readyz_reports_missing_schema(fresh_pg_server, make_config, log_e
         transport=httpx.ASGITransport(app=create_app(cfg=cfg, engine=engine)), base_url="https://testserver"
     ) as c:
         r = await c.get("/readyz")
-    assert r.status_code == 503 and r.json() == {"failing": ["migrations", "worker_heartbeat"]}
-    # both probes saw 42P01 through SQLAlchemy; a poisoned transaction would give 25P02 for the second one
-    assert [(e["probe"], e["sqlstate"]) for e in log_events() if e["event"] == "readiness_probe_failed"] == [
-        ("migrations", "42P01"),
-        ("worker_heartbeat", "42P01"),
-    ]
     await engine.dispose()
+    assert r.status_code == 503 and r.json() == {"failing": ["migrations", "worker_heartbeat"]}
+    # the schema state reads an empty database without an error (M5 Task 27: `behind`, no revision); the
+    # heartbeat probe saw 42P01 through SQLAlchemy. `test_a_probe_blocked_behind_a_lock_fails_alone` shows a
+    # failed probe leaving the next one its transaction.
+    failed = [e for e in log_events() if e["event"] == "readiness_probe_failed"]
+    assert [(e["probe"], e["sqlstate"], e["reason"]) for e in failed] == [
+        ("migrations", None, "behind"),
+        ("worker_heartbeat", "42P01", None),
+    ]
 
 
 async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_config) -> None:
@@ -367,8 +362,9 @@ async def test_readiness_flags_a_stale_heartbeat_and_a_foreign_revision(engine, 
     async with engine.begin() as c:
         await c.execute(
             sa.text(
-                "INSERT INTO worker_heartbeat VALUES "
-                "(1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now() - interval '90 seconds')"
+                "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, "
+                "lock_backend_pid, app_version, started_at, heartbeat_at) "
+                "VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now() - interval '90 seconds')"
             )
         )
     stale = await check_readiness(engine, code_head="0000_not_the_head", now=utcnow(), embedder=None)
@@ -405,9 +401,14 @@ async def test_readiness_reports_db_when_the_connection_dies_mid_check(engine, m
     assert [e["probe"] for e in log_events() if e["event"] == "readiness_probe_failed"] == ["db"]
 
 
+@pytest.mark.parametrize(
+    ("table", "probe"), [("alembic_version", "migrations"), ("worker_heartbeat", "worker_heartbeat")]
+)
 async def test_a_probe_blocked_behind_a_lock_fails_alone(
-    migrated, make_config, log_events, monkeypatch
+    migrated, make_config, log_events, monkeypatch, table, probe
 ) -> None:
+    """A probe that waits behind a lock fails by its statement timeout, alone: its savepoint rolled back, the
+    other probe runs in the same transaction (a poisoned one would give it 25P02)."""
     import psycopg
     from jobhunter.clock import utcnow
     from jobhunter.db.alembic_runner import code_head
@@ -422,17 +423,17 @@ async def test_a_probe_blocked_behind_a_lock_fails_alone(
         monkeypatch.setattr(health, "PROBE_STATEMENT_TIMEOUT", "200ms")
         # what a migration's ALTER TABLE holds until it commits
         with psycopg.connect(migrated.dsn("migrator")) as locker:
-            locker.execute("LOCK TABLE worker_heartbeat IN ACCESS EXCLUSIVE MODE")
+            locker.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")
             async with asyncio.timeout(10):  # without the statement timeout the probe would wait for the lock
                 report = await health.check_readiness(
                     engine, code_head=code_head(), now=utcnow(), embedder=None
                 )
             locker.rollback()
-        assert report == health.ReadinessReport(ok=False, failing=["worker_heartbeat"])
+        assert report == health.ReadinessReport(ok=False, failing=[probe])
         assert [
             (e["probe"], e["sqlstate"]) for e in log_events() if e["event"] == "readiness_probe_failed"
         ] == [
-            ("worker_heartbeat", "57014")  # query_canceled by the statement timeout
+            (probe, "57014")  # query_canceled by the statement timeout
         ]
         # the timeout was local to the probe's transaction: the pooled connection has its default back
         async with engine.connect() as conn:
@@ -463,9 +464,20 @@ async def test_the_lifespan_builds_the_state_from_the_environment(
 
     from jobhunter.api.app import create_app
     from jobhunter.config import ENV_PREFIXES
+    from jobhunter.observability import heartbeat_watch
 
     from tests.support.pg import server_env
 
+    # M5 Task 3: the lifespan's heartbeat watch runs a pass at its start, on a connection of the same pool
+    watched = asyncio.Event()
+    real_pass = heartbeat_watch.heartbeat_watch_pass
+
+    async def first_pass(*args: Any, **kwargs: Any) -> str:
+        verdict = await real_pass(*args, **kwargs)
+        watched.set()
+        return verdict
+
+    monkeypatch.setattr(heartbeat_watch, "heartbeat_watch_pass", first_pass)
     for name in [name for name in os.environ if name.startswith(ENV_PREFIXES)]:
         monkeypatch.delenv(name)
     env = server_env(migrated, "api", embedder_url=fake_embedder.base_url, JOBHUNTER_LOG_LEVEL="WARNING")
@@ -484,6 +496,7 @@ async def test_the_lifespan_builds_the_state_from_the_environment(
     try:
         assert logging.getLogger().level == logging.WARNING  # ruling T14-b
         engine = app.api.state.engine
+        await asyncio.wait_for(watched.wait(), 10)  # its connection is back in the pool: readiness reuses it
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="https://testserver"
         ) as c:

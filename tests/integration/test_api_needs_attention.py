@@ -52,6 +52,7 @@ LIST_SECTIONS: Final = (
     "mass_disappearances",
     "unscorable_groups",
     "broken_sources",
+    "failed_purges",
 )
 EMPTY: Final = {"count": 0, "items": []}
 PENDING_OF: Final = sa.text(
@@ -750,6 +751,14 @@ async def test_each_section_is_bounded_to_50_with_its_count(
                 "UPDATE source_instances i SET mass_event_snapshot_id = n.id FROM ats_snapshots n "
                 "WHERE n.source_instance_id = i.id AND i.instance_key LIKE 'board-%'"
             )
+        )
+        # deletions in progress without a purge operation (failed purges, M5 Task 18)
+        await c.execute(
+            sa.text(
+                "INSERT INTO deletion_manifests (manifest_uuid, kind, status) "
+                "SELECT gen_random_uuid(), 'job_tombstone', 'executing' FROM generate_series(1, :n)"
+            ),
+            {"n": N},
         )
     body = await attention(logged_in_client)
     for name in LIST_SECTIONS:

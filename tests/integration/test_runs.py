@@ -325,7 +325,7 @@ async def test_stale_data_alert_after_grace_and_two_intervals(engine, queue_app)
 
 
 async def test_run_collect_body_executes_the_run_with_the_runtime(monkeypatch) -> None:
-    calls: list[tuple[object, object, int, int, int]] = []
+    calls: list[tuple[object, object, int, int, int, object]] = []
 
     async def fake_execute_run(
         engine: object,
@@ -335,19 +335,20 @@ async def test_run_collect_body_executes_the_run_with_the_runtime(monkeypatch) -
         *,
         epoch: int,
         on_superseded: Callable[[], None],
+        deadman: object,
     ) -> str:
-        calls.append((engine, graph, run_id, attempt_no, epoch))
+        calls.append((engine, graph, run_id, attempt_no, epoch, deadman))
         on_superseded()  # as an admission whose epoch the fence refused calls it
         return "foreign_epoch"
 
     monkeypatch.setattr(runs, "execute_run", fake_execute_run)
-    engine, graph = object(), object()
+    engine, graph, pinger = object(), object(), object()
     runtime = SimpleNamespace(
-        engine=engine, collect_graph=graph, epoch=7, shutdown=ShutdownState()
-    )  # the `WorkerRuntime` fields it reads
+        engine=engine, collect_graph=graph, epoch=7, shutdown=ShutdownState(), deadman=pinger
+    )  # the `WorkerRuntime` fields it reads; M5 Task 5: its dead-man pinger, for `_finalize`'s fast path
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await run_collect(context, run_id=5, attempt_no=2)
-    assert calls == [(engine, graph, 5, 2, 7)]
+    assert calls == [(engine, graph, 5, 2, 7, pinger)]
     # Ruling T24-a: a superseded delivery asks this worker's runtime for the graceful stop.
     assert runtime.shutdown.requested.is_set()
 

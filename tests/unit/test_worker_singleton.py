@@ -142,3 +142,30 @@ def test_worker_health_failure_prints_one_line_naming_the_error_class(
         timeout=60,
     )
     assert (done.returncode, done.stdout, done.stderr) == (1, "", line)
+
+
+def test_the_worker_health_probe_loads_neither_langsmith_nor_langchain(tmp_path: Path) -> None:
+    """M5 Task 6, Ruling T6-9: `main` leaves the probe out of `disable_tracing` (`UNTRACEABLE_PROBES`) because
+    it cannot trace; should it come to load either, it leaves that set. Its database: a closed local port."""
+    (tmp_path / "db_app").write_text("the-db-app-password\n")
+    inherited = {k: v for k, v in os.environ.items() if not k.startswith(ENV_PREFIXES)}
+    env = {
+        **inherited,
+        "JOBHUNTER_ENV": "test",
+        "JOBHUNTER_DB_NAME": "jobhunter",
+        "JOBHUNTER_DB_HOST": "127.0.0.1",
+        "JOBHUNTER_DB_PORT": "1",
+        "JOBHUNTER_SECRETS_DIR": str(tmp_path),
+    }
+    code = (
+        "import sys\n"
+        "from jobhunter.cli import main\n"
+        "assert main(['worker-health']) == 1\n"
+        "loaded = [m for m in ('langsmith', 'langchain_core') if m in sys.modules]\n"
+        "assert not loaded, loaded\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code], env=env, capture_output=True, text=True, check=False, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == "worker-health: OperationalError\n"

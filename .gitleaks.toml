@@ -40,6 +40,18 @@ paths = ['''^tests/unit/test_config\.py$''']
 regexTarget = "line"
 regexes = ['''^\s*d = write_secrets\(tmp_path / "s", \*\*API_SECRETS, anthropic_key=b""\)\s*$''']
 
+# tests/unit/test_worker_main.py (M5 Task 4) checks that the worker hands the `ntfy_token` secret to its alert
+# dispatcher. Its `NTFY_TOKEN` stand-in was first a random-looking literal (commit ed23e04); fix round 1 made it a
+# low-entropy one the default rules pass, so this entry covers only that line in the history. It belongs to no
+# account or service.
+[[allowlists]]
+description = "the ntfy_token stand-in in tests/unit/test_worker_main.py"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/unit/test_worker_main\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*NTFY_TOKEN\s*=\s*"[A-Za-z0-9_]+"\s*$''']
+
 # scripts/spikes/v7_embedder.py (spike V7) pins the embedding model's files by sha256: each entry maps a file of
 # the public model revision to its Hugging Face LFS object id, 64 lowercase hex characters. They are checksums
 # of published files, not credentials. Only a dict entry of exactly that shape is allowed.

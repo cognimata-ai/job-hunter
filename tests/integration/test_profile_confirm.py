@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.collect import insert_revisions_awaiting, manual_run_id, seed_inputs
 from tests.support.eval import seed_adversarial
 from tests.support.faults import PausePoint
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.profile import (
     SYNTHETIC_CV,
@@ -377,15 +378,7 @@ async def test_an_active_profile_fence_on_the_matching_version_is_409_until_rele
 ) -> None:
     first = await confirmed(logged_in_client, await make_ready_draft(logged_in_client, op_runner, upload))
     async with engine.begin() as conn:
-        fence = (
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) "
-                    "VALUES ('profile', :v, 1) RETURNING id"
-                ),
-                {"v": first["profile_version_id"]},
-            )
-        ).scalar_one()
+        fence = await insert_test_fence(conn, kind="profile", profile_version_id=first["profile_version_id"])
     draft_id = await make_ready_draft(logged_in_client, op_runner, upload)
     before = await written_counts(engine)
     r = await confirm(logged_in_client, draft_id, key="fenced-confirm-key-01")
@@ -402,12 +395,7 @@ async def test_a_fence_on_another_version_does_not_refuse(
     logged_in_client, engine, op_runner, upload
 ) -> None:
     async with engine.begin() as conn:
-        await conn.execute(
-            sa.text(
-                "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) "
-                "VALUES ('profile', 999999, 1)"
-            )
-        )
+        await insert_test_fence(conn, kind="profile", profile_version_id=999999)
     await confirmed(logged_in_client, await make_ready_draft(logged_in_client, op_runner, upload))
 
 

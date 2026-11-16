@@ -69,9 +69,11 @@ the first sweep; the expiry and exhaustion sweeps then take those ids (`held`) a
 nothing more. A target that becomes a candidate after the pre-lock waits for the next cycle.
 
 **The user's moves**, in the API's transaction (`active_config FOR SHARE`, step 2; the route's idempotency
-row, step 3; then the target row `FOR UPDATE`, step 10; `ranking_state` last; never the month row, so none of
-them can wait on `budget_release`, which holds the month row and skips a target row another transaction
-holds: Codex r1 #19, #20):
+row, step 3; then the job row `FOR SHARE`, step 4, and its purge fences; then the target row `FOR UPDATE`,
+step 10; `ranking_state` last; never the month row, so none of them can wait on `budget_release`, which holds
+the month row and skips a target row another transaction holds: Codex r1 #19, #20). A job under a purge
+fence for the target's tuple, or one gone, is `not_found`, as the job's detail answers it (§20.2, M5 Task 8:
+`privacy.fences.lock_unfenced_jobs`), and nothing is written:
 - `score_now(conn, *, job_id, force, now, defer) -> ScoreNow | ScoreNowRefused` (§9.6.4): the job's
   current-revision target of the active tuple (`not_found` without one). `pending | budget_deferred |
   expired_unscored | deferred_duplicate` → `pending` with `override = 'score_now'`; `refused | failed_*` take
@@ -148,9 +150,10 @@ the items after. `cancel_batched(conn, *, submission_ids, reason)` is the same m
 of the given submissions.
 
 **Target-set deletion** (§20.2 L6369-6378; Task 23, Rulings P8, P52, Carries T10-f, T13-a, T16-c).
-`delete_target_set(conn, target_ids, *, now) -> int` deletes a set T of at most `TARGET_SET_CHUNK` (200)
-targets with every row they own, in the caller's transaction (the score-history retention's chunk, which holds
-`active_config FOR SHARE`; M5's purges reuse it), and returns how many targets it deleted. It is a non-owner
+`delete_target_set(conn, target_ids, *, now, on_cancelled=None) -> int` deletes a set T of at most
+`TARGET_SET_CHUNK` (200) targets with every row they own, in the caller's transaction (the score-history
+retention's chunk, which holds `active_config FOR SHARE`; M5's purges reuse it, through
+`privacy.deletion_graph.purge_target_set`), and returns how many targets it deleted. It is a non-owner
 mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_targets`, step 7), then T's rows
 `FOR UPDATE` in id order (step 10), before the attempts (T16-c); then the nine steps:
 1. `cancel_targets(target_ids=T, reason='purged')`: every target of T that is neither published nor
@@ -158,8 +161,10 @@ mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_tar
    `cancelled` (T10-f); an `in_batch` one is cancelled individually, as a merge cancels it (L3979, Ruling P8):
    its `batch_submission_id` cleared, its attempt `cancelled`, the submission untouched; each cancelled
    target's follow-up hold is given back once. S:L6370's "the submission's cancel is requested first"
-   disagrees with S:L3979; M5, whose purges are the callers that meet `in_batch` targets (the retention
-   deletes terminal ones only), decides it for purges;
+   and S:L3979 both hold for M5's purges, the callers that meet `in_batch` targets (the retention deletes
+   terminal ones only; M5 Task 11, Deviation 13): `privacy.deletion_graph.purge_target_set` records the
+   submission's cancel and leaves the evidence of the deleted items before it calls this, which cancels the
+   purged targets individually; the batch's other targets stay `in_batch`;
 2. `resume_draft_id := NULL` on T;
 3. the `result_evidence` and `det_results` (every instance, superseded or current) of T's results; the
    `score_feedback` and `golden_cases.labelled_from_result_id` references become NULL by their foreign keys;
@@ -170,6 +175,9 @@ mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_tar
 7. the `batch_items` of T with their `llm_calls` (a deferred pair), then every other `llm_calls` row of T's
    attempts; the spend ledger rows stay;
 8. the `score_attempts` of T; 9. T itself.
+A caller's `on_cancelled(conn)` hook runs between step 2 and step 3: a purge settles there the online spend
+entries whose calls step 7 deletes (`spend_ledger.settle_for_purge`), once step 1 has cancelled their targets,
+so no dispatch marker of theirs can commit any more (M5 Task 11, `privacy.deletion_graph`).
 Step 7 is the schedule's exception: it writes `llm_calls` rows (step 9 of the lock schedule) after rows of
 step 10 (T, its drafts and critic notes, its items), an order the foreign keys force (a draft and a critic
 note reference their call, an item and its call each other), which the spec's steps follow. For the retention
@@ -222,7 +230,7 @@ Ids, counts, codes and amounts only reach a log line.
 """
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR
@@ -247,6 +255,7 @@ from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.observability.logging import get_logger
+from jobhunter.privacy.fences import lock_jobs_shared, lock_unfenced_jobs
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import cycles, filters, similarity
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
@@ -812,6 +821,8 @@ _JOB_TARGET: Final = q(
     "FOR UPDATE OF t"
 )
 _TARGET: Final = q("SELECT id, state, state_reason FROM score_targets WHERE id = :t FOR UPDATE")
+# The job and tuple of a target, read before its job row is locked (a target never changes either).
+_TARGET_JOB: Final = q("SELECT job_id, llm_tuple_id FROM score_targets WHERE id = :t")
 _MEMBER: Final = q(
     "SELECT job_id FROM duplicate_group_members WHERE group_id = :g AND job_id = :j FOR UPDATE"
 )
@@ -879,7 +890,8 @@ async def score_now(
     config = await cycles.scoring_config(conn)  # step 2
     tuple_id = config.active.llm_tuple_id
     row = None
-    if tuple_id is not None:
+    # step 4: a fenced job (or one gone) has no target here, as it has no detail
+    if tuple_id is not None and await lock_unfenced_jobs(conn, [job_id], llm_tuple_id=tuple_id):
         row = (await conn.execute(_JOB_TARGET, {"job": job_id, "tuple": tuple_id})).first()
     if row is None:
         return _refused("not_found", "score_now", job_id=job_id)
@@ -903,6 +915,11 @@ async def retry(
 ) -> ScoreNow | ScoreNowRefused:
     """The user's Retry of a `refused` or `failed_*` target (L2880; module docstring)."""
     await cycles.lock_active_scoring(conn)  # step 2
+    owner = (await conn.execute(_TARGET_JOB, {"t": target_id})).first()
+    if owner is None or not await lock_unfenced_jobs(  # step 4: a fenced job's target is not found
+        conn, [int(owner.job_id)], llm_tuple_id=int(owner.llm_tuple_id)
+    ):
+        return _refused("not_found", "retry", target_id=target_id)
     row = (await conn.execute(_TARGET, {"t": target_id})).first()
     if row is None:
         return _refused("not_found", "retry", target_id=target_id)
@@ -918,6 +935,8 @@ async def score_individually(
 ) -> IndividualMember | ScoreNowRefused:
     """§8.7's Score individually of the group member `job_id` (module docstring, Controller ruling T13-b)."""
     active = await cycles.lock_active_scoring(conn)  # step 2
+    if not await lock_unfenced_jobs(conn, [job_id], llm_tuple_id=active.llm_tuple_id):  # step 4
+        return _refused("not_found", "score_individually", group_id=group_id, job_id=job_id)
     if (await conn.execute(_MEMBER, {"g": group_id, "j": job_id})).first() is None:
         return _refused("not_found", "score_individually", group_id=group_id, job_id=job_id)
     await conn.execute(_FLAG_MEMBER, {"g": group_id, "j": job_id})  # with or without a target (L3271)
@@ -1327,9 +1346,16 @@ _SET_DELETES: Final = (
 )
 
 
-async def delete_target_set(conn: AsyncConnection, target_ids: Sequence[int], *, now: datetime) -> int:
+async def delete_target_set(
+    conn: AsyncConnection,
+    target_ids: Sequence[int],
+    *,
+    now: datetime,
+    on_cancelled: Callable[[AsyncConnection], Awaitable[None]] | None = None,
+) -> int:
     """Delete the targets `target_ids` (at most `TARGET_SET_CHUNK`) and every row they own, in the caller's
-    transaction (module docstring); how many targets it deleted. `ValueError` for a larger set."""
+    transaction (module docstring); how many targets it deleted. `on_cancelled(conn)`, when given, runs after
+    step 2 (the targets cancelled) and before step 3's deletes. `ValueError` for a larger set."""
     ids = sorted(set(target_ids))
     if len(ids) > TARGET_SET_CHUNK:
         raise ValueError(f"a target-set deletion takes at most {TARGET_SET_CHUNK} targets, not {len(ids)}")
@@ -1339,6 +1365,8 @@ async def delete_target_set(conn: AsyncConnection, target_ids: Sequence[int], *,
     await conn.execute(_LOCK_SET, {"ids": ids})  # step 10, in id order, before the attempts (T16-c)
     cancelled = await cancel_targets(conn, target_ids=ids, reason=PURGED, now=now)  # 1
     await conn.execute(_UNRESUME, {"ids": ids})  # 2
+    if on_cancelled is not None:  # a purge settles its online entries here (M5 Task 11)
+        await on_cancelled(conn)
     counts: dict[str, int] = {}
     for name, statement in _SET_DELETES:  # 3 to 9, in order
         counts[name] = (await conn.execute(statement, {"ids": ids})).rowcount
@@ -1450,7 +1478,6 @@ _PROGRESS: Final = q(
     f"SELECT count(*) AS total, count(*) FILTER (WHERE NOT {NEEDS_TARGET_SQL}) AS done "  # noqa: S608
     f"FROM jobs j WHERE {RETAINED_JOB_SQL}"
 )
-_LOCK_JOBS: Final = q("SELECT id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR SHARE")
 _PROFILE_OF: Final = q("SELECT profile_version_id FROM llm_tuples WHERE id = :tuple")
 _BULK_PENDING: Final = q(
     "SELECT count(*) FROM score_targets WHERE bulk_operation_id = :bulk AND state = 'pending' "
@@ -1503,9 +1530,9 @@ async def create_chunk(
 
 
 async def lock_jobs(conn: AsyncConnection, job_ids: Sequence[int]) -> None:
-    """The job rows `FOR SHARE` in id order, in one statement (step 4); a deleted one is simply absent."""
-    if job_ids:
-        await conn.execute(_LOCK_JOBS, {"ids": sorted(job_ids)})
+    """The job rows `FOR SHARE` in id order, in one statement (step 4); a deleted one is simply absent
+    (`privacy.fences.lock_jobs_shared`, the one copy of that lock)."""
+    await lock_jobs_shared(conn, job_ids)
 
 
 def moved(counts: Counter[str]) -> bool:

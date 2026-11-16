@@ -26,13 +26,15 @@ while one exists, the active tuple's published results are paged by id (`det_res
 chunk of `DET_CHUNK` one transaction in the schedule's order: `fence_epoch`, `active_config FOR SHARE` (the
 tuple and the scope pointers, read again each chunk: a changed tuple or scope starts that scope's paging over,
 a cleared one ends it), the page's job rows `FOR SHARE` in id order (step 4, carry T6-d: before any result
-lock), then every result of the page without a current instance for the scope whose hash and algorithm version
-are current recomputed by `det_results.recompute_stale_instances`, which the scope apply's chunks share
-(`stale_of`, the staleness the live hook reads too, then `recompute_instance`: the result rows `FOR UPDATE`
-in id order, step 10). A chunk of the active scope that wrote an instance bumps the ranking as its last
-statement (a `det_results` current-instance change, §7.1 L1255); the pending scope's never do, the Jobs list
-shows the active scope's alone. A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the
-next pass recomputes each once. It counts the instances written.
+lock) and their purge fences (`privacy.fences.lock_unfenced_jobs`, §20.2, M5 Task 8: the results of a job
+under a fence for the tuple, or of one gone since the page was read, are skipped, and the next pass after the
+fence's release writes them), then every result of the page without a current instance for the scope whose
+hash and algorithm version are current recomputed by `det_results.recompute_stale_instances`, which the scope
+apply's chunks share (`stale_of`, the staleness the live hook reads too, then `recompute_instance`: the result
+rows `FOR UPDATE` in id order, step 10). A chunk of the active scope that wrote an instance bumps the ranking
+as its last statement (a `det_results` current-instance change, §7.1 L1255); the pending scope's never do, the
+Jobs list shows the active scope's alone. A changed `DET_ALGORITHM_VERSION` makes every current instance
+stale, so the next pass recomputes each once. It counts the instances written.
 
 **`admission_alerts`** (heavy, §9.6.5 L3686-3688; A2 A8) and **`scoring_drift`** (heavy, §11.13 L4633-4635,
 §17.6 L5595), one transaction each: `fence_epoch`, a plain read of the active tuple, scope and evaluation
@@ -95,6 +97,7 @@ from jobhunter.observability.metrics import (
     SCORE_TARGET_STATES,
     SCORE_TARGETS,
 )
+from jobhunter.privacy.fences import lock_unfenced_jobs
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import cycles, det_results, targets
 from jobhunter.scoring.det_results import PublishedInstance, ScopeRow
@@ -181,9 +184,11 @@ async def _det_chunk(
     )
     if not page:
         return page, 0
-    await targets.lock_jobs(conn, [item.job_id for item in page])  # step 4, before any result (carry T6-d)
+    # step 4, before any result (carry T6-d), then the fences: a fenced or vanished job's results are skipped
+    unfenced = await lock_unfenced_jobs(conn, [item.job_id for item in page], llm_tuple_id=llm_tuple_id)
+    writable = [item for item in page if item.job_id in unfenced]
     # step 10
-    recomputed = await det_results.recompute_stale_instances(conn, page, scope, scope_part=scope_part)
+    recomputed = await det_results.recompute_stale_instances(conn, writable, scope, scope_part=scope_part)
     return page, sum(1 for instance in recomputed if instance is not None)
 
 

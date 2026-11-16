@@ -8,6 +8,8 @@ from jobhunter.api import errors, openapi
 from jobhunter.api.app import create_app
 from jobhunter.api.edge import LOGIN_PATH, STATE_CHANGING_METHODS
 
+from tests.unit.test_openapi_m3 import documented_since_m5
+
 PROBLEM_REF: Final = "#/components/schemas/Problem"
 HTTP_METHODS: Final = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 # The one error response that is not a problem document: the readiness report (§14.1, §17.5).
@@ -137,8 +139,11 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
     ],
 )
 def test_routes_document_their_error_statuses(document, method, path, statuses) -> None:
+    """Each pin as it was before M5, with the fence's 409 that M5 Task 18 documents on a fenced write."""
     responses = operations(document)[(method, path)]["responses"]
-    assert {status for status in responses if int(status) >= 400} == statuses
+    assert {status for status in responses if int(status) >= 400} == documented_since_m5(
+        method, path, statuses
+    )
 
 
 def test_edge_and_session_errors_are_documented_on_every_api_route(document) -> None:

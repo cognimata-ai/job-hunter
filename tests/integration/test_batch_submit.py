@@ -46,6 +46,7 @@ from tests.support.batches import (
     submission_rows,
 )
 from tests.support.faults import PausePoint, no_fault, raising_at
+from tests.support.fences import insert_test_fence
 from tests.support.fixtures import count_rows
 from tests.support.llm import FakeLLM, open_alerts
 from tests.support.profile import OpRunner
@@ -296,16 +297,17 @@ async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothi
     engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets, current_epoch: int
 ) -> None:
     """L6365: the global purge fence refuses the submit before `submit_start`; the prepared submission is
-    abandoned (its entries released, its targets pending). Its follow-on, run while the fence stands, ends
-    `skipped: paused` and prepares nothing; once the fence is released, the `bulk_operations` reconciler
-    requests the batch again (Ruling T16-d), once, and it is submitted."""
+    abandoned (its entries released, its targets pending). Its follow-on is kept back at its claim while the
+    fence stands (M5 Task 8: `pending`, no attempt spent, nothing prepared), and the `bulk_operations`
+    reconciler requests nothing while it is pending (Ruling T16-d); once the fence is released, the follow-on
+    runs and its batch is submitted."""
     fake_llm.batches(BatchScript(create="ok"))
     pause = PausePoint(batch_ops.AFTER_PREPARE_COMMIT)
     assert setup.operation_id is not None
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)
     async with engine.begin() as conn:
-        await conn.execute(sa.text("INSERT INTO purge_fences (kind, manifest_id) VALUES ('global', 1)"))
+        await insert_test_fence(conn, kind="global")
     pause.resume()
     await asyncio.wait_for(running, 120)
     (sub,) = await submission_rows(engine)
@@ -315,20 +317,17 @@ async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothi
     assert await charged_attempts(engine, setup.llm_tuple_id) == 0
     follow_on = (await operations_of(engine, "batch_submit"))[-1]
     assert follow_on.payload["after_submission_id"] == sub.id and follow_on.status == "pending"
-    await op_runner.run_one(follow_on.id)  # paused by the fence (`pause_reason`): nothing prepared
-    assert (await operations_of(engine, "batch_submit"))[-1].progress == {"skipped": "paused"}
+    await op_runner.run_one(follow_on.id)  # not claimed under the fence (M5 Task 8): nothing prepared
+    kept = (await operations_of(engine, "batch_submit"))[-1]
+    assert (kept.id, kept.status, kept.progress, kept.last_error_code) == (follow_on.id, "pending", {}, None)
+    assert await count_rows(engine, "operations", id=follow_on.id, attempts=0) == 1
     assert await count_rows(engine, "batch_submissions") == 1
     assert await reconcile(engine, current_epoch) == 0  # the fence stands: no request
     async with engine.begin() as conn:
         await conn.execute(sa.text("UPDATE purge_fences SET released_at = now() WHERE kind = 'global'"))
-    assert await reconcile(engine, current_epoch) == 1
-    assert await reconcile(engine, current_epoch) == 0  # once: its request is pending
-    resumed = (await operations_of(engine, "batch_submit"))[-1]
-    assert (resumed.status, resumed.payload) == (
-        "pending",
-        {"bulk_operation_id": setup.bulk_operation_id, "llm_tuple_id": setup.llm_tuple_id},
-    )
-    assert await op_runner.run_pending() == [resumed.id]
+    assert await reconcile(engine, current_epoch) == 0  # the follow-on is pending: no request
+    await make_due(engine)
+    assert await op_runner.run_pending() == [follow_on.id]
     assert [row.state for row in await submission_rows(engine)] == ["abandoned", "submitted"]
     assert await reconcile(engine, current_epoch) == 0  # a submission in flight: no request
 

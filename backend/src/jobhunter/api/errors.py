@@ -16,8 +16,9 @@ The handlers (installed through `exception_handlers()`):
   `Allow` header). A 404 to a `GET` or `HEAD` outside `/api` (no route matched) is first offered to the SPA,
   `api.static.SpaFiles` on the app state (M4 Task 19); the problem stands when it declines;
 - any other `Exception`: the last-resort 500 `internal`. It logs `unhandled_exception` with the error class
-  only and persists the deduplicated `api.unhandled_exception` alert (§17.1). Starlette runs it from
-  `ServerErrorMiddleware`, which then re-raises to the edge.
+  only and persists the deduplicated `api.unhandled_exception` alert (§17.1), outside the write guard of a
+  guarded request (`db.fence_guard.suspended`), so a 500's alert is written even under delete-everything's
+  fence (M5 Task 8). Starlette runs it from `ServerErrorMiddleware`, which then re-raises to the edge.
 
 This module is a task boundary (ruff `BLE001` is allowed here). No exception message or traceback reaches a
 log line or an alert, and none reaches a response body except the 422 validation messages above: they can
@@ -50,6 +51,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
 from jobhunter.api.static import SpaFiles
+from jobhunter.db.fence_guard import suspended
 from jobhunter.errors import (
     RESERVED_PROBLEM_MEMBERS,
     CoMemberChanged,
@@ -211,7 +213,8 @@ def _respond(request: Request, problem: Problem) -> Response:
 
 
 async def persist_unhandled_alert(engine: AsyncEngine | None, exc: BaseException) -> None:
-    """Raise (or count again) the `api.unhandled_exception` alert of `exc`'s class in its own transaction.
+    """Raise (or count again) the `api.unhandled_exception` alert of `exc`'s class in its own transaction,
+    outside the write guard (`db.fence_guard.suspended`: written even under delete-everything's fence).
 
     Best effort: with no engine yet, or when the write fails or takes longer than `ALERT_PERSIST_TIMEOUT_S`,
     it logs `alert_persist_failed` with `error_class` (the class of `exc`) and `persist_error_class` (the
@@ -222,15 +225,16 @@ async def persist_unhandled_alert(engine: AsyncEngine | None, exc: BaseException
         log.error("alert_persist_failed", error_class=error_class, persist_error_class=None)
         return
     try:
-        async with asyncio.timeout(ALERT_PERSIST_TIMEOUT_S), engine.begin() as conn:
-            await raise_alert(
-                conn,
-                code=UNHANDLED_ALERT_CODE,
-                severity="warn",
-                subject=error_class,
-                message="unhandled exception in api",
-                context={"error_class": error_class},
-            )
+        with suspended():
+            async with asyncio.timeout(ALERT_PERSIST_TIMEOUT_S), engine.begin() as conn:
+                await raise_alert(
+                    conn,
+                    code=UNHANDLED_ALERT_CODE,
+                    severity="warn",
+                    subject=error_class,
+                    message="unhandled exception in api",
+                    context={"error_class": error_class},
+                )
     except Exception as failure:
         # The database that would hold the outcome is the one that failed: this line is the outcome left.
         log.error("alert_persist_failed", error_class=error_class, persist_error_class=type(failure).__name__)

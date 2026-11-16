@@ -1,7 +1,7 @@
 // System → Needs attention (spec §14.2 L5040-5044, §15.7; plan M4 Task 31, resolution d, U1, U3): one block per
 // section of `AttentionOut`, in `observability/attention.py`'s order. Each block shows its heading with the
 // section's full count, its items (the server sends at most 50), "and n more" when the count exceeds them, and
-// "Nothing here" when it is empty. There is no failed-purges block (U1: M5's).
+// "Nothing here" when it is empty. The failed purges are a section since M5 Task 18 (U1), shown since Task 20.
 //
 // Each item's action disables its button while it runs; once answered, Needs attention and the header's status
 // are read again (`systemApi`); a refusal shows as a `ProblemBox` at the item.
@@ -20,18 +20,25 @@
 // - **Paused scoring**: [Acknowledge] sends the pausing alert's acknowledgement.
 // - **Failed scope apply**: [Retry apply] (`useRetryApply`, telling its own failure at the item).
 // - **Broken sources** are information only; a `degraded` one shows as a warning.
+// - **Failed purges** (M5 Task 20, Deviation 22): each deletion by its kind and id, when it was asked for, how often
+//   its purge operation was requeued (its `attempts`, which count requeues, not runs: shown only when above 0,
+//   M5 Task 33) and its last error code; [Retry] asks in a `ConfirmDialog` (a new attempt carries the deletion
+//   on; its fence stays), whose confirm sends `POST /api/system/purges/{operation_id}/retry` (not keyed) once and is
+//   busy until answered; its refusal shows by its code (`PrivacyProblem`). A deletion without a purge operation has
+//   no Retry: the reconciler queues one.
 //
 // A job an item names is a `JobRef`, which opens the job in the Jobs page's drawer (`/?job=<id>`). The blocks are in
 // `codes.json`'s `order.attention_section` (`test_i18n_codes.py` holds it to `AttentionOut`); Needs attention is
 // read again every 60 s in the background while it shows, so a batch's "from" time turns into its Release.
 import { useNavigate } from "@tanstack/react-router";
 import type { TFunction } from "i18next";
-import { type ReactNode, useId, useMemo, useState } from "react";
+import { type ReactNode, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { Skeleton } from "../components/Skeleton";
+import { useFocusFallback } from "../components/useFocusFallback";
 import { useToast } from "../components/Toaster";
 import codes from "../i18n/codes.json";
 import { intlLocale, useServerText } from "../i18n/index";
@@ -41,6 +48,8 @@ import fields from "../settings/fields.module.css";
 import { useRetryApply } from "./api";
 import { type Format, useFormat } from "./format";
 import styles from "./NeedsAttention.module.css";
+import { PrivacyProblem } from "./PrivacyProblem";
+import { useRetryPurge, useSingleFlight } from "./privacyApi";
 import parts from "./SystemSection.module.css";
 import {
   type AttentionOut,
@@ -70,6 +79,7 @@ const KNOWN: ReadonlySet<string> = new Set(closedSet<Section>({
   broken_sources: true,
   paused_lane: true,
   scope_apply_failed: true,
+  failed_purges: true,
 }));
 
 /** The sections in the module's order (`codes.json`'s `order.attention_section`). */
@@ -103,13 +113,15 @@ function jobName(t: TFunction, jobId: number): string {
   return t("drawer.job_ref", { id: String(jobId) });
 }
 
-/** An item: what it is, its action, and below them its refusal. */
-function ItemRow({ children, actions, error }: { children: ReactNode; actions?: ReactNode; error?: unknown }) {
+/** An item: what it is, its action, and below them its refusal (`error` as a `ProblemBox`, or `problem` as
+ * given). */
+function ItemRow({ children, actions, error, problem }: { children: ReactNode; actions?: ReactNode; error?: unknown; problem?: ReactNode }) {
+  const shown = problem ?? (error != null ? <ProblemBox error={error} /> : null);
   return (
     <li className={styles.item}>
       <div className={styles.what}>{children}</div>
       {actions !== undefined && <div className={styles.actions}>{actions}</div>}
-      {error != null && <div className={styles.problem}><ProblemBox error={error} /></div>}
+      {shown !== null && <div className={styles.problem}>{shown}</div>}
     </li>
   );
 }
@@ -124,9 +136,12 @@ function Block({ name, count, shown, children }: { name: Section; count: number;
   const format = useFormat();
   const id = useId();
   const more = count - shown;
+  const block = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useFocusFallback(block, heading); // an item an action dealt with leaves on the next read, its buttons with it
   return (
-    <section aria-labelledby={id} className={styles.block}>
-      <h4 id={id} className={styles.blockTitle}>
+    <section ref={block} aria-labelledby={id} className={styles.block}>
+      <h4 ref={heading} id={id} tabIndex={-1} className={styles.blockTitle}>
         <span>{serverText("attention_section", name)}</span>{" "}
         <span className={cx(styles.count, count > 0 && styles.countSome)}>{format.number(count)}</span>
       </h4>
@@ -493,6 +508,57 @@ function ScopeItem({ failed }: { failed: NonNullable<AttentionOut["scope_apply_f
   );
 }
 
+function FailedPurgeItem({ item }: { item: Item<"failed_purges"> }) {
+  const { t } = useTranslation();
+  const format = useItemFormat();
+  const toast = useToast();
+  const retry = useRetryPurge();
+  const send = useSingleFlight(retry);
+  const [asking, setAsking] = useState(false);
+  const operationId = item.operation_id;
+  return (
+    <ItemRow problem={retry.error === null ? undefined : <PrivacyProblem error={retry.error} />}
+      actions={operationId === null ? undefined : (
+        <>
+          <button type="button" className={fields.button} disabled={retry.isPending} onClick={() => { setAsking(true); }}>
+            {t("attention.purge_retry")}
+          </button>
+          <ConfirmDialog open={asking} title={t("attention.purge_retry_title")} confirmLabel={t("attention.purge_retry_confirm")}
+            busy={retry.isPending}
+            onCancel={() => { if (!retry.isPending) { setAsking(false); } }}
+            onConfirm={() => {
+              send(operationId, {
+                onSuccess: () => {
+                  setAsking(false);
+                  toast({ message: t("attention.purge_retried") });
+                },
+                onError: () => { setAsking(false); },
+              });
+            }}>
+            <p>{t("attention.purge_retry_body")}</p>
+          </ConfirmDialog>
+        </>
+      )}>
+      <p className={styles.title}>
+        {t("attention.purge_title", { kind: t(`settings_privacy.kind.${item.kind}`), id: String(item.manifest_id) })}
+      </p>
+      <Meta>
+        {t("attention.purge_requested", { time: format.dayMonthTime(item.created_at) })}
+        {/* `attempts` counts requeues, not runs: none for a purge that failed on its first run (M5 Task 33) */}
+        {item.attempts > 0 && " · "}
+        {item.attempts > 0 && t("attention.purge_requeued", { count: item.attempts, value: format.number(item.attempts) })}
+      </Meta>
+      {item.last_error_code !== null && (
+        <p className={styles.codes}>
+          <span className={styles.meta}>{t("attention.last_error")}</span>
+          <code className={styles.code}>{item.last_error_code}</code>
+        </p>
+      )}
+      {operationId === null && <p className={styles.why}>{t("attention.purge_waiting")}</p>}
+    </ItemRow>
+  );
+}
+
 function listed<S extends Exclude<Section, "paused_lane" | "scope_apply_failed">>(
   data: AttentionOut,
   name: S,
@@ -540,6 +606,8 @@ function blockOf(data: AttentionOut, name: Section): ReactNode {
         </Block>
       );
     }
+    case "failed_purges":
+      return listed(data, name, (item) => <FailedPurgeItem key={item.manifest_id} item={item} />);
   }
 }
 

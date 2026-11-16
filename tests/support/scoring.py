@@ -160,6 +160,7 @@ from langgraph.types import Command
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.fences import insert_test_fence
 from tests.support.llm import score_profile
 from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import (
@@ -1238,13 +1239,6 @@ _PROFILE_VECTOR: Final = q(
 _EMBED_REVISION: Final = q(
     "UPDATE job_revisions SET embedding_status = 'embedded', embedding_id = :e WHERE id = :r"
 )
-_FENCE_JOBS: Final = q(
-    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1) "
-    "RETURNING id"
-)
-_FENCE_PROFILE: Final = q(
-    "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) VALUES ('profile', :pv, 1) RETURNING id"
-)
 _MANY_REVISIONED_JOBS: Final = q(
     "WITH j AS (INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, "
     "work_mode_possible, work_mode_source, employment_source, ad_language, completeness, posted_precision, "
@@ -1307,13 +1301,13 @@ async def profile_of_tuple(conn: AsyncConnection, llm_tuple_id: int) -> int:
 
 
 async def fence_jobs(conn: AsyncConnection, *job_ids: int) -> int:
-    """An active purge fence of kind `jobs` over `job_ids`; its id."""
-    return int((await conn.execute(_FENCE_JOBS, {"jobs": list(job_ids)})).scalar_one())
+    """An active purge fence of kind `jobs` over `job_ids`, with a manifest of its own; its id."""
+    return await insert_test_fence(conn, kind="jobs", job_ids=job_ids)
 
 
 async def fence_profile(conn: AsyncConnection, profile_version_id: int) -> int:
-    """An active purge fence of kind `profile` over `profile_version_id`; its id."""
-    return int((await conn.execute(_FENCE_PROFILE, {"pv": profile_version_id})).scalar_one())
+    """An active purge fence of kind `profile` over the version, with a manifest of its own; its id."""
+    return await insert_test_fence(conn, kind="profile", profile_version_id=profile_version_id)
 
 
 async def revisioned_jobs(engine: AsyncEngine, n: int, *, availability: str = "active") -> list[Job]:

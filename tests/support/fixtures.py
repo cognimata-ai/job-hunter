@@ -10,6 +10,7 @@ from typing import Any, Final, Protocol
 import httpx
 import procrastinate
 import psycopg
+import psycopg.types.json
 import pytest
 import sqlalchemy as sa
 import structlog
@@ -45,8 +46,9 @@ _LIBRARY_LOGGERS = (
 )
 # The tables `reset_database` empties with TRUNCATE (the migrator owns them, so only the migrator may
 # truncate). The seeded configuration chain, `active_config`, `ranking_state` and `sources` are kept
-# (`reset_database` restores the first three to their seeded state), `schedule_state` is reset (below), and so
-# is `checkpoint_migrations`: the checkpointer reads it to know its schema is set up. `source_instances` is
+# (`reset_database` restores them to their seeded state), `schedule_state` and `deadman_state` are
+# reset (below), and so are `checkpoint_migrations`, which the checkpointer reads to know its schema is set
+# up, and `schema_compat`, `migrate`'s record of the migration chain (M5). `source_instances` is
 # named on purpose: CASCADE empties it anyway with `watchlist_companies` and `ats_snapshots`, so
 # `reset_database` inserts the default instances again.
 #
@@ -99,6 +101,16 @@ TRUNCATED_TABLES: Final = (
     "dedup_decisions",
     "tombstone_keys",
     "hard_filter_results",
+    # M5: the manifests, their shipments, the backups, the exports and the purged batch items. Only
+    # `purge_fences` (named above) references a manifest besides `purged_batch_items`; `batch_submissions`,
+    # which `purged_batch_items` references, is not emptied by them (CASCADE follows the referencing side).
+    "deletion_manifests",
+    "manifest_shipments",
+    "manifest_shipment_items",
+    "backup_sets",
+    "backup_runs",
+    "exports",
+    "purged_batch_items",
 )
 _TRUNCATE: Final = f"TRUNCATE {', '.join(TRUNCATED_TABLES)} CASCADE"
 
@@ -202,6 +214,12 @@ ON CONFLICT (id) DO UPDATE SET
   anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
+# The dead-man state as `seed_defaults` wrote it (M5): the row deleted and inserted again as the seed inserts
+# it, so every other column takes its default (NULL today), whatever columns a later task adds. No foreign key
+# references the table.
+_DEADMAN_RESET: Final = ("DELETE FROM deadman_state", "INSERT INTO deadman_state (id) VALUES (1)")
+# A source purge's record on the kept `sources` rows (M5 Task 15), which `migrate` seeds NULL.
+_SOURCES_RESET: Final = "UPDATE sources SET purge_fence_at = NULL WHERE purge_fence_at IS NOT NULL"
 # Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the shipped
 # rubric v2 (M3 Task 3) and the shipped prompt-schema version 2 (M3 Task 4; `_SEEDED_ROWS` fails the reset
 # when one is missing), and the pointers a profile or a scope apply sets left NULL (the pending scope, the
@@ -316,6 +334,39 @@ _CONFIGURATION_RESET: Final = (
 )
 
 
+# Settings version 1 as `migrate` seeded it, per server (its container), read by the first reset that finds
+# it: delete-everything (M5 Task 16) deletes every settings version within its bound, version 1 among them,
+# and keeps the rows it names (its derived rows are the default document's, which the purge's reset reuses),
+# so the reset inserts it again with its id and its `created_at`, the day the schedule's anchor is computed
+# from.
+_SETTINGS_V1_COLUMNS: Final = (
+    "id, version_no, schema_version, payload, scope_version_id, model_policy_id, execution_config_id, "
+    "evaluation_policy_id, base_version_id, effect_classes, acknowledged_warnings, eval_override_ack, "
+    "created_at"
+)
+_SETTINGS_V1_READ: Final = f"SELECT {_SETTINGS_V1_COLUMNS} FROM settings_versions WHERE version_no = 1"  # noqa: S608
+_SETTINGS_V1_INSERT: Final = (
+    f"INSERT INTO settings_versions ({_SETTINGS_V1_COLUMNS}) OVERRIDING SYSTEM VALUE "  # noqa: S608
+    f"VALUES ({', '.join(['%s'] * len(_SETTINGS_V1_COLUMNS.split(',')))})"
+)
+_SEEDED_SETTINGS_V1: dict[str, tuple[Any, ...]] = {}
+
+
+def _restore_settings_v1(conn: psycopg.Connection[tuple[Any, ...]], server: PgServer) -> None:
+    """Settings version 1 inserted again as `migrate` seeded it when a delete-everything deleted it (above);
+    remembered on the first reset that finds it."""
+    found = conn.execute(_SETTINGS_V1_READ).fetchone()
+    if found is not None:
+        _SEEDED_SETTINGS_V1.setdefault(server.container, tuple(found))
+        return
+    seeded = _SEEDED_SETTINGS_V1.get(server.container)
+    if seeded is None:
+        raise LookupError("settings version 1 is missing and no reset has seen it: `migrated` seeds it")
+    values = list(seeded)
+    values[3] = psycopg.types.json.Jsonb(values[3])  # the payload
+    conn.execute(_SETTINGS_V1_INSERT, values)
+
+
 def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
     """Empty the tables of `_TRUNCATE`, `_M3_DELETE` and `_M2_DELETE`, restore the seeded configuration, in
     one transaction.
@@ -325,10 +376,13 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
 
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); the M3 tables
-    and the M1 tables they reference deleted (`_M3_DELETE`); `active_config` as the seed wrote it
+    and the M1 tables they reference deleted (`_M3_DELETE`); settings version 1 inserted again when a
+    delete-everything deleted it (`_restore_settings_v1`, M5 Task 16); `active_config` as the seed wrote it
     (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the shipped
     prompt-schema version 2, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
-    (`_M2_DELETE`); the schedule reset; then the settings versions after 1, the scope versions no settings
+    (`_M2_DELETE`); the schedule and the dead-man state reset (`_DEADMAN_RESET`: its row inserted again as
+    the seed inserts it); the sources' `purge_fence_at` NULL again, as `migrate` seeds it (`_SOURCES_RESET`: a
+    source purge's record, M5 Task 15); then the settings versions after 1, the scope versions no settings
     version uses, the model policies, execution configs and evaluation policies that no settings version or
     `active_config` names, the rubric rows other than the shipped v1 and v2 and the prompt-schema rows other
     than the two shipped versions that `active_config` does not name deleted, and the ranking generation set
@@ -346,6 +400,7 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(DEFAULT_INSTANCES_SQL)
         for statement in _M3_DELETE:
             conn.execute(statement)
+        _restore_settings_v1(conn, server)
         seeded = _SEEDED_HASHES
         if conn.execute(_SEEDED_ROWS, seeded).fetchone() != (True,):
             raise LookupError(
@@ -367,6 +422,9 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         )
         slot = latest_slot_at_or_before(anchor, interval_s, db_now[0])
         conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
+        for statement in _DEADMAN_RESET:
+            conn.execute(statement)
+        conn.execute(_SOURCES_RESET)
         for statement in _CONFIGURATION_RESET:
             conn.execute(statement, seeded if "%(" in statement else None)
 
@@ -455,6 +513,19 @@ _EPOCH_1_IS_CURRENT: Final = (
     "app_version, started_at, heartbeat_at) "
     "VALUES (1, gen_random_uuid(), 1, 'test', 1, 1, 'test', now(), now())"
 )
+_FRESH_HEARTBEAT: Final = (
+    "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, lock_backend_pid, "
+    "app_version, started_at, heartbeat_at) "
+    "VALUES (1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now()) "
+    "ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()"
+)
+
+
+async def fresh_heartbeat(engine: AsyncEngine) -> None:
+    """The worker's heartbeat written now, as `engine`'s role: the row inserted (epoch 1), or its
+    `heartbeat_at` moved to now; readiness's `worker_heartbeat` probe then passes."""
+    async with engine.begin() as conn:
+        await conn.execute(sa.text(_FRESH_HEARTBEAT))
 
 
 @pytest.fixture

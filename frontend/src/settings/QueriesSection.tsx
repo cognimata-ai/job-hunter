@@ -6,7 +6,9 @@
 //   enables it (a checkbox bound to the draft's `queries[]` entry by `query_id`), its exploration flag, its last
 //   coverage (in the display time zone), open gaps, yield, refresh cadence ("—" for none or 0, Carry T13) and a
 //   "too broad" badge. A query the draft does not list reads "Not in the settings", unticked: ticking adds it
-//   enabled (`addEntry`), and unticking an entry the draft added takes it back (`removeEntry`).
+//   enabled (`addEntry`), and unticking an entry the draft added takes it back (`removeEntry`). Its rows read as
+//   cards whenever its box is narrower than 60rem (`tables.boxCards`, M5 follow-ups Task F5), so it never scrolls
+//   sideways.
 // - **A row's cells** (`QueryStats`): a disclosure below the row, from one read of the stats for the section.
 // - **Add query**: a text of 2 to 120 characters (code points, trimmed) and its language, `POST /api/queries`,
 //   then the query enters the draft enabled (`queriesApi.useAddQuery`).
@@ -298,7 +300,7 @@ function QueryTable() {
       </th>
     );
     body = (
-      <div className={tables.scroll}>
+      <div className={cx(tables.scroll, tables.boxCards)}>
         <table role="table" className={tables.table} aria-labelledby={headingId}>
           <thead role="rowgroup">
             <tr role="row">

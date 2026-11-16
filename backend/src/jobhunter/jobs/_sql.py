@@ -12,7 +12,9 @@ honest, without which it chose nested loops over whole-table scans and JIT compi
   the walk's estimate down to one row (and make a full sort look cheaper than the LIMIT walk of its index);
 - the deferred members that match (`DEFERRED_MEMBER`) are one uncorrelated set, an InitPlan run once per
   statement, not an EXISTS costed (and planned around) for every row it would rarely run for;
-- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`).
+- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`);
+- a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8, D21) is decided by one uncorrelated "no fence is
+  open" first, an InitPlan run once per statement, so no row pays for `is_fenced` while no fence stands.
 """
 
 from collections.abc import Mapping
@@ -24,6 +26,7 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q as sql
 from jobhunter.jobs.query import ScoringBucket, UserStatus
+from jobhunter.privacy.fences import NO_OPEN_FENCE_SQL
 
 ACTIVE: Final = sql(
     "SELECT a.llm_tuple_id, a.scope_version_id, s.payload AS scope FROM active_config a "
@@ -297,6 +300,8 @@ STATUS_SQL: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 NOT_HIDDEN: Final = "u.hidden_at IS NULL"
+# No unreleased purge fence matches the card's job: a fenced job is no card (module docstring).
+NOT_FENCED: Final = f"({NO_OPEN_FENCE_SQL} OR NOT is_fenced(j.id))"
 BUCKET_ORDER: Final[tuple[ScoringBucket, ...]] = (
     "scored",
     "filtered",

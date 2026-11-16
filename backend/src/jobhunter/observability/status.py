@@ -40,9 +40,10 @@ and no table sizes (D5). What each field reads:
   stored window shows the units of the window its first run would bootstrap.
 - `scope` (D11): the pending scope, the progress of its live `apply_scope` operation (`null` without a live
   one; a count it has not reported yet is 0), and `scope_apply.scope_applied`.
-- `banners`: `compute_banners` over the facts above and the score lane's pause reason
-  (`cycles.pause_reason` over a plain read of the active configuration, in the process's LLM mode, as the
-  system health reads it; none with nothing seeded).
+- `banners`: `compute_banners` over the facts above, the score lane's pause reason (`cycles.pause_reason`
+  over a plain read of the active configuration, in the process's LLM mode, as the system health reads it;
+  none with nothing seeded) and whether a deletion manifest is `completed` but not yet `shipped`
+  (`deletion_manifests_open`; M5 Task 18).
 
 **The banners** (`compute_banners`), built in this table's order, then sorted critical, warn, info, the
 table's order kept within a severity:
@@ -56,6 +57,7 @@ table's order kept within a severity:
 | `critical_alerts` | critical | an unresolved, unacknowledged critical alert (D4) | `{count}` |
 | `paid_search_paused` | warn | `paid_search.paused` | `{until, reason}` |
 | `scope_not_applied` | warn | nothing pending and the scope not applied (D11) | `{}` |
+| `deletion_unshipped` | warn | a deletion manifest `completed` and not `shipped` (§15.1, §19.5) | `{}` |
 | `applying_settings` | info | a pending scope | `{done, total}`, or `{failed: true}` (below) |
 | `rescoring` | info | a re-score with `done < total`, or still `creating` | `{done, total}` |
 
@@ -115,6 +117,7 @@ BannerCode = Literal[
     "critical_alerts",
     "paid_search_paused",
     "scope_not_applied",
+    "deletion_unshipped",
     "applying_settings",
     "rescoring",
 ]
@@ -145,6 +148,10 @@ _PENDING_TARGETS: Final = q(
     "/* status.pending_targets */ SELECT count(*) FROM score_targets t "
     "JOIN active_config a ON a.llm_tuple_id = t.llm_tuple_id "
     "WHERE a.id = 1 AND t.state IN ('pending', 'budget_deferred')"
+)
+# `deletion_manifests_open (status, completed_at) WHERE status <> 'shipped'`.
+_UNSHIPPED: Final = q(
+    "/* status.unshipped */ SELECT EXISTS (SELECT 1 FROM deletion_manifests WHERE status = 'completed')"
 )
 _UNACKED_ALERTS: Final = q(
     "/* status.alerts */ SELECT count(*) FILTER (WHERE severity = 'critical') AS critical, count(*) AS total "
@@ -294,6 +301,7 @@ class BannerFacts:
     paid_search: PaidSearchOut
     scope: ScopeStatusOut
     rescore: RescoreOut | None
+    deletion_unshipped: bool
 
 
 # ---- the pure parts ---------------------------------------------------------------------------------------
@@ -375,6 +383,8 @@ def compute_banners(f: BannerFacts) -> list[BannerOut]:
     scope = f.scope
     if scope.pending_version_id is None and not scope.applied:
         found.append(BannerOut(code="scope_not_applied", severity="warn", params={}))
+    if f.deletion_unshipped:
+        found.append(BannerOut(code="deletion_unshipped", severity="warn", params={}))
     if scope.pending_version_id is not None:
         progress = scope.progress
         applying: dict[str, JsonValue] = (
@@ -489,6 +499,7 @@ async def system_status(conn: AsyncConnection, *, now: datetime, fake_llm: bool)
         paid_search=paid,
         scope=scope,
         rescore=rescore,
+        deletion_unshipped=bool((await conn.execute(_UNSHIPPED)).scalar_one()),
     )
     return StatusOut(
         last_run=await _last_run(conn, now),

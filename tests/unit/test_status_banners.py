@@ -54,6 +54,7 @@ def facts(
     paid: PaidSearchOut = NOT_PAUSED,
     scope: ScopeStatusOut = APPLIED,
     rescore: RescoreOut | None = None,
+    deletion_unshipped: bool = False,
 ) -> BannerFacts:
     return BannerFacts(
         run_age_state=run_age_state,
@@ -62,6 +63,7 @@ def facts(
         paid_search=paid,
         scope=scope,
         rescore=rescore,
+        deletion_unshipped=deletion_unshipped,
     )
 
 
@@ -170,12 +172,14 @@ def test_banners_sort_by_severity_then_table_order() -> None:
             applied=False,
         ),
         rescore=RescoreOut(bulk_operation_id=3, done=10, total=40, creating=False),
+        deletion_unshipped=True,
     )
     assert banners(every) == [
         ("stale_data", "critical", {}),
         ("critical_alerts", "critical", {"count": 2}),
         ("scoring_paused", "warn", {"reason": "global_fence"}),
         ("paid_search_paused", "warn", {"until": "2026-11-20T00:00:00Z", "reason": "serpapi_disabled"}),
+        ("deletion_unshipped", "warn", {}),
         ("applying_settings", "info", {"done": 1, "total": 6}),
         ("rescoring", "info", {"done": 10, "total": 40}),
     ]
@@ -185,13 +189,16 @@ def test_banners_sort_by_severity_then_table_order() -> None:
         critical_unacked=1,
         paid=PaidSearchOut(paused=True, until=None, reason="serpapi_unavailable"),
         scope=ScopeStatusOut(pending_version_id=None, progress=None, applied=False),
+        deletion_unshipped=True,
     )
     assert banners(other) == [
         ("scoring_paused", "critical", {"reason": "schema_unverified"}),
         ("critical_alerts", "critical", {"count": 1}),
         ("paid_search_paused", "warn", {"until": None, "reason": "serpapi_unavailable"}),
         ("scope_not_applied", "warn", {}),
+        ("deletion_unshipped", "warn", {}),
     ]
+    assert banners(facts(deletion_unshipped=True)) == [("deletion_unshipped", "warn", {})]
     assert banners(facts()) == []
     quiet: tuple[RunAgeState, ...] = ("ok", "warn", "grace", "none")
     for state in quiet:

@@ -1,4 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../api/schema";
 import codes from "../i18n/codes.json";
@@ -11,7 +12,7 @@ type AttentionOut = components["schemas"]["AttentionOut"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 // The blocks in `AttentionOut`'s order (observability/attention.py; `codes.json`'s `order.attention_section`,
-// which test_i18n_codes.py holds to the model): no failed-purges block (U1).
+// which test_i18n_codes.py holds to the model), the failed purges last.
 const ORDER = codes.order.attention_section as (keyof AttentionOut)[];
 
 // Needs attention's job links are the router's: these tests render the app at Profile & Settings.
@@ -108,7 +109,7 @@ const RETRIEVE_FAILING: AttentionOut["retrieve_failing"] = {
 };
 
 describe("NeedsAttention", () => {
-  it("shows one block per section in the module's order, with no failed-purges block", async () => {
+  it("shows one block per section in the module's order", async () => {
     fakeApi({ signedIn: true });
     renderApp("/settings#system");
     await block("raw_items");
@@ -117,7 +118,7 @@ describe("NeedsAttention", () => {
     ORDER.forEach((name, i) => {
       expect(headings[i]?.startsWith(en[`attention_section.${name}`]), name).toBe(true);
     });
-    expect(headings.some((h) => /purge|lösch/i.test(h))).toBe(false);
+    expect(ORDER.at(-1)).toBe("failed_purges");
     // an empty section says so in one line
     expect(within(await block("identity_conflicts")).getByText(en["attention.nothing"])).toBeTruthy();
     expect(within(await block("paused_lane")).getByText(en["attention.nothing"])).toBeTruthy();
@@ -450,6 +451,136 @@ describe("NeedsAttention", () => {
     });
     const keyed = posts.filter((call) => requestsTo(api, call)[0]?.headers.get("Idempotency-Key") != null);
     expect(keyed).toEqual(["POST /api/batches/3/release", "POST /api/targets/51/retry"]);
+  });
+
+  it("lists failed purges with Retry", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({
+      failed_purges: {
+        count: 3,
+        items: [
+          { manifest_id: 12, kind: "source_purge", created_at: "2026-11-03T04:00:00Z", operation_id: 81, last_error_code: "postcondition_failed", attempts: 3 },
+          { manifest_id: 11, kind: "golden_case_delete", created_at: "2026-11-02T04:00:00Z", operation_id: null, last_error_code: null, attempts: 0 },
+        ],
+      },
+    });
+    let answer: (response: Response) => void = () => undefined;
+    api.routes.set("POST /api/system/purges/81/retry", () => new Promise<Response>((resolve) => { answer = resolve; }));
+    const app = renderApp("/settings#system");
+    const purges = await block("failed_purges");
+    expect(within(purges).getByRole("heading", { level: 4 }).textContent).toContain("3");
+    expect(within(purges).getByText("and 1 more")).toBeTruthy();
+    // each deletion by its kind and id, when it was asked for, its attempts and its last error code
+    const failed = item(purges, /#12/);
+    expect(failed.textContent).toContain(en["settings_privacy.kind.source_purge"]);
+    expect(failed.textContent).toContain("requeued 3\u00a0times"); // no break inside, plan M5 Task 33
+    expect(within(failed).getByText("postcondition_failed").tagName).toBe("CODE");
+    // one without a purge operation has nothing to retry: the reconciler queues it again
+    const waiting = item(purges, /#11/);
+    expect(waiting.textContent).toContain(en["settings_privacy.kind.golden_case_delete"]);
+    expect(waiting.textContent).toContain(en["attention.purge_waiting"]);
+    expect(within(waiting).queryByRole("button")).toBeNull();
+
+    // Retry asks first; Cancel sends nothing
+    const retry = within(failed).getByRole<HTMLButtonElement>("button", { name: en["attention.purge_retry"] });
+    fireEvent.click(retry);
+    let dialog = screen.getByRole("alertdialog", { name: en["attention.purge_retry_title"] });
+    expect(dialog.textContent).toContain(en["attention.purge_retry_body"]);
+    fireEvent.click(within(dialog).getByRole("button", { name: en["action.cancel"] }));
+    expect(requestsTo(api, "POST /api/system/purges/81/retry")).toHaveLength(0);
+    // the confirm sends once, unkeyed, and is busy until the answer, as is the item's Retry
+    fireEvent.click(retry);
+    dialog = screen.getByRole("alertdialog", { name: en["attention.purge_retry_title"] });
+    const confirm = within(dialog).getByRole<HTMLButtonElement>("button", { name: en["attention.purge_retry_confirm"] });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    await waitFor(() => {
+      expect(confirm.disabled).toBe(true);
+    });
+    expect(retry.disabled).toBe(true);
+    fireEvent.click(confirm);
+    expect(requestsTo(api, "POST /api/system/purges/81/retry")).toHaveLength(1);
+    expect(requestsTo(api, "POST /api/system/purges/81/retry")[0]?.headers.get("Idempotency-Key")).toBeNull();
+    const reads = requestsTo(api, "GET /api/system/needs-attention").length;
+    api.attention = attentionOut();
+    answer(json({ operation_id: 82, manifest_id: 12 }, 202));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(await screen.findByText(en["attention.purge_retried"])).toBeTruthy();
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/system/needs-attention").length).toBeGreaterThan(reads);
+    });
+    await waitFor(async () => {
+      expect(within(await block("failed_purges")).getByText(en["attention.nothing"])).toBeTruthy();
+    });
+    expect(app.router.state.location.pathname).toBe("/settings");
+  });
+
+  it("a purge's requeues show only when there were some, as requeues (plan M5 Task 33, Ruling T33-15)", async () => {
+    // `operations.attempts` counts requeues, not runs: a purge that failed on its first run has 0
+    const api = fakeApi({ signedIn: true });
+    const failedPurge = (manifestId: number, attempts: number) => ({
+      manifest_id: manifestId, kind: "golden_case_delete" as const, created_at: "2026-11-03T04:00:00Z",
+      operation_id: 80 + manifestId, last_error_code: "postcondition_failed", attempts,
+    });
+    api.attention = attentionOut({ failed_purges: { count: 3, items: [failedPurge(3, 0), failedPurge(2, 1), failedPurge(1, 2)] } });
+    renderApp("/settings#system");
+    const purges = await block("failed_purges");
+    const first = item(purges, /#3/);
+    expect(first.textContent).not.toMatch(/requeued|attempt/);
+    expect(first.textContent).toContain("postcondition_failed");
+    expect(item(purges, /#2/).textContent).toContain("requeued 1\u00a0time");
+    expect(item(purges, /#1/).textContent).toContain("requeued 2\u00a0times");
+  });
+
+  it("a retried purge that leaves the list hands the focus to its block's heading", async () => {
+    // plan M5 Task 33, the visual pass: the dialog gave the focus back to Retry, which the next read removed
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({
+      failed_purges: {
+        count: 1,
+        items: [{ manifest_id: 12, kind: "source_purge", created_at: "2026-11-03T04:00:00Z", operation_id: 81, last_error_code: "postcondition_failed", attempts: 0 }],
+      },
+    });
+    api.routes.set("POST /api/system/purges/81/retry", () => {
+      api.attention = attentionOut();
+      return json({ operation_id: 82, manifest_id: 12 }, 202);
+    });
+    const user = userEvent.setup();
+    renderApp("/settings#system");
+    const failed = item(await block("failed_purges"), /#12/);
+    await user.click(within(failed).getByRole("button", { name: en["attention.purge_retry"] }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.purge_retry_confirm"] }));
+    await waitFor(async () => {
+      expect(within(await block("failed_purges")).getByText(en["attention.nothing"])).toBeTruthy();
+    });
+    const purges = await block("failed_purges");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(purges).getByRole("heading", { level: 4 }));
+    });
+  });
+
+  it("a refused purge retry shows by its code at its item", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.attention = attentionOut({
+      failed_purges: {
+        count: 1,
+        items: [{ manifest_id: 12, kind: "delete_everything", created_at: "2026-11-03T04:00:00Z", operation_id: 81, last_error_code: null, attempts: 1 }],
+      },
+    });
+    const answers = [problem(409, "conflict_state"), problem(418, "teapot", { detail: "The server's own words" })];
+    api.routes.set("POST /api/system/purges/81/retry", () => answers.shift() ?? problem(500, "internal"));
+    renderApp("/settings#system");
+    const failed = item(await block("failed_purges"), /#12/);
+    for (const expected of [en["problem.conflict_state"], en["settings_privacy.error_generic"]]) {
+      fireEvent.click(within(failed).getByRole("button", { name: en["attention.purge_retry"] }));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en["attention.purge_retry_confirm"] }));
+      await waitFor(() => {
+        expect(within(failed).getByRole("alert").textContent).toContain(expected);
+      });
+    }
+    expect(within(failed).getByRole("alert").textContent).not.toMatch(/teapot|own words/);
   });
 
   it("a failed retry apply shows at its item, with no transient toast", async () => {

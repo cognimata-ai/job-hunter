@@ -5,6 +5,7 @@ are package data next to this module, so an installed (non-editable) wheel finds
 """
 
 from pathlib import Path
+from types import ModuleType
 from typing import Final
 
 from alembic import command
@@ -47,3 +48,9 @@ def code_head() -> str:
     if head is None:
         raise RuntimeError("the migrations directory has no revision")
     return head
+
+
+def chain_modules() -> list[ModuleType]:
+    """The migration module of every revision in this package, base first (`db.compat` reads them)."""
+    scripts = ScriptDirectory.from_config(_script_config()).walk_revisions()  # from the head down
+    return [script.module for script in reversed(list(scripts))]

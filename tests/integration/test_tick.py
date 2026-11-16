@@ -15,6 +15,7 @@ from jobhunter.worker.tick import insert_active_collect, run_tick
 from procrastinate.job_context import JobContext
 from sqlalchemy.exc import IntegrityError
 
+from tests.support.fences import insert_test_fence
 from tests.support.logs import logged
 
 pytestmark = pytest.mark.integration
@@ -390,6 +391,7 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
@@ -431,6 +433,8 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
         epoch=3,
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
@@ -503,6 +507,8 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
         epoch=current_epoch,  # the daily cadence's own fence admits it
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(FencedOut) as fenced:  # the job fails, after the daily cadence ran
@@ -530,6 +536,7 @@ async def test_a_fence_of_another_owner_fails_the_tick_and_never_stops_the_worke
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     with pytest.raises(FencedOut):
         await tasks.tick(
@@ -566,6 +573,8 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
         epoch=current_epoch,
         embedder=None,
         shutdown=ShutdownState(),
+        cfg=None,
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     with pytest.raises(RuntimeError):
@@ -589,13 +598,20 @@ async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_recon
     reconcilers.reconciler("probe", "heavy")(probe)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     embedder = object()  # the runtime's client, whatever it is: handed on as is
+    cfg = object()  # the runtime's configuration, as is (M5 Task 3: `metrics_refresh` reads its paths)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=3, embedder=embedder, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=3,
+        embedder=embedder,
+        shutdown=ShutdownState(),
+        cfg=cfg,
+        deadman=None,
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.reconcile_heavy(context, timestamp=0)
     [ctx] = seen
-    assert ctx.embedder is embedder
+    assert ctx.embedder is embedder and ctx.cfg is cfg
     assert ctx.engine is engine and ctx.queue is queue_app and ctx.defer is defer_in_tx
     assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
 
@@ -620,6 +636,7 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
@@ -675,7 +692,13 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
     stale = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=current_epoch,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=None,
+        deadman=None,
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": stale})), timestamp=0)
     assert await runs(engine) == [] and await stored_cursor(engine) == A
@@ -691,7 +714,57 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
         embedder=None,
         shutdown=ShutdownState(),
         cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
+        deadman=None,  # M5 Task 5: the reconcile context carries it
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
     assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)
     assert not current.shutdown.requested.is_set()
+
+
+_RELEASE_FENCES = sa.text("UPDATE purge_fences SET released_at = now() WHERE released_at IS NULL")
+
+
+async def global_fence(engine) -> None:
+    """Delete-everything's `global` fence, committed (over a manifest of its own)."""
+    async with engine.begin() as c:
+        await insert_test_fence(c, kind="global")
+
+
+async def test_a_tick_under_a_global_fence_inserts_no_run_and_moves_no_cursor(
+    engine, queue_app, caplog
+) -> None:
+    """§20.4 step 1 (M5 Task 16, Ruling T16-4): while delete-everything's `global` fence stands, the tick
+    inserts no run of any kind, neither the `missed` ones, nor a `queued` one, nor a `skipped_overlap` beside
+    an active collection, and leaves its cursor where it is."""
+    caplog.set_level(logging.INFO, logger="jobhunter.worker.tick")
+    await schedule(engine, interval=21600, cursor=A)
+    first = await tick(engine, A + timedelta(hours=6, minutes=1))  # a collection queued before the fence
+    assert first.queued_run_id is not None
+    before = await runs(engine)
+    await global_fence(engine)
+    for hours in (12, 30):  # one slot due (beside an active collection), then two missed and one due
+        rep = await tick(engine, A + timedelta(hours=hours, minutes=1))
+        assert (rep.missed, rep.queued_run_id, rep.skipped_overlap) == (0, None, False)
+        assert rep.cursor == A + timedelta(hours=6)
+    assert await runs(engine) == before and await stored_cursor(engine) == A + timedelta(hours=6)
+    assert len(logged(caplog, "tick_skipped_global_fence")) == 2
+
+
+async def test_the_first_tick_after_the_global_fence_records_its_window_missed(engine, queue_app) -> None:
+    """The fence's window is not lost: the first tick after its release records the slots it held back as
+    `missed` (one statement, the `slots_missed` warning) and queues the latest, as after any downtime."""
+    await schedule(engine, interval=21600, cursor=A)
+    await global_fence(engine)
+    for hours in (6, 12):
+        assert (await tick(engine, A + timedelta(hours=hours, minutes=1))).queued_run_id is None
+    assert await runs(engine) == [] and await stored_cursor(engine) == A
+    async with engine.begin() as c:
+        await c.execute(_RELEASE_FENCES)
+    rep = await tick(engine, A + timedelta(hours=18, minutes=1))
+    assert rep.missed == 2 and rep.queued_run_id is not None
+    assert await runs(engine) == [
+        (A + timedelta(hours=6), "missed", "schedule"),
+        (A + timedelta(hours=12), "missed", "schedule"),
+        (A + timedelta(hours=18), "queued", "schedule"),
+    ]
+    assert await stored_cursor(engine) == A + timedelta(hours=18)

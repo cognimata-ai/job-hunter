@@ -100,6 +100,10 @@ def test_a_spec_with_a_column_effect_for_a_state_in_no_edge_is_refused() -> None
         TransitionSpec("t", "s", None, {"gone": "at"}, frozenset(), {}, frozenset({("a", "b")}))
     with pytest.raises(ValueError, match="managed by transition"):
         TransitionSpec("t", "s", "r", {}, frozenset(), {}, frozenset({("a", "b")}), settable=frozenset({"r"}))
+    with pytest.raises(ValueError, match=r"\['b'\] have no changed-at column to keep"):
+        TransitionSpec(
+            "t", "s", None, {}, frozenset(), {}, frozenset({("a", "b")}), first_entry_kept=frozenset("b")
+        )
 
 
 async def test_a_reason_for_a_table_without_a_reason_column_is_refused(monkeypatch) -> None:
@@ -251,8 +255,9 @@ def test_m2_machines() -> None:
         "ended_at",
     }
 
+    # M2's two edges; M5 adds the purge's three (`test_m5_machines`)
     proposals = TRANSITIONS["query_proposals"]
-    assert proposals.allowed == {("running", "ready"), ("running", "failed")}
+    assert {("running", "ready"), ("running", "failed")} <= proposals.allowed
     assert proposals.state_col == "status"
     assert proposals.settable == {"items", "llm_call_id"}
 
@@ -485,6 +490,71 @@ def test_m3_machines() -> None:
     assert items.settable == {"llm_call_id", "stop_reason"}
 
 
+def test_m5_machines() -> None:
+    # §7.14: a manifest is written, then its file shipped; no owner and no reason column. The prune returns
+    # a manifest to `completed` when its receipt names a snapshot restic no longer lists (final fix D1): the
+    # shipment is cleared, and the completion keeps its time.
+    manifests = TRANSITIONS["deletion_manifests"]
+    assert manifests.allowed == {
+        ("executing", "completed"),
+        ("completed", "shipped"),
+        ("shipped", "completed"),
+    }
+    assert (manifests.state_col, manifests.reason_col) == ("status", None)
+    assert manifests.changed_at == {"completed": "completed_at", "shipped": "shipped_at"}
+    assert manifests.owner_cols == frozenset()
+    assert manifests.clear_on_exit == {"shipped": ("shipped_at", "shipment_id")}
+    assert manifests.first_entry_kept == {"completed"}
+    assert manifests.settable == {"file_sha256", "scope", "shipment_id", "replay_log"}
+
+    # D9: an export is built (`running`), then served until it expires or a purge removes it
+    exports = TRANSITIONS["exports"]
+    assert exports.allowed == {
+        ("running", "ready"),
+        ("running", "failed"),
+        ("running", "purged"),
+        ("ready", "expired"),
+        ("ready", "purged"),
+    }
+    assert (exports.state_col, exports.reason_col, exports.changed_at) == ("status", None, {})
+    assert (exports.owner_cols, exports.clear_on_exit) == (frozenset(), {})
+    assert exports.settable == {"storage_path", "sha256", "size_bytes", "purge_generation"}
+
+    # §19.5: a backup set, and a prune or restore-test run, each `running` until it ends; its error the reason
+    for table, settable in (
+        (
+            "backup_sets",
+            {
+                "restic_snapshot_id",
+                "dump_sha256",
+                "dump_bytes",
+                "db_snapshot_at",
+                "manifest_count",
+                "row_counts",
+                "cv_file_count",
+            },
+        ),
+        ("backup_runs", {"report"}),
+    ):
+        spec = TRANSITIONS[table]
+        assert spec.allowed == {("running", "succeeded"), ("running", "failed")}, table
+        assert (spec.state_col, spec.reason_col) == ("status", "error"), table
+        assert spec.changed_at == {"succeeded": "finished_at", "failed": "finished_at"}, table
+        assert (spec.owner_cols, spec.clear_on_exit) == (frozenset(), {}), table
+        assert spec.settable == settable, table
+
+    # §7.5's `purged` (Task 14's profile purge): from every state, the items nulled in the same update
+    proposals = TRANSITIONS["query_proposals"]
+    assert proposals.allowed == {
+        ("running", "ready"),
+        ("running", "failed"),
+        ("running", "purged"),
+        ("ready", "purged"),
+        ("failed", "purged"),
+    }
+    assert "items" in proposals.settable and proposals.changed_at == {}
+
+
 class RecordingConnection:
     """A connection that keeps every statement it is given and answers each with no rows."""
 
@@ -639,6 +709,14 @@ WHERE_ID = {"where": "t.id = :id", "params": {"id": 1}}
             "not a column name",
         ),
         ("score_targets", ["pending"], "pending", {**WHERE_ID, "returning": ()}, "returning is empty"),
+        # a JSONB bind names a value of params (M5 Task 14)
+        (
+            "score_targets",
+            ["pending"],
+            "pending",
+            {**WHERE_ID, "jsonb": ["report"]},
+            r"\['report'\] in jsonb have no value in params",
+        ),
         # an expression over another table would make SQLAlchemy append its own FROM inside the SET list
         (
             "score_targets",
