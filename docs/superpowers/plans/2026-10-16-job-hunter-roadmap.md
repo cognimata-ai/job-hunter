@@ -62,5 +62,5 @@ Each spike records its result in `docs/spikes/V<n>.md`.
 | M1 | [`2026-10-17-m1-collection-pipeline.md`](2026-10-17-m1-collection-pipeline.md) | complete |
 | M2 | [`2026-10-20-m2-llm-profile-settings.md`](2026-10-20-m2-llm-profile-settings.md) | complete |
 | M3 | [`2026-10-25-m3-agentic-scoring.md`](2026-10-25-m3-agentic-scoring.md) | complete |
-| M4 | [`2026-11-02-m4-api-and-web-ui.md`](2026-11-02-m4-api-and-web-ui.md) | in progress |
-| M5 | [`2026-11-09-m5-operations-privacy-production.md`](2026-11-09-m5-operations-privacy-production.md) | in progress |
+| M4 | [`2026-11-02-m4-api-and-web-ui.md`](2026-11-02-m4-api-and-web-ui.md) | complete |
+| M5 | [`2026-11-09-m5-operations-privacy-production.md`](2026-11-09-m5-operations-privacy-production.md) | complete |
