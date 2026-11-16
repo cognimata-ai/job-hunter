@@ -24,9 +24,12 @@ from jobhunter.db.sql import q
 from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql, listing
 from jobhunter.jobs._sql import TRGM_WORD_THRESHOLD
+from jobhunter.jobs.facets import facets
 from jobhunter.jobs.listing import Counts, PageSelection, Position, SelectedRow, select_page
 from jobhunter.jobs.query import JobsQuery, LocationFilter
-from sqlalchemy.ext.asyncio import AsyncEngine
+from jobhunter.normalize.titles import normalize_title
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.jobs_list import (
     BERLIN,
@@ -286,6 +289,115 @@ async def test_keyword_finds_softwareentwickler_by_entwickler(engine: AsyncEngin
     for sort in ("score_mid", "posted", "first_seen"):
         found = await ids(engine, JobsQuery(q="Entwickler", sort=sort))
         assert sorted(found) == sorted([senior, plain])
+
+
+# Task P2 of the jobs-list perf plan: the keyword's matches are read once per request, in its snapshot
+# Each text index's scans by this backend since its stats were last flushed, which no flush changes inside a
+# transaction: the title's and the full text's
+_TEXT_INDEX_SCANS: Final = q(
+    "SELECT pg_stat_get_xact_numscans(CAST('jobs_title_trgm' AS regclass)) AS title, "
+    "pg_stat_get_xact_numscans(CAST('job_revisions_tsv' AS regclass)) AS text"
+)
+_SEQSCAN: Final = {setting: q(f"SET LOCAL enable_seqscan = {setting}") for setting in ("on", "off")}
+_SHOW_SEQSCAN: Final = q("SHOW enable_seqscan")
+_CURRENT_REVISION: Final = q("SELECT current_revision_id FROM jobs WHERE id = :id")
+_RETITLE: Final = (
+    q("UPDATE jobs SET title = :title, title_norm = :title_norm WHERE id = :id"),
+    q(
+        "UPDATE job_revisions SET llm_input = jsonb_build_object('title', CAST(:title AS text)) "
+        "WHERE id = :revision"
+    ),
+)
+
+
+async def test_a_keyword_page_and_its_facets_read_each_text_index_once(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """A first page with its counts, and the facets, each read the keyword's matches once, by the two text
+    indexes (a sequential scan reads neither), in one statement; every other statement binds them."""
+    developer, _ = await seed_cards(
+        engine, [Card(title="Softwareentwickler"), Card(title="Marketing Manager")]
+    )
+    query = JobsQuery(q="Entwickler")
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool) -> None:
+        statements.append(statement)
+
+    async def scans(conn: AsyncConnection) -> tuple[int, int]:
+        row = (await conn.execute(_TEXT_INDEX_SCANS)).one()
+        return int(row.title), int(row.text)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        async with read_snapshot(engine) as conn:
+            before = await scans(conn)
+            selected = await select_page(conn, query, window=ANY, after=None, limit=20, with_counts=True)
+            listed = tuple(n - b for n, b in zip(await scans(conn), before, strict=True))
+        of_page = list(statements)
+        statements.clear()
+        async with read_snapshot(engine) as conn:
+            before = await scans(conn)
+            counted = await facets(conn, query, window=ANY, company_q="", limit=10)
+            faceted = tuple(n - b for n, b in zip(await scans(conn), before, strict=True))
+        of_facets = list(statements)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert [row.job_id for row in selected.rows] == [developer]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert [company.count for company in counted.companies] == [1]
+    assert (listed, faceted) == ((1, 1), (1, 1))
+    for ran in (of_page, of_facets):
+        matching = [s for s in ran if "<%" in s or "websearch_to_tsquery" in s]
+        assert len(matching) == 1 and matching[0].startswith("/* jobs_list.keyword */"), matching
+
+
+@pytest.mark.parametrize("setting", ["on", "off"])
+async def test_the_keyword_read_leaves_the_planner_setting_as_it_found_it(
+    engine: AsyncEngine, active_tuple: int, setting: str
+) -> None:
+    """The keyword's read takes the text indexes under a planner setting of its own; the page's other
+    statements, and whatever its caller runs after it, are planned under the caller's."""
+    await seed_cards(engine, [Card(title="Softwareentwickler")])
+    async with read_snapshot(engine) as conn:
+        await conn.execute(_SEQSCAN[setting])
+        selected = await select_page(
+            conn, JobsQuery(q="Entwickler"), window=ANY, after=None, limit=5, with_counts=True
+        )
+        shown = (await conn.execute(_SHOW_SEQSCAN)).scalar_one()
+    assert (len(selected.rows), shown) == (1, setting)
+
+
+async def retitle(conn: AsyncConnection, job_id: int, title: str) -> None:
+    """The job's title, and its current revision's, whose full text it is."""
+    revision = (await conn.execute(_CURRENT_REVISION, {"id": job_id})).scalar_one()
+    params = {
+        "id": job_id,
+        "revision": revision,
+        "title": title,
+        "title_norm": normalize_title(title).title_norm,
+    }
+    for statement in _RETITLE:
+        await conn.execute(statement, params)
+
+
+async def test_the_keyword_matches_follow_the_page_snapshot(engine: AsyncEngine, active_tuple: int) -> None:
+    """The keyword's matches are read in the page's snapshot, so they agree with its every statement: titles
+    changed after the snapshot began change neither the page nor its counts."""
+    renamed, other = await seed_cards(
+        engine, [Card(title="Softwareentwickler"), Card(title="Marketing Manager")]
+    )
+    async with read_snapshot(engine) as conn:
+        await listing.read_active(conn)  # the snapshot is taken
+        async with engine.begin() as write:
+            await retitle(write, renamed, "Marketing Manager")
+            await retitle(write, other, "Softwareentwickler")
+        selected = await select_page(
+            conn, JobsQuery(q="Entwickler"), window=ANY, after=None, limit=20, with_counts=True
+        )
+    assert [row.job_id for row in selected.rows] == [renamed]
+    assert selected.counts is not None and selected.counts.total == 1
+    assert await ids(engine, JobsQuery(q="Entwickler")) == [other]
 
 
 async def test_location_matches_any_resolved_candidate_and_never_unresolved_or_country_wide(

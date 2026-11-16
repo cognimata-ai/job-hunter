@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Final
 
 import pytest
-from jobhunter.jobs.listing import Active, _filter, card_set
+from jobhunter.jobs.listing import Active, Matches, _filter, card_set
 from jobhunter.jobs.query import JobsQuery, LocationFilter
 
 Window = tuple[datetime | None, datetime | None]
@@ -32,6 +32,8 @@ QUERIES: Final = (
         contested="exclude",
     ),
 )
+# The keyword's matches, as `listing.read_matches` reads them (plan Task P2)
+MATCHES: Final = Matches(keyword_revisions=(11, 12), keyword_jobs=(21,))
 FENCE_TERMS: Final = ("is_fenced", "purge_fences")
 NOT_FENCED: Final = " AND NOT is_fenced(j.id)"
 
@@ -50,8 +52,8 @@ cases = pytest.mark.parametrize(
 def test_without_an_open_fence_the_filter_names_no_fence(
     query: JobsQuery, window: Window, active: Active
 ) -> None:
-    where = _filter(query, window, active, fence_open=False)
-    cards = card_set(query, window=window, active=active, fence_open=False)
+    where = _filter(query, window, active, fence_open=False, matches=MATCHES)
+    cards = card_set(query, window=window, active=active, fence_open=False, matches=MATCHES)
     for sql in (where.sql, cards.sql):
         assert not [term for term in FENCE_TERMS if term in sql], sql
 
@@ -60,13 +62,13 @@ def test_without_an_open_fence_the_filter_names_no_fence(
 def test_with_an_open_fence_the_filter_adds_not_is_fenced_alone(
     query: JobsQuery, window: Window, active: Active
 ) -> None:
-    fenced = _filter(query, window, active, fence_open=True)
-    unfenced = _filter(query, window, active, fence_open=False)
+    fenced = _filter(query, window, active, fence_open=True, matches=MATCHES)
+    unfenced = _filter(query, window, active, fence_open=False, matches=MATCHES)
     assert fenced.sql == NOT_FENCED + unfenced.sql
     assert "purge_fences" not in fenced.sql  # the snapshot already showed a fence: no "none is open" term
     assert fenced.binds == unfenced.binds
-    fenced_cards = card_set(query, window=window, active=active, fence_open=True)
-    unfenced_cards = card_set(query, window=window, active=active, fence_open=False)
+    fenced_cards = card_set(query, window=window, active=active, fence_open=True, matches=MATCHES)
+    unfenced_cards = card_set(query, window=window, active=active, fence_open=False, matches=MATCHES)
     assert fenced_cards.sql.count("is_fenced") == 1 and "purge_fences" not in fenced_cards.sql
     assert fenced_cards.sql.replace(NOT_FENCED, "", 1) == unfenced_cards.sql
     assert fenced_cards.binds == unfenced_cards.binds

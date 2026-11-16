@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.jobs import _sql
-from jobhunter.jobs.listing import card_set, read_active
+from jobhunter.jobs.listing import card_set, read_active, read_matches
 from jobhunter.jobs.query import JobsQuery
 from jobhunter.normalize.text import fold
 from jobhunter.privacy.fences import any_fence_open
@@ -84,11 +84,20 @@ async def facets(
         raise ValueError("the limit must be at least 1")
     active = await read_active(conn)
     fence_open = await any_fence_open(conn)  # once, for both sets (`listing`'s module docstring, Cards)
+    matches = await read_matches(conn, q)  # likewise (Filters): neither depends on the company or source
     by_company = card_set(
-        q.model_copy(update={"company": frozenset()}), window=window, active=active, fence_open=fence_open
+        q.model_copy(update={"company": frozenset()}),
+        window=window,
+        active=active,
+        fence_open=fence_open,
+        matches=matches,
     )
     by_source = card_set(
-        q.model_copy(update={"source": frozenset()}), window=window, active=active, fence_open=fence_open
+        q.model_copy(update={"source": frozenset()}),
+        window=window,
+        active=active,
+        fence_open=fence_open,
+        matches=matches,
     )
     prefix = fold(company_q)
     having = _COMPANY_PREFIX if prefix else ""
