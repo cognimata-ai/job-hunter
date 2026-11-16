@@ -22,7 +22,11 @@ re-creates a row of a deleted job.
   `detail = "purge_in_progress"` (M4 Ruling P3's mapping, the problem `api.errors.domain_problem` answers a
   `FencedOut` with);
 - `NO_OPEN_FENCE_SQL`: "no fence is open", the uncorrelated `NOT EXISTS` a selection ORs before `is_fenced`
-  (D21): an InitPlan, run once, that spares every row the function while no fence stands.
+  (D21): an InitPlan, run once, that spares every row the function while no fence stands;
+- `any_fence_open(conn)`: its negation as a value, "an unreleased fence of any kind stands" in `conn`'s
+  snapshot. The Jobs list and its facets read it once per request, in their read snapshot, and add the
+  `is_fenced` conjunct only when it holds (`jobs._sql.NOT_FENCED`; plan `2026-11-16-jobs-list-perf` Task P1,
+  Ruling JP-1): within one `REPEATABLE READ` snapshot every statement's InitPlan would read the same answer.
 
 **A profile version's fence** (M5 Task 14). `is_fenced` matches a `profile` fence through a tuple of its
 version; the writers that name a version, not a job and a tuple, read it with `version_fenced(conn,
@@ -78,6 +82,7 @@ from jobhunter.privacy.manifests import FenceKind
 
 PURGE_IN_PROGRESS: Final = "purge_in_progress"
 NO_OPEN_FENCE_SQL: Final = "NOT EXISTS (SELECT 1 FROM purge_fences f WHERE f.released_at IS NULL)"
+_ANY_FENCE_OPEN: Final = q(f"SELECT NOT {NO_OPEN_FENCE_SQL}")
 QUIESCE_POLL_S: Final = 1.0
 QUIESCE_TIMEOUT: Final = timedelta(minutes=10)
 # The application role's own transactions that began before `:since`, in this database (module docstring).
@@ -115,6 +120,11 @@ _FENCED: Final = q(
 def purge_in_progress() -> Refusal:
     """The refusal of a user's write that meets a fenced job (module docstring)."""
     return Refusal(409, "conflict_state", "A purge is in progress", detail=PURGE_IN_PROGRESS)
+
+
+async def any_fence_open(conn: AsyncConnection) -> bool:
+    """Whether an unreleased purge fence of any kind stands in `conn`'s snapshot (module docstring)."""
+    return bool((await conn.execute(_ANY_FENCE_OPEN)).scalar_one())
 
 
 async def fenced_jobs(

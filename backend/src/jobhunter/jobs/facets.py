@@ -30,6 +30,7 @@ from jobhunter.jobs import _sql
 from jobhunter.jobs.listing import card_set, read_active
 from jobhunter.jobs.query import JobsQuery
 from jobhunter.normalize.text import fold
+from jobhunter.privacy.fences import any_fence_open
 
 _COMPANIES_HEAD: Final = (
     "/* jobs_facets.companies */ SELECT c.company_key, "
@@ -82,8 +83,13 @@ async def facets(
     if limit < 1:
         raise ValueError("the limit must be at least 1")
     active = await read_active(conn)
-    by_company = card_set(q.model_copy(update={"company": frozenset()}), window=window, active=active)
-    by_source = card_set(q.model_copy(update={"source": frozenset()}), window=window, active=active)
+    fence_open = await any_fence_open(conn)  # once, for both sets (`listing`'s module docstring, Cards)
+    by_company = card_set(
+        q.model_copy(update={"company": frozenset()}), window=window, active=active, fence_open=fence_open
+    )
+    by_source = card_set(
+        q.model_copy(update={"source": frozenset()}), window=window, active=active, fence_open=fence_open
+    )
     prefix = fold(company_q)
     having = _COMPANY_PREFIX if prefix else ""
     company_sql = _COMPANIES_HEAD + by_company.sql + _COMPANIES_GROUP + having + _COMPANIES_ORDER

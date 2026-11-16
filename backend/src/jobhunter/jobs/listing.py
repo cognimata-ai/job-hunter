@@ -1,15 +1,20 @@
 """The Jobs list engine (spec §15.3, §14.3 L5078; plan M4 Task 4, R8, B1, B2, B4, B5, B8, B15, B18, A1 #33).
 
 `select_page` selects one page of cards in the caller's read snapshot (`db.snapshot.read_snapshot`): it reads
-the active tuple and scope from `active_config` without a lock, then runs one statement per segment of the
-page's walk until it holds `limit + 1` rows, and returns the first `limit`, the position after the last one
-(`next`, when there is more) and, on a first page that asks for them, the counts. `read_active` is that read
-of the active tuple and scope; `card_set` is the same cards under the same filters as SQL to aggregate over
-(the facets of M4 Task 5), and `display_timezone` the active settings' zone of a `custom` window (B31).
+the active tuple and scope from `active_config` without a lock, and whether a purge fence is open, then runs
+one statement per segment of the page's walk until it holds `limit + 1` rows, and returns the first `limit`,
+the position after the last one (`next`, when there is more) and, on a first page that asks for them, the
+counts. `read_active` is that read of the active tuple and scope; `card_set` is the same cards under the same
+filters as SQL to aggregate over (the facets of M4 Task 5), and `display_timezone` the active settings' zone
+of a `custom` window (B31).
 
 **Cards** (B2). A card is an unmerged job with a current revision, not a synthetic golden-case job, not under
-a purge fence (§20.2, M5 Task 8, D21: `jobs._sql.NOT_FENCED`, as its detail answers 404), whose current
-revision has no target of the active tuple in `deferred_duplicate`. A group card is its
+a purge fence (§20.2, M5 Task 8: `jobs._sql.NOT_FENCED`, as its detail answers 404), whose current revision
+has no target of the active tuple in `deferred_duplicate`. The fence's conjunct is added only while a fence is
+open: `select_page` and the facets read `privacy.fences.any_fence_open` once per request, in the caller's
+snapshot, and pass it on as `fence_open` (plan `2026-11-16-jobs-list-perf` Task P1, Ruling JP-1). Within one
+`REPEATABLE READ` snapshot every statement would see the same fences, so this is the per-statement "no fence
+is open" of D21 read once; a caller outside such a snapshot would lose that agreement. A group card is its
 representative's row. Each card has one score row: `t` the active-tuple target of its current revision, `r`
 the result `t` published, `d` the current instance of `r` under the active scope, `h` its hard-filter result
 under that scope and `u` the user's actions on it (no row: unseen).
@@ -65,6 +70,7 @@ from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql
 from jobhunter.jobs.query import JobsQuery, score_filter_active
 from jobhunter.normalize.text import fold
+from jobhunter.privacy.fences import any_fence_open
 from jobhunter.settings.model import Display
 from jobhunter.types import JSONValue
 
@@ -271,10 +277,13 @@ def _rendered(terms: Sequence[tuple[str, ...]], alias: str) -> str:
     )
 
 
-def _filter(q: JobsQuery, window: tuple[datetime | None, datetime | None], active: Active) -> _Filter:
-    """Every predicate of `q` over a card's score row (`j`, `t`, `r`, `d`, `h`, `u`), module docstring."""
+def _filter(
+    q: JobsQuery, window: tuple[datetime | None, datetime | None], active: Active, *, fence_open: bool
+) -> _Filter:
+    """Every predicate of `q` over a card's score row (`j`, `t`, `r`, `d`, `h`, `u`), module docstring; the
+    fence's only while the caller's snapshot shows one open (`fence_open`)."""
     terms, binds = _row_terms(q, window)
-    conjuncts: list[str] = [_sql.NOT_FENCED]  # a fenced job is no card (module docstring)
+    conjuncts: list[str] = [_sql.NOT_FENCED] if fence_open else []  # a fenced job is no card (docstring)
     if terms and active.llm_tuple_id is None:  # no tuple, no deferred member
         conjuncts.append(_rendered(terms, "j"))
     elif terms:
@@ -461,10 +470,13 @@ async def display_timezone(conn: AsyncConnection) -> str:
     return Display().timezone if zone is None else str(zone)
 
 
-def card_set(q: JobsQuery, *, window: tuple[datetime | None, datetime | None], active: Active) -> CardSet:
+def card_set(
+    q: JobsQuery, *, window: tuple[datetime | None, datetime | None], active: Active, fence_open: bool
+) -> CardSet:
     """The cards `select_page` lists for `q` under `active`, in no order (the facets' set, `jobs.facets`):
-    every filter of `q` over the card's score row, with the sort's score variant."""
-    where = _filter(q, window, active)
+    every filter of `q` over the card's score row, with the sort's score variant; `fence_open` is
+    `privacy.fences.any_fence_open` in the caller's snapshot (module docstring, Cards)."""
+    where = _filter(q, window, active, fence_open=fence_open)
     context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
     return CardSet(_sql.CARD_FROM + _sql.CARD + where.sql, MappingProxyType({**context, **where.binds}))
 
@@ -486,7 +498,7 @@ async def select_page(
         raise ValueError("the limit must be at least 1")
     _checked(q, after)
     active = await read_active(conn)
-    where = _filter(q, window, active)
+    where = _filter(q, window, active, fence_open=await any_fence_open(conn))  # once (docstring, Cards)
     context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
     rows: list[SelectedRow] = []
     for segment in _segments(q, active, where, after):

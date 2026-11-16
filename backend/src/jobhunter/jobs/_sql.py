@@ -5,7 +5,7 @@ name or variant name is ever interpolated, and every value is a bound parameter.
 card's score row: `j` the job, `t` its active-tuple target, `r` the published result, `d` the current
 instance, `h` the hard-filter result, `u` the user's actions, and `m` a deferred group member.
 
-**Plans at scale** (M4 Task 5, B29: the list's p95 on 50,000 cards). Three shapes keep the planner's estimates
+**Plans at scale** (M4 Task 5, B29: the list's p95 on 50,000 cards). Four shapes keep the planner's estimates
 honest, without which it chose nested loops over whole-table scans and JIT compilation:
 - a walk from an instance or a target finds its job by a fenced lateral lookup (`OFFSET 0`): the job is one
   row per walked row, so the redundant `current_revision_id` check is no join selectivity that would multiply
@@ -13,8 +13,12 @@ honest, without which it chose nested loops over whole-table scans and JIT compi
 - the deferred members that match (`DEFERRED_MEMBER`) are one uncorrelated set, an InitPlan run once per
   statement, not an EXISTS costed (and planned around) for every row it would rarely run for;
 - the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`);
-- a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8, D21) is decided by one uncorrelated "no fence is
-  open" first, an InitPlan run once per statement, so no row pays for `is_fenced` while no fence stands.
+- a card under a purge fence (`NOT_FENCED`, §20.2, M5 Task 8) is filtered only while a fence is open: the list
+  and its facets read `privacy.fences.any_fence_open` once per request, in their read snapshot, and add
+  `NOT_FENCED` only when it holds (plan `2026-11-16-jobs-list-perf` Task P1, Ruling JP-1). With none open, a
+  statement names neither `is_fenced` nor `purge_fences`: M4's SQL. `is_fenced` is SQL the planner cannot see
+  into, and as a conjunct of every statement, even behind D21's uncorrelated "no fence is open", it skewed the
+  row estimates: `count_unscored` then joined `user_job_actions` by a scan per row.
 """
 
 from collections.abc import Mapping
@@ -26,7 +30,6 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q as sql
 from jobhunter.jobs.query import ScoringBucket, UserStatus
-from jobhunter.privacy.fences import NO_OPEN_FENCE_SQL
 
 ACTIVE: Final = sql(
     "SELECT a.llm_tuple_id, a.scope_version_id, s.payload AS scope FROM active_config a "
@@ -300,8 +303,9 @@ STATUS_SQL: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 NOT_HIDDEN: Final = "u.hidden_at IS NULL"
-# No unreleased purge fence matches the card's job: a fenced job is no card (module docstring).
-NOT_FENCED: Final = f"({NO_OPEN_FENCE_SQL} OR NOT is_fenced(j.id))"
+# No unreleased purge fence matches the card's job: a fenced job is no card. Added only while the request's
+# snapshot shows a fence open, so it needs no "no fence is open" term of its own (module docstring).
+NOT_FENCED: Final = "NOT is_fenced(j.id)"
 BUCKET_ORDER: Final[tuple[ScoringBucket, ...]] = (
     "scored",
     "filtered",
